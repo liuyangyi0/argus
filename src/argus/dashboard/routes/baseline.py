@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -24,11 +25,14 @@ logger = structlog.get_logger()
 
 router = APIRouter()
 
+_GRADE_COLORS = {"A": "#4caf50", "B": "#8bc34a", "C": "#ff9800", "F": "#f44336"}
+
 _TABS = [
     ("capture", "基线采集", "/api/baseline/capture"),
     ("browse", "基线浏览", "/api/baseline/list"),
     ("train", "模型训练", "/api/baseline/train"),
     ("models", "模型管理", "/api/baseline/models"),
+    ("history", "训练报告", "/api/baseline/training-history"),
 ]
 
 
@@ -347,6 +351,12 @@ async def start_training(request: Request):
     if not camera_id:
         return JSONResponse({"error": "请选择摄像头"}, status_code=400)
 
+    # Get database if available
+    database = getattr(request.app.state, "database", None)
+    database_url = None
+    if database:
+        database_url = database._database_url
+
     try:
         task_manager.submit(
             "model_training",
@@ -356,6 +366,7 @@ async def start_training(request: Request):
             models_dir=str(config.storage.models_dir),
             model_type=model_type,
             export_format=export_format,
+            database_url=database_url,
         )
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -461,6 +472,211 @@ async def deploy_model(request: Request):
     return JSONResponse({"error": "模型部署失败"}, status_code=500)
 
 
+# ── Training history & reports (TRN-004/007) ──
+
+
+@router.get("/training-history", response_class=HTMLResponse)
+async def training_history(request: Request):
+    """Show training history with quality grades."""
+    database = getattr(request.app.state, "database", None)
+    if not database:
+        return HTMLResponse(empty_state("数据库不可用"))
+
+    camera_id = request.query_params.get("camera_id")
+    records = database.get_training_history(camera_id=camera_id, limit=50)
+
+    if not records:
+        return HTMLResponse(empty_state("暂无训练记录", "完成一次模型训练后，训练报告将显示在此处"))
+
+
+
+    rows = ""
+    for r in records:
+        grade_color = _GRADE_COLORS.get(r.quality_grade, "#888")
+        grade_badge = (
+            f'<span style="color:{grade_color};font-weight:bold;font-size:16px;">'
+            f'{r.quality_grade or "—"}</span>'
+        )
+        threshold_str = f"{r.threshold_recommended:.3f}" if r.threshold_recommended else "—"
+        trained_at = r.trained_at.strftime("%Y-%m-%d %H:%M") if r.trained_at else "—"
+        status_str = "完成" if r.status == "complete" else "失败"
+        status_color = "#4caf50" if r.status == "complete" else "#f44336"
+
+        rows += f"""
+        <tr>
+            <td>{r.camera_id}</td>
+            <td>{r.model_type}</td>
+            <td>{r.baseline_count}</td>
+            <td>{r.train_count}/{r.val_count}</td>
+            <td>{grade_badge}</td>
+            <td>{threshold_str}</td>
+            <td style="color:{status_color};">{status_str}</td>
+            <td>{r.duration_seconds:.0f}s</td>
+            <td>{trained_at}</td>
+            <td>
+                <button class="btn btn-ghost btn-sm"
+                    hx-get="/api/baseline/training-report/{r.id}"
+                    hx-target="#tab-content" hx-swap="innerHTML">
+                    详情
+                </button>
+            </td>
+        </tr>"""
+
+    return HTMLResponse(f"""
+    <div class="card">
+        <h3>训练历史</h3>
+        <table>
+            <thead><tr>
+                <th>摄像头</th><th>模型</th><th>基线数</th>
+                <th>训练/验证</th><th>质量</th><th>推荐阈值</th>
+                <th>状态</th><th>耗时</th><th>时间</th><th>操作</th>
+            </tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+    </div>""")
+
+
+@router.get("/training-report/{record_id}", response_class=HTMLResponse)
+async def training_report(request: Request, record_id: int):
+    """Show detailed training report for a specific record."""
+    database = getattr(request.app.state, "database", None)
+    if not database:
+        return HTMLResponse(empty_state("数据库不可用"))
+
+    record = database.get_training_record(record_id)
+    if not record:
+        return HTMLResponse(empty_state("训练记录不存在"))
+
+    back_btn = (
+        '<button class="btn btn-ghost btn-sm mb-16" '
+        'hx-get="/api/baseline/training-history" hx-target="#tab-content" hx-swap="innerHTML">'
+        '← 返回列表</button>'
+    )
+
+
+    grade_color = _GRADE_COLORS.get(record.quality_grade, "#888")
+
+    # Pre-validation section
+    pre_val_html = ""
+    if record.corruption_rate is not None:
+        pre_val_html = f"""
+        <div class="card">
+            <h3>基线质量验证 (TRN-001)</h3>
+            <table>
+                <tr><td>验证结果</td><td>{"通过" if record.pre_validation_passed else "失败"}</td></tr>
+                <tr><td>损坏率</td><td>{record.corruption_rate:.1%}</td></tr>
+                <tr><td>近似重复率</td><td>{record.near_duplicate_rate:.1%}</td></tr>
+                <tr><td>亮度标准差</td><td>{record.brightness_std:.1f}</td></tr>
+            </table>
+        </div>"""
+
+    # Score distribution section
+    score_html = ""
+    if record.val_score_mean is not None:
+        score_html = f"""
+        <div class="card">
+            <h3>验证集分数分布 (TRN-003)</h3>
+            <table>
+                <tr><td>均值</td><td>{record.val_score_mean:.4f}</td></tr>
+                <tr><td>标准差</td><td>{record.val_score_std:.4f}</td></tr>
+                <tr><td>最大值</td><td>{record.val_score_max:.4f}</td></tr>
+                <tr><td>P95</td><td>{record.val_score_p95:.4f}</td></tr>
+            </table>
+        </div>"""
+
+    # Output validation section
+    output_html = ""
+    if record.checkpoint_valid is not None:
+        smoke_str = "通过" if record.smoke_test_passed else "失败"
+        latency_str = f"{record.inference_latency_ms:.1f}ms" if record.inference_latency_ms else "—"
+        output_html = f"""
+        <div class="card">
+            <h3>输出验证 (TRN-006)</h3>
+            <table>
+                <tr><td>模型文件</td><td>{"有效" if record.checkpoint_valid else "无效"}</td></tr>
+                <tr><td>导出文件</td><td>{"有效" if record.export_valid else "无效/未导出"}</td></tr>
+                <tr><td>冒烟测试</td><td>{smoke_str}</td></tr>
+                <tr><td>推理延迟</td><td>{latency_str}</td></tr>
+            </table>
+        </div>"""
+
+    trained_at = record.trained_at.strftime("%Y-%m-%d %H:%M:%S") if record.trained_at else "—"
+    threshold_str = f"{record.threshold_recommended:.4f}" if record.threshold_recommended else "—"
+
+    return HTMLResponse(f"""
+    {back_btn}
+    <div class="card" style="border-left:4px solid {grade_color};">
+        <h3>训练报告 #{record.id}</h3>
+        <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;">
+            <span style="font-size:48px;font-weight:bold;color:{grade_color};">
+                {record.quality_grade or "—"}
+            </span>
+            <div>
+                <div><strong>摄像头:</strong> {record.camera_id}</div>
+                <div><strong>模型:</strong> {record.model_type} | {record.export_format or "未导出"}</div>
+                <div><strong>数据:</strong> {record.baseline_count} 基线 → {record.train_count} 训练 + {record.val_count} 验证</div>
+                <div><strong>推荐阈值:</strong> {threshold_str}</div>
+                <div><strong>耗时:</strong> {record.duration_seconds:.0f} 秒 | {trained_at}</div>
+            </div>
+        </div>
+        {f'<div style="color:#f44336;margin-bottom:12px;"><strong>错误:</strong> {record.error}</div>' if record.error else ''}
+    </div>
+    {pre_val_html}
+    {score_html}
+    {output_html}
+    """)
+
+
+@router.post("/compare")
+async def compare_models_route(request: Request):
+    """Compare two trained models (TRN-008)."""
+    database = getattr(request.app.state, "database", None)
+    if not database:
+        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+
+    data = await request.json()
+    old_record_id = data.get("old_record_id")
+    new_record_id = data.get("new_record_id")
+
+    if not old_record_id or not new_record_id:
+        return JSONResponse({"error": "缺少参数"}, status_code=400)
+
+    old_record = database.get_training_record(int(old_record_id))
+    new_record = database.get_training_record(int(new_record_id))
+
+    if not old_record or not new_record:
+        return JSONResponse({"error": "训练记录不存在"}, status_code=404)
+
+    if not old_record.model_path or not new_record.model_path:
+        return JSONResponse({"error": "模型路径不存在"}, status_code=400)
+
+    # Find a validation set (prefer new record's baseline)
+    config = request.app.state.config
+    baselines_dir = Path(config.storage.baselines_dir)
+    val_dir = baselines_dir / new_record.camera_id / new_record.zone_id
+    if not val_dir.exists():
+        return JSONResponse({"error": "验证集目录不存在"}, status_code=400)
+
+    try:
+        from argus.anomaly.baseline import BaselineManager
+        from argus.anomaly.trainer import ModelTrainer
+
+        bm = BaselineManager(baselines_dir=str(baselines_dir))
+        trainer = ModelTrainer(baseline_manager=bm)
+
+        # Find model files
+        old_model = trainer._find_best_model_file(Path(old_record.model_path))
+        new_model = trainer._find_best_model_file(Path(new_record.model_path))
+
+        if not old_model or not new_model:
+            return JSONResponse({"error": "无法找到模型文件"}, status_code=400)
+
+        result = trainer.compare_models(old_model, new_model, val_dir)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # ── Background task functions ──
 
 
@@ -512,11 +728,13 @@ def _capture_baseline_task(
 
 
 def _train_model_task(
-    progress_callback, *, baselines_dir, models_dir, camera_id, model_type, export_format
+    progress_callback, *, baselines_dir, models_dir, camera_id, model_type,
+    export_format, database_url=None
 ):
-    """Train an anomaly detection model using the real ModelTrainer API (CRIT-01 fix).
+    """Train an anomaly detection model with full validation pipeline.
 
-    Uses BaselineManager + ModelTrainer with correct constructor signatures.
+    Uses ModelTrainer with progress callback for UI updates.
+    Saves TrainingRecord to database when available.
     """
     progress_callback(5, "正在验证基线数据...")
 
@@ -527,12 +745,6 @@ def _train_model_task(
         raise RuntimeError("Anomalib 未安装，无法训练模型")
 
     bm = BaselineManager(baselines_dir=baselines_dir)
-    image_count = bm.count_images(camera_id, "default")
-
-    if image_count < 30:
-        raise ValueError(f"基线图片不足: 需要至少 30 张，实际 {image_count} 张")
-
-    progress_callback(10, f"找到 {image_count} 张基线图片，正在训练 {model_type} 模型...")
 
     trainer = ModelTrainer(
         baseline_manager=bm,
@@ -540,22 +752,83 @@ def _train_model_task(
         exports_dir=str(Path(models_dir).parent / "exports"),
     )
 
-    # Train (blocking call)
+    # Train with progress callback
     fmt = export_format if export_format != "none" else None
     result = trainer.train(
         camera_id=camera_id,
         zone_id="default",
         model_type=model_type,
         export_format=fmt,
+        progress_callback=progress_callback,
     )
 
     if result.status == TrainingStatus.FAILED:
         raise RuntimeError(result.error or "训练失败（未知原因）")
 
-    progress_callback(100, f"训练完成 — 耗时 {result.duration_seconds:.0f} 秒")
+    # Save training record to database
+    if database_url:
+        try:
+            from argus.storage.database import Database
+            from argus.storage.models import TrainingRecord
+
+            db = Database(database_url=database_url)
+            db.initialize()
+
+            # Get baseline version
+            baseline_dir = bm.get_baseline_dir(camera_id, "default")
+            baseline_version = baseline_dir.name
+
+            pre_val = result.pre_validation or {}
+            output_val = result.output_validation or {}
+            val_stats = result.val_stats or {}
+            quality = result.quality_report
+
+            record = TrainingRecord(
+                camera_id=camera_id,
+                zone_id="default",
+                model_type=model_type,
+                export_format=fmt,
+                baseline_version=baseline_version,
+                baseline_count=result.image_count,
+                train_count=result.train_count,
+                val_count=result.val_count,
+                pre_validation_passed=pre_val.get("passed", True),
+                corruption_rate=pre_val.get("corruption_rate"),
+                near_duplicate_rate=pre_val.get("near_duplicate_rate"),
+                brightness_std=pre_val.get("brightness_std"),
+                val_score_mean=val_stats.get("mean"),
+                val_score_std=val_stats.get("std"),
+                val_score_max=val_stats.get("max"),
+                val_score_p95=val_stats.get("p95"),
+                quality_grade=quality.grade if quality else None,
+                threshold_recommended=result.threshold_recommended,
+                model_path=result.model_path,
+                export_path=str(Path(models_dir).parent / "exports" / camera_id / "default") if fmt else None,
+                checkpoint_valid=output_val.get("checkpoint_valid"),
+                export_valid=output_val.get("export_valid"),
+                smoke_test_passed=output_val.get("smoke_test_passed"),
+                inference_latency_ms=output_val.get("inference_latency_ms"),
+                status=result.status.value,
+                error=result.error,
+                duration_seconds=result.duration_seconds,
+                trained_at=datetime.utcnow(),
+            )
+            db.save_training_record(record)
+            db.close()
+        except Exception as e:
+            logger.warning("training.record_save_failed", error=str(e))
+
+    grade_str = f" | 质量: {result.quality_report.grade}" if result.quality_report else ""
+    threshold_str = f" | 推荐阈值: {result.threshold_recommended:.3f}" if result.threshold_recommended else ""
+    progress_callback(100, f"训练完成 — 耗时 {result.duration_seconds:.0f} 秒{grade_str}{threshold_str}")
+
     return {
         "model_path": result.model_path,
         "status": result.status.value,
         "duration": result.duration_seconds,
         "image_count": result.image_count,
+        "train_count": result.train_count,
+        "val_count": result.val_count,
+        "quality_grade": result.quality_report.grade if result.quality_report else None,
+        "threshold_recommended": result.threshold_recommended,
     }
