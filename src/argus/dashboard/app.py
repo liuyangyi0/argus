@@ -213,5 +213,6 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
     <div id="toast-container" class="toast-container"></div>
     <script src="/static/js/toast.js"></script>
     <script src="/static/js/zone_editor.js"></script>
+    <script src="/static/js/alert_audio.js"></script>
 </body>
 </html>""")
