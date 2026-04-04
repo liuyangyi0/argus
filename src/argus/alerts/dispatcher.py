@@ -21,6 +21,7 @@ import structlog
 
 from argus.alerts.grader import Alert
 from argus.config.schema import AlertConfig
+from argus.core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from argus.storage.database import Database
 
 logger = structlog.get_logger()
@@ -50,6 +51,13 @@ class AlertDispatcher:
         self._alerts_dir.mkdir(parents=True, exist_ok=True)
         self._http_client = None
         self._shutdown = threading.Event()
+
+        # DET-009: Circuit breaker for webhook dispatch
+        cb_config = CircuitBreakerConfig(
+            failure_threshold=getattr(config, "circuit_breaker_threshold", 5),
+            recovery_timeout_seconds=getattr(config, "circuit_breaker_timeout", 60.0),
+        )
+        self._circuit_breaker = CircuitBreaker(cb_config)
 
         # Background webhook dispatch thread
         self._webhook_queue: Queue = Queue(maxsize=100)
@@ -91,22 +99,29 @@ class AlertDispatcher:
         # Channel 1: Database (always active)
         self._dispatch_database(alert, snapshot_path, heatmap_path)
 
-        # Channel 2: Webhook (non-blocking, queued to background thread)
+        # Channel 2: Webhook (non-blocking, queued to background thread, with circuit breaker DET-009)
         if self._config.webhook.enabled:
-            payload = {
-                "alert_id": alert.alert_id,
-                "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
-                "camera_id": alert.camera_id,
-                "zone_id": alert.zone_id,
-                "severity": alert.severity.value,
-                "anomaly_score": round(alert.anomaly_score, 4),
-                "snapshot_path": snapshot_path,
-                "heatmap_path": heatmap_path,
-            }
-            try:
-                self._webhook_queue.put_nowait(payload)
-            except Exception:
-                logger.warning("dispatch.webhook_queue_full", alert_id=alert.alert_id)
+            if self._circuit_breaker.allow_request():
+                payload = {
+                    "alert_id": alert.alert_id,
+                    "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
+                    "camera_id": alert.camera_id,
+                    "zone_id": alert.zone_id,
+                    "severity": alert.severity.value,
+                    "anomaly_score": round(alert.anomaly_score, 4),
+                    "snapshot_path": snapshot_path,
+                    "heatmap_path": heatmap_path,
+                }
+                try:
+                    self._webhook_queue.put_nowait(payload)
+                except Exception:
+                    logger.warning("dispatch.webhook_queue_full", alert_id=alert.alert_id)
+            else:
+                logger.warning(
+                    "dispatch.circuit_open",
+                    alert_id=alert.alert_id,
+                    msg="Circuit breaker open, webhook skipped",
+                )
 
         # Channel 3: Email (non-blocking, queued to background thread)
         if self._config.email.enabled and self._config.email.recipients:
@@ -176,6 +191,7 @@ class AlertDispatcher:
 
                 response = self._http_client.post(self._config.webhook.url, json=payload)
                 response.raise_for_status()
+                self._circuit_breaker.record_success()
                 logger.debug(
                     "dispatch.webhook_ok",
                     alert_id=payload.get("alert_id"),
@@ -183,6 +199,7 @@ class AlertDispatcher:
                 )
                 backoff = 1.0  # reset on success
             except Exception as e:
+                self._circuit_breaker.record_failure()
                 logger.error(
                     "dispatch.webhook_failed",
                     alert_id=payload.get("alert_id"),
@@ -271,7 +288,7 @@ class AlertDispatcher:
                 backoff = min(backoff * 2, 30.0)
 
     def _save_snapshot(self, alert: Alert) -> str | None:
-        """Save the alert snapshot frame to disk."""
+        """Save the alert snapshot frame to disk with anomaly region annotations (DET-007)."""
         if alert.snapshot is None:
             return None
 
@@ -279,13 +296,56 @@ class AlertDispatcher:
             date_dir = self._alerts_dir / _date_folder(alert.timestamp) / alert.camera_id
             date_dir.mkdir(parents=True, exist_ok=True)
 
+            # DET-007: Annotate snapshot with red rectangles around anomaly regions
+            annotated = self._annotate_snapshot(
+                alert.snapshot, alert.heatmap, alert.anomaly_score
+            )
+
             filename = f"{alert.alert_id}_snapshot.jpg"
             path = date_dir / filename
-            cv2.imwrite(str(path), alert.snapshot, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(str(path), annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
             return str(path)
         except Exception as e:
             logger.error("dispatch.snapshot_save_failed", error=str(e))
             return None
+
+    @staticmethod
+    def _annotate_snapshot(
+        frame: np.ndarray,
+        heatmap: np.ndarray | None,
+        score: float,
+    ) -> np.ndarray:
+        """Draw red rectangles around anomaly regions with score labels (DET-007)."""
+        annotated = frame.copy()
+        if heatmap is None:
+            return annotated
+
+        h, w = frame.shape[:2]
+        heatmap_resized = cv2.resize(heatmap, (w, h))
+
+        # Threshold heatmap to binary mask
+        binary = (heatmap_resized > 0.5).astype(np.uint8) * 255
+
+        # Find contours of anomaly regions
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 100:  # Skip tiny noise regions
+                continue
+            x, y, cw, ch = cv2.boundingRect(contour)
+            # Red rectangle
+            cv2.rectangle(annotated, (x, y), (x + cw, y + ch), (0, 0, 255), 2)
+            # Score label with background
+            label = f"{score:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            cv2.rectangle(annotated, (x, y - th - 6), (x + tw + 4, y), (0, 0, 255), -1)
+            cv2.putText(
+                annotated, label, (x + 2, y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
+            )
+
+        return annotated
 
     def _save_heatmap(self, alert: Alert) -> str | None:
         """Save the anomaly heatmap to disk as a colored overlay."""
@@ -330,6 +390,10 @@ class AlertDispatcher:
         except OSError as e:
             logger.error("dispatch.disk_check_failed", error=str(e))
             return True  # Fail-open: allow save if check itself fails
+
+    def get_circuit_breaker_status(self) -> dict:
+        """Get circuit breaker status for dashboard display (DET-009)."""
+        return self._circuit_breaker.get_status()
 
     def close(self) -> None:
         """Clean up resources, draining queues before shutdown."""

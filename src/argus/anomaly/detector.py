@@ -27,6 +27,19 @@ class AnomalyResult:
     threshold: float
 
 
+@dataclass
+class DetectorStatus:
+    """Current operational status of the anomaly detector (DET-004)."""
+
+    mode: str  # "anomalib" or "ssim_fallback"
+    model_path: str | None
+    model_loaded: bool
+    threshold: float
+    ssim_calibration_progress: float  # 0.0 to 1.0, relevant in SSIM mode
+    ssim_calibrated: bool
+    ssim_noise_floor: float | None
+
+
 class AnomalibDetector:
     """Anomaly detection using Anomalib models.
 
@@ -279,6 +292,27 @@ class AnomalibDetector:
             threshold=self.threshold,
         )
 
+    def get_status(self) -> DetectorStatus:
+        """Return current detector operational status (DET-004)."""
+        baseline_count = getattr(self, "_ssim_baseline_count", 0)
+        calibrated = baseline_count >= self._ssim_baseline_frames
+        if self._loaded:
+            calibration_progress = 1.0
+        elif baseline_count > 0:
+            calibration_progress = min(1.0, baseline_count / self._ssim_baseline_frames)
+        else:
+            calibration_progress = 0.0
+
+        return DetectorStatus(
+            mode="anomalib" if self._loaded else "ssim_fallback",
+            model_path=str(self._model_path) if self._model_path else None,
+            model_loaded=self._loaded,
+            threshold=self.threshold,
+            ssim_calibration_progress=calibration_progress,
+            ssim_calibrated=calibrated,
+            ssim_noise_floor=getattr(self, "_ssim_noise_floor", None),
+        )
+
     def hot_reload(self, new_model_path: Path) -> bool:
         """Hot-reload the anomaly model without stopping inference.
 
@@ -362,6 +396,9 @@ class MultiScaleDetector:
 
     def load(self) -> bool:
         return self._base.load()
+
+    def get_status(self) -> DetectorStatus:
+        return self._base.get_status()
 
     def hot_reload(self, new_model_path: Path) -> bool:
         return self._base.hot_reload(new_model_path)

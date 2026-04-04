@@ -17,7 +17,7 @@ import structlog
 
 from argus.alerts.grader import Alert
 from argus.config.schema import AlertConfig, CameraConfig
-from argus.core.pipeline import DetectionPipeline, PipelineStats
+from argus.core.pipeline import DetectionPipeline, PipelineMode, PipelineStats
 
 logger = structlog.get_logger()
 
@@ -62,6 +62,17 @@ class CameraManager:
         self._lock = threading.Lock()
         self._alert_count = 0
         self._last_frame_counts: dict[str, int] = {}  # camera_id -> last known frame count
+
+        # DET-012: Pre-load shared YOLO model for all pipelines
+        self._shared_yolo = None
+        if cameras:
+            try:
+                from argus.person.detector import get_shared_yolo
+
+                model_name = cameras[0].person_filter.model_name
+                self._shared_yolo = get_shared_yolo(model_name)
+            except Exception as e:
+                logger.warning("manager.shared_yolo_failed", error=str(e))
 
     def start_all(self) -> list[str]:
         """Start all camera pipelines. Returns list of successfully started camera IDs."""
@@ -150,6 +161,58 @@ class CameraManager:
             return None
         return pipeline.get_raw_frame()
 
+    def set_pipeline_mode(self, camera_id: str, mode: PipelineMode) -> bool:
+        """Set pipeline operating mode for a camera (DET-006)."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return False
+        pipeline.set_mode(mode)
+        return True
+
+    def get_pipeline_mode(self, camera_id: str) -> str | None:
+        """Get pipeline operating mode for a camera (DET-006)."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return None
+        return pipeline.mode.value
+
+    def get_learning_progress(self, camera_id: str) -> dict | None:
+        """Get learning mode progress for a camera (DET-010)."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return None
+        return pipeline.get_learning_progress()
+
+    def get_diagnostics(self, camera_id: str, n: int = 50) -> list | None:
+        """Get recent frame diagnostics for a camera (DET-008)."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return None
+        return pipeline.get_diagnostics_buffer().get_recent(n)
+
+    def evaluate_threshold(self, camera_id: str, threshold: float) -> dict | None:
+        """Evaluate how a new threshold would affect alert counts (DET-005)."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return None
+        return pipeline.get_diagnostics_buffer().evaluate_threshold(threshold)
+
+    def get_detector_status(self, camera_id: str) -> dict | None:
+        """Get anomaly detector status for a camera (DET-004)."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return None
+        status = pipeline.get_detector_status()
+        return {
+            "mode": status.mode,
+            "model_path": status.model_path,
+            "model_loaded": status.model_loaded,
+            "threshold": status.threshold,
+            "ssim_calibration_progress": status.ssim_calibration_progress,
+            "ssim_calibrated": status.ssim_calibrated,
+            "ssim_noise_floor": status.ssim_noise_floor,
+        }
+
     def get_latest_anomaly_map(self, camera_id: str) -> np.ndarray | None:
         """Get the latest anomaly heatmap from a camera for overlay stream."""
         pipeline = self._pipelines.get(camera_id)
@@ -179,6 +242,7 @@ class CameraManager:
             camera_config=cam_config,
             alert_config=self._alert_config,
             on_alert=_alert_handler,
+            shared_yolo_model=self._shared_yolo,
         )
 
         if not pipeline.initialize():
