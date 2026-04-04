@@ -67,6 +67,8 @@ class AnomalibDetector:
         self._ssim_baseline_frames = ssim_baseline_frames
         self._ssim_sensitivity = ssim_sensitivity
         self._ssim_midpoint = ssim_midpoint
+        self._ssim_baseline_count = 0
+        self._ssim_noise_floor: float | None = None
 
     def load(self) -> bool:
         """Load the Anomalib model for inference.
@@ -294,12 +296,11 @@ class AnomalibDetector:
 
     def get_status(self) -> DetectorStatus:
         """Return current detector operational status (DET-004)."""
-        baseline_count = getattr(self, "_ssim_baseline_count", 0)
-        calibrated = baseline_count >= self._ssim_baseline_frames
+        calibrated = self._ssim_baseline_count >= self._ssim_baseline_frames
         if self._loaded:
             calibration_progress = 1.0
-        elif baseline_count > 0:
-            calibration_progress = min(1.0, baseline_count / self._ssim_baseline_frames)
+        elif self._ssim_baseline_count > 0:
+            calibration_progress = min(1.0, self._ssim_baseline_count / self._ssim_baseline_frames)
         else:
             calibration_progress = 0.0
 
@@ -310,7 +311,7 @@ class AnomalibDetector:
             threshold=self.threshold,
             ssim_calibration_progress=calibration_progress,
             ssim_calibrated=calibrated,
-            ssim_noise_floor=getattr(self, "_ssim_noise_floor", None),
+            ssim_noise_floor=self._ssim_noise_floor,
         )
 
     def hot_reload(self, new_model_path: Path) -> bool:

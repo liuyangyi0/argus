@@ -24,7 +24,7 @@ from typing import Callable
 import numpy as np
 import structlog
 
-from argus.alerts.grader import Alert, AlertGrader
+from argus.alerts.grader import Alert, AlertGrader, DetectionType
 from argus.anomaly.detector import AnomalibDetector, AnomalyResult, DetectorStatus
 from argus.core.diagnostics import (
     DiagnosticsBuffer,
@@ -290,20 +290,21 @@ class DetectionPipeline:
         current_mode = self.mode
         diag.pipeline_mode = current_mode.value
 
-        # Save raw frame before zone masking for baseline capture (CRIT-05)
+        # Save raw frame reference before zone masking (CRIT-05)
+        # No copy here — get_raw_frame() copies on read
         with self._latest_raw_frame_lock:
-            self._latest_raw_frame = frame.copy()
+            self._latest_raw_frame = frame
 
-        # Stage 0: Apply zone mask (exclude regions become black)
+        # Stage 0: Apply zone mask
         t0 = time.monotonic()
         frame = self._zone_mask.apply(frame)
         diag.stages.append(StageResult(
             stage_name="zone_mask", duration_ms=(time.monotonic() - t0) * 1000
         ))
 
-        # Save latest frame for live preview
+        # Save latest frame reference — get_latest_frame() copies on read
         with self._latest_frame_lock:
-            self._latest_frame = frame.copy()
+            self._latest_frame = frame
 
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
         t1 = time.monotonic()
@@ -412,7 +413,7 @@ class DetectionPipeline:
         self._update_lock_state(anomaly_result)
 
         # YOLO-004: Determine hybrid detection type
-        detection_type = "anomaly"
+        detection_type = DetectionType.ANOMALY
         detected_objects: list[dict] = []
         if detection_result.non_person_objects:
             detected_objects = [
@@ -425,9 +426,9 @@ class DetectionPipeline:
                 for obj in detection_result.non_person_objects
             ]
             if anomaly_result.is_anomalous:
-                detection_type = "hybrid"  # Both YOLO and Anomalib agree
+                detection_type = DetectionType.HYBRID
             else:
-                detection_type = "object"  # Only YOLO detected
+                detection_type = DetectionType.OBJECT
 
         # DET-006: LEARNING mode suppresses alerts
         if current_mode == PipelineMode.LEARNING:

@@ -202,6 +202,8 @@ class AlertConfig(BaseModel):
     )
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
+    circuit_breaker_threshold: int = Field(default=5, ge=1, le=50)
+    circuit_breaker_timeout: float = Field(default=60.0, ge=10.0, le=600.0)
 
 
 class AuthConfig(BaseModel):
