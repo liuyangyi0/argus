@@ -72,6 +72,46 @@ class PersonFilterConfig(BaseModel):
     model_name: str = "yolo11n.pt"
 
 
+class CaptureQualityConfig(BaseModel):
+    """Frame quality filters for baseline capture."""
+
+    enabled: bool = True
+    blur_threshold: float = Field(
+        default=100.0, ge=10.0, le=1000.0,
+        description="Laplacian variance below this is considered blurry",
+    )
+    blur_adaptive_pct: float = Field(
+        default=0.3, ge=0.1, le=0.9,
+        description="Adaptive blur floor = median(accepted scores) * this",
+    )
+    brightness_min: float = Field(default=30.0, ge=0.0, le=128.0)
+    brightness_max: float = Field(default=225.0, ge=128.0, le=255.0)
+    brightness_std_min: float = Field(
+        default=10.0, ge=0.0, le=50.0,
+        description="Minimum grayscale standard deviation (rejects flat frames)",
+    )
+    saturated_pixel_max_pct: float = Field(
+        default=0.30, ge=0.0, le=1.0,
+        description="Max fraction of pixels < 5 or > 250",
+    )
+    ssim_dedup_threshold: float = Field(
+        default=0.98, ge=0.90, le=1.0,
+        description="SSIM >= this vs previous accepted frame → duplicate",
+    )
+    ssim_resize: int = Field(
+        default=256, ge=64, le=512,
+        description="Resize frames to NxN before SSIM computation",
+    )
+    person_confidence: float = Field(
+        default=0.3, ge=0.1, le=0.9,
+        description="YOLO person detection confidence for baseline filtering",
+    )
+    entropy_min: float = Field(
+        default=3.0, ge=0.0, le=8.0,
+        description="Shannon entropy below this = encoder error frame",
+    )
+
+
 class AnomalyConfig(BaseModel):
     """Anomalib anomaly detection parameters."""
 
@@ -256,4 +296,5 @@ class ArgusConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    capture_quality: CaptureQualityConfig = Field(default_factory=CaptureQualityConfig)
     log_level: str = "INFO"
