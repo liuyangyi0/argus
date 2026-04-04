@@ -9,7 +9,7 @@ import structlog
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from argus.storage.models import AlertRecord, Base, BaselineRecord
+from argus.storage.models import AlertRecord, Base, BaselineRecord, TrainingRecord
 
 logger = structlog.get_logger()
 
@@ -206,6 +206,36 @@ class Database:
                 images=len(image_paths),
             )
             return len(old_alerts), image_paths
+
+    # ── Training history (TRN-007) ──
+
+    def save_training_record(self, **kwargs) -> None:
+        """Save a training history record."""
+        with self.get_session() as session:
+            record = TrainingRecord(**kwargs)
+            session.add(record)
+            session.commit()
+            logger.debug("database.training_record_saved", training_id=kwargs.get("training_id"))
+
+    def get_training_history(
+        self, camera_id: str | None = None, limit: int = 20
+    ) -> list[dict]:
+        """Get training history, optionally filtered by camera."""
+        with self.get_session() as session:
+            stmt = select(TrainingRecord).order_by(TrainingRecord.started_at.desc())
+            if camera_id:
+                stmt = stmt.where(TrainingRecord.camera_id == camera_id)
+            stmt = stmt.limit(limit)
+            records = list(session.scalars(stmt).all())
+            return [r.to_dict() for r in records]
+
+    def get_training_record(self, training_id: str) -> dict | None:
+        """Get a single training record by ID."""
+        with self.get_session() as session:
+            record = session.scalar(
+                select(TrainingRecord).where(TrainingRecord.training_id == training_id)
+            )
+            return record.to_dict() if record else None
 
     def close(self) -> None:
         """Close the database engine."""

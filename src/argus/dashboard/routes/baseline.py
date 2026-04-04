@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
+import numpy as np
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -17,8 +19,26 @@ from argus.dashboard.components import (
     form_select,
     page_header,
     progress_bar,
+    stat_card,
     tab_bar,
 )
+
+
+@dataclass
+class CaptureStats:
+    """Statistics for a completed baseline capture session."""
+
+    total_frames: int
+    captured_frames: int
+    filtered_frames: int
+    filter_reasons: dict[str, int] = field(default_factory=dict)
+    retention_rate: float = 0.0
+    brightness_range: tuple[float, float] = (0.0, 0.0)
+    capture_duration_seconds: float = 0.0
+
+    def __post_init__(self):
+        if self.total_frames > 0:
+            self.retention_rate = self.captured_frames / self.total_frames
 
 logger = structlog.get_logger()
 
@@ -67,8 +87,38 @@ async def capture_form(request: Request):
                               hint="建议至少 100 帧，覆盖不同光照条件", min_val="10", max_val="1000")
     interval_input = form_group("采集间隔（秒）", "interval", value="2.0", input_type="number",
                                  hint="帧之间的时间间隔", min_val="0.5", max_val="60", step="0.5")
+    session_label_select = form_select("采集场景", "session_label", [
+        ("daytime", "白天/日间"),
+        ("night", "夜间"),
+        ("maintenance", "检修期间"),
+        ("custom", "自定义"),
+    ], hint="选择当前采集的场景类型，建议覆盖多种场景以提高模型鲁棒性")
 
-    # Show active capture tasks
+    # Coverage hint: check which session types already exist
+    coverage_hint = ""
+    config = request.app.state.config
+    if config:
+        baselines_dir = Path(config.storage.baselines_dir)
+        existing_sessions: set[str] = set()
+        for cam_dir in (sorted(baselines_dir.iterdir()) if baselines_dir.exists() else []):
+            if cam_dir.is_dir():
+                for ver_dir in cam_dir.iterdir():
+                    if ver_dir.is_dir():
+                        name = ver_dir.name.lower()
+                        for label_key in ("daytime", "night", "maintenance"):
+                            if label_key in name:
+                                existing_sessions.add(label_key)
+        if existing_sessions and len(existing_sessions) < 3:
+            missing = {"daytime", "night", "maintenance"} - existing_sessions
+            labels_map = {"daytime": "白天/日间", "night": "夜间", "maintenance": "检修期间"}
+            missing_labels = "、".join(labels_map[m] for m in sorted(missing))
+            coverage_hint = (
+                f'<div class="card" style="border-left:3px solid #ffb74d;padding:12px;margin-bottom:12px;">'
+                f'<span style="color:#ffb74d;">提示:</span> 尚未采集以下场景: {missing_labels}。'
+                f'建议覆盖多种场景以提高检测准确率。</div>'
+            )
+
+    # Show active capture tasks or stats for completed ones
     task_html = ""
     task_manager = getattr(request.app.state, "task_manager", None)
     if task_manager:
@@ -78,9 +128,18 @@ async def capture_form(request: Request):
             task_html = '<div class="card" style="border-left:3px solid #4fc3f7;"><h3>正在采集</h3>'
             task_html += f'<div hx-get="/api/tasks/{active[0].task_id}" hx-trigger="every 1s" hx-swap="outerHTML"></div>'
             task_html += '</div>'
+        else:
+            # Show stats for most recently completed capture
+            completed = [t for t in task_manager.get_active_tasks()
+                         if t.task_type == "baseline_capture" and t.status.value == "complete"]
+            if completed:
+                task_html = (
+                    '<div hx-get="/api/baseline/capture/stats" hx-trigger="load" hx-swap="innerHTML"></div>'
+                )
 
     return HTMLResponse(f"""
     {task_html}
+    {coverage_hint}
     <div class="card">
         <h3>开始基线采集</h3>
         <p style="color:#8890a0;font-size:13px;margin-bottom:16px;">
@@ -89,6 +148,7 @@ async def capture_form(request: Request):
         </p>
         <form hx-post="/api/baseline/capture" hx-target="#tab-content" hx-swap="innerHTML">
             {cam_select}
+            {session_label_select}
             <div class="form-row">
                 {count_input}
                 {interval_input}
@@ -114,6 +174,7 @@ async def start_capture(request: Request):
     camera_id = form.get("camera_id", "")
     count = int(form.get("count", 100))
     interval = float(form.get("interval", 2.0))
+    session_label = form.get("session_label", "daytime")
 
     if not camera_id:
         return JSONResponse({"error": "请选择摄像头"}, status_code=400)
@@ -129,6 +190,7 @@ async def start_capture(request: Request):
             output_dir=baselines_dir,
             count=count,
             interval=interval,
+            session_label=session_label,
         )
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -218,8 +280,15 @@ async def baseline_images(request: Request, camera_id: str):
     grid = '<div class="thumb-grid">'
     for img in images[:100]:  # Limit to 100 thumbnails
         grid += (
+            f'<div class="thumb-item" style="display:inline-block;position:relative;margin:4px;">'
             f'<img src="/api/baseline/{camera_id}/image/{img.name}?version={version}" '
             f'alt="{img.name}" title="{img.name}">'
+            f'<button class="btn btn-ghost btn-sm" style="position:absolute;top:2px;right:2px;'
+            f'background:rgba(0,0,0,0.6);color:#ff5252;font-size:14px;padding:2px 6px;border-radius:4px;" '
+            f'hx-delete="/api/baseline/{camera_id}/image/{img.name}?version={version}" '
+            f'hx-target="#tab-content" hx-swap="innerHTML" '
+            f'hx-confirm="确定删除此图片？">&times;</button>'
+            f'</div>'
         )
     grid += '</div>'
 
@@ -261,6 +330,88 @@ async def baseline_image(request: Request, camera_id: str, filename: str):
 
     _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
     return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
+
+@router.get("/capture/stats", response_class=HTMLResponse)
+async def capture_stats_report(request: Request):
+    """Display capture statistics after a capture task completes."""
+    task_manager = getattr(request.app.state, "task_manager", None)
+    if not task_manager:
+        return HTMLResponse("")
+
+    # Find the most recently completed capture task
+    completed = [
+        t for t in task_manager.get_active_tasks()
+        if t.task_type == "baseline_capture" and t.status.value == "complete" and t.result
+    ]
+    if not completed:
+        return HTMLResponse("")
+
+    task = completed[-1]
+    result = task.result
+    stats = result.get("stats", {})
+
+    if not stats:
+        return HTMLResponse("")
+
+    retention_pct = f"{stats.get('retention_rate', 0) * 100:.0f}%"
+    duration = stats.get("capture_duration_seconds", 0)
+    duration_str = f"{duration:.0f}s" if duration < 60 else f"{duration / 60:.1f}min"
+    brightness_min = stats.get("brightness_min", 0)
+    brightness_max = stats.get("brightness_max", 0)
+
+    cards = (
+        stat_card("采集帧数", str(stats.get("captured_frames", 0)), "#4fc3f7")
+        + stat_card("总帧数", str(stats.get("total_frames", 0)), "#e0e0e0")
+        + stat_card("过滤帧数", str(stats.get("filtered_frames", 0)), "#ffb74d")
+        + stat_card("保留率", retention_pct, "#66bb6a" if stats.get("retention_rate", 0) > 0.8 else "#ff7043")
+        + stat_card("耗时", duration_str, "#e0e0e0")
+        + stat_card("亮度范围", f"{brightness_min:.0f}-{brightness_max:.0f}", "#e0e0e0")
+    )
+
+    filter_html = ""
+    filter_reasons = stats.get("filter_reasons", {})
+    if filter_reasons:
+        items = "".join(f"<li>{reason}: {cnt} 帧</li>" for reason, cnt in filter_reasons.items())
+        filter_html = f'<div style="margin-top:8px;"><strong>过滤原因:</strong><ul>{items}</ul></div>'
+
+    return HTMLResponse(f"""
+    <div class="card" style="border-left:3px solid #66bb6a;">
+        <h3>采集统计报告</h3>
+        <div class="stat-row" style="display:flex;gap:12px;flex-wrap:wrap;">
+            {cards}
+        </div>
+        {filter_html}
+    </div>""")
+
+
+@router.delete("/{camera_id}/image/{filename}")
+async def delete_baseline_image(request: Request, camera_id: str, filename: str):
+    """Delete a single baseline image."""
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    version = request.query_params.get("version", "default")
+    baselines_dir = Path(config.storage.baselines_dir)
+
+    # Path safety: validate the resolved path is under baselines directory
+    img_path = (baselines_dir / camera_id / version / filename).resolve()
+    if not str(img_path).startswith(str(baselines_dir.resolve())):
+        return Response(status_code=400)
+
+    if not img_path.exists():
+        return Response(status_code=404)
+
+    img_path.unlink()
+    logger.info("baseline.image_deleted", camera_id=camera_id, filename=filename, version=version)
+
+    # Return refreshed thumbnail list via HTMX
+    return HTMLResponse(
+        f'<div hx-get="/api/baseline/{camera_id}/images?version={version}" '
+        f'hx-trigger="load" hx-target="#tab-content" hx-swap="innerHTML"></div>',
+        headers={"HX-Trigger": '{"showToast": {"message": "图片已删除", "type": "success"}}'},
+    )
 
 
 @router.get("/train", response_class=HTMLResponse)
@@ -465,21 +616,29 @@ async def deploy_model(request: Request):
 
 
 def _capture_baseline_task(
-    progress_callback, *, camera_manager, camera_id, output_dir, count, interval
+    progress_callback, *, camera_manager, camera_id, output_dir, count, interval,
+    session_label="daytime",
 ):
     """Capture raw (unmasked) baseline frames from a running camera.
 
     Uses get_raw_frame() to get frames BEFORE zone masking is applied,
     ensuring training data is clean of zone mask artifacts (CRIT-05).
     Uses BaselineManager-compatible directory structure (HIGH-07).
+    Session label is stored as a directory prefix for multi-session support (CAP-008).
     """
     from argus.anomaly.baseline import BaselineManager
 
     bm = BaselineManager(baselines_dir=output_dir)
-    version_dir = bm.create_new_version(camera_id, "default")
+    # Use session_label as zone_id prefix for directory organization
+    zone_id = f"{session_label}_default" if session_label != "daytime" else "default"
+    version_dir = bm.create_new_version(camera_id, zone_id)
 
     captured = 0
     skipped_none = 0
+    filter_reasons: dict[str, int] = {}
+    brightness_values: list[float] = []
+    start_time = time.monotonic()
+
     for i in range(count):
         # Use raw frame (before zone mask) for training data
         frame = camera_manager.get_raw_frame(camera_id)
@@ -488,11 +647,17 @@ def _capture_baseline_task(
             frame = camera_manager.get_latest_frame(camera_id)
 
         if frame is not None:
+            # Track brightness for stats
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            mean_brightness = float(np.mean(gray))
+            brightness_values.append(mean_brightness)
+
             path = version_dir / f"baseline_{captured:05d}.png"
             cv2.imwrite(str(path), frame)
             captured += 1
         else:
             skipped_none += 1
+            filter_reasons["no_frame"] = filter_reasons.get("no_frame", 0) + 1
 
         progress_callback(
             int((i + 1) / count * 100),
@@ -500,15 +665,47 @@ def _capture_baseline_task(
         )
         time.sleep(interval)
 
+    capture_duration = time.monotonic() - start_time
+
     # Set as current version
     if captured > 0:
-        bm.set_current_version(camera_id, "default", version_dir.name)
+        bm.set_current_version(camera_id, zone_id, version_dir.name)
+
+    # Build capture stats
+    brightness_range = (
+        (min(brightness_values), max(brightness_values)) if brightness_values else (0.0, 0.0)
+    )
+    stats = CaptureStats(
+        total_frames=count,
+        captured_frames=captured,
+        filtered_frames=skipped_none,
+        filter_reasons=filter_reasons,
+        brightness_range=brightness_range,
+        capture_duration_seconds=capture_duration,
+    )
 
     logger.info(
         "baseline.capture_complete",
         camera_id=camera_id, captured=captured, skipped=skipped_none, total=count,
+        session_label=session_label, retention_rate=f"{stats.retention_rate:.1%}",
     )
-    return {"captured": captured, "skipped": skipped_none, "total": count, "output_dir": str(version_dir)}
+    return {
+        "captured": captured,
+        "skipped": skipped_none,
+        "total": count,
+        "output_dir": str(version_dir),
+        "session_label": session_label,
+        "stats": {
+            "total_frames": stats.total_frames,
+            "captured_frames": stats.captured_frames,
+            "filtered_frames": stats.filtered_frames,
+            "filter_reasons": stats.filter_reasons,
+            "retention_rate": stats.retention_rate,
+            "brightness_min": stats.brightness_range[0],
+            "brightness_max": stats.brightness_range[1],
+            "capture_duration_seconds": stats.capture_duration_seconds,
+        },
+    }
 
 
 def _train_model_task(
