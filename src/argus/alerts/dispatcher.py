@@ -54,8 +54,8 @@ class AlertDispatcher:
 
         # DET-009: Circuit breaker for webhook dispatch
         cb_config = CircuitBreakerConfig(
-            failure_threshold=getattr(config, "circuit_breaker_threshold", 5),
-            recovery_timeout_seconds=getattr(config, "circuit_breaker_timeout", 60.0),
+            failure_threshold=config.circuit_breaker_threshold,
+            recovery_timeout_seconds=config.circuit_breaker_timeout,
         )
         self._circuit_breaker = CircuitBreaker(cb_config)
 
@@ -336,28 +336,21 @@ class AlertDispatcher:
         if heatmap is None:
             return annotated
 
+        from argus.core.anomaly_postprocess import AnomalyMapProcessor
+
         h, w = frame.shape[:2]
         heatmap_resized = cv2.resize(heatmap, (w, h))
 
-        # Threshold heatmap to binary mask
-        binary = (heatmap_resized > 0.5).astype(np.uint8) * 255
+        processor = AnomalyMapProcessor(min_contour_area=100)
+        regions = processor.extract_regions(heatmap_resized, threshold=0.5)
 
-        # Find contours of anomaly regions
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 100:  # Skip tiny noise regions
-                continue
-            x, y, cw, ch = cv2.boundingRect(contour)
-            # Red rectangle
-            cv2.rectangle(annotated, (x, y), (x + cw, y + ch), (0, 0, 255), 2)
-            # Score label with background
+        for r in regions:
+            cv2.rectangle(annotated, (r.x, r.y), (r.x + r.width, r.y + r.height), (0, 0, 255), 2)
             label = f"{score:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-            cv2.rectangle(annotated, (x, y - th - 6), (x + tw + 4, y), (0, 0, 255), -1)
+            cv2.rectangle(annotated, (r.x, r.y - th - 6), (r.x + tw + 4, r.y), (0, 0, 255), -1)
             cv2.putText(
-                annotated, label, (x + 2, y - 4),
+                annotated, label, (r.x + 2, r.y - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
             )
 
