@@ -9,7 +9,7 @@ import structlog
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from argus.storage.models import AlertRecord, Base, BaselineRecord, TrainingRecord
+from argus.storage.models import AlertRecord, AlertWorkflowStatus, Base, BaselineRecord, TrainingRecord
 
 logger = structlog.get_logger()
 
@@ -236,6 +236,50 @@ class Database:
                 select(TrainingRecord).where(TrainingRecord.training_id == training_id)
             )
             return record.to_dict() if record else None
+
+    # ── Alert workflow (YOLO-005) ──
+
+    def update_alert_workflow(
+        self, alert_id: str, status: str,
+        assigned_to: str | None = None, notes: str | None = None,
+    ) -> bool:
+        """Update alert workflow status."""
+        try:
+            AlertWorkflowStatus(status)
+        except ValueError:
+            return False
+
+        with self.get_session() as session:
+            record = session.scalar(
+                select(AlertRecord).where(AlertRecord.alert_id == alert_id)
+            )
+            if record is None:
+                return False
+
+            record.workflow_status = status
+            if assigned_to is not None:
+                record.assigned_to = assigned_to
+            if notes is not None:
+                record.notes = notes
+            if status == AlertWorkflowStatus.RESOLVED.value:
+                record.resolved_at = datetime.utcnow()
+            if status == AlertWorkflowStatus.ACKNOWLEDGED.value:
+                record.acknowledged = True
+            if status == AlertWorkflowStatus.FALSE_POSITIVE.value:
+                record.false_positive = True
+
+            session.commit()
+            return True
+
+    def get_alert_workflow_stats(self) -> dict[str, int]:
+        """Get counts per workflow status for dashboard display."""
+        with self.get_session() as session:
+            alerts = list(session.scalars(select(AlertRecord)).all())
+            stats: dict[str, int] = {ws.value: 0 for ws in AlertWorkflowStatus}
+            for alert in alerts:
+                status = alert.workflow_status or "new"
+                stats[status] = stats.get(status, 0) + 1
+            return stats
 
     def close(self) -> None:
         """Close the database engine."""

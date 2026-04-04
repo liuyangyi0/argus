@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class AlertWorkflowStatus(str, Enum):
+    """Workflow status for alert lifecycle management."""
+
+    NEW = "new"
+    ACKNOWLEDGED = "acknowledged"
+    INVESTIGATING = "investigating"
+    RESOLVED = "resolved"
+    CLOSED = "closed"
+    FALSE_POSITIVE = "false_positive"
 
 
 class Base(DeclarativeBase):
@@ -30,6 +42,11 @@ class AlertRecord(Base):
     acknowledged_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     false_positive: Mapped[bool] = mapped_column(Boolean, default=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workflow_status: Mapped[str] = mapped_column(
+        String(20), default="new", server_default="new", nullable=False
+    )
+    assigned_to: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
@@ -49,6 +66,9 @@ class AlertRecord(Base):
             "acknowledged_by": self.acknowledged_by,
             "false_positive": self.false_positive,
             "notes": self.notes,
+            "workflow_status": self.workflow_status,
+            "assigned_to": self.assigned_to,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

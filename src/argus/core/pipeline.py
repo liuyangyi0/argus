@@ -411,6 +411,24 @@ class DetectionPipeline:
         # Update anomaly lock state
         self._update_lock_state(anomaly_result)
 
+        # YOLO-004: Determine hybrid detection type
+        detection_type = "anomaly"
+        detected_objects: list[dict] = []
+        if detection_result.non_person_objects:
+            detected_objects = [
+                {
+                    "class_name": obj.class_name,
+                    "confidence": round(obj.confidence, 3),
+                    "track_id": obj.track_id,
+                    "bbox": [obj.x1, obj.y1, obj.x2, obj.y2],
+                }
+                for obj in detection_result.non_person_objects
+            ]
+            if anomaly_result.is_anomalous:
+                detection_type = "hybrid"  # Both YOLO and Anomalib agree
+            else:
+                detection_type = "object"  # Only YOLO detected
+
         # DET-006: LEARNING mode suppresses alerts
         if current_mode == PipelineMode.LEARNING:
             self._update_latency(start)
@@ -424,7 +442,8 @@ class DetectionPipeline:
             ))
             return None
 
-        if not anomaly_result.is_anomalous:
+        # Skip alert if neither Anomalib nor YOLO detected anything
+        if not anomaly_result.is_anomalous and not detected_objects:
             self._update_latency(start)
             diag.total_duration_ms = (time.monotonic() - start) * 1000
             self._diagnostics.append(diag)
@@ -438,8 +457,12 @@ class DetectionPipeline:
 
         self.stats.anomalies_detected += 1
 
-        # Multi-zone alert grading
-        alert = self._evaluate_zones(frame_data, anomaly_result, frame)
+        # Multi-zone alert grading with semantic context
+        alert = self._evaluate_zones(
+            frame_data, anomaly_result, frame,
+            detection_type=detection_type,
+            detected_objects=detected_objects,
+        )
 
         self._update_latency(start)
 
@@ -567,7 +590,8 @@ class DetectionPipeline:
         )
 
     def _evaluate_zones(
-        self, frame_data: FrameData, anomaly_result: AnomalyResult, frame: np.ndarray
+        self, frame_data: FrameData, anomaly_result: AnomalyResult, frame: np.ndarray,
+        detection_type: str = "anomaly", detected_objects: list[dict] | None = None,
     ) -> Alert | None:
         """Evaluate anomaly against all configured include zones."""
         include_zones = self._zone_mask.get_include_zones()
@@ -582,6 +606,8 @@ class DetectionPipeline:
                 frame_number=frame_data.frame_number,
                 frame=frame,
                 anomaly_map=anomaly_result.anomaly_map,
+                detection_type=detection_type,
+                detected_objects=detected_objects,
             )
 
         # Evaluate all zones and return the highest-severity alert (HIGH-06)
@@ -595,6 +621,8 @@ class DetectionPipeline:
                 frame_number=frame_data.frame_number,
                 frame=frame,
                 anomaly_map=anomaly_result.anomaly_map,
+                detection_type=detection_type,
+                detected_objects=detected_objects,
             )
             if alert is not None:
                 if best_alert is None or _severity_rank(alert.severity) > _severity_rank(best_alert.severity):
