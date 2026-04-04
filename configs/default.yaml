@@ -1,0 +1,89 @@
+node_id: argus-edge-01
+
+cameras:
+  - camera_id: cam_01
+    name: "Demo Camera"
+    source: "data/demo4.mp4"  # Replace with RTSP URL for real deployment
+    protocol: file
+    fps_target: 5
+    resolution: [1920, 1080]
+    zones: []
+    mog2:
+      history: 500
+      var_threshold: 25.0
+      detect_shadows: true
+      change_pct_threshold: 0.005
+      enable_stabilization: true  # 相位相关防抖，补偿厂房振动引起的1-2px相机偏移
+    person_filter:
+      confidence: 0.4
+      skip_frame_on_person: false
+      model_name: yolo11n.pt
+    anomaly:
+      model_type: patchcore
+      threshold: 0.7
+      image_size: [256, 256]
+      enable_multiscale: true   # 开启后切片检测，提升小物体检出率（延迟从~30ms增到~270ms）
+      tile_size: 512            # 切片尺寸（像素），512适合1080p
+      tile_overlap: 0.25        # 切片重叠率，0.25=25%重叠防边缘遗漏
+
+alerts:
+  severity_thresholds:
+    info: 0.50
+    low: 0.70
+    medium: 0.85
+    high: 0.95
+  temporal:
+    min_consecutive_frames: 3
+    max_gap_seconds: 10.0
+    min_spatial_overlap: 0.3   # 连续帧异常区域IoU需≥30%，过滤飘动物误报（0=关闭）
+  suppression:
+    same_zone_window_seconds: 300
+    same_camera_window_seconds: 60
+  zone_multipliers:
+    critical: 1.2
+    standard: 1.0
+    low_priority: 0.8
+  webhook:
+    enabled: false
+    url: ""
+  email:
+    enabled: false
+    smtp_host: "mail.plant.local"
+    smtp_port: 587
+    smtp_username: ""
+    smtp_password: ""
+    from_address: "argus@plant.local"
+    use_tls: true
+    min_severity: high
+    recipients: []
+
+auth:
+  enabled: false
+  api_token: ""  # Set via ARGUS_AUTH_TOKEN env var or here
+  session_timeout_minutes: 480
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8080
+  debug: false
+  mjpeg_fps: 5.0
+
+logging:
+  log_dir: "data/logs"
+  max_file_size_mb: 50
+  backup_count: 10
+  log_format: json
+
+storage:
+  database_url: "sqlite:///data/db/argus.db"
+  baselines_dir: "data/baselines"
+  models_dir: "data/models"
+  exports_dir: "data/exports"
+  alerts_dir: "data/alerts"
+
+models:
+  yolo_path: "yolo11n.pt"
+  anomalib_model_dir: "data/models"
+  anomalib_export_dir: "data/exports"
+
+log_level: INFO

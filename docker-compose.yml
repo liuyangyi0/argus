@@ -1,0 +1,35 @@
+# Argus FOE Detection System
+# Usage: docker compose up -d
+
+services:
+  argus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: argus-edge
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist data across restarts
+      - ./data/baselines:/app/data/baselines
+      - ./data/models:/app/data/models
+      - ./data/exports:/app/data/exports
+      - ./data/db:/app/data/db
+      - ./data/alerts:/app/data/alerts
+      - ./data/logs:/app/data/logs
+      # Custom config
+      - ./configs:/app/configs:ro
+    environment:
+      - ARGUS_LOG_LEVEL=INFO
+    # Resource limits for edge deployment
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/api/system/health').raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
