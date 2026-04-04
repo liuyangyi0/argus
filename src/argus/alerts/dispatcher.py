@@ -59,6 +59,7 @@ class AlertDispatcher:
         )
         self._circuit_breaker = CircuitBreaker(cb_config)
 
+        # HIGH-13: Non-daemon threads so queued alerts are not discarded on shutdown
         # Background webhook dispatch thread
         self._webhook_queue: Queue = Queue(maxsize=100)
         self._webhook_thread: threading.Thread | None = None
@@ -66,7 +67,7 @@ class AlertDispatcher:
             self._webhook_thread = threading.Thread(
                 target=self._webhook_worker,
                 name="argus-webhook",
-                daemon=True,
+                daemon=False,
             )
             self._webhook_thread.start()
 
@@ -77,7 +78,7 @@ class AlertDispatcher:
             self._email_thread = threading.Thread(
                 target=self._email_worker,
                 name="argus-email",
-                daemon=True,
+                daemon=False,
             )
             self._email_thread.start()
 
@@ -173,41 +174,56 @@ class AlertDispatcher:
     def _webhook_worker(self) -> None:
         """Background thread that sends webhook HTTP POST requests.
 
-        Runs in its own thread to avoid blocking camera processing threads.
-        Uses exponential backoff on failure to avoid tight retry loops.
+        HIGH-01: Uses per-payload retry loop with exponential backoff.
+        Failed payloads retry up to 3 times before being dropped (logged).
+        Thread never dies on exception — wraps entire loop in try/except.
         """
         logger.info("webhook_worker.started", url=self._config.webhook.url)
-        backoff = 1.0
+        max_retries = 3
+
         while not self._shutdown.is_set():
             try:
                 payload = self._webhook_queue.get(timeout=5.0)
             except Empty:
                 continue
 
-            try:
-                if self._http_client is None:
-                    import httpx
-                    self._http_client = httpx.Client(timeout=self._config.webhook.timeout)
+            # Per-payload retry loop (HIGH-01)
+            backoff = 1.0
+            for attempt in range(1, max_retries + 1):
+                if self._shutdown.is_set():
+                    break
+                try:
+                    if self._http_client is None:
+                        import httpx
+                        self._http_client = httpx.Client(timeout=self._config.webhook.timeout)
 
-                response = self._http_client.post(self._config.webhook.url, json=payload)
-                response.raise_for_status()
-                self._circuit_breaker.record_success()
-                logger.debug(
-                    "dispatch.webhook_ok",
-                    alert_id=payload.get("alert_id"),
-                    status=response.status_code,
-                )
-                backoff = 1.0  # reset on success
-            except Exception as e:
-                self._circuit_breaker.record_failure()
-                logger.error(
-                    "dispatch.webhook_failed",
-                    alert_id=payload.get("alert_id"),
-                    error=str(e),
-                )
-                # Exponential backoff, but don't break
-                self._shutdown.wait(timeout=min(backoff, 30.0))
-                backoff = min(backoff * 2, 30.0)
+                    response = self._http_client.post(self._config.webhook.url, json=payload)
+                    response.raise_for_status()
+                    self._circuit_breaker.record_success()
+                    logger.debug(
+                        "dispatch.webhook_ok",
+                        alert_id=payload.get("alert_id"),
+                        status=response.status_code,
+                    )
+                    break  # Success, move to next payload
+                except Exception as e:
+                    self._circuit_breaker.record_failure()
+                    if attempt >= max_retries:
+                        logger.error(
+                            "dispatch.webhook_dropped",
+                            alert_id=payload.get("alert_id"),
+                            error=str(e),
+                            attempts=attempt,
+                        )
+                    else:
+                        logger.warning(
+                            "dispatch.webhook_retry",
+                            alert_id=payload.get("alert_id"),
+                            error=str(e),
+                            attempt=attempt,
+                        )
+                        self._shutdown.wait(timeout=min(backoff, 30.0))
+                        backoff = min(backoff * 2, 30.0)
 
     def _email_worker(self) -> None:
         """Background thread that sends email alerts via SMTP.
@@ -396,15 +412,41 @@ class AlertDispatcher:
         return self._circuit_breaker.get_status()
 
     def close(self) -> None:
-        """Clean up resources, draining queues before shutdown."""
+        """Clean up resources, draining queues before shutdown (HIGH-13).
+
+        Signals shutdown, then waits for worker threads to drain their queues.
+        Non-daemon threads ensure this method is always reached before process exit.
+        """
+        logger.info(
+            "dispatcher.closing",
+            webhook_pending=self._webhook_queue.qsize(),
+            email_pending=self._email_queue.qsize(),
+        )
         self._shutdown.set()
-        # Wait for queues to drain
+
+        # Wait for threads to finish processing remaining items
         if self._webhook_thread and self._webhook_thread.is_alive():
-            self._webhook_thread.join(timeout=5.0)
+            self._webhook_thread.join(timeout=10.0)
+            if self._webhook_thread.is_alive():
+                logger.warning("dispatcher.webhook_drain_timeout")
         if self._email_thread and self._email_thread.is_alive():
-            self._email_thread.join(timeout=5.0)
+            self._email_thread.join(timeout=10.0)
+            if self._email_thread.is_alive():
+                logger.warning("dispatcher.email_drain_timeout")
+
+        # Log any items still in queues after drain
+        remaining_webhook = self._webhook_queue.qsize()
+        remaining_email = self._email_queue.qsize()
+        if remaining_webhook > 0 or remaining_email > 0:
+            logger.error(
+                "dispatcher.alerts_lost_on_shutdown",
+                webhook_remaining=remaining_webhook,
+                email_remaining=remaining_email,
+            )
+
         if self._http_client:
             self._http_client.close()
+        logger.info("dispatcher.closed")
 
 
 def _date_folder(timestamp: float) -> str:

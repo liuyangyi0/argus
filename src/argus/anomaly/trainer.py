@@ -249,18 +249,13 @@ class ModelTrainer:
         export_format: str,
         export_path: str,
     ) -> None:
-        """Export trained model to an optimized inference format."""
-        from anomalib.deploy import ExportType
+        """Export trained model to an optimized inference format.
 
-        export_type_map = {
-            "openvino": ExportType.OPENVINO,
-            "onnx": ExportType.ONNX,
-        }
-        export_type = export_type_map.get(export_format, ExportType.OPENVINO)
-
+        CRIT-02/HIGH-12: Use correct Anomalib 2.x export API (export_mode parameter).
+        """
+        # Anomalib 2.x uses export_mode (str), not export_type (enum)
         engine.export(
             model=model,
-            export_type=export_type,
-            export_root=export_path,
+            export_mode=export_format,  # "openvino" or "onnx"
         )
         logger.info("training.exported", format=export_format, path=export_path)
