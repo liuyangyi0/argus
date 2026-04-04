@@ -65,11 +65,23 @@ class MOG2Config(BaseModel):
 
 
 class PersonFilterConfig(BaseModel):
-    """YOLO person detection parameters."""
+    """YOLO object detection parameters (YOLO-001/002/003).
+
+    Despite the name (kept for backward compatibility), this configures
+    multi-class COCO detection with optional tracking.
+    """
 
     confidence: float = Field(default=0.4, ge=0.1, le=0.95)
     skip_frame_on_person: bool = False
     model_name: str = "yolo11n.pt"
+    classes_to_detect: list[int] = Field(
+        default=[0],
+        description="COCO class IDs to detect. [0]=person only.",
+    )
+    enable_tracking: bool = Field(
+        default=False,
+        description="Enable BoT-SORT tracking for persistent object IDs across frames.",
+    )
 
 
 class AnomalyConfig(BaseModel):

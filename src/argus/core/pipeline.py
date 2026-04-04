@@ -35,7 +35,7 @@ from argus.core.diagnostics import (
 from argus.capture.camera import CameraCapture, FrameData
 from argus.config.schema import AlertConfig, CameraConfig, ZonePriority
 from argus.core.zone_mask import ZoneMaskEngine
-from argus.person.detector import PersonFilterResult, YOLOPersonDetector
+from argus.person.detector import ObjectDetectionResult, YOLOObjectDetector
 from argus.prefilter.mog2 import MOG2PreFilter, PreFilterResult
 
 logger = structlog.get_logger()
@@ -112,12 +112,14 @@ class DetectionPipeline:
             enable_stabilization=camera_config.mog2.enable_stabilization,
         )
 
-        # Stage 2: Person filter (DET-012: shared YOLO model)
-        self._person_detector = YOLOPersonDetector(
+        # Stage 2: Object detection (YOLO-003: multi-class + tracking)
+        self._object_detector = YOLOObjectDetector(
             model_name=camera_config.person_filter.model_name,
             confidence=camera_config.person_filter.confidence,
             skip_frame_on_person=camera_config.person_filter.skip_frame_on_person,
             shared_model=shared_yolo_model,
+            classes_to_detect=camera_config.person_filter.classes_to_detect,
+            enable_tracking=camera_config.person_filter.enable_tracking,
         )
 
         # Stage 3: Anomaly detector — auto-discover trained model
@@ -352,30 +354,38 @@ class DetectionPipeline:
                 },
             ))
 
-        # Stage 2: Person filter
+        # Stage 2: Object detection (YOLO-003: multi-class + tracking)
         t2 = time.monotonic()
-        person_result: PersonFilterResult = self._person_detector.detect(frame)
-        if person_result.has_persons and self.camera_config.person_filter.skip_frame_on_person:
+        detection_result: ObjectDetectionResult = self._object_detector.detect(frame)
+        if detection_result.has_persons and self.camera_config.person_filter.skip_frame_on_person:
             self.stats.frames_skipped_person += 1
             diag.stages.append(StageResult(
-                stage_name="person",
+                stage_name="yolo",
                 duration_ms=(time.monotonic() - t2) * 1000,
                 skipped=True,
                 skip_reason="person_detected",
-                metadata={"person_count": len(person_result.persons)},
+                metadata={
+                    "person_count": len(detection_result.persons),
+                    "object_count": len(detection_result.objects),
+                },
             ))
             diag.total_duration_ms = (time.monotonic() - start) * 1000
             self._diagnostics.append(diag)
             return None
 
         diag.stages.append(StageResult(
-            stage_name="person",
+            stage_name="yolo",
             duration_ms=(time.monotonic() - t2) * 1000,
-            metadata={"person_count": len(person_result.persons)},
+            metadata={
+                "person_count": len(detection_result.persons),
+                "object_count": len(detection_result.objects),
+                "classes": [o.class_name for o in detection_result.non_person_objects],
+                "track_ids": [o.track_id for o in detection_result.objects if o.track_id is not None],
+            },
         ))
 
         analysis_frame = (
-            person_result.masked_frame if person_result.masked_frame is not None else frame
+            detection_result.masked_frame if detection_result.masked_frame is not None else frame
         )
 
         # Stage 3: Anomaly detection
