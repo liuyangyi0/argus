@@ -87,7 +87,7 @@ class PersonFilterConfig(BaseModel):
 class AnomalyConfig(BaseModel):
     """Anomalib anomaly detection parameters."""
 
-    model_type: Literal["patchcore", "efficient_ad", "anomalydino"] = "patchcore"
+    model_type: Literal["patchcore", "efficient_ad", "fastflow", "padim"] = "patchcore"
     threshold: float = Field(default=0.7, ge=0.1, le=0.99)
     image_size: tuple[int, int] = (256, 256)
     enable_multiscale: bool = Field(
