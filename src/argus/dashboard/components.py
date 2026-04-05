@@ -142,13 +142,38 @@ def progress_bar(progress: int, status: str = "running") -> str:
     </div>"""
 
 
-def empty_state(message: str, hint: str = "") -> str:
-    """Empty state placeholder."""
+def empty_state(
+    message: str,
+    hint: str = "",
+    icon: str = "",
+    action_label: str = "",
+    action_url: str = "",
+    positive: bool = False,
+) -> str:
+    """Empty state placeholder with optional icon, action button, and positive/negative tone.
+
+    Args:
+        positive: If True, renders with green check (good news, e.g. "no alerts").
+    """
+    icon_html = ""
+    if icon:
+        icon_html = f'<div class="icon">{icon}</div>'
+    elif positive:
+        icon_html = '<div class="icon" style="color:var(--status-ok);">&#10003;</div>'
+
     hint_html = f'<div class="hint">{hint}</div>' if hint else ""
+    action_html = ""
+    if action_label and action_url:
+        action_html = (
+            f'<div style="margin-top:var(--space-4);">'
+            f'<a href="{action_url}" class="btn btn-ghost btn-sm">{action_label}</a></div>'
+        )
     return f"""
     <div class="empty-state">
+        {icon_html}
         <div class="message">{message}</div>
         {hint_html}
+        {action_html}
     </div>"""
 
 
