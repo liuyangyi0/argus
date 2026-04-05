@@ -107,6 +107,22 @@ def form_select(label: str, name: str, options: list[tuple[str, str]], selected:
     </div>"""
 
 
+def form_checkbox(
+    label: str, name: str, checked: bool = False, hint: str = ""
+) -> str:
+    """Form checkbox with label and optional hint."""
+    chk = " checked" if checked else ""
+    hint_html = f'<div class="form-hint">{hint}</div>' if hint else ""
+    return f"""
+    <div class="form-group">
+        <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" name="{name}" value="1"{chk}>
+            {label}
+        </label>
+        {hint_html}
+    </div>"""
+
+
 def progress_bar(progress: int, status: str = "running") -> str:
     """Animated progress bar. Status: running, success, error."""
     fill_cls = "progress-fill"
