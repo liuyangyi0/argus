@@ -215,11 +215,11 @@ class TestTaskManagerCallback:
 
 
 class TestDashboardWithWebSocket:
-    def test_index_page_includes_ws_client(self, client):
-        """Index page should include ws-client.js."""
+    def test_index_page_serves_vue_spa(self, client):
+        """Index page should serve Vue SPA with app mount point."""
         response = client.get("/")
         assert response.status_code == 200
-        assert "ws-client.js" in response.text
+        assert '<div id="app">' in response.text
 
     def test_overview_has_ws_topic_attribute(self, client, health):
         """Overview endpoint should have data-ws-topic attribute."""

@@ -22,6 +22,21 @@ from argus.anomaly.baseline import BaselineManager
 
 logger = structlog.get_logger()
 
+MIN_BASELINE_IMAGES: int = 30
+
+_EMPTY_VAL_STATS: dict = {
+    "scores": [],
+    "mean": 0.0,
+    "std": 0.0,
+    "min": 0.0,
+    "max": 0.0,
+    "p5": 0.0,
+    "p25": 0.0,
+    "p50": 0.0,
+    "p75": 0.0,
+    "p95": 0.0,
+}
+
 MODEL_INFO = {
     "patchcore": {
         "name": "PatchCore",

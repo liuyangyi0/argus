@@ -88,12 +88,14 @@ def create_app(
     app.add_middleware(RateLimitMiddleware, max_requests_per_minute=60)
 
     auth_config = getattr(config, "auth", None) or AuthConfig()
+    session_secret = secrets.token_hex(32)
     app.add_middleware(
         AuthMiddleware,
         config=auth_config,
-        session_secret=secrets.token_hex(32),
+        session_secret=session_secret,
         database=database,
     )
+    app.state.session_secret = session_secret
 
     app.include_router(auth_router)
 

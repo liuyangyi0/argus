@@ -44,17 +44,17 @@ def client(db, health, alerts_dir):
 
 class TestDashboardPages:
     def test_index_page_loads(self, client):
-        """Root page should return HTML."""
+        """Root page should return Vue SPA HTML."""
         response = client.get("/")
         assert response.status_code == 200
-        assert "ARGUS" in response.text
+        assert '<div id="app">' in response.text or "<div id=\"app\">" in response.text
         assert "text/html" in response.headers["content-type"]
 
     def test_cameras_page_loads(self, client):
-        """Cameras page should return HTML."""
+        """Cameras page should return Vue SPA HTML (client-side routing)."""
         response = client.get("/cameras")
         assert response.status_code == 200
-        assert "ARGUS" in response.text
+        assert '<div id="app">' in response.text or "<div id=\"app\">" in response.text
 
     def test_alerts_page_loads(self, client):
         """Alerts page should return HTML."""
@@ -271,11 +271,18 @@ class TestCompositeGeneration:
         assert result is not None
 
     def test_generate_composite_missing_file(self, tmp_path):
-        """Should return None for missing files."""
-        result = _generate_composite(
-            str(tmp_path / "nonexistent.jpg"),
-            str(tmp_path / "also_missing.jpg"),
-        )
+        """Should return None for missing files.
+
+        Note: ultralytics monkey-patches cv2.imread to raise FileNotFoundError
+        instead of returning None, so we mock it to restore standard behavior.
+        """
+        from unittest.mock import patch
+
+        with patch("cv2.imread", return_value=None):
+            result = _generate_composite(
+                str(tmp_path / "nonexistent.jpg"),
+                str(tmp_path / "also_missing.jpg"),
+            )
         assert result is None
 
 

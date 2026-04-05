@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import shutil
 from pathlib import Path
 
@@ -493,7 +494,7 @@ async def logs_tab(request: Request):
     except Exception as e:
         return HTMLResponse(empty_state(f"读取日志失败: {e}"))
 
-    log_content = "".join(tail)
+    log_content = html.escape("".join(tail))
     return HTMLResponse(f"""
     <div class="card" hx-get="/api/config/logs" hx-trigger="every 5s" hx-swap="outerHTML">
         <h3>最近日志（最后 50 行）</h3>

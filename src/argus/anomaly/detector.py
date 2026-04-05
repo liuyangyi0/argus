@@ -7,6 +7,7 @@ normal appearance is flagged as anomalous with a score and heatmap.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +71,7 @@ class AnomalibDetector:
         self._ssim_midpoint = ssim_midpoint
         self._ssim_baseline_count = 0
         self._ssim_noise_floor: float | None = None
+        self._reload_lock = threading.Lock()
 
     def load(self) -> bool:
         """Load the Anomalib model for inference.
@@ -103,6 +105,9 @@ class AnomalibDetector:
         # Torch inferencer for .ckpt / .pt files (or OpenVINO fallback)
         try:
             import os
+            # Required for Anomalib Torch model loading (TorchInferencer).
+            # Only affects the Torch fallback path when OpenVINO is unavailable.
+            # Security: enables arbitrary code execution from model files — only load trusted models.
             os.environ.setdefault("TRUST_REMOTE_CODE", "1")
             from anomalib.deploy import TorchInferencer
             self._engine = TorchInferencer(path=self._model_path)
@@ -334,11 +339,6 @@ class AnomalibDetector:
         succeeds, atomically swaps it in. If it fails, keeps the old model.
         Thread-safe via a lock around the engine swap.
         """
-        import threading
-
-        if not hasattr(self, "_reload_lock"):
-            self._reload_lock = threading.Lock()
-
         logger.info("anomaly.hot_reload_start", path=str(new_model_path))
 
         try:

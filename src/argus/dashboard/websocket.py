@@ -56,21 +56,24 @@ class ConnectionManager:
         self._event_queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue(maxsize=1000)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._broadcast_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """Start the broadcast dispatcher loop."""
         self._loop = asyncio.get_running_loop()
         self._broadcast_task = asyncio.create_task(self._dispatch_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info("ws.manager_started", max_connections=self._max_connections)
 
     async def stop(self) -> None:
         """Stop the manager and close all connections."""
-        if self._broadcast_task:
-            self._broadcast_task.cancel()
-            try:
-                await self._broadcast_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._broadcast_task, self._heartbeat_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         for client in list(self._connections.values()):
             await self._close_client(client)

@@ -80,8 +80,11 @@ class ObjectDetection:
 class ObjectDetectionResult:
     """Result of the object detection stage (YOLO-003)."""
 
-    persons: list[PersonDetection]
-    has_persons: bool
+    persons: list[PersonDetection] = field(default_factory=list)
+    has_persons: bool = False
+    objects: list[ObjectDetection] = field(default_factory=list)
+    has_objects: bool = False
+    non_person_objects: list[ObjectDetection] = field(default_factory=list)
     masked_frame: np.ndarray | None = None  # frame with persons blacked out
     filter_available: bool = True  # False when YOLO model failed to load
 
