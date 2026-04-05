@@ -40,16 +40,13 @@ _SYSTEM_TABS = [
 @router.get("", response_class=HTMLResponse)
 async def system_page(request: Request):
     """System administration page — unified tab interface."""
-    header = page_header("系统", "管理配置、备份、审计和用户")
+    is_htmx = request.headers.get("HX-Request") == "true"
+    header = "" if is_htmx else page_header("系统", "管理配置、备份、审计和用户")
     tabs = tab_bar(_SYSTEM_TABS, "overview")
     return HTMLResponse(f"""
     {header}
     {tabs}
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {{
-            htmx.ajax('GET', '/api/system/overview', {{target: '#tab-content', swap: 'innerHTML'}});
-        }});
-    </script>""")
+    <div hx-get="/api/system/overview" hx-trigger="load" hx-target="#tab-content" hx-swap="innerHTML"></div>""")
 
 
 @router.get("/overview", response_class=HTMLResponse)
