@@ -1137,3 +1137,42 @@ def _train_model_task(
         "quality_grade": result.quality_report.grade if result.quality_report else None,
         "threshold_recommended": result.threshold_recommended,
     }
+
+
+@router.post("/optimize", response_class=HTMLResponse)
+async def optimize_baseline(request: Request):
+    """Optimize baseline by selecting most diverse subset (A4-2)."""
+    form = await request.form()
+    camera_id = form.get("camera_id", "")
+    target_ratio = float(form.get("target_ratio", 0.2))
+
+    app = request.app
+    baseline_mgr = getattr(app.state, "baseline_manager", None)
+    if baseline_mgr is None:
+        return HTMLResponse('<div class="error">基线管理器未初始化</div>')
+
+    baseline_dir = baseline_mgr.get_baseline_dir(camera_id, "default")
+    all_images = sorted(
+        list(baseline_dir.glob("*.png")) + list(baseline_dir.glob("*.jpg"))
+    )
+    if not all_images:
+        return HTMLResponse('<div class="error">未找到基线图片</div>')
+
+    target_count = max(30, int(len(all_images) * target_ratio))
+    selected = baseline_mgr.diversity_select(baseline_dir, target_count)
+    selected_set = set(selected)
+
+    # Move unselected to backup directory
+    backup_dir = baseline_dir / "backup"
+    backup_dir.mkdir(exist_ok=True)
+    moved = 0
+    for img_path in all_images:
+        if img_path not in selected_set:
+            import shutil
+            shutil.move(str(img_path), str(backup_dir / img_path.name))
+            moved += 1
+
+    return HTMLResponse(
+        f'<div class="success">优化完成: 保留 {len(selected)} 张, '
+        f'移除 {moved} 张到 backup/</div>'
+    )

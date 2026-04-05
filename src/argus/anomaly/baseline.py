@@ -117,6 +117,64 @@ class BaselineManager:
                 })
         return results
 
+    def diversity_select(
+        self,
+        image_dir: Path,
+        target_count: int,
+        feature_size: tuple[int, int] = (64, 64),
+    ) -> list[Path]:
+        """Select the most diverse subset of images using k-center greedy.
+
+        Uses color histogram features in LAB space for perceptual diversity.
+        Returns paths of selected images, sorted by file name.
+
+        Algorithm (Sener & Savarese, ICLR 2018 simplified):
+        1. Compute feature vector for each image (LAB color histogram)
+        2. Start with first image as seed
+        3. Iteratively add the image farthest from all already-selected images
+        4. Stop at target_count
+        """
+        image_paths = sorted(
+            list(image_dir.glob("*.png")) + list(image_dir.glob("*.jpg"))
+        )
+
+        if len(image_paths) <= target_count:
+            return image_paths
+
+        # Step 1: Compute features (LAB color histograms, 3 channels x 32 bins = 96-dim)
+        features = []
+        for p in image_paths:
+            img = cv2.imread(str(p))
+            if img is None:
+                features.append(np.zeros(96))
+                continue
+            img = cv2.resize(img, feature_size)
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            hist = []
+            for ch in range(3):
+                h = cv2.calcHist([lab], [ch], None, [32], [0, 256])
+                h = h.flatten() / (h.sum() + 1e-8)
+                hist.append(h)
+            features.append(np.concatenate(hist))
+
+        features = np.array(features)  # (N, 96)
+
+        # Step 2-4: K-center greedy
+        n = len(features)
+        selected = [0]
+        min_distances = np.full(n, np.inf)
+
+        for _ in range(target_count - 1):
+            last = features[selected[-1]]
+            dists = np.linalg.norm(features - last, axis=1)
+            min_distances = np.minimum(min_distances, dists)
+            min_distances[selected] = -1  # exclude already selected
+
+            next_idx = int(np.argmax(min_distances))
+            selected.append(next_idx)
+
+        return [image_paths[i] for i in sorted(selected)]
+
     def cleanup_old_versions(
         self, camera_id: str, zone_id: str = "default", keep: int = 3
     ) -> int:

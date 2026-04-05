@@ -11,6 +11,7 @@ from argus.config.loader import load_config
 from argus.config.schema import (
     ArgusConfig, AlertSeverity, ZonePriority,
     SeverityThresholds, MOG2Config, CameraConfig, TemporalConfirmation,
+    AnomalyConfig, CalibrationConfig, SimplexConfig,
 )
 
 
@@ -112,3 +113,94 @@ class TestConfigLoader:
         assert config.node_id == "argus-edge-01"
         assert len(config.cameras) == 1
         assert config.cameras[0].camera_id == "cam_01"
+
+
+class TestDinomaly2Config:
+    """B1-6: Dinomaly2 configuration tests."""
+
+    def test_dinomaly2_config_valid(self):
+        """model_type=dinomaly2 + backbone + layers 正确解析。"""
+        config = AnomalyConfig(
+            model_type="dinomaly2",
+            dinomaly_backbone="dinov2_vitb14",
+            dinomaly_encoder_layers=[2, 5, 8, 11],
+        )
+        assert config.model_type == "dinomaly2"
+        assert config.dinomaly_backbone == "dinov2_vitb14"
+
+    def test_dinomaly2_few_shot_minimum(self):
+        """dinomaly_few_shot_images validates range."""
+        config = AnomalyConfig(model_type="dinomaly2", dinomaly_few_shot_images=8)
+        assert config.dinomaly_few_shot_images == 8
+
+    def test_dinomaly2_multi_class_default_false(self):
+        """dinomaly_multi_class defaults to False."""
+        config = AnomalyConfig(model_type="dinomaly2")
+        assert config.dinomaly_multi_class is False
+
+
+class TestQuantizationConfig:
+    """B2-4: Quantization configuration tests."""
+
+    def test_quantization_config_values(self):
+        """fp32/fp16/int8 都是合法值。"""
+        for q in ("fp32", "fp16", "int8"):
+            config = AnomalyConfig(quantization=q)
+            assert config.quantization == q
+
+    def test_int8_calibration_images_range(self):
+        """calibration_images validates range 50-1000."""
+        config = AnomalyConfig(quantization="int8", quantization_calibration_images=100)
+        assert config.quantization_calibration_images == 100
+
+        with pytest.raises(ValidationError):
+            AnomalyConfig(quantization="int8", quantization_calibration_images=10)
+
+
+class TestCUSUMConfig:
+    """A1-3: CUSUM evidence config tests."""
+
+    def test_evidence_lambda_range(self):
+        """evidence_lambda must be 0.80-0.99."""
+        config = TemporalConfirmation(evidence_lambda=0.95)
+        assert config.evidence_lambda == 0.95
+
+        with pytest.raises(ValidationError):
+            TemporalConfirmation(evidence_lambda=0.5)
+
+    def test_evidence_threshold_range(self):
+        """evidence_threshold must be 0.5-20.0."""
+        config = TemporalConfirmation(evidence_threshold=5.0)
+        assert config.evidence_threshold == 5.0
+
+
+class TestCalibrationConfig:
+    """A2-2: Calibration config tests."""
+
+    def test_calibration_default_disabled(self):
+        """Calibration should be disabled by default."""
+        config = CalibrationConfig()
+        assert config.enabled is False
+
+    def test_calibration_fprs(self):
+        """FPR values should be within range."""
+        config = CalibrationConfig(
+            enabled=True,
+            target_fpr_info=0.10,
+            target_fpr_low=0.01,
+            target_fpr_medium=0.001,
+            target_fpr_high=0.0001,
+        )
+        assert config.target_fpr_info == 0.10
+
+
+class TestSimplexConfig:
+    """A3-2: Simplex config tests."""
+
+    def test_simplex_default_enabled(self):
+        config = SimplexConfig()
+        assert config.enabled is True
+
+    def test_simplex_diff_threshold_range(self):
+        with pytest.raises(ValidationError):
+            SimplexConfig(diff_threshold=5)  # below 10

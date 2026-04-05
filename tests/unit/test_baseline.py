@@ -91,3 +91,42 @@ class TestBaselineManager:
     def test_empty_baseline_count(self, bm):
         """No images should return 0."""
         assert bm.count_images("nonexistent") == 0
+
+
+class TestDiversitySelect:
+    """Tests for k-center greedy diversity selection (A4)."""
+
+    def _create_test_images(self, tmp_path, count=100):
+        """Create test images with varying colors for diversity testing."""
+        import cv2
+
+        img_dir = tmp_path / "images"
+        img_dir.mkdir()
+        rng = np.random.default_rng(42)
+        for i in range(count):
+            img = np.full((64, 64, 3), rng.integers(0, 256, 3), dtype=np.uint8)
+            cv2.imwrite(str(img_dir / f"img_{i:05d}.png"), img)
+        return img_dir
+
+    def test_diversity_select_reduces_count(self, tmp_path):
+        """100 张图 → target=20 → 返回 20 个 Path。"""
+        bm = BaselineManager(baselines_dir=tmp_path / "baselines")
+        img_dir = self._create_test_images(tmp_path, count=100)
+        result = bm.diversity_select(img_dir, target_count=20)
+        assert len(result) == 20
+        assert all(p.exists() for p in result)
+
+    def test_diversity_select_with_fewer_images(self, tmp_path):
+        """图片数 < target → 返回全部。"""
+        bm = BaselineManager(baselines_dir=tmp_path / "baselines")
+        img_dir = self._create_test_images(tmp_path, count=10)
+        result = bm.diversity_select(img_dir, target_count=50)
+        assert len(result) == 10
+
+    def test_diversity_select_returns_sorted_paths(self, tmp_path):
+        """返回的 Path 列表按文件名排序。"""
+        bm = BaselineManager(baselines_dir=tmp_path / "baselines")
+        img_dir = self._create_test_images(tmp_path, count=50)
+        result = bm.diversity_select(img_dir, target_count=15)
+        names = [p.name for p in result]
+        assert names == sorted(names)

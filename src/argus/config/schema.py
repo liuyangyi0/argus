@@ -64,6 +64,33 @@ class MOG2Config(BaseModel):
     )
 
 
+class CameraHealthConfig(BaseModel):
+    """Camera hardware health monitoring."""
+
+    enabled: bool = Field(default=True)
+    freeze_detection: bool = Field(default=True)
+    lens_contamination_detection: bool = Field(default=True)
+    displacement_detection: bool = Field(default=True)
+    flash_suppression: bool = Field(default=True)
+    gain_drift_detection: bool = Field(default=True)
+    freeze_window_frames: int = Field(default=10, ge=5, le=30)
+    sharpness_drop_pct: float = Field(default=0.3, ge=0.1, le=0.8)
+    displacement_threshold_px: float = Field(default=20.0, ge=5.0, le=100.0)
+    flash_sigma: float = Field(default=3.0, ge=2.0, le=5.0)
+    gain_drift_threshold_pct: float = Field(default=20.0, ge=5.0, le=50.0)
+
+
+class SimplexConfig(BaseModel):
+    """Simplex safety channel: formally verifiable frame-difference detector."""
+
+    enabled: bool = Field(default=True, description="Enable simplex parallel detection channel")
+    diff_threshold: int = Field(default=30, ge=10, le=100)
+    min_area_px: int = Field(default=500, ge=100, le=50000)
+    min_static_seconds: float = Field(default=30.0, ge=5.0, le=600.0)
+    morph_kernel_size: int = Field(default=5, ge=3, le=15)
+    match_radius_px: int = Field(default=50, ge=10, le=200)
+
+
 class PersonFilterConfig(BaseModel):
     """YOLO object detection parameters (YOLO-001/002/003).
 
@@ -127,7 +154,7 @@ class CaptureQualityConfig(BaseModel):
 class AnomalyConfig(BaseModel):
     """Anomalib anomaly detection parameters."""
 
-    model_type: Literal["patchcore", "efficient_ad", "fastflow", "padim"] = "patchcore"
+    model_type: Literal["patchcore", "efficient_ad", "fastflow", "padim", "dinomaly2"] = "patchcore"
     threshold: float = Field(default=0.7, ge=0.1, le=0.99)
     image_size: tuple[int, int] = (256, 256)
     enable_multiscale: bool = Field(
@@ -142,6 +169,32 @@ class AnomalyConfig(BaseModel):
         default=0.25, ge=0.0, le=0.5,
         description="Overlap ratio between adjacent tiles (0.0-0.5)",
     )
+    # Dinomaly2 parameters (only used when model_type="dinomaly2")
+    dinomaly_backbone: str = Field(
+        default="dinov2_vitb14",
+        description="DINOv2 backbone variant (dinov2_vits14, dinov2_vitb14, dinov2_vitl14)",
+    )
+    dinomaly_encoder_layers: list[int] = Field(
+        default=[2, 5, 8, 11],
+        description="Intermediate ViT layers to extract features from",
+    )
+    dinomaly_few_shot_images: int = Field(
+        default=8, ge=1, le=100,
+        description="Minimum baseline images for few-shot mode (Dinomaly2 supports 8-shot)",
+    )
+    dinomaly_multi_class: bool = Field(
+        default=False,
+        description="Use unified multi-class model for all cameras (shared backbone)",
+    )
+    # INT8 quantization (B2)
+    quantization: Literal["fp32", "fp16", "int8"] = Field(
+        default="fp16",
+        description="Model precision for inference (fp32=full, fp16=half, int8=quantized)",
+    )
+    quantization_calibration_images: int = Field(
+        default=100, ge=50, le=1000,
+        description="Number of baseline images used for INT8 calibration",
+    )
     # SSIM fallback parameters (used when no trained model is available)
     ssim_baseline_frames: int = Field(
         default=15, ge=5, le=100,
@@ -155,6 +208,45 @@ class AnomalyConfig(BaseModel):
         default=0.015, ge=0.001, le=0.5,
         description="Sigmoid midpoint for SSIM score normalization",
     )
+
+
+class ClassifierConfig(BaseModel):
+    """Open vocabulary detection classifier (D1)."""
+
+    enabled: bool = Field(default=False)
+    model_name: str = Field(default="yolov8s-worldv2.pt")
+    vocabulary: list[str] = Field(
+        default_factory=lambda: [
+            "wrench", "bolt", "nut", "screwdriver", "hammer",
+            "rag", "glove", "plastic bag", "tape", "wire",
+            "insulation", "debris", "paint chip",
+            "insect", "bird", "shadow", "reflection",
+        ]
+    )
+    min_anomaly_score_to_classify: float = Field(default=0.5, ge=0.0, le=1.0)
+    high_risk_labels: list[str] = Field(
+        default_factory=lambda: ["wrench", "bolt", "nut", "screwdriver", "hammer"]
+    )
+    low_risk_labels: list[str] = Field(
+        default_factory=lambda: ["insect", "shadow", "reflection"]
+    )
+
+
+class SegmenterConfig(BaseModel):
+    """SAM 2 instance segmentation (D2)."""
+
+    enabled: bool = Field(default=False)
+    model_size: str = Field(default="small", description="SAM 2 model size: small, base, large")
+
+
+class DriftConfig(BaseModel):
+    """Score distribution drift monitoring."""
+
+    enabled: bool = Field(default=True)
+    window_size: int = Field(default=5000, ge=500, le=100000)
+    check_interval: int = Field(default=500, ge=100, le=5000)
+    ks_threshold: float = Field(default=0.1, ge=0.01, le=0.5)
+    p_value_threshold: float = Field(default=0.01, ge=0.001, le=0.1)
 
 
 class CameraConfig(BaseModel):
@@ -176,6 +268,9 @@ class CameraConfig(BaseModel):
     mog2: MOG2Config = Field(default_factory=MOG2Config)
     person_filter: PersonFilterConfig = Field(default_factory=PersonFilterConfig)
     anomaly: AnomalyConfig = Field(default_factory=AnomalyConfig)
+    simplex: SimplexConfig = Field(default_factory=SimplexConfig)
+    health: CameraHealthConfig = Field(default_factory=CameraHealthConfig)
+    drift: DriftConfig = Field(default_factory=DriftConfig)
 
 
 class SeverityThresholds(BaseModel):
@@ -208,6 +303,15 @@ class TemporalConfirmation(BaseModel):
         default=0.3, ge=0.0, le=1.0,
         description="Min IoU between consecutive anomaly heatmaps (0=disabled)",
     )
+    # CUSUM evidence accumulation
+    evidence_lambda: float = Field(
+        default=0.95, ge=0.80, le=0.99,
+        description="Exponential decay factor for evidence accumulation (0.8-0.99)",
+    )
+    evidence_threshold: float = Field(
+        default=3.0, ge=0.5, le=20.0,
+        description="Accumulated evidence threshold to trigger alert (0.5-20.0)",
+    )
 
 
 class SuppressionConfig(BaseModel):
@@ -235,12 +339,27 @@ class EmailConfig(BaseModel):
     recipients: list[str] = Field(default_factory=list)
 
 
+class CalibrationConfig(BaseModel):
+    """Conformal prediction score calibration."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Use calibrated thresholds instead of manual severity_thresholds",
+    )
+    target_fpr_info: float = Field(default=0.10, ge=0.001, le=0.5)
+    target_fpr_low: float = Field(default=0.01, ge=0.0001, le=0.1)
+    target_fpr_medium: float = Field(default=0.001, ge=0.00001, le=0.01)
+    target_fpr_high: float = Field(default=0.0001, ge=0.000001, le=0.001)
+    min_calibration_samples: int = Field(default=50, ge=20, le=1000)
+
+
 class AlertConfig(BaseModel):
     """Alert system configuration."""
 
     severity_thresholds: SeverityThresholds = Field(default_factory=SeverityThresholds)
     temporal: TemporalConfirmation = Field(default_factory=TemporalConfirmation)
     suppression: SuppressionConfig = Field(default_factory=SuppressionConfig)
+    calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     zone_multipliers: dict[str, float] = Field(
         default_factory=lambda: {"critical": 1.2, "standard": 1.0, "low_priority": 0.8}
     )
@@ -311,6 +430,27 @@ class ModelsConfig(BaseModel):
     anomalib_export_dir: Path = Path("data/exports")
 
 
+class CameraOverlapConfig(BaseModel):
+    """Overlap between two cameras for cross-correlation."""
+
+    camera_a: str
+    camera_b: str
+    homography: list[list[float]] = Field(
+        description="3x3 homography matrix projecting from camera_a to camera_b",
+    )
+
+
+class CrossCameraConfig(BaseModel):
+    """Cross-camera anomaly correlation."""
+
+    enabled: bool = Field(default=False)
+    overlap_pairs: list[CameraOverlapConfig] = Field(default_factory=list)
+    uncorroborated_severity_downgrade: int = Field(
+        default=1, ge=0, le=2,
+        description="Downgrade severity by N levels when uncorroborated (0=disabled)",
+    )
+
+
 class ArgusConfig(BaseModel):
     """Top-level configuration for the Argus system."""
 
@@ -323,4 +463,5 @@ class ArgusConfig(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     capture_quality: CaptureQualityConfig = Field(default_factory=CaptureQualityConfig)
+    cross_camera: CrossCameraConfig = Field(default_factory=CrossCameraConfig)
     log_level: str = "INFO"
