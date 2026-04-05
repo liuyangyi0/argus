@@ -1,9 +1,14 @@
-"""System status and overview API routes (Chinese UI)."""
+"""System status, overview, and administration routes (Chinese UI).
+
+Consolidates: overview, system info, config, backup, audit, reports, users
+into a single tabbed interface.
+"""
 
 from __future__ import annotations
 
 import shutil
 
+import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
@@ -13,14 +18,43 @@ from argus.dashboard.components import (
     status_badge,
     status_banner,
     status_dot,
+    tab_bar,
 )
 
+logger = structlog.get_logger()
+
 router = APIRouter()
+
+# Sub-tabs for the /system page
+_SYSTEM_TABS = [
+    ("overview", "系统概览", "/api/system/overview"),
+    ("details", "系统详情", "/api/system/details"),
+    ("config", "配置管理", "/api/config"),
+    ("backup", "数据备份", "/api/backup"),
+    ("audit", "审计日志", "/api/audit"),
+    ("reports", "报表统计", "/api/reports"),
+    ("users", "用户管理", "/api/users"),
+]
+
+
+@router.get("", response_class=HTMLResponse)
+async def system_page(request: Request):
+    """System administration page — unified tab interface."""
+    header = page_header("系统", "管理配置、备份、审计和用户")
+    tabs = tab_bar(_SYSTEM_TABS, "overview")
+    return HTMLResponse(f"""
+    {header}
+    {tabs}
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            htmx.ajax('GET', '/api/system/overview', {{target: '#tab-content', swap: 'innerHTML'}});
+        }});
+    </script>""")
 
 
 @router.get("/overview", response_class=HTMLResponse)
 async def overview(request: Request):
-    """Dashboard overview with key metrics and camera grid."""
+    """Dashboard overview with key metrics, camera grid, and pending actions."""
     health_monitor = request.app.state.health_monitor
     camera_manager = request.app.state.camera_manager
     db = request.app.state.db
@@ -79,7 +113,7 @@ async def overview(request: Request):
                 locked_cams.append(cam.camera_id)
         if locked_cams:
             lock_items = "".join(
-                f'<div class="flex-between" style="padding:6px 0;">'
+                f'<div class="flex-between" style="padding:var(--space-2) 0;">'
                 f'<span>{status_dot("degraded")}{cam_id} — 异常区域已锁定</span>'
                 f'<button class="btn btn-warning btn-sm" '
                 f'hx-post="/api/config/clear-lock/{cam_id}" hx-swap="outerHTML">'
@@ -87,25 +121,90 @@ async def overview(request: Request):
                 for cam_id in locked_cams
             )
             lock_html = f"""
-            <div class="card" style="border-left:3px solid #ff9800;">
+            <div class="card" style="border-left:3px solid var(--status-warn);">
                 <h3>异常锁定</h3>
                 {lock_items}
             </div>"""
 
     # Stat cards
-    alert_color = "#f44336" if high_alerts > 0 else "#4caf50"
+    alert_color = "var(--status-critical)" if high_alerts > 0 else "var(--status-ok)"
     stats_html = f"""
-    <div class="grid-4" style="margin-bottom:20px;">
-        {stat_card("摄像头在线", f"{connected}/{total_cams}", "#4fc3f7")}
+    <div class="grid-4 mb-16">
+        {stat_card("摄像头在线", f"{connected}/{total_cams}", "var(--status-info-text)")}
         {stat_card("累计告警", str(total_alerts), alert_color)}
         {stat_card("可用磁盘", disk_text)}
         {stat_card("运行时间", uptime)}
     </div>"""
 
+    # ── Pending actions — the "what to do right now" section ──
+    pending_items = []
+
+    # Pending alerts (unacknowledged HIGH/MEDIUM)
+    if db:
+        try:
+            unack_high = db.get_alert_count(severity="high")
+            unack_med = db.get_alert_count(severity="medium")
+            pending_alert_count = unack_high + unack_med
+            if pending_alert_count > 0:
+                pending_items.append(
+                    f'<div class="flex-between" style="padding:var(--space-3) 0;'
+                    f'border-bottom:1px solid var(--border-subtle);">'
+                    f'<span style="color:var(--status-critical-text);">'
+                    f'待处理告警 <strong>{pending_alert_count}</strong> 条'
+                    f'</span>'
+                    f'<a href="/alerts" class="btn btn-sm btn-primary">处理</a>'
+                    f'</div>'
+                )
+        except Exception:
+            pass
+
+    # Running tasks
+    task_manager = getattr(request.app.state, "task_manager", None)
+    if task_manager:
+        active = task_manager.get_active_tasks()
+        running = [t for t in active if t.status.value in ("pending", "running")]
+        if running:
+            pending_items.append(
+                f'<div class="flex-between" style="padding:var(--space-3) 0;'
+                f'border-bottom:1px solid var(--border-subtle);">'
+                f'<span style="color:var(--status-info-text);">'
+                f'运行中的任务 <strong>{len(running)}</strong> 个'
+                f'</span>'
+                f'<a href="/models" class="btn btn-sm btn-ghost">查看</a>'
+                f'</div>'
+            )
+
+    # Offline cameras
+    offline = [c for c in cameras_status if not c.connected]
+    if offline:
+        cam_ids = ", ".join(c.camera_id for c in offline[:3])
+        pending_items.append(
+            f'<div class="flex-between" style="padding:var(--space-3) 0;'
+            f'border-bottom:1px solid var(--border-subtle);">'
+            f'<span style="color:var(--status-warn-text);">'
+            f'离线摄像头 <strong>{len(offline)}</strong> 台 ({cam_ids})'
+            f'</span>'
+            f'<a href="/cameras" class="btn btn-sm btn-ghost">查看</a>'
+            f'</div>'
+        )
+
+    pending_html = ""
+    if pending_items:
+        pending_html = f"""
+        <div class="card" style="border-left:3px solid var(--status-info);">
+            <h3>待办事项</h3>
+            {"".join(pending_items)}
+        </div>"""
+    else:
+        pending_html = f"""
+        <div class="card" style="border-left:3px solid var(--status-ok);">
+            <h3>待办事项</h3>
+            <p style="color:var(--text-tertiary);padding:var(--space-2) 0;">暂无待办 — 一切正常</p>
+        </div>"""
+
     # Camera grid
     camera_cards = ""
     for cam in cameras_status:
-        dot_cls = "status-healthy" if cam.connected else "status-offline"
         status_text = "在线" if cam.connected else "离线"
         frames = cam.stats.frames_captured if cam.stats else 0
         latency = f"{cam.stats.avg_latency_ms:.1f}ms" if cam.stats else "N/A"
@@ -119,7 +218,7 @@ async def overview(request: Request):
         )
 
         camera_cards += f"""
-        <div class="camera-card" style="cursor:pointer;"
+        <div class="camera-card camera-list-card"
              hx-get="/api/cameras/{cam.camera_id}/detail" hx-target="#content" hx-swap="innerHTML"
              hx-push-url="/cameras?cam={cam.camera_id}">
             <div class="header">
@@ -137,7 +236,7 @@ async def overview(request: Request):
     cameras_html = f"""
     <div class="card">
         <h3>摄像头概览</h3>
-        <div class="grid-2">{camera_cards if camera_cards else '<p style="color:#616161;">暂无摄像头</p>'}</div>
+        <div class="grid-2">{camera_cards if camera_cards else '<p style="color:var(--text-tertiary);">暂无摄像头</p>'}</div>
     </div>"""
 
     # Recent alerts
@@ -151,7 +250,7 @@ async def overview(request: Request):
                     ts = a.timestamp.strftime("%H:%M:%S") if a.timestamp else ""
                     rows += f"""
                     <tr>
-                        <td style="font-size:12px;">{a.alert_id[:20]}</td>
+                        <td class="mono" style="font-size:var(--text-xs);">{a.alert_id[:20]}</td>
                         <td>{ts}</td>
                         <td>{a.camera_id}</td>
                         <td>{a.zone_id}</td>
@@ -169,36 +268,12 @@ async def overview(request: Request):
                         </tr></thead>
                         <tbody>{rows}</tbody>
                     </table>
-                    <div style="text-align:center;margin-top:12px;">
+                    <div style="text-align:center;margin-top:var(--space-3);">
                         <a href="/alerts" class="btn btn-ghost btn-sm">查看全部告警</a>
                     </div>
                 </div>"""
         except Exception:
             pass
-
-    # Quick actions
-    actions_html = f"""
-    <div class="card">
-        <h3>快捷操作</h3>
-        <div class="flex gap-12" style="flex-wrap:wrap;">
-            <button class="btn btn-primary" hx-post="/api/config/reload" hx-swap="none">重新加载配置</button>
-            <a href="/baseline" class="btn btn-ghost">管理基线与模型</a>
-            <a href="/config" class="btn btn-ghost">系统设置</a>
-        </div>
-    </div>"""
-
-    # Task status
-    tasks_html = ""
-    task_manager = getattr(request.app.state, "task_manager", None)
-    if task_manager:
-        active = task_manager.get_active_tasks()
-        running = [t for t in active if t.status.value in ("pending", "running")]
-        if running:
-            tasks_html = (
-                '<div class="card"><h3>运行中的任务</h3>'
-                '<div hx-get="/api/tasks" hx-trigger="load" hx-swap="innerHTML"></div>'
-                '</div>'
-            )
 
     return HTMLResponse(f"""
     <div data-ws-topic="health" data-ws-refresh-url="/api/system/overview"
@@ -206,10 +281,10 @@ async def overview(request: Request):
         {banner_html}
         {lock_html}
         {stats_html}
-        {tasks_html}
-        <div class="grid-2" style="margin-bottom:20px;">
+        {pending_html}
+        <div class="grid-2 mb-16">
             <div>{cameras_html}</div>
-            <div>{recent_alerts_html}{actions_html}</div>
+            <div>{recent_alerts_html}</div>
         </div>
     </div>""")
 
@@ -240,9 +315,9 @@ async def health(request: Request):
     }
 
 
-@router.get("", response_class=HTMLResponse)
-async def system_detail(request: Request):
-    """Detailed system information page."""
+@router.get("/details", response_class=HTMLResponse)
+async def system_details(request: Request):
+    """Detailed system information sub-tab."""
     health_monitor = request.app.state.health_monitor
     if not health_monitor:
         return HTMLResponse('<div class="empty-state"><div class="message">健康监控不可用</div></div>')
@@ -259,21 +334,19 @@ async def system_detail(request: Request):
             <td>{c.frames_captured}</td>
             <td>{c.avg_latency_ms:.1f}ms</td>
             <td>{c.reconnect_count}</td>
-            <td style="color:#8890a0;">{c.error or "—"}</td>
+            <td style="color:var(--text-tertiary);">{c.error or "—"}</td>
         </tr>"""
 
     return HTMLResponse(f"""
-    <div data-ws-topic="health" data-ws-refresh-url="/api/system"
-         hx-get="/api/system" hx-trigger="every 30s" hx-swap="outerHTML">
-        {page_header("系统信息")}
+    <div>
         <div class="card">
             <h3>运行状态</h3>
             <table>
-                <tr><td style="color:#8890a0;width:120px;">操作系统</td><td>{h.platform}</td></tr>
-                <tr><td style="color:#8890a0;">Python 版本</td><td>{h.python_version}</td></tr>
-                <tr><td style="color:#8890a0;">运行时间</td><td>{_format_uptime(h.uptime_seconds)}</td></tr>
-                <tr><td style="color:#8890a0;">系统状态</td><td>{h.status.value.upper()}</td></tr>
-                <tr><td style="color:#8890a0;">累计告警</td><td>{h.total_alerts}</td></tr>
+                <tr><td style="color:var(--text-secondary);width:120px;">操作系统</td><td>{h.platform}</td></tr>
+                <tr><td style="color:var(--text-secondary);">Python 版本</td><td>{h.python_version}</td></tr>
+                <tr><td style="color:var(--text-secondary);">运行时间</td><td>{_format_uptime(h.uptime_seconds)}</td></tr>
+                <tr><td style="color:var(--text-secondary);">系统状态</td><td>{h.status.value.upper()}</td></tr>
+                <tr><td style="color:var(--text-secondary);">累计告警</td><td>{h.total_alerts}</td></tr>
             </table>
         </div>
 
@@ -284,7 +357,7 @@ async def system_detail(request: Request):
                     <th>摄像头</th><th>状态</th><th>帧数</th>
                     <th>延迟</th><th>重连次数</th><th>错误信息</th>
                 </tr></thead>
-                <tbody>{camera_rows if camera_rows else '<tr><td colspan="6" style="color:#616161;">暂无摄像头</td></tr>'}</tbody>
+                <tbody>{camera_rows if camera_rows else '<tr><td colspan="6" style="color:var(--text-tertiary);">暂无摄像头</td></tr>'}</tbody>
             </table>
         </div>
     </div>""")
