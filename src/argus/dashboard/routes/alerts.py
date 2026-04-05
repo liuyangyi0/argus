@@ -398,6 +398,18 @@ async def bulk_acknowledge(request: Request):
         if db.acknowledge_alert(aid, "operator"):
             count += 1
 
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="bulk_acknowledge",
+            target_type="alert",
+            target_id=",".join(alert_ids[:10]),
+            detail=f"批量确认 {count} 条告警",
+            ip_address=client_ip,
+        )
+
     return JSONResponse({"status": "ok", "count": count, "message": f"已确认 {count} 条告警"})
 
 
@@ -415,6 +427,18 @@ async def bulk_false_positive(request: Request):
     for aid in alert_ids:
         if db.mark_false_positive(aid):
             count += 1
+
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="bulk_false_positive",
+            target_type="alert",
+            target_id=",".join(alert_ids[:10]),
+            detail=f"批量标记 {count} 条为误报",
+            ip_address=client_ip,
+        )
 
     return JSONResponse({"status": "ok", "count": count, "message": f"已标记 {count} 条为误报"})
 
@@ -463,6 +487,16 @@ async def acknowledge_alert(request: Request, alert_id: str):
     """Acknowledge an alert."""
     db = request.app.state.db
     if db and db.acknowledge_alert(alert_id, "operator"):
+        audit = getattr(request.app.state, "audit_logger", None)
+        client_ip = request.client.host if request.client else ""
+        if audit:
+            audit.log(
+                user="operator",
+                action="acknowledge_alert",
+                target_type="alert",
+                target_id=alert_id,
+                ip_address=client_ip,
+            )
         return HTMLResponse('<span style="color:#4caf50;font-size:12px;">已确认</span>')
     return HTMLResponse('<span style="color:#f44336;font-size:12px;">操作失败</span>')
 
@@ -472,6 +506,16 @@ async def mark_false_positive(request: Request, alert_id: str):
     """Mark an alert as a false positive."""
     db = request.app.state.db
     if db and db.mark_false_positive(alert_id):
+        audit = getattr(request.app.state, "audit_logger", None)
+        client_ip = request.client.host if request.client else ""
+        if audit:
+            audit.log(
+                user="operator",
+                action="mark_false_positive",
+                target_type="alert",
+                target_id=alert_id,
+                ip_address=client_ip,
+            )
         return HTMLResponse('<span style="color:#ff9800;font-size:12px;">已标记误报</span>')
     return HTMLResponse('<span style="color:#f44336;font-size:12px;">操作失败</span>')
 

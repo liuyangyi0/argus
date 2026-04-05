@@ -21,6 +21,8 @@ from argus.core.health import HealthMonitor
 from argus.core.scheduler import TaskScheduler, create_maintenance_tasks
 from argus.dashboard.app import create_app
 from argus.dashboard.tasks import TaskManager
+from argus.storage.audit import AuditLogger
+from argus.storage.backup import BackupManager
 from argus.storage.database import Database
 
 logger = structlog.get_logger()
@@ -142,6 +144,12 @@ def main():
     db = Database(database_url=config.storage.database_url)
     db.initialize()
 
+    # Create default admin user if no users exist
+    if db.user_count() == 0:
+        from argus.dashboard.auth import hash_password
+        db.create_user("admin", hash_password("admin"), "admin", "管理员")
+        logger.info("auth.default_user_created", username="admin", msg="Default admin user created (password: admin)")
+
     health = HealthMonitor()
 
     dispatcher = AlertDispatcher(
@@ -187,6 +195,12 @@ def main():
     dashboard_thread = None
     if not args.no_dashboard:
         task_mgr = TaskManager(max_concurrent=2)
+        audit_logger = AuditLogger(database=db)
+        backup_mgr = BackupManager(
+            database_url=config.storage.database_url,
+            backup_dir="data/backups",
+            max_backups=10,
+        )
         app = create_app(
             database=db,
             camera_manager=manager,
@@ -196,6 +210,8 @@ def main():
             config_path=args.config,
             task_manager=task_mgr,
         )
+        app.state.audit_logger = audit_logger
+        app.state.backup_manager = backup_mgr
 
         def run_dashboard():
             import uvicorn
@@ -222,6 +238,17 @@ def main():
         health_monitor=health,
         alerts_dir=config.storage.alerts_dir,
     )
+
+    # Scheduled automatic backup every 6 hours
+    if not args.no_dashboard:
+        def _scheduled_backup():
+            try:
+                result = backup_mgr.create_backup(include_models=False)
+                logger.info("backup.scheduled_ok", size_mb=result.get("size_mb"), duration=result.get("duration_seconds"))
+            except Exception as e:
+                logger.error("backup.scheduled_failed", error=str(e))
+
+        scheduler.add_interval_task("auto_backup", _scheduled_backup, hours=6)
 
     # Start cameras
     logger.info("argus.starting", cameras=len(cameras))

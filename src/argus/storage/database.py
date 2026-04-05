@@ -9,7 +9,7 @@ import structlog
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from argus.storage.models import AlertRecord, Base, BaselineRecord
+from argus.storage.models import AlertRecord, Base, BaselineRecord, User
 
 logger = structlog.get_logger()
 
@@ -206,6 +206,67 @@ class Database:
                 images=len(image_paths),
             )
             return len(old_alerts), image_paths
+
+    # ── User management ──
+
+    def create_user(
+        self,
+        username: str,
+        password_hash: str,
+        role: str = "viewer",
+        display_name: str | None = None,
+    ) -> User:
+        """Create a new user record."""
+        with self.get_session() as session:
+            user = User(
+                username=username,
+                password_hash=password_hash,
+                role=role,
+                display_name=display_name,
+            )
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+            logger.info("database.user_created", username=username, role=role)
+            return user
+
+    def get_user(self, username: str) -> User | None:
+        """Get a user by username."""
+        with self.get_session() as session:
+            return session.scalar(select(User).where(User.username == username))
+
+    def get_all_users(self) -> list[User]:
+        """Return all users ordered by username."""
+        with self.get_session() as session:
+            return list(session.scalars(select(User).order_by(User.username)).all())
+
+    def update_user(self, username: str, **kwargs) -> bool:
+        """Update user fields. Returns True if the user was found and updated."""
+        with self.get_session() as session:
+            user = session.scalar(select(User).where(User.username == username))
+            if user is None:
+                return False
+            for key, value in kwargs.items():
+                if hasattr(user, key):
+                    setattr(user, key, value)
+            session.commit()
+            return True
+
+    def delete_user(self, username: str) -> bool:
+        """Delete a user. Returns True if deleted."""
+        with self.get_session() as session:
+            user = session.scalar(select(User).where(User.username == username))
+            if user is None:
+                return False
+            session.delete(user)
+            session.commit()
+            logger.info("database.user_deleted", username=username)
+            return True
+
+    def user_count(self) -> int:
+        """Return total number of users."""
+        with self.get_session() as session:
+            return len(list(session.scalars(select(User)).all()))
 
     def close(self) -> None:
         """Close the database engine."""
