@@ -95,6 +95,10 @@ class MOG2PreFilter:
 
         self._prev_gray = gray
 
+        # MED-02: Validate phase correlation result (can return NaN/Inf on edge cases)
+        if not (np.isfinite(dx) and np.isfinite(dy)):
+            return frame
+
         # Only compensate small vibration; large shifts are real motion
         if abs(dx) < 5.0 and abs(dy) < 5.0 and (abs(dx) > 0.3 or abs(dy) > 0.3):
             M = np.float64([[1, 0, -dx], [0, 1, -dy]])
@@ -121,7 +125,9 @@ class MOG2PreFilter:
             PreFilterResult with change detection outcome.
         """
         # Phase correlation stabilization — compensate camera micro-vibration
-        if self.enable_stabilization:
+        # HIGH-02: Skip stabilization when learning is frozen (lock active)
+        # to avoid introducing shadow artifacts from alignment during freeze
+        if self.enable_stabilization and learning_rate_override != 0.0:
             frame = self._align_frame(frame)
 
         # Median blur suppresses radiation-induced salt-and-pepper noise on CMOS

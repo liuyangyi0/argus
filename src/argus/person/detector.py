@@ -80,12 +80,10 @@ class ObjectDetection:
 class ObjectDetectionResult:
     """Result of the object detection stage (YOLO-003)."""
 
-    objects: list[ObjectDetection] = field(default_factory=list)
-    has_objects: bool = False
-    has_persons: bool = False  # Convenience: any person class detected
-    persons: list[ObjectDetection] = field(default_factory=list)  # Person-only subset
-    non_person_objects: list[ObjectDetection] = field(default_factory=list)
-    masked_frame: np.ndarray | None = None  # Frame with persons blurred out
+    persons: list[PersonDetection]
+    has_persons: bool
+    masked_frame: np.ndarray | None = None  # frame with persons blacked out
+    filter_available: bool = True  # False when YOLO model failed to load
 
 
 # Backward-compatible aliases
@@ -141,10 +139,10 @@ class YOLOObjectDetector:
             )
         except Exception as e:
             self._available = False
-            logger.warning(
+            logger.error(
                 "yolo.unavailable",
                 error=str(e),
-                msg="Object detection disabled — all frames will be analyzed",
+                msg="Person filtering OFFLINE — all frames will be analyzed unfiltered",
             )
 
     def detect(self, frame: np.ndarray) -> ObjectDetectionResult:
@@ -155,7 +153,7 @@ class YOLOObjectDetector:
         self._ensure_model()
 
         if not self._available:
-            return ObjectDetectionResult()
+            return PersonFilterResult(persons=[], has_persons=False, filter_available=False)
 
         # YOLO-002: Use tracking if enabled, otherwise standard predict
         if self.enable_tracking:

@@ -199,7 +199,8 @@ async def overview(request: Request):
             )
 
     return HTMLResponse(f"""
-    <div hx-get="/api/system/overview" hx-trigger="every 3s" hx-swap="outerHTML">
+    <div data-ws-topic="health" data-ws-refresh-url="/api/system/overview"
+         hx-get="/api/system/overview" hx-trigger="every 30s" hx-swap="outerHTML">
         {banner_html}
         {lock_html}
         {stats_html}
@@ -260,7 +261,8 @@ async def system_detail(request: Request):
         </tr>"""
 
     return HTMLResponse(f"""
-    <div hx-get="/api/system" hx-trigger="every 5s" hx-swap="outerHTML">
+    <div data-ws-topic="health" data-ws-refresh-url="/api/system"
+         hx-get="/api/system" hx-trigger="every 30s" hx-swap="outerHTML">
         {page_header("系统信息")}
         <div class="card">
             <h3>运行状态</h3>

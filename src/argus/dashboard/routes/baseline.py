@@ -130,7 +130,7 @@ async def capture_form(request: Request):
                   if t.task_type == "baseline_capture" and t.status.value in ("pending", "running")]
         if active:
             task_html = '<div class="card" style="border-left:3px solid #4fc3f7;"><h3>正在采集</h3>'
-            task_html += f'<div hx-get="/api/tasks/{active[0].task_id}" hx-trigger="every 1s" hx-swap="outerHTML"></div>'
+            task_html += f'<div hx-get="/api/tasks/{active[0].task_id}" data-ws-topic="tasks" data-ws-refresh-url="/api/tasks/{active[0].task_id}" hx-trigger="every 30s" hx-swap="outerHTML"></div>'
             task_html += '</div>'
         else:
             # Show stats for most recently completed capture
@@ -459,7 +459,7 @@ async def train_form(request: Request):
                   if t.task_type == "model_training" and t.status.value in ("pending", "running")]
         if active:
             task_html = '<div class="card" style="border-left:3px solid #4fc3f7;"><h3>正在训练</h3>'
-            task_html += f'<div hx-get="/api/tasks/{active[0].task_id}" hx-trigger="every 1s" hx-swap="outerHTML"></div>'
+            task_html += f'<div hx-get="/api/tasks/{active[0].task_id}" data-ws-topic="tasks" data-ws-refresh-url="/api/tasks/{active[0].task_id}" hx-trigger="every 30s" hx-swap="outerHTML"></div>'
             task_html += '</div>'
 
     cam_select = form_select("选择摄像头", "camera_id", cam_options)

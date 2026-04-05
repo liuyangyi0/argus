@@ -14,6 +14,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -44,10 +45,12 @@ class AlertDispatcher:
         config: AlertConfig,
         database: Database,
         alerts_dir: str | Path = "data/alerts",
+        on_alert: Callable[[str, dict], None] | None = None,
     ):
         self._config = config
         self._db = database
         self._alerts_dir = Path(alerts_dir)
+        self._on_alert_ws = on_alert
         self._alerts_dir.mkdir(parents=True, exist_ok=True)
         self._http_client = None
         self._shutdown = threading.Event()
@@ -144,6 +147,20 @@ class AlertDispatcher:
                     self._email_queue.put_nowait(email_data)
                 except Exception:
                     logger.warning("dispatch.email_queue_full", alert_id=alert.alert_id)
+
+        # Channel 4: WebSocket push (real-time dashboard notification)
+        if self._on_alert_ws:
+            try:
+                self._on_alert_ws("alerts", {
+                    "alert_id": alert.alert_id,
+                    "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
+                    "camera_id": alert.camera_id,
+                    "zone_id": alert.zone_id,
+                    "severity": alert.severity.value,
+                    "anomaly_score": round(alert.anomaly_score, 4),
+                })
+            except Exception:
+                pass
 
         logger.info(
             "alert.dispatched",
