@@ -13,6 +13,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 
 import numpy as np
 import structlog
@@ -35,6 +36,17 @@ class Alert:
     frame_number: int
     snapshot: np.ndarray | None = None
     heatmap: np.ndarray | None = None
+    # YOLO-005: Semantic detection context
+    detection_type: str = "anomaly"  # DetectionType value: "anomaly", "object", "hybrid"
+    detected_objects: list[dict] = field(default_factory=list)
+
+
+class DetectionType(str, Enum):
+    """Type of detection that triggered an alert (YOLO-005)."""
+
+    ANOMALY = "anomaly"  # Anomalib only
+    OBJECT = "object"  # YOLO object detection only
+    HYBRID = "hybrid"  # Both YOLO and Anomalib agree
 
 
 @dataclass
@@ -76,6 +88,8 @@ class AlertGrader:
         frame_number: int,
         frame: np.ndarray | None = None,
         anomaly_map: np.ndarray | None = None,
+        detection_type: str = "anomaly",
+        detected_objects: list[dict] | None = None,
     ) -> Alert | None:
         """Evaluate an anomaly detection and potentially produce an alert.
 
@@ -183,6 +197,8 @@ class AlertGrader:
             frame_number=frame_number,
             snapshot=frame,
             heatmap=anomaly_map,
+            detection_type=detection_type,
+            detected_objects=detected_objects or [],
         )
 
         # Reset tracker after emitting alert

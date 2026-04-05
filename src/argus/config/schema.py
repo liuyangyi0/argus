@@ -65,11 +65,23 @@ class MOG2Config(BaseModel):
 
 
 class PersonFilterConfig(BaseModel):
-    """YOLO person detection parameters."""
+    """YOLO object detection parameters (YOLO-001/002/003).
+
+    Despite the name (kept for backward compatibility), this configures
+    multi-class COCO detection with optional tracking.
+    """
 
     confidence: float = Field(default=0.4, ge=0.1, le=0.95)
     skip_frame_on_person: bool = False
     model_name: str = "yolo11n.pt"
+    classes_to_detect: list[int] = Field(
+        default=[0],
+        description="COCO class IDs to detect. [0]=person only.",
+    )
+    enable_tracking: bool = Field(
+        default=False,
+        description="Enable BoT-SORT tracking for persistent object IDs across frames.",
+    )
 
 
 class CaptureQualityConfig(BaseModel):
@@ -115,7 +127,7 @@ class CaptureQualityConfig(BaseModel):
 class AnomalyConfig(BaseModel):
     """Anomalib anomaly detection parameters."""
 
-    model_type: Literal["patchcore", "efficient_ad", "anomalydino"] = "patchcore"
+    model_type: Literal["patchcore", "efficient_ad", "fastflow", "padim"] = "patchcore"
     threshold: float = Field(default=0.7, ge=0.1, le=0.99)
     image_size: tuple[int, int] = (256, 256)
     enable_multiscale: bool = Field(
@@ -230,6 +242,8 @@ class AlertConfig(BaseModel):
     )
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
+    circuit_breaker_threshold: int = Field(default=5, ge=1, le=50)
+    circuit_breaker_timeout: float = Field(default=60.0, ge=10.0, le=600.0)
 
 
 class AuthConfig(BaseModel):

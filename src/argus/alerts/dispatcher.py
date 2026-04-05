@@ -21,6 +21,7 @@ import structlog
 
 from argus.alerts.grader import Alert
 from argus.config.schema import AlertConfig
+from argus.core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from argus.storage.database import Database
 
 logger = structlog.get_logger()
@@ -51,6 +52,14 @@ class AlertDispatcher:
         self._http_client = None
         self._shutdown = threading.Event()
 
+        # DET-009: Circuit breaker for webhook dispatch
+        cb_config = CircuitBreakerConfig(
+            failure_threshold=config.circuit_breaker_threshold,
+            recovery_timeout_seconds=config.circuit_breaker_timeout,
+        )
+        self._circuit_breaker = CircuitBreaker(cb_config)
+
+        # HIGH-13: Non-daemon threads so queued alerts are not discarded on shutdown
         # Background webhook dispatch thread
         self._webhook_queue: Queue = Queue(maxsize=100)
         self._webhook_thread: threading.Thread | None = None
@@ -58,7 +67,7 @@ class AlertDispatcher:
             self._webhook_thread = threading.Thread(
                 target=self._webhook_worker,
                 name="argus-webhook",
-                daemon=True,
+                daemon=False,
             )
             self._webhook_thread.start()
 
@@ -69,7 +78,7 @@ class AlertDispatcher:
             self._email_thread = threading.Thread(
                 target=self._email_worker,
                 name="argus-email",
-                daemon=True,
+                daemon=False,
             )
             self._email_thread.start()
 
@@ -91,22 +100,29 @@ class AlertDispatcher:
         # Channel 1: Database (always active)
         self._dispatch_database(alert, snapshot_path, heatmap_path)
 
-        # Channel 2: Webhook (non-blocking, queued to background thread)
+        # Channel 2: Webhook (non-blocking, queued to background thread, with circuit breaker DET-009)
         if self._config.webhook.enabled:
-            payload = {
-                "alert_id": alert.alert_id,
-                "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
-                "camera_id": alert.camera_id,
-                "zone_id": alert.zone_id,
-                "severity": alert.severity.value,
-                "anomaly_score": round(alert.anomaly_score, 4),
-                "snapshot_path": snapshot_path,
-                "heatmap_path": heatmap_path,
-            }
-            try:
-                self._webhook_queue.put_nowait(payload)
-            except Exception:
-                logger.warning("dispatch.webhook_queue_full", alert_id=alert.alert_id)
+            if self._circuit_breaker.allow_request():
+                payload = {
+                    "alert_id": alert.alert_id,
+                    "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
+                    "camera_id": alert.camera_id,
+                    "zone_id": alert.zone_id,
+                    "severity": alert.severity.value,
+                    "anomaly_score": round(alert.anomaly_score, 4),
+                    "snapshot_path": snapshot_path,
+                    "heatmap_path": heatmap_path,
+                }
+                try:
+                    self._webhook_queue.put_nowait(payload)
+                except Exception:
+                    logger.warning("dispatch.webhook_queue_full", alert_id=alert.alert_id)
+            else:
+                logger.warning(
+                    "dispatch.circuit_open",
+                    alert_id=alert.alert_id,
+                    msg="Circuit breaker open, webhook skipped",
+                )
 
         # Channel 3: Email (non-blocking, queued to background thread)
         if self._config.email.enabled and self._config.email.recipients:
@@ -158,39 +174,56 @@ class AlertDispatcher:
     def _webhook_worker(self) -> None:
         """Background thread that sends webhook HTTP POST requests.
 
-        Runs in its own thread to avoid blocking camera processing threads.
-        Uses exponential backoff on failure to avoid tight retry loops.
+        HIGH-01: Uses per-payload retry loop with exponential backoff.
+        Failed payloads retry up to 3 times before being dropped (logged).
+        Thread never dies on exception — wraps entire loop in try/except.
         """
         logger.info("webhook_worker.started", url=self._config.webhook.url)
-        backoff = 1.0
+        max_retries = 3
+
         while not self._shutdown.is_set():
             try:
                 payload = self._webhook_queue.get(timeout=5.0)
             except Empty:
                 continue
 
-            try:
-                if self._http_client is None:
-                    import httpx
-                    self._http_client = httpx.Client(timeout=self._config.webhook.timeout)
+            # Per-payload retry loop (HIGH-01)
+            backoff = 1.0
+            for attempt in range(1, max_retries + 1):
+                if self._shutdown.is_set():
+                    break
+                try:
+                    if self._http_client is None:
+                        import httpx
+                        self._http_client = httpx.Client(timeout=self._config.webhook.timeout)
 
-                response = self._http_client.post(self._config.webhook.url, json=payload)
-                response.raise_for_status()
-                logger.debug(
-                    "dispatch.webhook_ok",
-                    alert_id=payload.get("alert_id"),
-                    status=response.status_code,
-                )
-                backoff = 1.0  # reset on success
-            except Exception as e:
-                logger.error(
-                    "dispatch.webhook_failed",
-                    alert_id=payload.get("alert_id"),
-                    error=str(e),
-                )
-                # Exponential backoff, but don't break
-                self._shutdown.wait(timeout=min(backoff, 30.0))
-                backoff = min(backoff * 2, 30.0)
+                    response = self._http_client.post(self._config.webhook.url, json=payload)
+                    response.raise_for_status()
+                    self._circuit_breaker.record_success()
+                    logger.debug(
+                        "dispatch.webhook_ok",
+                        alert_id=payload.get("alert_id"),
+                        status=response.status_code,
+                    )
+                    break  # Success, move to next payload
+                except Exception as e:
+                    self._circuit_breaker.record_failure()
+                    if attempt >= max_retries:
+                        logger.error(
+                            "dispatch.webhook_dropped",
+                            alert_id=payload.get("alert_id"),
+                            error=str(e),
+                            attempts=attempt,
+                        )
+                    else:
+                        logger.warning(
+                            "dispatch.webhook_retry",
+                            alert_id=payload.get("alert_id"),
+                            error=str(e),
+                            attempt=attempt,
+                        )
+                        self._shutdown.wait(timeout=min(backoff, 30.0))
+                        backoff = min(backoff * 2, 30.0)
 
     def _email_worker(self) -> None:
         """Background thread that sends email alerts via SMTP.
@@ -271,7 +304,7 @@ class AlertDispatcher:
                 backoff = min(backoff * 2, 30.0)
 
     def _save_snapshot(self, alert: Alert) -> str | None:
-        """Save the alert snapshot frame to disk."""
+        """Save the alert snapshot frame to disk with anomaly region annotations (DET-007)."""
         if alert.snapshot is None:
             return None
 
@@ -279,13 +312,49 @@ class AlertDispatcher:
             date_dir = self._alerts_dir / _date_folder(alert.timestamp) / alert.camera_id
             date_dir.mkdir(parents=True, exist_ok=True)
 
+            # DET-007: Annotate snapshot with red rectangles around anomaly regions
+            annotated = self._annotate_snapshot(
+                alert.snapshot, alert.heatmap, alert.anomaly_score
+            )
+
             filename = f"{alert.alert_id}_snapshot.jpg"
             path = date_dir / filename
-            cv2.imwrite(str(path), alert.snapshot, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(str(path), annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
             return str(path)
         except Exception as e:
             logger.error("dispatch.snapshot_save_failed", error=str(e))
             return None
+
+    @staticmethod
+    def _annotate_snapshot(
+        frame: np.ndarray,
+        heatmap: np.ndarray | None,
+        score: float,
+    ) -> np.ndarray:
+        """Draw red rectangles around anomaly regions with score labels (DET-007)."""
+        annotated = frame.copy()
+        if heatmap is None:
+            return annotated
+
+        from argus.core.anomaly_postprocess import AnomalyMapProcessor
+
+        h, w = frame.shape[:2]
+        heatmap_resized = cv2.resize(heatmap, (w, h))
+
+        processor = AnomalyMapProcessor(min_contour_area=100)
+        regions = processor.extract_regions(heatmap_resized, threshold=0.5)
+
+        for r in regions:
+            cv2.rectangle(annotated, (r.x, r.y), (r.x + r.width, r.y + r.height), (0, 0, 255), 2)
+            label = f"{score:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            cv2.rectangle(annotated, (r.x, r.y - th - 6), (r.x + tw + 4, r.y), (0, 0, 255), -1)
+            cv2.putText(
+                annotated, label, (r.x + 2, r.y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
+            )
+
+        return annotated
 
     def _save_heatmap(self, alert: Alert) -> str | None:
         """Save the anomaly heatmap to disk as a colored overlay."""
@@ -331,16 +400,46 @@ class AlertDispatcher:
             logger.error("dispatch.disk_check_failed", error=str(e))
             return True  # Fail-open: allow save if check itself fails
 
+    def get_circuit_breaker_status(self) -> dict:
+        """Get circuit breaker status for dashboard display (DET-009)."""
+        return self._circuit_breaker.get_status()
+
     def close(self) -> None:
-        """Clean up resources, draining queues before shutdown."""
+        """Clean up resources, draining queues before shutdown (HIGH-13).
+
+        Signals shutdown, then waits for worker threads to drain their queues.
+        Non-daemon threads ensure this method is always reached before process exit.
+        """
+        logger.info(
+            "dispatcher.closing",
+            webhook_pending=self._webhook_queue.qsize(),
+            email_pending=self._email_queue.qsize(),
+        )
         self._shutdown.set()
-        # Wait for queues to drain
+
+        # Wait for threads to finish processing remaining items
         if self._webhook_thread and self._webhook_thread.is_alive():
-            self._webhook_thread.join(timeout=5.0)
+            self._webhook_thread.join(timeout=10.0)
+            if self._webhook_thread.is_alive():
+                logger.warning("dispatcher.webhook_drain_timeout")
         if self._email_thread and self._email_thread.is_alive():
-            self._email_thread.join(timeout=5.0)
+            self._email_thread.join(timeout=10.0)
+            if self._email_thread.is_alive():
+                logger.warning("dispatcher.email_drain_timeout")
+
+        # Log any items still in queues after drain
+        remaining_webhook = self._webhook_queue.qsize()
+        remaining_email = self._email_queue.qsize()
+        if remaining_webhook > 0 or remaining_email > 0:
+            logger.error(
+                "dispatcher.alerts_lost_on_shutdown",
+                webhook_remaining=remaining_webhook,
+                email_remaining=remaining_email,
+            )
+
         if self._http_client:
             self._http_client.close()
+        logger.info("dispatcher.closed")
 
 
 def _date_folder(timestamp: float) -> str:
