@@ -155,6 +155,36 @@ class Database:
             session.commit()
             return True
 
+    def update_alert_workflow(
+        self,
+        alert_id: str,
+        workflow_status: str,
+        notes: str | None = None,
+        assigned_to: str | None = None,
+    ) -> bool:
+        """Transition alert workflow status with optional notes/assignment."""
+        from datetime import datetime, timezone
+
+        with self.get_session() as session:
+            record = session.scalar(
+                select(AlertRecord).where(AlertRecord.alert_id == alert_id)
+            )
+            if record is None:
+                return False
+            record.workflow_status = workflow_status
+            if notes:
+                record.notes = notes
+            if assigned_to:
+                record.assigned_to = assigned_to
+            if workflow_status in ("resolved", "closed"):
+                record.resolved_at = datetime.now(timezone.utc)
+            if workflow_status == "false_positive":
+                record.false_positive = True
+            if workflow_status == "acknowledged":
+                record.acknowledged = True
+            session.commit()
+            return True
+
     def get_alert_count(
         self,
         camera_id: str | None = None,
