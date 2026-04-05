@@ -18,7 +18,7 @@ def page_header(title: str, subtitle: str = "", actions_html: str = "") -> str:
     </div>"""
 
 
-def stat_card(label: str, value: str, color: str = "#e0e0e0") -> str:
+def stat_card(label: str, value: str, color: str = "var(--text-primary)") -> str:
     """Metric stat card with large value and small label."""
     return f"""
     <div class="card stat">
@@ -28,10 +28,16 @@ def stat_card(label: str, value: str, color: str = "#e0e0e0") -> str:
 
 
 def status_badge(severity: str) -> str:
-    """Severity badge with color coding."""
-    labels = {"info": "提示", "low": "低", "medium": "中", "high": "高"}
-    label = labels.get(severity, severity)
-    return f'<span class="badge badge-{severity}">{label}</span>'
+    """Severity badge with triple encoding: color + icon + text."""
+    config = {
+        "info": ("提示", "&#9432;"),      # i in circle
+        "low": ("低", "&#9888;"),          # warning triangle
+        "medium": ("中", "&#9888;"),       # warning triangle
+        "high": ("高", "&#9888;"),         # warning triangle
+    }
+    label, icon = config.get(severity, (severity, ""))
+    pulse = " alert-critical-pulse" if severity == "high" else ""
+    return f'<span class="badge badge-{severity}{pulse}">{icon} {label}</span>'
 
 
 def status_dot(status: str) -> str:
@@ -182,3 +188,51 @@ def camera_select(cameras: list, selected_id: str = "") -> str:
     """Camera selection dropdown from camera status list."""
     options = [(c.camera_id, f"{c.camera_id} - {c.name}") for c in cameras]
     return form_select("选择摄像头", "camera_id", options, selected=selected_id)
+
+
+def pipeline_stepper(steps: list[dict]) -> str:
+    """Pipeline progress stepper for camera lifecycle.
+
+    Each step dict:
+        name: str       — display label
+        status: str     — "completed" / "active" / "pending" / "warning" / "error"
+        info: str       — subtitle text (e.g. "v007 ✓" or "Day 2/7")
+        url: str        — optional click target URL
+    """
+    # Status to dot content mapping
+    dot_content = {
+        "completed": "&#10003;",  # checkmark
+        "active": "&#9679;",      # filled circle
+        "pending": "",
+        "warning": "!",
+        "error": "&#10007;",      # X mark
+    }
+
+    html_parts = []
+    for i, step in enumerate(steps):
+        status = step.get("status", "pending")
+        name = step.get("name", "")
+        info = step.get("info", "")
+        url = step.get("url", "")
+
+        dot = dot_content.get(status, "")
+        info_html = f'<div class="step-info">{info}</div>' if info else ""
+
+        wrapper_start = f'<a href="{url}" style="text-decoration:none;color:inherit;">' if url else ""
+        wrapper_end = "</a>" if url else ""
+
+        html_parts.append(f"""
+        {wrapper_start}
+        <div class="stepper-step {status}">
+            <div class="step-dot">{dot}</div>
+            <div class="step-label">{name}</div>
+            {info_html}
+        </div>
+        {wrapper_end}""")
+
+        # Add connector between steps (not after last)
+        if i < len(steps) - 1:
+            conn_cls = "completed" if status == "completed" else ""
+            html_parts.append(f'<div class="stepper-connector {conn_cls}"></div>')
+
+    return f'<div class="pipeline-stepper">{"".join(html_parts)}</div>'
