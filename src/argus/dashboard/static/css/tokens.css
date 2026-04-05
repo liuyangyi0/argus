@@ -132,7 +132,6 @@
   /* ========== Layout ========== */
   --sidebar-width:    240px;
   --content-max:      1600px;
-  --nav-height:       0px;  /* No top nav, sidebar layout */
 }
 
 /* ========== Reduced Motion ========== */
