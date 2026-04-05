@@ -268,7 +268,7 @@ class DetectionPipeline:
             camera_id=self.camera_config.camera_id,
             anomaly_model_loaded=self._anomaly_detector.is_loaded,
             zones=len(self.camera_config.zones),
-            heartbeat_interval=self._heartbeat_interval,
+            heartbeat_interval=self._heartbeat_seconds,
         )
         return True
 
