@@ -1,263 +1,61 @@
-"""Reusable HTML component functions for the Argus dashboard.
+"""Minimal stubs for legacy HTML component functions.
 
-All text output is in Chinese. Components return HTML strings that
-can be embedded in route handler responses.
+These are kept only to prevent ImportError in route files that still
+contain HTMX HTML-rendering code. The Vue SPA frontend does not use these.
 """
-
-from __future__ import annotations
 
 
 def page_header(title: str, subtitle: str = "", actions_html: str = "") -> str:
-    """Page header with title, optional subtitle, and action buttons."""
-    sub = f'<div class="subtitle">{subtitle}</div>' if subtitle else ""
-    actions = f'<div class="flex gap-12">{actions_html}</div>' if actions_html else ""
-    return f"""
-    <div class="page-header">
-        <div><h2>{title}</h2>{sub}</div>
-        {actions}
-    </div>"""
+    return f"<h2>{title}</h2>"
 
 
-def stat_card(label: str, value: str, color: str = "var(--text-primary)") -> str:
-    """Metric stat card with large value and small label."""
-    return f"""
-    <div class="card stat">
-        <div class="value" style="color:{color};">{value}</div>
-        <div class="label">{label}</div>
-    </div>"""
+def stat_card(label: str, value: str, color: str = "") -> str:
+    return f"<div>{label}: {value}</div>"
 
 
 def status_badge(severity: str) -> str:
-    """Severity badge with triple encoding: color + icon + text."""
-    config = {
-        "info": ("提示", "&#9432;"),      # i in circle
-        "low": ("低", "&#9888;"),          # warning triangle
-        "medium": ("中", "&#9888;"),       # warning triangle
-        "high": ("高", "&#9888;"),         # warning triangle
-    }
-    label, icon = config.get(severity, (severity, ""))
-    pulse = " alert-critical-pulse" if severity == "high" else ""
-    return f'<span class="badge badge-{severity}{pulse}">{icon} {label}</span>'
+    return f"<span>{severity}</span>"
 
 
 def status_dot(status: str) -> str:
-    """Small colored status dot."""
-    cls_map = {
-        "healthy": "status-healthy",
-        "degraded": "status-degraded",
-        "unhealthy": "status-unhealthy",
-        "offline": "status-offline",
-        "connected": "status-healthy",
-        "disconnected": "status-offline",
-    }
-    cls = cls_map.get(status, "status-offline")
-    return f'<span class="status-dot {cls}"></span>'
+    return ""
 
 
 def status_banner(status: str, message: str) -> str:
-    """Full-width status banner for system health."""
-    icons = {"healthy": "●", "degraded": "◐", "unhealthy": "○"}
-    icon = icons.get(status, "○")
-    return f"""
-    <div class="status-banner {status}">
-        <span style="font-size:18px;">{icon}</span>
-        <span>{message}</span>
-    </div>"""
+    return f"<div>{message}</div>"
 
 
-def form_group(
-    label: str,
-    name: str,
-    value: str = "",
-    input_type: str = "text",
-    hint: str = "",
-    placeholder: str = "",
-    required: bool = False,
-    min_val: str = "",
-    max_val: str = "",
-    step: str = "",
-) -> str:
-    """Form input group with label and optional hint."""
-    attrs = f'name="{name}" id="{name}" value="{value}" class="form-input"'
-    if placeholder:
-        attrs += f' placeholder="{placeholder}"'
-    if required:
-        attrs += " required"
-    if min_val:
-        attrs += f' min="{min_val}"'
-    if max_val:
-        attrs += f' max="{max_val}"'
-    if step:
-        attrs += f' step="{step}"'
-    hint_html = f'<div class="form-hint">{hint}</div>' if hint else ""
-    return f"""
-    <div class="form-group">
-        <label class="form-label" for="{name}">{label}</label>
-        <input type="{input_type}" {attrs}>
-        {hint_html}
-    </div>"""
+def form_group(label: str, name: str, **kwargs) -> str:
+    return f'<input name="{name}" />'
 
 
-def form_select(label: str, name: str, options: list[tuple[str, str]], selected: str = "", hint: str = "") -> str:
-    """Form select dropdown. Options are (value, display_text) tuples."""
-    opts_html = ""
-    for val, text in options:
-        sel = ' selected' if val == selected else ''
-        opts_html += f'<option value="{val}"{sel}>{text}</option>'
-    hint_html = f'<div class="form-hint">{hint}</div>' if hint else ""
-    return f"""
-    <div class="form-group">
-        <label class="form-label" for="{name}">{label}</label>
-        <select name="{name}" id="{name}" class="form-select">{opts_html}</select>
-        {hint_html}
-    </div>"""
+def form_select(label: str, name: str, options=None, **kwargs) -> str:
+    return f'<select name="{name}"></select>'
 
 
-def form_checkbox(
-    label: str, name: str, checked: bool = False, hint: str = ""
-) -> str:
-    """Form checkbox with label and optional hint."""
-    chk = " checked" if checked else ""
-    hint_html = f'<div class="form-hint">{hint}</div>' if hint else ""
-    return f"""
-    <div class="form-group">
-        <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-            <input type="checkbox" name="{name}" value="1"{chk}>
-            {label}
-        </label>
-        {hint_html}
-    </div>"""
+def form_checkbox(label: str, name: str, **kwargs) -> str:
+    return f'<input type="checkbox" name="{name}" />'
 
 
-def progress_bar(progress: int, status: str = "running") -> str:
-    """Animated progress bar. Status: running, success, error."""
-    fill_cls = "progress-fill"
-    if status == "complete":
-        fill_cls += " success"
-    elif status == "failed":
-        fill_cls += " error"
-    return f"""
-    <div class="progress-bar">
-        <div class="{fill_cls}" style="width:{progress}%;"></div>
-    </div>"""
+def progress_bar(progress: int = 0, status: str = "") -> str:
+    return f"<div>{progress}%</div>"
 
 
-def empty_state(
-    message: str,
-    hint: str = "",
-    icon: str = "",
-    action_label: str = "",
-    action_url: str = "",
-    positive: bool = False,
-) -> str:
-    """Empty state placeholder with optional icon, action button, and positive/negative tone.
-
-    Args:
-        positive: If True, renders with green check (good news, e.g. "no alerts").
-    """
-    icon_html = ""
-    if icon:
-        icon_html = f'<div class="icon">{icon}</div>'
-    elif positive:
-        icon_html = '<div class="icon" style="color:var(--status-ok);">&#10003;</div>'
-
-    hint_html = f'<div class="hint">{hint}</div>' if hint else ""
-    action_html = ""
-    if action_label and action_url:
-        action_html = (
-            f'<div style="margin-top:var(--space-4);">'
-            f'<a href="{action_url}" class="btn btn-ghost btn-sm">{action_label}</a></div>'
-        )
-    return f"""
-    <div class="empty-state">
-        {icon_html}
-        <div class="message">{message}</div>
-        {hint_html}
-        {action_html}
-    </div>"""
+def empty_state(message: str = "", hint: str = "", **kwargs) -> str:
+    return f"<div>{message}</div>"
 
 
-def confirm_button(
-    text: str,
-    url: str,
-    method: str = "post",
-    target: str = "",
-    swap: str = "outerHTML",
-    css_class: str = "btn btn-primary btn-sm",
-    confirm_msg: str = "",
-) -> str:
-    """HTMX-powered button with optional confirm dialog."""
-    hx_method = f'hx-{method}="{url}"'
-    hx_target = f'hx-target="{target}"' if target else ""
-    hx_confirm = f'hx-confirm="{confirm_msg}"' if confirm_msg else ""
-    return (
-        f'<button class="{css_class}" {hx_method} hx-swap="{swap}" '
-        f'{hx_target} {hx_confirm}>{text}</button>'
-    )
+def confirm_button(text: str, url: str, **kwargs) -> str:
+    return f"<button>{text}</button>"
 
 
-def tab_bar(tabs: list[tuple[str, str, str]], active_tab: str) -> str:
-    """Tab navigation bar. Tabs are (id, label, url) tuples."""
-    items = ""
-    for tab_id, label, url in tabs:
-        active = " active" if tab_id == active_tab else ""
-        items += (
-            f'<button class="tab-item{active}" '
-            f'hx-get="{url}" hx-target="#tab-content" hx-swap="innerHTML">'
-            f'{label}</button>'
-        )
-    return f'<div class="tab-bar">{items}</div><div id="tab-content"></div>'
+def tab_bar(tabs=None, active_tab: str = "") -> str:
+    return "<div></div>"
 
 
-def camera_select(cameras: list, selected_id: str = "") -> str:
-    """Camera selection dropdown from camera status list."""
-    options = [(c.camera_id, f"{c.camera_id} - {c.name}") for c in cameras]
-    return form_select("选择摄像头", "camera_id", options, selected=selected_id)
+def camera_select(cameras=None, selected_id: str = "") -> str:
+    return "<select></select>"
 
 
-def pipeline_stepper(steps: list[dict]) -> str:
-    """Pipeline progress stepper for camera lifecycle.
-
-    Each step dict:
-        name: str       — display label
-        status: str     — "completed" / "active" / "pending" / "warning" / "error"
-        info: str       — subtitle text (e.g. "v007 ✓" or "Day 2/7")
-        url: str        — optional click target URL
-    """
-    # Status to dot content mapping
-    dot_content = {
-        "completed": "&#10003;",  # checkmark
-        "active": "&#9679;",      # filled circle
-        "pending": "",
-        "warning": "!",
-        "error": "&#10007;",      # X mark
-    }
-
-    html_parts = []
-    for i, step in enumerate(steps):
-        status = step.get("status", "pending")
-        name = step.get("name", "")
-        info = step.get("info", "")
-        url = step.get("url", "")
-
-        dot = dot_content.get(status, "")
-        info_html = f'<div class="step-info">{info}</div>' if info else ""
-
-        wrapper_start = f'<a href="{url}" class="stepper-link">' if url else ""
-        wrapper_end = "</a>" if url else ""
-
-        html_parts.append(f"""
-        {wrapper_start}
-        <div class="stepper-step {status}">
-            <div class="step-dot">{dot}</div>
-            <div class="step-label">{name}</div>
-            {info_html}
-        </div>
-        {wrapper_end}""")
-
-        # Add connector between steps (not after last)
-        if i < len(steps) - 1:
-            conn_cls = "completed" if status == "completed" else ""
-            html_parts.append(f'<div class="stepper-connector {conn_cls}"></div>')
-
-    return f'<div class="pipeline-stepper">{"".join(html_parts)}</div>'
+def pipeline_stepper(steps=None) -> str:
+    return "<div></div>"
