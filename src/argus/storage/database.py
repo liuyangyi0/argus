@@ -9,9 +9,11 @@ import structlog
 from sqlalchemy import create_engine, func as sa_func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from argus.storage.models import AlertRecord, Base, BaselineRecord, TrainingRecord, User
+from argus.storage.models import AlertRecord, AlertWorkflowStatus, Base, BaselineRecord, TrainingRecord, User
 
 logger = structlog.get_logger()
+
+_USER_UPDATABLE_FIELDS = {"display_name", "role", "password_hash", "is_active"}
 
 
 class Database:
@@ -182,6 +184,9 @@ class Database:
         assigned_to: str | None = None,
     ) -> bool:
         """Transition alert workflow status with optional notes/assignment."""
+        valid_statuses = {s.value for s in AlertWorkflowStatus}
+        if workflow_status not in valid_statuses:
+            return False
         with self.get_session() as session:
             record = session.scalar(
                 select(AlertRecord).where(AlertRecord.alert_id == alert_id)
@@ -202,6 +207,18 @@ class Database:
             session.commit()
             return True
 
+    def get_alert_workflow_stats(self) -> dict[str, int]:
+        """Return count of alerts grouped by workflow_status."""
+        stats = {s.value: 0 for s in AlertWorkflowStatus}
+        with self.get_session() as session:
+            rows = session.execute(
+                select(AlertRecord.workflow_status, sa_func.count())
+                .group_by(AlertRecord.workflow_status)
+            ).all()
+            for status, count in rows:
+                stats[status] = count
+        return stats
+
     def get_alert_count(
         self,
         camera_id: str | None = None,
@@ -221,9 +238,7 @@ class Database:
 
         Image paths are returned so the caller can delete files from disk.
         """
-        from datetime import timedelta
-
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         with self.get_session() as session:
             old_alerts = list(
                 session.scalars(
@@ -342,7 +357,7 @@ class Database:
             if user is None:
                 return False
             for key, value in kwargs.items():
-                if hasattr(user, key):
+                if key in _USER_UPDATABLE_FIELDS and hasattr(user, key):
                     setattr(user, key, value)
             session.commit()
             return True

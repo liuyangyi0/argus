@@ -297,7 +297,7 @@ class DetectionPipeline:
             return None
 
         try:
-            return self._process_frame_inner(frame_data, frame, start)
+            return self._process_frame_inner(frame_data, frame, start, diag)
         except Exception as e:
             # CRIT-03: Clear buffers on exception to prevent memory leak
             with self._latest_raw_frame_lock:
@@ -313,9 +313,10 @@ class DetectionPipeline:
             return None
 
     def _process_frame_inner(
-        self, frame_data: FrameData, frame: np.ndarray, start: float
+        self, frame_data: FrameData, frame: np.ndarray, start: float, diag: FrameDiagnostics
     ) -> Alert | None:
         """Inner frame processing logic (extracted for CRIT-03 exception safety)."""
+        current_mode = self.mode
         # Save raw frame before zone masking (need copy since zone_mask mutates frame)
         with self._latest_raw_frame_lock:
             self._latest_raw_frame = frame
@@ -332,6 +333,7 @@ class DetectionPipeline:
             self._latest_frame = frame
 
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
+        t1 = time.monotonic()
         # MED-05: Time-based heartbeat instead of frame-count
         now = time.monotonic()
         is_heartbeat = (now - self._last_heartbeat_time) >= self._heartbeat_seconds
@@ -375,10 +377,11 @@ class DetectionPipeline:
                 self.stats.frames_heartbeat += 1
 
         # Stage 2: Person filter
-        person_result: PersonFilterResult = self._person_detector.detect(frame)
+        t2 = time.monotonic()
+        detection_result: ObjectDetectionResult = self._object_detector.detect(frame)
 
         # HIGH-04: Warn once if person filter is unavailable
-        if not person_result.filter_available and not self._person_filter_warned:
+        if not detection_result.filter_available and not self._person_filter_warned:
             self._person_filter_warned = True
             logger.warning(
                 "pipeline.person_filter_offline",
@@ -386,7 +389,7 @@ class DetectionPipeline:
                 msg="YOLO person filter unavailable — frames will not be filtered for humans",
             )
 
-        if person_result.has_persons and self.camera_config.person_filter.skip_frame_on_person:
+        if detection_result.has_persons and self.camera_config.person_filter.skip_frame_on_person:
             self.stats.frames_skipped_person += 1
             # HIGH-03: Still update lock state even when person filter skips
             self._update_lock_state_time(time.monotonic())

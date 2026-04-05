@@ -21,7 +21,7 @@ import os
 import secrets
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import structlog
@@ -222,9 +222,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         window = 60.0
 
         # Prune old entries
-        entries = self._counters[client_ip]
-        self._counters[client_ip] = [t for t in entries if now - t < window]
-        entries = self._counters[client_ip]
+        entries = [t for t in self._counters[client_ip] if now - t < window]
+        if not entries:
+            self._counters.pop(client_ip, None)
+        else:
+            self._counters[client_ip] = entries
 
         if len(entries) >= self._max_rpm:
             logger.warning("rate_limit.exceeded", client_ip=client_ip, count=len(entries))
@@ -234,7 +236,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 headers={"Retry-After": "60"},
             )
 
-        entries.append(now)
+        self._counters[client_ip].append(now)
         return await call_next(request)
 
 
@@ -325,7 +327,7 @@ async def login_handler(request: Request):
         )
 
     # Update last_login timestamp
-    db.update_user(username, last_login=datetime.utcnow())
+    db.update_user(username, last_login=datetime.now(timezone.utc))
 
     token = create_session_token(user.username, user.role, secret)
     response = RedirectResponse(url=next_url, status_code=302)

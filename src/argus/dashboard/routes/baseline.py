@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1141,7 +1142,7 @@ def _train_model_task(
                 status=result.status.value,
                 error=result.error,
                 duration_seconds=result.duration_seconds,
-                trained_at=datetime.utcnow(),
+                trained_at=datetime.now(timezone.utc),
             )
             db.save_training_record(record)
             db.close()

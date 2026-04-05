@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from datetime import datetime
 
 from fastapi import APIRouter, Request
@@ -48,27 +49,30 @@ async def users_page(request: Request):
             else '<span style="color:#f44336;">禁用</span>'
         )
 
+        safe_username = html.escape(u.username)
+        safe_display = html.escape(u.display_name) if u.display_name else "—"
+
         # Don't allow deleting yourself
         delete_btn = ""
         if u.username != current_username:
             delete_btn = (
                 f'<button class="btn btn-danger btn-sm" style="margin-left:4px;" '
-                f'hx-delete="/api/users/{u.username}" '
+                f'hx-delete="/api/users/{safe_username}" '
                 f'hx-target="#users-table-body" hx-swap="innerHTML" '
-                f'hx-confirm="确定删除用户 {u.username}？此操作不可撤销。">删除</button>'
+                f'hx-confirm="确定删除用户 {safe_username}？此操作不可撤销。">删除</button>'
             )
 
         toggle_active_label = "禁用" if u.active else "启用"
         toggle_btn = (
             f'<button class="btn btn-ghost btn-sm" '
-            f'hx-post="/api/users/{u.username}/toggle-active" '
+            f'hx-post="/api/users/{safe_username}/toggle-active" '
             f'hx-target="#users-table-body" hx-swap="innerHTML">{toggle_active_label}</button>'
         )
 
         rows += f"""
         <tr>
-            <td>{u.username}</td>
-            <td>{u.display_name or "—"}</td>
+            <td>{safe_username}</td>
+            <td>{safe_display}</td>
             <td>{role_label}</td>
             <td>{active_label}</td>
             <td>{last_login}</td>
@@ -205,6 +209,8 @@ def _users_table_rows_response(db) -> HTMLResponse:
     for u in users:
         last_login = u.last_login.strftime("%Y-%m-%d %H:%M") if u.last_login else "从未"
         role_label = _ROLE_LABELS.get(u.role, u.role)
+        safe_username = html.escape(u.username)
+        safe_display = html.escape(u.display_name) if u.display_name else "—"
         active_label = (
             '<span style="color:#4caf50;">启用</span>'
             if u.active
@@ -213,19 +219,19 @@ def _users_table_rows_response(db) -> HTMLResponse:
         toggle_active_label = "禁用" if u.active else "启用"
         toggle_btn = (
             f'<button class="btn btn-ghost btn-sm" '
-            f'hx-post="/api/users/{u.username}/toggle-active" '
+            f'hx-post="/api/users/{safe_username}/toggle-active" '
             f'hx-target="#users-table-body" hx-swap="innerHTML">{toggle_active_label}</button>'
         )
         delete_btn = (
             f'<button class="btn btn-danger btn-sm" style="margin-left:4px;" '
-            f'hx-delete="/api/users/{u.username}" '
+            f'hx-delete="/api/users/{safe_username}" '
             f'hx-target="#users-table-body" hx-swap="innerHTML" '
-            f'hx-confirm="确定删除用户 {u.username}？此操作不可撤销。">删除</button>'
+            f'hx-confirm="确定删除用户 {safe_username}？此操作不可撤销。">删除</button>'
         )
         rows += f"""
         <tr>
-            <td>{u.username}</td>
-            <td>{u.display_name or "—"}</td>
+            <td>{safe_username}</td>
+            <td>{safe_display}</td>
             <td>{role_label}</td>
             <td>{active_label}</td>
             <td>{last_login}</td>
