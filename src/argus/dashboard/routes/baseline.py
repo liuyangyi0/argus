@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from argus.dashboard.components import (
     confirm_button,
     empty_state,
+    form_checkbox,
     form_group,
     form_select,
     page_header,
@@ -67,6 +68,21 @@ async def capture_form(request: Request):
                               hint="建议至少 100 帧，覆盖不同光照条件", min_val="10", max_val="1000")
     interval_input = form_group("采集间隔（秒）", "interval", value="2.0", input_type="number",
                                  hint="帧之间的时间间隔", min_val="0.5", max_val="60", step="0.5")
+    quality_checkbox = form_checkbox(
+        "启用质量过滤", "quality_filter", checked=True,
+        hint="自动过滤模糊、过曝、重复、有人、编码错误帧",
+    )
+    session_select = form_select(
+        "采集时段", "session_label",
+        [("day", "白天（日间正常光照）"), ("night", "夜间（低光照条件）"),
+         ("maintenance", "检修（检修期间场景）"), ("other", "其他")],
+        hint="建议分多个时段采集以提高模型鲁棒性",
+    )
+
+    # Coverage hints: check existing capture_meta.json files (CAP-008)
+    coverage_html = _build_coverage_hints(
+        Path(config.storage.baselines_dir), [v for v, _ in cam_options]
+    )
 
     # Show active capture tasks
     task_html = ""
@@ -81,6 +97,7 @@ async def capture_form(request: Request):
 
     return HTMLResponse(f"""
     {task_html}
+    {coverage_html}
     <div class="card">
         <h3>开始基线采集</h3>
         <p style="color:#8890a0;font-size:13px;margin-bottom:16px;">
@@ -93,6 +110,8 @@ async def capture_form(request: Request):
                 {count_input}
                 {interval_input}
             </div>
+            {session_select}
+            {quality_checkbox}
             <div class="form-actions">
                 <button type="submit" class="btn btn-primary">开始采集</button>
             </div>
@@ -114,11 +133,20 @@ async def start_capture(request: Request):
     camera_id = form.get("camera_id", "")
     count = int(form.get("count", 100))
     interval = float(form.get("interval", 2.0))
+    quality_enabled = form.get("quality_filter", "") == "1"
+    session_label = form.get("session_label", "")
 
     if not camera_id:
         return JSONResponse({"error": "请选择摄像头"}, status_code=400)
 
     baselines_dir = str(config.storage.baselines_dir)
+
+    # Build quality config from global config, respecting form toggle
+    from argus.config.schema import CaptureQualityConfig
+
+    quality_config = CaptureQualityConfig(
+        **{**config.capture_quality.model_dump(), "enabled": quality_enabled}
+    )
 
     try:
         task_id = task_manager.submit(
@@ -129,6 +157,8 @@ async def start_capture(request: Request):
             output_dir=baselines_dir,
             count=count,
             interval=interval,
+            quality_config=quality_config,
+            session_label=session_label,
         )
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -218,8 +248,14 @@ async def baseline_images(request: Request, camera_id: str):
     grid = '<div class="thumb-grid">'
     for img in images[:100]:  # Limit to 100 thumbnails
         grid += (
+            f'<div class="thumb-item">'
             f'<img src="/api/baseline/{camera_id}/image/{img.name}?version={version}" '
             f'alt="{img.name}" title="{img.name}">'
+            f'<button class="btn-delete-thumb" '
+            f'hx-delete="/api/baseline/{camera_id}/image/{img.name}?version={version}" '
+            f'hx-target="closest .thumb-item" hx-swap="outerHTML" '
+            f'hx-confirm="确定删除此图片？">&times;</button>'
+            f'</div>'
         )
     grid += '</div>'
 
@@ -261,6 +297,26 @@ async def baseline_image(request: Request, camera_id: str, filename: str):
 
     _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
     return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
+
+@router.delete("/{camera_id}/image/{filename}")
+async def delete_baseline_image(request: Request, camera_id: str, filename: str):
+    """Delete a single baseline image (CAP-007)."""
+    config = request.app.state.config
+    version = request.query_params.get("version", "default")
+    baselines_dir = Path(config.storage.baselines_dir)
+
+    # Path safety
+    img_path = (baselines_dir / camera_id / version / filename).resolve()
+    if not str(img_path).startswith(str(baselines_dir.resolve())):
+        return Response(status_code=400)
+
+    if not img_path.exists():
+        return Response(status_code=404)
+
+    img_path.unlink()
+    logger.info("baseline.image_deleted", camera_id=camera_id, version=version, filename=filename)
+    return HTMLResponse("")  # HTMX removes the element
 
 
 @router.get("/train", response_class=HTMLResponse)
@@ -461,54 +517,169 @@ async def deploy_model(request: Request):
     return JSONResponse({"error": "模型部署失败"}, status_code=500)
 
 
+# ── Helpers ──
+
+
+_SESSION_LABELS = {"day": "白天", "night": "夜间", "maintenance": "检修", "other": "其他"}
+
+
+def _build_coverage_hints(baselines_dir: Path, camera_ids: list[str]) -> str:
+    """Build coverage hint HTML showing which session labels exist per camera (CAP-008)."""
+    import json
+
+    if not baselines_dir.exists():
+        return ""
+
+    hints = []
+    for cam_id in camera_ids:
+        cam_dir = baselines_dir / cam_id / "default"
+        if not cam_dir.exists():
+            continue
+
+        existing_labels: dict[str, int] = {}
+        for version_dir in sorted(cam_dir.iterdir()):
+            meta_path = version_dir / "capture_meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text())
+                label = meta.get("session_label", "")
+                accepted = meta.get("stats", {}).get("accepted", 0)
+                if label:
+                    existing_labels[label] = existing_labels.get(label, 0) + accepted
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        if not existing_labels:
+            continue
+
+        items = []
+        for key, display in _SESSION_LABELS.items():
+            if key in existing_labels:
+                items.append(
+                    f'<span style="color:#4caf50;">&#10003; {display} ({existing_labels[key]}帧)</span>'
+                )
+            else:
+                items.append(f'<span style="color:#f44336;">&#10007; 缺少{display}</span>')
+
+        hints.append(
+            f'<div style="margin-bottom:4px;"><strong>{cam_id}:</strong> '
+            + " &nbsp; ".join(items)
+            + "</div>"
+        )
+
+    if not hints:
+        return ""
+
+    return (
+        '<div class="card" style="border-left:3px solid #ff9800;margin-bottom:12px;">'
+        '<h3 style="font-size:14px;">采集覆盖性检查</h3>'
+        '<div style="font-size:12px;color:#8890a0;">'
+        + "".join(hints)
+        + "</div></div>"
+    )
+
+
 # ── Background task functions ──
 
 
 def _capture_baseline_task(
-    progress_callback, *, camera_manager, camera_id, output_dir, count, interval
+    progress_callback,
+    *,
+    camera_manager,
+    camera_id,
+    output_dir,
+    count,
+    interval,
+    quality_config=None,
+    session_label="",
 ):
     """Capture raw (unmasked) baseline frames from a running camera.
 
     Uses get_raw_frame() to get frames BEFORE zone masking is applied,
     ensuring training data is clean of zone mask artifacts (CRIT-05).
     Uses BaselineManager-compatible directory structure (HIGH-07).
+    Applies quality filtering (CAP-002~009) when quality_config is provided.
     """
+    import json
+
     from argus.anomaly.baseline import BaselineManager
+    from argus.capture.quality import CaptureStats, FrameQualityFilter
+    from argus.config.schema import CaptureQualityConfig
 
     bm = BaselineManager(baselines_dir=output_dir)
     version_dir = bm.create_new_version(camera_id, "default")
 
-    captured = 0
-    skipped_none = 0
+    if quality_config is None:
+        quality_config = CaptureQualityConfig()
+    quality_filter = FrameQualityFilter(quality_config)
+    stats = CaptureStats()
+    prev_accepted_frame = None
+
     for i in range(count):
+        stats.total_grabbed += 1
+
         # Use raw frame (before zone mask) for training data
         frame = camera_manager.get_raw_frame(camera_id)
         if frame is None:
             # Fallback to latest processed frame if raw not available
             frame = camera_manager.get_latest_frame(camera_id)
 
-        if frame is not None:
-            path = version_dir / f"baseline_{captured:05d}.png"
-            cv2.imwrite(str(path), frame)
-            captured += 1
+        if frame is None:
+            stats.null_frames += 1
         else:
-            skipped_none += 1
+            result = quality_filter.check(frame, prev_accepted_frame)
+            if result.accepted:
+                path = version_dir / f"baseline_{stats.accepted:05d}.png"
+                cv2.imwrite(str(path), frame)
+                stats.accepted += 1
+                stats.brightness_values.append(result.brightness_mean)
+                prev_accepted_frame = frame
+            else:
+                stats.record_rejection(result.rejection_reason)
 
-        progress_callback(
-            int((i + 1) / count * 100),
-            f"已采集 {captured}/{count} 帧 (跳过 {skipped_none})",
-        )
+        # Progress message with filter stats
+        rejected = stats.total_rejected
+        msg = f"已采集 {stats.accepted}/{count} 帧"
+        if rejected > 0 or stats.null_frames > 0:
+            msg += f" (过滤 {rejected}, 空帧 {stats.null_frames})"
+
+        progress_callback(int((i + 1) / count * 100), msg)
         time.sleep(interval)
 
     # Set as current version
-    if captured > 0:
+    if stats.accepted > 0:
         bm.set_current_version(camera_id, "default", version_dir.name)
+
+    # Write capture metadata for session tracking (CAP-008)
+    meta = {
+        "session_label": session_label,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "camera_id": camera_id,
+        "quality_filter_enabled": quality_config.enabled,
+        "stats": stats.to_dict(),
+    }
+    meta_path = version_dir / "capture_meta.json"
+    try:
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    except OSError:
+        logger.warning("baseline.meta_write_failed", path=str(meta_path))
 
     logger.info(
         "baseline.capture_complete",
-        camera_id=camera_id, captured=captured, skipped=skipped_none, total=count,
+        camera_id=camera_id,
+        accepted=stats.accepted,
+        rejected=stats.total_rejected,
+        null_frames=stats.null_frames,
+        total=count,
     )
-    return {"captured": captured, "skipped": skipped_none, "total": count, "output_dir": str(version_dir)}
+    return {
+        "captured": stats.accepted,
+        "skipped": stats.null_frames,
+        "total": count,
+        "output_dir": str(version_dir),
+        "stats": stats.to_dict(),
+    }
 
 
 def _train_model_task(

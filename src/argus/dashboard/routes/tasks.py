@@ -100,6 +100,16 @@ def _render_task_card(task) -> str:
 
     bar = progress_bar(task.progress, task.status.value)
 
+    # Capture stats block for completed baseline captures (CAP-006)
+    stats_html = ""
+    if (
+        task.status == TaskStatus.COMPLETE
+        and task.task_type == "baseline_capture"
+        and isinstance(task.result, dict)
+        and "stats" in task.result
+    ):
+        stats_html = _render_capture_stats(task.result["stats"])
+
     return f"""
     <div class="task-card" id="task-{task.task_id}" {poll_attr}>
         <div class="task-header">
@@ -114,4 +124,43 @@ def _render_task_card(task) -> str:
         {bar}
         <div class="task-message">{task.message}</div>
         {error_html}
+        {stats_html}
+    </div>"""
+
+
+def _render_capture_stats(stats: dict) -> str:
+    """Render baseline capture statistics block (CAP-006)."""
+    total = stats.get("total_grabbed", 0)
+    accepted = stats.get("accepted", 0)
+    rejected = stats.get("total_rejected", 0)
+    bmin = stats.get("brightness_min", 0)
+    bmax = stats.get("brightness_max", 0)
+
+    # Filter breakdown
+    reasons = []
+    for key, label in [
+        ("rejected_blur", "模糊"),
+        ("rejected_exposure", "曝光"),
+        ("rejected_duplicate", "重复"),
+        ("rejected_person", "人员"),
+        ("rejected_encoder", "编码错误"),
+    ]:
+        val = stats.get(key, 0)
+        if val > 0:
+            reasons.append(f"{label} {val}")
+
+    reason_text = " | ".join(reasons) if reasons else "无"
+
+    return f"""
+    <div style="margin-top:8px;padding:8px 12px;background:#1a1d27;border-radius:6px;font-size:12px;color:#8890a0;">
+        <div style="margin-bottom:4px;">
+            <span style="color:#e0e0e0;">采集统计:</span>
+            抓取 {total} 帧 | 保留 <span style="color:#4fc3f7;">{accepted}</span> 帧 | 过滤 {rejected} 帧
+        </div>
+        <div style="margin-bottom:4px;">
+            <span style="color:#e0e0e0;">过滤原因:</span> {reason_text}
+        </div>
+        <div>
+            <span style="color:#e0e0e0;">亮度范围:</span> {bmin:.0f} - {bmax:.0f}
+        </div>
     </div>"""
