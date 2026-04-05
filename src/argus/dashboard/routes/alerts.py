@@ -617,7 +617,12 @@ async def acknowledge_alert(request: Request, alert_id: str):
 
 @router.post("/{alert_id}/false-positive", response_class=HTMLResponse)
 async def mark_false_positive(request: Request, alert_id: str):
-    """Mark an alert as a false positive."""
+    """Mark an alert as a false positive and add its snapshot to baseline.
+
+    False positive feedback loop (A4-3): when a normal scene triggers a false
+    alarm, saving its snapshot as a baseline image teaches the model to treat
+    similar scenes as normal, reducing future false positives.
+    """
     db = request.app.state.db
     if db and db.mark_false_positive(alert_id):
         audit = getattr(request.app.state, "audit_logger", None)
@@ -630,8 +635,81 @@ async def mark_false_positive(request: Request, alert_id: str):
                 target_id=alert_id,
                 ip_address=client_ip,
             )
+
+        # FP feedback loop: save snapshot as new baseline image
+        _add_fp_snapshot_to_baseline(request, alert_id)
+
         return HTMLResponse('<span style="color:#ff9800;font-size:12px;">已标记误报</span>')
     return HTMLResponse('<span style="color:#f44336;font-size:12px;">操作失败</span>')
+
+
+def _add_fp_snapshot_to_baseline(request: Request, alert_id: str) -> None:
+    """Copy the false-positive alert's snapshot into the current baseline version.
+
+    This creates a feedback loop: FP -> add to baseline -> retrain -> fewer FPs.
+    """
+    import shutil
+    import structlog
+
+    log = structlog.get_logger()
+
+    db = request.app.state.db
+    if not db:
+        return
+
+    alert = db.get_alert(alert_id)
+    if alert is None or not alert.snapshot_path:
+        return
+
+    snapshot = Path(alert.snapshot_path)
+    if not snapshot.exists():
+        log.warning("fp_feedback.snapshot_missing", alert_id=alert_id, path=str(snapshot))
+        return
+
+    # Get baseline manager
+    baseline_mgr = getattr(request.app.state, "baseline_manager", None)
+    if baseline_mgr is None:
+        config = getattr(request.app.state, "config", None)
+        if config is None:
+            return
+        from argus.anomaly.baseline import BaselineManager
+        baseline_mgr = BaselineManager(baselines_dir=str(config.storage.baselines_dir))
+
+    camera_id = alert.camera_id
+    zone_id = getattr(alert, "zone_id", "default") or "default"
+
+    baseline_dir = baseline_mgr.get_baseline_dir(camera_id, zone_id)
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate a unique filename based on alert id to avoid collisions
+    ext = snapshot.suffix or ".png"
+    dest = baseline_dir / f"fp_{alert_id[:16]}{ext}"
+    try:
+        shutil.copy2(str(snapshot), str(dest))
+    except OSError as exc:
+        log.error("fp_feedback.copy_failed", alert_id=alert_id, error=str(exc))
+        return
+
+    # Audit trail
+    audit = getattr(request.app.state, "audit_logger", None)
+    if audit:
+        client_ip = request.client.host if request.client else ""
+        audit.log(
+            user="operator",
+            action="fp_add_to_baseline",
+            target_type="baseline",
+            target_id=f"{camera_id}/{zone_id}",
+            detail=f"Added FP snapshot {alert_id} as {dest.name}",
+            ip_address=client_ip,
+        )
+
+    log.info(
+        "fp_feedback.added_to_baseline",
+        alert_id=alert_id,
+        camera_id=camera_id,
+        zone_id=zone_id,
+        dest=str(dest),
+    )
 
 
 @router.get("/json")

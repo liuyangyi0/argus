@@ -88,3 +88,50 @@ class TestCrossCameraCorrelator:
         # Check from cam_a perspective at (100, 100) → should project to (150, 130)
         result = correlator.check("cam_a", (100, 100), now)
         assert result.corroborated is True
+
+    def test_configurable_threshold(self):
+        """自定义 threshold → 只有超过该阈值才算 corroborated。"""
+        pair = self._identity_pair()
+        # High threshold: 0.5 score should NOT corroborate
+        correlator = CrossCameraCorrelator([pair], corroboration_threshold=0.8)
+
+        anomaly_map = np.zeros((200, 200), dtype=np.float32)
+        anomaly_map[80:120, 80:120] = 0.5  # Below threshold of 0.8
+        now = time.time()
+        correlator.update("cam_b", anomaly_map, now)
+
+        result = correlator.check("cam_a", (100, 100), now)
+        assert result.corroborated is False
+
+    def test_reverse_direction_uses_inverse_homography(self):
+        """cam_b 查询 cam_a 的数据时使用逆矩阵。"""
+        pair = CameraOverlapPair(
+            camera_a="cam_a",
+            camera_b="cam_b",
+            homography=[[1, 0, 50], [0, 1, 30], [0, 0, 1]],
+        )
+        correlator = CrossCameraCorrelator([pair])
+
+        # cam_a has anomaly at (100, 100)
+        anomaly_map = np.zeros((300, 300), dtype=np.float32)
+        anomaly_map[80:120, 80:120] = 0.8
+        now = time.time()
+        correlator.update("cam_a", anomaly_map, now)
+
+        # From cam_b at (150, 130) → inverse projects to (100, 100) in cam_a
+        result = correlator.check("cam_b", (150, 130), now)
+        assert result.corroborated is True
+        assert result.partner_camera == "cam_a"
+
+    def test_prune_stale_removes_old_maps(self):
+        """prune_stale 清除超时数据。"""
+        pair = self._identity_pair()
+        correlator = CrossCameraCorrelator([pair])
+
+        old_time = time.time() - 60  # 60 seconds ago
+        anomaly_map = np.ones((200, 200), dtype=np.float32) * 0.9
+        correlator.update("cam_b", anomaly_map, old_time)
+        assert "cam_b" in correlator._recent_maps
+
+        correlator.prune_stale(max_age=30.0)
+        assert "cam_b" not in correlator._recent_maps

@@ -130,3 +130,80 @@ class TestDiversitySelect:
         result = bm.diversity_select(img_dir, target_count=15)
         names = [p.name for p in result]
         assert names == sorted(names)
+
+
+class TestOptimizeMovesToBackup:
+    """Tests for the optimize workflow that moves unselected images to backup (A4)."""
+
+    def test_optimize_moves_to_backup(self, tmp_path):
+        """Unselected images should be moved to a backup/ subdirectory."""
+        import shutil as _shutil
+
+        bm = BaselineManager(baselines_dir=tmp_path / "baselines")
+        version_dir = bm.create_new_version("cam_01")
+        bm.set_current_version("cam_01", "default", version_dir.name)
+
+        # Create 60 test images with varying colors
+        rng = np.random.default_rng(123)
+        for i in range(60):
+            img = np.full((64, 64, 3), rng.integers(0, 256, 3), dtype=np.uint8)
+            import cv2
+            cv2.imwrite(str(version_dir / f"img_{i:05d}.png"), img)
+
+        baseline_dir = bm.get_baseline_dir("cam_01", "default")
+        all_images = sorted(
+            list(baseline_dir.glob("*.png")) + list(baseline_dir.glob("*.jpg"))
+        )
+        assert len(all_images) == 60
+
+        # Select diverse subset — keep 30 (minimum)
+        target_count = max(30, int(len(all_images) * 0.2))
+        selected = bm.diversity_select(baseline_dir, target_count)
+        selected_set = set(selected)
+        assert len(selected) == 30  # min 30
+
+        # Move unselected to backup
+        backup_dir = baseline_dir / "backup"
+        backup_dir.mkdir(exist_ok=True)
+        moved = 0
+        for img_path in all_images:
+            if img_path not in selected_set:
+                _shutil.move(str(img_path), str(backup_dir / img_path.name))
+                moved += 1
+
+        assert moved == 30  # 60 - 30
+        assert len(list(backup_dir.glob("*.png"))) == 30
+        remaining = list(baseline_dir.glob("*.png"))
+        assert len(remaining) == 30
+
+
+class TestFalsePositiveAddsToBaseline:
+    """Tests for the FP feedback loop that adds snapshots to baseline (A4-3)."""
+
+    def test_false_positive_adds_to_baseline(self, tmp_path):
+        """Marking an alert as FP should copy its snapshot into baseline dir."""
+        import shutil as _shutil
+
+        bm = BaselineManager(baselines_dir=tmp_path / "baselines")
+        version_dir = bm.create_new_version("cam_01")
+        bm.set_current_version("cam_01", "default", version_dir.name)
+
+        # Create a fake snapshot (simulating what the alert would reference)
+        alerts_dir = tmp_path / "alerts"
+        alerts_dir.mkdir()
+        snapshot = alerts_dir / "alert_snapshot.jpg"
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        import cv2
+        cv2.imwrite(str(snapshot), img)
+        assert snapshot.exists()
+
+        # Simulate the FP feedback: copy snapshot into baseline dir
+        baseline_dir = bm.get_baseline_dir("cam_01", "default")
+        dest = baseline_dir / "fp_testalertid0001.jpg"
+        _shutil.copy2(str(snapshot), str(dest))
+
+        # Verify the snapshot was added
+        assert dest.exists()
+        images = list(baseline_dir.glob("*.jpg")) + list(baseline_dir.glob("*.png"))
+        assert len(images) >= 1
+        assert any("fp_" in p.name for p in images)

@@ -98,6 +98,62 @@ class ModelRegistry:
 
         logger.info("model_registry.activated", model_version_id=model_version_id)
 
+    def list_models(self, camera_id: str | None = None) -> list[ModelRecord]:
+        """List all models, optionally filtered by camera_id."""
+        with self._session_factory() as session:
+            query = session.query(ModelRecord).order_by(ModelRecord.created_at.desc())
+            if camera_id:
+                query = query.filter_by(camera_id=camera_id)
+            return list(query.all())
+
+    def rollback(self, camera_id: str) -> ModelRecord | None:
+        """Reactivate the previous model version for a camera.
+
+        Deactivates the current active model and activates the most recent
+        previously registered model. Returns the newly activated model or None
+        if no previous model exists.
+        """
+        with self._session_factory() as session:
+            # Find current active model
+            current = (
+                session.query(ModelRecord)
+                .filter_by(camera_id=camera_id, is_active=True)
+                .first()
+            )
+
+            # Find the previous model (most recent non-active, or second most recent)
+            query = (
+                session.query(ModelRecord)
+                .filter_by(camera_id=camera_id)
+                .order_by(ModelRecord.created_at.desc())
+            )
+            candidates = list(query.all())
+
+            previous = None
+            for candidate in candidates:
+                if current is None or candidate.model_version_id != current.model_version_id:
+                    previous = candidate
+                    break
+
+            if previous is None:
+                logger.warning("model_registry.rollback_no_previous", camera_id=camera_id)
+                return None
+
+            # Deactivate all models for this camera
+            session.query(ModelRecord).filter_by(
+                camera_id=camera_id, is_active=True
+            ).update({"is_active": False})
+
+            previous.is_active = True
+            session.commit()
+
+            logger.info(
+                "model_registry.rollback",
+                camera_id=camera_id,
+                model_version_id=previous.model_version_id,
+            )
+            return previous
+
     @staticmethod
     def _compute_dir_hash(path: Path) -> str:
         """Compute SHA256 hash of all files in a directory."""

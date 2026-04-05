@@ -86,3 +86,66 @@ class TestModelRegistry:
         vid2 = registry.register(m2, baseline_dir, "cam_01", "patchcore")
 
         assert vid1 != vid2
+
+    def test_rollback_to_previous(self, registry, baseline_dir, tmp_path):
+        """Rollback should reactivate the previous model version."""
+        m1 = tmp_path / "model_a"
+        m1.mkdir()
+        (m1 / "model.xml").write_text("v1")
+
+        m2 = tmp_path / "model_b"
+        m2.mkdir()
+        (m2 / "model.xml").write_text("v2")
+
+        vid1 = registry.register(m1, baseline_dir, "cam_01", "patchcore")
+        registry.activate(vid1)
+
+        vid2 = registry.register(m2, baseline_dir, "cam_01", "patchcore")
+        registry.activate(vid2)
+
+        # Current active should be vid2
+        active = registry.get_active("cam_01")
+        assert active.model_version_id == vid2
+
+        # Rollback should reactivate vid1
+        rolled_back = registry.rollback("cam_01")
+        assert rolled_back is not None
+        assert rolled_back.model_version_id == vid1
+
+        active = registry.get_active("cam_01")
+        assert active.model_version_id == vid1
+
+    def test_rollback_no_previous(self, registry, model_dir, baseline_dir):
+        """Rollback with only one model should return None."""
+        vid = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        registry.activate(vid)
+
+        result = registry.rollback("cam_01")
+        assert result is None
+
+    def test_list_models_by_camera(self, registry, baseline_dir, tmp_path):
+        """list_models should filter by camera_id correctly."""
+        m1 = tmp_path / "m1"
+        m1.mkdir()
+        (m1 / "model.xml").write_text("cam01 model")
+
+        m2 = tmp_path / "m2"
+        m2.mkdir()
+        (m2 / "model.xml").write_text("cam02 model")
+
+        registry.register(m1, baseline_dir, "cam_01", "patchcore")
+        registry.register(m2, baseline_dir, "cam_02", "patchcore")
+
+        all_models = registry.list_models()
+        assert len(all_models) == 2
+
+        cam01_models = registry.list_models(camera_id="cam_01")
+        assert len(cam01_models) == 1
+        assert cam01_models[0].camera_id == "cam_01"
+
+        cam02_models = registry.list_models(camera_id="cam_02")
+        assert len(cam02_models) == 1
+        assert cam02_models[0].camera_id == "cam_02"
+
+        empty = registry.list_models(camera_id="cam_99")
+        assert len(empty) == 0

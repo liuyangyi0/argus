@@ -12,7 +12,7 @@ from argus.config.schema import AnomalyConfig
 class TestModelInfo:
     """MODEL_INFO metadata dict."""
 
-    EXPECTED_MODELS = {"patchcore", "efficient_ad", "fastflow", "padim"}
+    EXPECTED_MODELS = {"patchcore", "efficient_ad", "fastflow", "padim", "dinomaly2"}
     REQUIRED_KEYS = {"name", "description", "speed", "epochs", "memory"}
 
     def test_contains_all_model_types(self):

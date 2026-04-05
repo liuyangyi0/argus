@@ -15,8 +15,9 @@ from typing import Callable
 import numpy as np
 import structlog
 
-from argus.alerts.grader import Alert
-from argus.config.schema import AlertConfig, CameraConfig
+from argus.alerts.grader import Alert, AlertSeverity
+from argus.config.schema import AlertConfig, AnomalyConfig, CameraConfig, ClassifierConfig, CrossCameraConfig, SegmenterConfig
+from argus.core.correlation import CameraOverlapPair, CrossCameraCorrelator
 from argus.core.pipeline import DetectionPipeline, PipelineMode, PipelineStats
 
 logger = structlog.get_logger()
@@ -53,11 +54,16 @@ class CameraManager:
         alert_config: AlertConfig,
         on_alert: Callable[[Alert], None] | None = None,
         on_status_change: Callable[[str, dict], None] | None = None,
+        cross_camera_config: CrossCameraConfig | None = None,
+        segmenter_config: SegmenterConfig | None = None,
+        classifier_config: ClassifierConfig | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
         self._on_alert = on_alert
         self._on_status_change = on_status_change
+        self._segmenter_config = segmenter_config
+        self._classifier_config = classifier_config
         self._pipelines: dict[str, DetectionPipeline] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stop_event = threading.Event()
@@ -67,6 +73,29 @@ class CameraManager:
 
         # B1-5: Shared anomaly detector for dinomaly_multi_class mode
         self._shared_anomaly_detector = None
+        self._shared_detector_lock = threading.Lock()
+
+        # C3: Cross-camera anomaly correlation
+        self._correlator: CrossCameraCorrelator | None = None
+        self._cross_camera_config = cross_camera_config
+        if cross_camera_config and cross_camera_config.enabled and cross_camera_config.overlap_pairs:
+            pairs = [
+                CameraOverlapPair(
+                    camera_a=p.camera_a,
+                    camera_b=p.camera_b,
+                    homography=p.homography,
+                )
+                for p in cross_camera_config.overlap_pairs
+            ]
+            self._correlator = CrossCameraCorrelator(
+                pairs=pairs,
+                corroboration_threshold=cross_camera_config.corroboration_threshold,
+            )
+            logger.info(
+                "manager.cross_camera_enabled",
+                pairs=len(pairs),
+                threshold=cross_camera_config.corroboration_threshold,
+            )
 
         # DET-012: Pre-load shared YOLO model for all pipelines
         self._shared_yolo = None
@@ -78,6 +107,46 @@ class CameraManager:
                 self._shared_yolo = get_shared_yolo(model_name)
             except Exception as e:
                 logger.warning("manager.shared_yolo_failed", error=str(e))
+
+    def _get_shared_detector(self, anomaly_config: AnomalyConfig) -> object:
+        """Get or create the shared anomaly detector for multi-class Dinomaly mode.
+
+        Thread-safe: uses a lock to ensure the detector is created only once.
+        Returns an AnomalibDetector instance shared across all cameras.
+        """
+        if self._shared_anomaly_detector is not None:
+            return self._shared_anomaly_detector
+
+        with self._shared_detector_lock:
+            # Double-check after acquiring lock
+            if self._shared_anomaly_detector is not None:
+                return self._shared_anomaly_detector
+
+            from argus.anomaly.detector import AnomalibDetector
+
+            # For shared multi-class mode, find a trained model from any camera
+            model_path = None
+            for cam in self._cameras:
+                candidate = DetectionPipeline._find_model(cam.camera_id)
+                if candidate is not None:
+                    model_path = candidate
+                    break
+
+            self._shared_anomaly_detector = AnomalibDetector(
+                model_path=model_path,
+                threshold=anomaly_config.threshold,
+                image_size=anomaly_config.image_size,
+                ssim_baseline_frames=anomaly_config.ssim_baseline_frames,
+                ssim_sensitivity=anomaly_config.ssim_sensitivity,
+                ssim_midpoint=anomaly_config.ssim_midpoint,
+                enable_calibration=anomaly_config.enable_calibration,
+            )
+            logger.info(
+                "manager.shared_detector_created",
+                model_path=str(model_path),
+                model_type=anomaly_config.model_type,
+            )
+            return self._shared_anomaly_detector
 
     def start_all(self) -> list[str]:
         """Start all camera pipelines. Returns list of successfully started camera IDs."""
@@ -101,10 +170,10 @@ class CameraManager:
         logger.info("manager.stopping", cameras=len(self._threads))
         self._stop_event.set()
 
-        for camera_id, pipeline in self._pipelines.items():
+        for camera_id, pipeline in list(self._pipelines.items()):
             pipeline.shutdown()
 
-        for camera_id, thread in self._threads.items():
+        for camera_id, thread in list(self._threads.items()):
             thread.join(timeout=10.0)
             if thread.is_alive():
                 logger.warning("manager.thread_timeout", camera_id=camera_id)
@@ -225,6 +294,24 @@ class CameraManager:
             return None
         return pipeline.get_latest_anomaly_map()
 
+    def get_drift_status(self, camera_id: str) -> dict | None:
+        """Get drift detection status for a camera."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return None
+        status = pipeline.get_drift_status()
+        if status is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "is_drifted": status.is_drifted,
+            "ks_statistic": round(status.ks_statistic, 4),
+            "p_value": round(status.p_value, 6),
+            "reference_mean": round(status.reference_mean, 4),
+            "current_mean": round(status.current_mean, 4),
+            "samples_collected": status.samples_collected,
+        }
+
     def _notify_camera_status(self, camera_id: str) -> None:
         """Notify WebSocket subscribers of camera status change."""
         if not self._on_status_change:
@@ -264,16 +351,63 @@ class CameraManager:
         camera_id = cam_config.camera_id
 
         def _alert_handler(alert: Alert):
+            # C3: Cross-camera correlation check before emitting
+            if self._correlator is not None:
+                anomaly_map = pipeline.get_latest_anomaly_map()
+                location = self._anomaly_peak_location(anomaly_map)
+                max_age = (
+                    self._cross_camera_config.max_age_seconds
+                    if self._cross_camera_config
+                    else 5.0
+                )
+                result = self._correlator.check(
+                    camera_id=alert.camera_id,
+                    anomaly_location=location,
+                    timestamp=time.time(),
+                    max_age_seconds=max_age,
+                )
+                alert.corroborated = result.corroborated
+                alert.correlation_partner = result.partner_camera
+                if not result.corroborated:
+                    downgrade = (
+                        self._cross_camera_config.uncorroborated_severity_downgrade
+                        if self._cross_camera_config
+                        else 1
+                    )
+                    if downgrade > 0:
+                        alert.severity = self._downgrade_severity(
+                            alert.severity, downgrade
+                        )
+                    logger.info(
+                        "manager.alert_uncorroborated",
+                        camera_id=alert.camera_id,
+                        partner=result.partner_camera,
+                        severity=alert.severity.value,
+                    )
+
             with self._lock:
                 self._alert_count += 1
             if self._on_alert:
                 self._on_alert(alert)
+
+        # B1-5: Use shared detector for dinomaly multi-class mode
+        shared_detector = None
+        anomaly_cfg = cam_config.anomaly
+        if (
+            anomaly_cfg.model_type == "dinomaly2"
+            and anomaly_cfg.dinomaly_multi_class
+        ):
+            shared_detector = self._get_shared_detector(anomaly_cfg)
 
         pipeline = DetectionPipeline(
             camera_config=cam_config,
             alert_config=self._alert_config,
             on_alert=_alert_handler,
             shared_yolo_model=self._shared_yolo,
+            on_drift=self._on_status_change,
+            segmenter_config=self._segmenter_config,
+            classifier_config=self._classifier_config,
+            shared_anomaly_detector=shared_detector,
         )
 
         if not pipeline.initialize():
@@ -307,6 +441,14 @@ class CameraManager:
             while not self._stop_event.is_set():
                 try:
                     alert = pipeline.run_once()
+
+                    # C3: Feed anomaly map to cross-camera correlator
+                    if self._correlator is not None:
+                        anomaly_map = pipeline.get_latest_anomaly_map()
+                        if anomaly_map is not None:
+                            self._correlator.update(
+                                camera_id, anomaly_map, time.time()
+                            )
 
                     # Update watchdog timer on successful frame processing
                     if pipeline.stats.frames_captured > 0:
@@ -343,3 +485,30 @@ class CameraManager:
             logger.info("camera_loop.stopped", camera_id=camera_id)
             with self._lock:
                 self._threads.pop(camera_id, None)
+
+    @staticmethod
+    def _anomaly_peak_location(anomaly_map: np.ndarray | None) -> tuple[int, int]:
+        """Find the peak anomaly location in a heatmap. Returns (x, y)."""
+        if anomaly_map is None or anomaly_map.size == 0:
+            return (0, 0)
+        idx = np.argmax(anomaly_map)
+        h, w = anomaly_map.shape[:2]
+        y, x = divmod(int(idx), w)
+        return (x, y)
+
+    _SEVERITY_ORDER = [
+        AlertSeverity.INFO,
+        AlertSeverity.LOW,
+        AlertSeverity.MEDIUM,
+        AlertSeverity.HIGH,
+    ]
+
+    @classmethod
+    def _downgrade_severity(cls, severity: AlertSeverity, levels: int) -> AlertSeverity:
+        """Downgrade alert severity by N levels (minimum INFO)."""
+        try:
+            idx = cls._SEVERITY_ORDER.index(severity)
+        except ValueError:
+            return severity
+        new_idx = max(0, idx - levels)
+        return cls._SEVERITY_ORDER[new_idx]

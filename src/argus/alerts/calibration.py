@@ -104,8 +104,17 @@ class ConformalCalibrator:
         )
         return result
 
-    def save(self, result: CalibrationResult, path: Path) -> None:
-        """Save calibration to JSON file alongside model."""
+    def save(
+        self,
+        result: CalibrationResult,
+        path: Path,
+        sorted_scores: np.ndarray | None = None,
+    ) -> None:
+        """Save calibration to JSON file alongside model.
+
+        If sorted_scores is provided, they are included so the detector can
+        compute per-frame p-values at inference time.
+        """
         data = {
             "info": result.info_threshold,
             "low": result.low_threshold,
@@ -114,6 +123,8 @@ class ConformalCalibrator:
             "n_samples": result.n_calibration_samples,
             "target_fprs": result.target_fprs,
         }
+        if sorted_scores is not None:
+            data["sorted_scores"] = [round(float(s), 6) for s in sorted_scores]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2))
 
@@ -130,3 +141,16 @@ class ConformalCalibrator:
             n_calibration_samples=data["n_samples"],
             target_fprs=data["target_fprs"],
         )
+
+    @staticmethod
+    def load_sorted_scores(path: Path) -> np.ndarray | None:
+        """Load sorted calibration scores for p-value computation.
+
+        Returns None if the file doesn't exist or lacks sorted_scores.
+        """
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text())
+        if "sorted_scores" not in data:
+            return None
+        return np.array(data["sorted_scores"], dtype=np.float64)

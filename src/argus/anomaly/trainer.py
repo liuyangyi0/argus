@@ -66,7 +66,30 @@ MODEL_INFO = {
         "epochs": 1,
         "memory": "低",
     },
+    "dinomaly2": {
+        "name": "Dinomaly",
+        "description": "DINOv2 重建异常检测，支持少样本 (8-shot)",
+        "speed": "中等",
+        "epochs": 1,
+        "memory": "高",
+    },
 }
+
+# Mapping from user-facing backbone names to anomalib Dinomaly encoder_name values
+_DINOMALY_BACKBONE_MAP = {
+    "dinov2_vits14": "dinov2reg_vit_small_14",
+    "dinov2_vitb14": "dinov2reg_vit_base_14",
+    "dinov2_vitl14": "dinov2reg_vit_large_14",
+}
+
+
+def _resolve_dinomaly_backbone(backbone: str) -> str:
+    """Resolve user-facing backbone name to anomalib Dinomaly encoder_name.
+
+    If the name is already in anomalib format (e.g. 'dinov2reg_vit_base_14'),
+    it is returned as-is.
+    """
+    return _DINOMALY_BACKBONE_MAP.get(backbone, backbone)
 
 
 class TrainingStatus(str, Enum):
@@ -104,11 +127,70 @@ class TrainingResult:
     quality_report: QualityReport | None = None
     threshold_recommended: float | None = None
     output_validation: dict | None = None
+    model_version_id: str | None = None
 
 
 def _list_images(directory: Path) -> list[Path]:
     """Return sorted list of .png and .jpg files in directory."""
     return sorted(list(directory.glob("*.png")) + list(directory.glob("*.jpg")))
+
+
+def _build_calibration_dataset(
+    ov_model,
+    val_dir: Path | None,
+    max_images: int = 100,
+) -> list[np.ndarray]:
+    """Build a calibration dataset for INT8 quantization from validation images.
+
+    Returns a list of preprocessed numpy arrays matching the model's input shape.
+    Each element is a single-batch NCHW float32 tensor ready for NNCF.
+    """
+    if val_dir is None or not val_dir.exists():
+        return []
+
+    val_normal = val_dir / "normal" if (val_dir / "normal").exists() else val_dir
+    images = _list_images(val_normal)
+    if not images:
+        return []
+
+    # Determine model input shape from the OpenVINO model
+    input_layer = ov_model.input(0)
+    input_shape = input_layer.shape  # e.g., [1, 3, 256, 256]
+
+    # Handle dynamic shapes — fall back to 256x256
+    try:
+        _, channels, height, width = [
+            int(d) if not isinstance(d, int) and hasattr(d, 'get_length') and d.get_length() != -1
+            else int(d) if isinstance(d, int)
+            else 256
+            for d in input_shape
+        ]
+    except (ValueError, TypeError):
+        channels, height, width = 3, 256, 256
+
+    calibration_data = []
+    for img_path in images[:max_images]:
+        frame = cv2.imread(str(img_path))
+        if frame is None:
+            continue
+
+        # Resize and convert BGR -> RGB
+        resized = cv2.resize(frame, (width, height))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+        # HWC -> NCHW float32, normalized to [0, 1]
+        blob = rgb.astype(np.float32) / 255.0
+        blob = blob.transpose(2, 0, 1)  # HWC -> CHW
+        blob = np.expand_dims(blob, axis=0)  # CHW -> NCHW
+
+        calibration_data.append(blob)
+
+    logger.info(
+        "training.calibration_dataset_built",
+        images=len(calibration_data),
+        input_shape=f"{1}x{channels}x{height}x{width}",
+    )
+    return calibration_data
 
 
 class ModelTrainer:
@@ -123,10 +205,12 @@ class ModelTrainer:
         baseline_manager: BaselineManager,
         models_dir: str | Path = "data/models",
         exports_dir: str | Path = "data/exports",
+        model_registry=None,
     ):
         self._baseline_manager = baseline_manager
         self._models_dir = Path(models_dir)
         self._exports_dir = Path(exports_dir)
+        self._model_registry = model_registry
         self._status = TrainingStatus.IDLE
         self._last_result: TrainingResult | None = None
 
@@ -153,11 +237,18 @@ class ModelTrainer:
         model_type: str = "patchcore",
         image_size: int = 256,
         export_format: str | None = "openvino",
+        quantization: str = "fp16",
+        calibration_images: int = 100,
         progress_callback: callable | None = None,
+        anomaly_config: object | None = None,
     ) -> TrainingResult:
         """Train an anomaly detection model for a specific camera/zone.
 
         Full pipeline: validate -> split -> train -> export -> evaluate -> report.
+
+        Args:
+            anomaly_config: Optional AnomalyConfig with model-specific parameters
+                (e.g. dinomaly_backbone, dinomaly_encoder_layers for dinomaly2).
         """
         start = time.monotonic()
 
@@ -168,10 +259,23 @@ class ModelTrainer:
         baseline_dir = self._baseline_manager.get_baseline_dir(camera_id, zone_id)
         image_count = self._baseline_manager.count_images(camera_id, zone_id)
 
-        if image_count < MIN_BASELINE_IMAGES:
+        # Dinomaly2 supports few-shot mode with fewer images
+        min_images = MIN_BASELINE_IMAGES
+        if model_type == "dinomaly2" and anomaly_config is not None:
+            few_shot_min = getattr(anomaly_config, "dinomaly_few_shot_images", 8)
+            if image_count < MIN_BASELINE_IMAGES and image_count >= few_shot_min:
+                min_images = few_shot_min
+                logger.info(
+                    "trainer.few_shot_mode",
+                    camera_id=camera_id,
+                    image_count=image_count,
+                    few_shot_min=few_shot_min,
+                )
+
+        if image_count < min_images:
             return self._fail(
                 start,
-                error=f"基线图片不足: {image_count} 张 (需要 >= {MIN_BASELINE_IMAGES})",
+                error=f"基线图片不足: {image_count} 张 (需要 >= {min_images})",
                 image_count=image_count,
             )
 
@@ -179,7 +283,7 @@ class ModelTrainer:
         self._status = TrainingStatus.VALIDATING
         _progress(5, "正在验证基线质量...")
 
-        pre_validation = self._validate_baseline_quality(baseline_dir)
+        pre_validation = self._validate_baseline_quality(baseline_dir, min_images=min_images)
         if not pre_validation["passed"]:
             error_msg = "; ".join(pre_validation["errors"])
             return self._fail(
@@ -228,6 +332,7 @@ class ModelTrainer:
                 output_dir=output_dir,
                 model_type=model_type,
                 image_size=image_size,
+                anomaly_config=anomaly_config,
             )
         except ImportError:
             return self._fail(start, error="anomalib 未安装", **common_fail_kwargs)
@@ -239,7 +344,8 @@ class ModelTrainer:
         export_path_str = None
         if export_format:
             self._status = TrainingStatus.EXPORTING
-            _progress(70, f"正在导出 {export_format} 格式...")
+            quant_label = f" + {quantization}" if quantization != "fp32" else ""
+            _progress(70, f"正在导出 {export_format}{quant_label} 格式...")
             try:
                 export_path_str = str(self._exports_dir / camera_id / zone_id)
                 self._export_model(
@@ -247,6 +353,9 @@ class ModelTrainer:
                     model=model,
                     export_format=export_format,
                     export_path=export_path_str,
+                    quantization=quantization,
+                    val_dir=val_dir,
+                    calibration_images=calibration_images,
                 )
             except Exception as e:
                 logger.error("training.export_failed", error=str(e))
@@ -283,6 +392,33 @@ class ModelTrainer:
 
         _progress(95, f"训练完成 — 质量等级: {quality_report.grade}")
 
+        # C4: Register model version in registry
+        model_version_id = None
+        if self._model_registry is not None:
+            try:
+                model_version_id = self._model_registry.register(
+                    model_path=output_dir,
+                    baseline_dir=baseline_dir,
+                    camera_id=camera_id,
+                    model_type=model_type,
+                    training_params={
+                        "image_size": image_size,
+                        "export_format": export_format,
+                        "quantization": quantization,
+                        "train_count": train_count,
+                        "val_count": val_count,
+                        "quality_grade": quality_report.grade,
+                    },
+                )
+                self._model_registry.activate(model_version_id)
+                logger.info(
+                    "training.model_registered",
+                    model_version_id=model_version_id,
+                    camera_id=camera_id,
+                )
+            except Exception as e:
+                logger.error("training.model_registry_failed", error=str(e))
+
         duration = time.monotonic() - start
         result = TrainingResult(
             status=TrainingStatus.COMPLETE,
@@ -296,6 +432,7 @@ class ModelTrainer:
             quality_report=quality_report,
             threshold_recommended=threshold_recommended,
             output_validation=output_validation,
+            model_version_id=model_version_id,
         )
         self._status = TrainingStatus.COMPLETE
         self._last_result = result
@@ -319,7 +456,9 @@ class ModelTrainer:
                     calibrator = ConformalCalibrator()
                     cal_result = calibrator.calibrate(cal_scores)
                     cal_path = output_dir / "calibration.json"
-                    calibrator.save(cal_result, cal_path)
+                    calibrator.save(
+                        cal_result, cal_path, sorted_scores=np.sort(cal_scores)
+                    )
                     logger.info("trainer.calibration_saved", path=str(cal_path))
                 else:
                     logger.warning(
@@ -338,7 +477,9 @@ class ModelTrainer:
 
     # ── TRN-001: Pre-training validation ──
 
-    def _validate_baseline_quality(self, baseline_dir: Path) -> dict:
+    def _validate_baseline_quality(
+        self, baseline_dir: Path, min_images: int = MIN_BASELINE_IMAGES,
+    ) -> dict:
         """Validate baseline image quality before training.
 
         Thresholds: corruption < 10%, near-duplicate < 80%, brightness std > 2.0.
@@ -347,13 +488,13 @@ class ModelTrainer:
         total = len(images)
         errors: list[str] = []
 
-        if total < MIN_BASELINE_IMAGES:
+        if total < min_images:
             return {
                 "passed": False,
                 "corruption_rate": 0.0,
                 "near_duplicate_rate": 0.0,
                 "brightness_std": 0.0,
-                "errors": [f"图片数量不足: {total} (需要 >= {MIN_BASELINE_IMAGES})"],
+                "errors": [f"图片数量不足: {total} (需要 >= {min_images})"],
             }
 
         corrupted = 0
@@ -725,11 +866,15 @@ class ModelTrainer:
         output_dir: Path,
         model_type: str,
         image_size: int,
+        anomaly_config: object | None = None,
     ) -> tuple:
         """Execute Anomalib training. Raises ImportError if anomalib is not installed.
 
         Returns (engine, model) so the caller can use them for export.
         data_dir should be the train split directory (containing a 'normal' subdirectory).
+
+        Args:
+            anomaly_config: Optional AnomalyConfig for model-specific parameters.
         """
         from anomalib.data import Folder
         from anomalib.engine import Engine
@@ -763,7 +908,22 @@ class ModelTrainer:
             # Dinomaly2 uses DINOv2 backbone with reconstruction-based anomaly detection
             try:
                 from anomalib.models import Dinomaly
-                model = Dinomaly()
+
+                # Build constructor kwargs from anomaly_config
+                dinomaly_kwargs: dict = {}
+                if anomaly_config is not None:
+                    backbone = getattr(anomaly_config, "dinomaly_backbone", None)
+                    if backbone:
+                        dinomaly_kwargs["encoder_name"] = _resolve_dinomaly_backbone(backbone)
+                    encoder_layers = getattr(anomaly_config, "dinomaly_encoder_layers", None)
+                    if encoder_layers:
+                        dinomaly_kwargs["target_layers"] = encoder_layers
+
+                model = Dinomaly(**dinomaly_kwargs)
+                logger.info(
+                    "trainer.dinomaly_created",
+                    **{k: str(v) for k, v in dinomaly_kwargs.items()},
+                )
             except ImportError:
                 # Fallback: if Dinomaly not in current anomalib version, use PatchCore
                 logger.warning(
@@ -805,10 +965,17 @@ class ModelTrainer:
         model,
         export_format: str,
         export_path: str,
+        quantization: str = "fp16",
+        val_dir: Path | None = None,
+        calibration_images: int = 100,
     ) -> None:
         """Export trained model to an optimized inference format.
 
         CRIT-02/HIGH-12: Use correct Anomalib 2.x export API (export_mode parameter).
+
+        If quantization == "int8" and export_format == "openvino", runs NNCF
+        post-training quantization on the exported FP model using validation
+        images as calibration data.
         """
         # Anomalib 2.x uses export_mode (str), not export_type (enum)
         engine.export(
@@ -816,3 +983,95 @@ class ModelTrainer:
             export_mode=export_format,  # "openvino" or "onnx"
         )
         logger.info("training.exported", format=export_format, path=export_path)
+
+        # INT8 post-training quantization (B2)
+        if quantization == "int8" and export_format == "openvino":
+            ModelTrainer._quantize_int8(
+                export_path=Path(export_path),
+                val_dir=val_dir,
+                calibration_images=calibration_images,
+            )
+
+    @staticmethod
+    def _quantize_int8(
+        export_path: Path,
+        val_dir: Path | None = None,
+        calibration_images: int = 100,
+    ) -> None:
+        """Apply INT8 post-training quantization to an exported OpenVINO model.
+
+        Uses NNCF's quantize() with calibration data from validation images.
+        Falls back gracefully if nncf is not installed.
+        """
+        try:
+            import nncf
+        except ImportError:
+            logger.warning(
+                "training.int8_skipped",
+                reason="nncf not installed — run: pip install argus[quantize]",
+            )
+            return
+
+        try:
+            import openvino as ov
+        except ImportError:
+            logger.warning(
+                "training.int8_skipped",
+                reason="openvino not installed",
+            )
+            return
+
+        # Find the exported .xml model file
+        xml_files = sorted(export_path.rglob("*.xml"))
+        if not xml_files:
+            logger.warning("training.int8_skipped", reason="No .xml model found in export path")
+            return
+
+        model_xml = xml_files[0]
+        logger.info("training.int8_quantizing", model=str(model_xml))
+
+        try:
+            # Load FP model
+            core = ov.Core()
+            ov_model = core.read_model(model_xml)
+
+            # Build calibration dataset from validation images
+            cal_images = _build_calibration_dataset(
+                ov_model=ov_model,
+                val_dir=val_dir,
+                max_images=calibration_images,
+            )
+
+            if not cal_images:
+                logger.warning(
+                    "training.int8_skipped",
+                    reason="No calibration images available",
+                )
+                return
+
+            # Run NNCF post-training quantization
+            quantized_model = nncf.quantize(
+                ov_model,
+                nncf.Dataset(cal_images),
+                subset_size=min(len(cal_images), calibration_images),
+                model_type=nncf.ModelType.TRANSFORMER,
+                preset=nncf.QuantizationPreset.MIXED,
+            )
+
+            # Save INT8 model — overwrite the FP model files
+            model_bin = model_xml.with_suffix(".bin")
+            ov.save_model(quantized_model, str(model_xml))
+
+            logger.info(
+                "training.int8_complete",
+                model=str(model_xml),
+                original_size_mb=round(model_bin.stat().st_size / 1024 / 1024, 1)
+                if model_bin.exists() else None,
+            )
+
+        except Exception as e:
+            logger.error("training.int8_failed", error=str(e))
+            logger.warning(
+                "training.int8_fallback",
+                msg="Keeping FP model — INT8 quantization failed",
+            )

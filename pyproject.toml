@@ -30,6 +30,8 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.8.0",
 ]
+quantize = ["nncf>=2.7.0"]
+segment = ["sam2>=1.0"]
 
 [project.scripts]
 argus = "argus.__main__:main"

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Table, Badge, Button, Typography, Space, Modal, Form, Input, Select, InputNumber, message } from 'ant-design-vue'
 import { PlusOutlined } from '@ant-design/icons-vue'
 import api, { getCameras, startCamera, stopCamera } from '../api'
+import { useWebSocket } from '../composables/useWebSocket'
 
 const router = useRouter()
 const cameras = ref<any[]>([])
@@ -17,7 +18,6 @@ const addForm = ref({
   fps_target: 5,
   resolution: '1920,1080',
 })
-let timer: ReturnType<typeof setInterval>
 
 async function fetchData() {
   try {
@@ -28,11 +28,16 @@ async function fetchData() {
   }
 }
 
-onMounted(() => {
-  fetchData()
-  timer = setInterval(fetchData, 10000)
+const { } = useWebSocket({
+  topics: ['cameras'],
+  onMessage(topic, data) {
+    if (topic === 'cameras') cameras.value = data
+  },
+  fallbackPoll: fetchData,
+  fallbackInterval: 10000,
 })
-onUnmounted(() => clearInterval(timer))
+
+onMounted(fetchData)
 
 async function handleStart(id: string) {
   await startCamera(id)

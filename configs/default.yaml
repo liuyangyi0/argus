@@ -25,6 +25,30 @@ cameras:
       enable_multiscale: true   # 开启后切片检测，提升小物体检出率（延迟从~30ms增到~270ms）
       tile_size: 512            # 切片尺寸（像素），512适合1080p
       tile_overlap: 0.25        # 切片重叠率，0.25=25%重叠防边缘遗漏
+      enable_calibration: true  # 训练后有 calibration.json 时，用共形预测校准异常分数
+      # Dinomaly2 parameters (only used when model_type="dinomaly2")
+      # dinomaly_backbone: dinov2_vitb14        # DINOv2 backbone: dinov2_vits14, dinov2_vitb14, dinov2_vitl14
+      # dinomaly_encoder_layers: [2, 5, 8, 11]  # ViT layers to extract features from
+      # dinomaly_few_shot_images: 8              # Min baseline images for few-shot mode (1-100)
+      # dinomaly_multi_class: false              # Share one detector across all cameras
+      # Model quantization: fp32 (full precision), fp16 (half, default), int8 (quantized, fastest CPU inference)
+      # INT8 requires nncf: pip install argus[quantize]
+      quantization: fp16
+      quantization_calibration_images: 100  # 用于INT8校准的验证集图片数量（50-1000）
+    simplex:
+      enabled: true             # Simplex safety channel: lightweight frame-diff detector runs parallel to Anomalib
+      diff_threshold: 30        # Binary threshold for frame difference (10-100)
+      min_area_px: 500          # Minimum contour area in pixels to track (100-50000)
+      min_static_seconds: 30.0  # Seconds a region must be static before detection (5-600)
+      morph_kernel_size: 5      # Morphology kernel size for noise removal (3-15)
+      match_radius_px: 50       # Max pixel distance to match tracked centroids (10-200)
+    drift:
+      enabled: true               # KS test drift monitoring on anomaly score distribution
+      reference_window: 500       # Initial scores to collect as reference distribution (100-5000)
+      test_window: 100            # Sliding window size; KS test runs every test_window scores (50-1000)
+      p_value_threshold: 0.01     # KS test significance level (0.001-0.1)
+      ks_threshold: 0.1           # KS statistic threshold for drift detection (0.01-0.5)
+      cooldown_minutes: 30        # Minutes before re-alerting drift for same camera (5-1440)
 
 alerts:
   severity_thresholds:
@@ -87,5 +111,52 @@ models:
   yolo_path: "yolo11n.pt"
   anomalib_model_dir: "data/models"
   anomalib_export_dir: "data/exports"
+
+classifier:
+  enabled: false                        # D1: Open vocabulary classification (requires YOLO-World model)
+  model_name: "yolov8s-worldv2.pt"      # YOLO-World model variant
+  vocabulary:                            # FOE vocabulary for nuclear plant environments
+    - wrench
+    - bolt
+    - nut
+    - screwdriver
+    - hammer
+    - rag
+    - glove
+    - plastic bag
+    - tape
+    - wire
+    - insulation
+    - debris
+    - paint chip
+    - insect
+    - bird
+    - shadow
+    - reflection
+  min_anomaly_score_to_classify: 0.5    # Only classify when anomaly score >= this (0.0-1.0)
+  high_risk_labels:                     # Labels that escalate alert severity
+    - wrench
+    - bolt
+    - nut
+    - screwdriver
+    - hammer
+  low_risk_labels:                      # Labels that suppress/downgrade alert severity
+    - insect
+    - shadow
+    - reflection
+
+segmenter:
+  enabled: false                        # D2: SAM 2 instance segmentation (requires pip install argus[segment])
+  model_size: "small"                   # SAM 2 model size: tiny, small, base_plus, large
+  max_points: 5                         # Max anomaly peaks to segment per frame (1-20)
+  min_anomaly_score: 0.7                # Minimum anomaly score to trigger segmentation (0.1-0.99)
+  min_mask_area_px: 100                 # Minimum mask area in pixels — smaller objects are discarded (10-100000)
+
+cross_camera:
+  enabled: false
+  overlap_pairs: []  # List of {camera_a, camera_b, homography} for overlapping camera pairs
+  corroboration_threshold: 0.3  # Partner anomaly score above this = corroborated (0.1-0.9)
+  max_age_seconds: 5.0  # Max age of partner anomaly data to use (1-30s)
+  uncorroborated_severity_downgrade: 1  # Downgrade severity by N levels when uncorroborated (0=disabled)
 
 log_level: INFO

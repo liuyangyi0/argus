@@ -178,6 +178,9 @@ def main():
         cameras=cameras,
         alert_config=config.alerts,
         on_alert=on_alert,
+        cross_camera_config=config.cross_camera,
+        segmenter_config=config.segmenter,
+        classifier_config=config.classifier,
     )
 
     # Graceful shutdown

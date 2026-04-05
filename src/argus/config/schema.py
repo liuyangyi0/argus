@@ -172,7 +172,8 @@ class AnomalyConfig(BaseModel):
     # Dinomaly2 parameters (only used when model_type="dinomaly2")
     dinomaly_backbone: str = Field(
         default="dinov2_vitb14",
-        description="DINOv2 backbone variant (dinov2_vits14, dinov2_vitb14, dinov2_vitl14)",
+        description="DINOv2 backbone variant (dinov2_vits14, dinov2_vitb14, dinov2_vitl14). "
+        "Mapped to anomalib encoder names automatically (e.g. dinov2_vitb14 → dinov2reg_vit_base_14).",
     )
     dinomaly_encoder_layers: list[int] = Field(
         default=[2, 5, 8, 11],
@@ -194,6 +195,11 @@ class AnomalyConfig(BaseModel):
     quantization_calibration_images: int = Field(
         default=100, ge=50, le=1000,
         description="Number of baseline images used for INT8 calibration",
+    )
+    # Conformal prediction calibration
+    enable_calibration: bool = Field(
+        default=True,
+        description="Apply conformal calibration to anomaly scores when calibration.json exists",
     )
     # SSIM fallback parameters (used when no trained model is available)
     ssim_baseline_frames: int = Field(
@@ -236,17 +242,49 @@ class SegmenterConfig(BaseModel):
     """SAM 2 instance segmentation (D2)."""
 
     enabled: bool = Field(default=False)
-    model_size: str = Field(default="small", description="SAM 2 model size: small, base, large")
+    model_size: str = Field(
+        default="small",
+        pattern="^(tiny|small|base_plus|large)$",
+        description="SAM 2 model size: tiny, small, base_plus, large",
+    )
+    max_points: int = Field(
+        default=5, ge=1, le=20,
+        description="Max anomaly peaks to segment per frame",
+    )
+    min_anomaly_score: float = Field(
+        default=0.7, ge=0.1, le=0.99,
+        description="Minimum anomaly score to trigger segmentation",
+    )
+    min_mask_area_px: int = Field(
+        default=100, ge=10, le=100000,
+        description="Minimum mask area in pixels — smaller objects are discarded",
+    )
 
 
 class DriftConfig(BaseModel):
-    """Score distribution drift monitoring."""
+    """Score distribution drift monitoring via Kolmogorov-Smirnov test."""
 
     enabled: bool = Field(default=True)
-    window_size: int = Field(default=5000, ge=500, le=100000)
-    check_interval: int = Field(default=500, ge=100, le=5000)
-    ks_threshold: float = Field(default=0.1, ge=0.01, le=0.5)
-    p_value_threshold: float = Field(default=0.01, ge=0.001, le=0.1)
+    reference_window: int = Field(
+        default=500, ge=100, le=5000,
+        description="Number of initial scores to collect as reference distribution",
+    )
+    test_window: int = Field(
+        default=100, ge=50, le=1000,
+        description="Sliding window size for comparison against reference",
+    )
+    p_value_threshold: float = Field(
+        default=0.01, ge=0.001, le=0.1,
+        description="KS test significance level",
+    )
+    ks_threshold: float = Field(
+        default=0.1, ge=0.01, le=0.5,
+        description="KS statistic threshold for drift detection",
+    )
+    cooldown_minutes: int = Field(
+        default=30, ge=5, le=1440,
+        description="Minutes before re-alerting drift for same camera",
+    )
 
 
 class CameraConfig(BaseModel):
@@ -445,6 +483,14 @@ class CrossCameraConfig(BaseModel):
 
     enabled: bool = Field(default=False)
     overlap_pairs: list[CameraOverlapConfig] = Field(default_factory=list)
+    corroboration_threshold: float = Field(
+        default=0.3, ge=0.1, le=0.9,
+        description="Partner anomaly score threshold to consider corroborated",
+    )
+    max_age_seconds: float = Field(
+        default=5.0, ge=1.0, le=30.0,
+        description="Max age of partner data to use for correlation",
+    )
     uncorroborated_severity_downgrade: int = Field(
         default=1, ge=0, le=2,
         description="Downgrade severity by N levels when uncorroborated (0=disabled)",
@@ -463,5 +509,7 @@ class ArgusConfig(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     capture_quality: CaptureQualityConfig = Field(default_factory=CaptureQualityConfig)
+    classifier: ClassifierConfig = Field(default_factory=ClassifierConfig)
+    segmenter: SegmenterConfig = Field(default_factory=SegmenterConfig)
     cross_camera: CrossCameraConfig = Field(default_factory=CrossCameraConfig)
     log_level: str = "INFO"

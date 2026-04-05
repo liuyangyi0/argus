@@ -1,10 +1,18 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import {
   Card, Tabs, Descriptions, Typography, Table, Button, Space, Tag,
-  Form, Input, Select, message, Popconfirm, Badge,
+  Form, Input, Select, message, Popconfirm, Badge, Switch,
 } from 'ant-design-vue'
-import api, { getHealth } from '../api'
+import api, {
+  getHealth,
+  getUsers as apiGetUsers,
+  createUser as apiCreateUser,
+  deleteUser as apiDeleteUser,
+  toggleUserActive,
+  getAuditLogs,
+} from '../api'
+import { useWebSocket } from '../composables/useWebSocket'
 
 const activeTab = ref('overview')
 const health = ref<any>(null)
@@ -14,37 +22,46 @@ const users = ref<any[]>([])
 const usersLoading = ref(false)
 const newUser = ref({ username: '', password: '', role: 'operator', display_name: '' })
 
+// ── Audit ──
+const auditEntries = ref<any[]>([])
+const auditLoading = ref(false)
+const auditTotal = ref(0)
+const auditPagination = reactive({ current: 1, pageSize: 20 })
+const auditFilters = reactive({ user: '', action: '' })
+const auditUserOptions = ref<string[]>([])
+
 // ── Config ──
 const configLoading = ref(false)
 
-onMounted(async () => {
+async function fetchHealth() {
   try {
     const res = await getHealth()
     health.value = res.data
   } catch (e) {
     console.error(e)
   }
+}
+
+const { } = useWebSocket({
+  topics: ['health'],
+  onMessage(topic, data) {
+    if (topic === 'health') health.value = data
+  },
+  fallbackPoll: fetchHealth,
+  fallbackInterval: 15000,
 })
 
+onMounted(fetchHealth)
+
+// ── Users functions ──
 async function loadUsers() {
   usersLoading.value = true
   try {
-    // Parse users from HTML endpoint (until JSON API exists)
-    const res = await api.get('/users', { responseType: 'text', headers: { 'HX-Request': 'true' } })
-    const html = res.data as string
-    const rows: any[] = []
-    // Simple extraction
-    const trRegex = /<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]*)<\/td>\s*<td[^>]*>([^<]*)<\/td>/g
-    let match
-    while ((match = trRegex.exec(html)) !== null) {
-      const username = match[1].trim()
-      if (username && username !== '用户名' && !username.includes('td')) {
-        rows.push({ username, role: match[2].trim(), display_name: match[3].trim() })
-      }
-    }
-    users.value = rows
+    const res = await apiGetUsers()
+    users.value = res.data.users
   } catch (e) {
     console.error(e)
+    message.error('加载用户列表失败')
   } finally {
     usersLoading.value = false
   }
@@ -52,12 +69,12 @@ async function loadUsers() {
 
 async function createUser() {
   try {
-    const form = new FormData()
-    form.append('username', newUser.value.username)
-    form.append('password', newUser.value.password)
-    form.append('role', newUser.value.role)
-    form.append('display_name', newUser.value.display_name)
-    await api.post('/users', form)
+    await apiCreateUser({
+      username: newUser.value.username,
+      password: newUser.value.password,
+      role: newUser.value.role,
+      display_name: newUser.value.display_name,
+    })
     message.success('用户已创建')
     newUser.value = { username: '', password: '', role: 'operator', display_name: '' }
     loadUsers()
@@ -68,7 +85,7 @@ async function createUser() {
 
 async function deleteUser(username: string) {
   try {
-    await api.delete(`/users/${username}`)
+    await apiDeleteUser(username)
     message.success('已删除')
     loadUsers()
   } catch (e: any) {
@@ -76,6 +93,50 @@ async function deleteUser(username: string) {
   }
 }
 
+async function handleToggleActive(username: string) {
+  try {
+    await toggleUserActive(username)
+    message.success('状态已更新')
+    loadUsers()
+  } catch (e: any) {
+    message.error('切换状态失败')
+  }
+}
+
+// ── Audit functions ──
+async function loadAudit() {
+  auditLoading.value = true
+  try {
+    const res = await getAuditLogs({
+      page: auditPagination.current,
+      page_size: auditPagination.pageSize,
+      user: auditFilters.user || undefined,
+      action: auditFilters.action || undefined,
+    })
+    auditEntries.value = res.data.entries
+    auditTotal.value = res.data.total
+    const uniqueUsers = new Set<string>(res.data.entries.map((e: any) => e.user).filter(Boolean))
+    auditUserOptions.value = Array.from(uniqueUsers).sort()
+  } catch (e) {
+    console.error(e)
+    message.error('加载审计日志失败')
+  } finally {
+    auditLoading.value = false
+  }
+}
+
+function onAuditTableChange(pagination: any) {
+  auditPagination.current = pagination.current
+  auditPagination.pageSize = pagination.pageSize
+  loadAudit()
+}
+
+function onAuditFilterChange() {
+  auditPagination.current = 1
+  loadAudit()
+}
+
+// ── Config functions ──
 async function reloadConfig() {
   configLoading.value = true
   try {
@@ -100,13 +161,25 @@ async function createBackup() {
 function onTabChange(key: string | number) {
   activeTab.value = String(key)
   if (key === 'users') loadUsers()
+  if (key === 'audit') loadAudit()
 }
 
+// ── Column definitions ──
 const userColumns = [
   { title: '用户名', dataIndex: 'username', key: 'username' },
-  { title: '角色', dataIndex: 'role', key: 'role' },
   { title: '显示名', dataIndex: 'display_name', key: 'display_name' },
+  { title: '角色', dataIndex: 'role', key: 'role' },
+  { title: '状态', key: 'active', width: 100 },
+  { title: '最后登录', dataIndex: 'last_login', key: 'last_login' },
   { title: '操作', key: 'action', width: 120 },
+]
+
+const auditColumns = [
+  { title: '时间', dataIndex: 'timestamp', key: 'timestamp', width: 180 },
+  { title: '用户', dataIndex: 'user', key: 'user', width: 120 },
+  { title: '操作', dataIndex: 'action', key: 'action', width: 150 },
+  { title: '详情', dataIndex: 'details', key: 'details', ellipsis: true },
+  { title: 'IP 地址', dataIndex: 'ip_address', key: 'ip_address', width: 140 },
 ]
 
 const roleLabels: Record<string, string> = { admin: '管理员', operator: '操作员', viewer: '观察者' }
@@ -182,8 +255,41 @@ const roleColors: Record<string, string> = { admin: 'red', operator: 'blue', vie
 
       <!-- Audit -->
       <Tabs.TabPane key="audit" tab="审计日志">
-        <Card>
-          <p style="color: #666">审计日志查看需要后端 JSON API 支持，当前可通过旧版界面 (localhost:8080/audit) 查看。</p>
+        <Card title="审计日志">
+          <Space style="margin-bottom: 16px">
+            <Select
+              v-model:value="auditFilters.user"
+              placeholder="按用户筛选"
+              allow-clear
+              style="width: 160px"
+              @change="onAuditFilterChange"
+            >
+              <Select.Option v-for="u in auditUserOptions" :key="u" :value="u">{{ u }}</Select.Option>
+            </Select>
+            <Input
+              v-model:value="auditFilters.action"
+              placeholder="按操作筛选"
+              allow-clear
+              style="width: 200px"
+              @press-enter="onAuditFilterChange"
+            />
+            <Button @click="onAuditFilterChange">筛选</Button>
+          </Space>
+          <Table
+            :columns="auditColumns"
+            :data-source="auditEntries"
+            :loading="auditLoading"
+            :pagination="{
+              current: auditPagination.current,
+              pageSize: auditPagination.pageSize,
+              total: auditTotal,
+              showSizeChanger: true,
+              showTotal: (t: number) => `共 ${t} 条`,
+            }"
+            row-key="id"
+            size="small"
+            @change="onAuditTableChange"
+          />
         </Card>
       </Tabs.TabPane>
 
@@ -224,6 +330,18 @@ const roleColors: Record<string, string> = { admin: 'red', operator: 'blue', vie
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'role'">
                 <Tag :color="roleColors[record.role]">{{ roleLabels[record.role] || record.role }}</Tag>
+              </template>
+              <template v-if="column.key === 'active'">
+                <Switch
+                  :checked="record.active"
+                  checked-children="启用"
+                  un-checked-children="禁用"
+                  size="small"
+                  @change="handleToggleActive(record.username)"
+                />
+              </template>
+              <template v-if="column.key === 'last_login'">
+                {{ record.last_login || '-' }}
               </template>
               <template v-if="column.key === 'action'">
                 <Popconfirm title="确定删除此用户？" @confirm="deleteUser(record.username)">

@@ -9,8 +9,16 @@ import cv2
 import numpy as np
 import pytest
 
+from unittest.mock import MagicMock, patch
+
 from argus.anomaly.baseline import BaselineManager
-from argus.anomaly.trainer import ModelTrainer, QualityReport, TrainingStatus
+from argus.anomaly.trainer import (
+    ModelTrainer,
+    QualityReport,
+    TrainingStatus,
+    _resolve_dinomaly_backbone,
+)
+from argus.config.schema import AnomalyConfig
 
 
 @pytest.fixture
@@ -472,3 +480,182 @@ class TestFindBestModelFile:
         """Should return None when no model files exist."""
         result = ModelTrainer._find_best_model_file(tmp_path)
         assert result is None
+
+
+# ── Dinomaly2 Integration ──
+
+
+class TestDinomaly2BackboneMapping:
+    """Test backbone name resolution from user-facing to anomalib format."""
+
+    def test_maps_vitb14(self):
+        assert _resolve_dinomaly_backbone("dinov2_vitb14") == "dinov2reg_vit_base_14"
+
+    def test_maps_vits14(self):
+        assert _resolve_dinomaly_backbone("dinov2_vits14") == "dinov2reg_vit_small_14"
+
+    def test_maps_vitl14(self):
+        assert _resolve_dinomaly_backbone("dinov2_vitl14") == "dinov2reg_vit_large_14"
+
+    def test_passthrough_anomalib_format(self):
+        """Already-resolved names should pass through unchanged."""
+        assert _resolve_dinomaly_backbone("dinov2reg_vit_base_14") == "dinov2reg_vit_base_14"
+
+    def test_passthrough_unknown(self):
+        """Unknown names should pass through for anomalib to validate."""
+        assert _resolve_dinomaly_backbone("custom_backbone") == "custom_backbone"
+
+
+class TestDinomaly2ConfigPassedToModel:
+    """Verify that _train_anomalib passes AnomalyConfig params to Dinomaly constructor."""
+
+    def test_dinomaly2_receives_config_params(self, trainer, tmp_path):
+        """Mock Dinomaly class and verify constructor receives correct params."""
+        mock_dinomaly_cls = MagicMock()
+        mock_dinomaly_instance = MagicMock()
+        mock_dinomaly_cls.return_value = mock_dinomaly_instance
+        mock_engine_cls = MagicMock()
+        mock_folder_cls = MagicMock()
+
+        anomaly_config = AnomalyConfig(
+            model_type="dinomaly2",
+            dinomaly_backbone="dinov2_vitb14",
+            dinomaly_encoder_layers=[2, 5, 8, 11],
+        )
+
+        train_dir = tmp_path / "train" / "normal"
+        train_dir.mkdir(parents=True)
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        with patch("anomalib.data.Folder", mock_folder_cls, create=True), \
+             patch("anomalib.engine.Engine", mock_engine_cls, create=True), \
+             patch("anomalib.models.Dinomaly", mock_dinomaly_cls, create=True):
+            trainer._train_anomalib(
+                data_dir=tmp_path / "train",
+                output_dir=output_dir,
+                model_type="dinomaly2",
+                image_size=256,
+                anomaly_config=anomaly_config,
+            )
+
+        mock_dinomaly_cls.assert_called_once_with(
+            encoder_name="dinov2reg_vit_base_14",
+            target_layers=[2, 5, 8, 11],
+        )
+
+    def test_dinomaly2_no_config_uses_defaults(self, trainer, tmp_path):
+        """When anomaly_config is None, Dinomaly should be called with no kwargs."""
+        mock_dinomaly_cls = MagicMock()
+        mock_dinomaly_cls.return_value = MagicMock()
+        mock_engine_cls = MagicMock()
+        mock_folder_cls = MagicMock()
+
+        train_dir = tmp_path / "train" / "normal"
+        train_dir.mkdir(parents=True)
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        with patch("anomalib.data.Folder", mock_folder_cls, create=True), \
+             patch("anomalib.engine.Engine", mock_engine_cls, create=True), \
+             patch("anomalib.models.Dinomaly", mock_dinomaly_cls, create=True):
+            trainer._train_anomalib(
+                data_dir=tmp_path / "train",
+                output_dir=output_dir,
+                model_type="dinomaly2",
+                image_size=256,
+                anomaly_config=None,
+            )
+
+        mock_dinomaly_cls.assert_called_once_with()
+
+
+class TestDinomaly2FewShot:
+    """Verify that dinomaly2 supports few-shot mode with fewer baseline images."""
+
+    def test_dinomaly2_few_shot_allows_small_baseline(self, trainer, bm):
+        """< 30 images with dinomaly2 should not fail validation when >= few_shot_images."""
+        _create_baseline_images(bm, count=15, varied=True)
+
+        anomaly_config = AnomalyConfig(
+            model_type="dinomaly2",
+            dinomaly_few_shot_images=8,
+        )
+
+        # With patchcore, 15 images would fail (needs 30)
+        result_patchcore = trainer.train("cam_01", model_type="patchcore")
+        assert result_patchcore.status == TrainingStatus.FAILED
+        assert "不足" in result_patchcore.error
+
+        # With dinomaly2 + anomaly_config, 15 images should pass the count check
+        # (will fail later at anomalib training since anomalib is not mocked here,
+        #  but the important thing is it does NOT fail with the image count error)
+        result_dinomaly = trainer.train(
+            "cam_01", model_type="dinomaly2", anomaly_config=anomaly_config
+        )
+        # It should get past the image count check — it may fail at pre-validation
+        # quality checks or training, but NOT with the "基线图片不足" message
+        if result_dinomaly.status == TrainingStatus.FAILED:
+            # The error should NOT be about insufficient image count
+            assert "基线图片不足" not in result_dinomaly.error
+            assert "图片数量不足" not in result_dinomaly.error
+
+    def test_dinomaly2_still_fails_below_few_shot_min(self, trainer, bm):
+        """dinomaly2 with too few images (below few_shot_images) should still fail."""
+        _create_baseline_images(bm, count=5, varied=True)
+
+        anomaly_config = AnomalyConfig(
+            model_type="dinomaly2",
+            dinomaly_few_shot_images=8,
+        )
+
+        result = trainer.train(
+            "cam_01", model_type="dinomaly2", anomaly_config=anomaly_config
+        )
+        assert result.status == TrainingStatus.FAILED
+        assert "不足" in result.error
+
+
+class TestDinomaly2FallbackOnImportError:
+    """Verify fallback to PatchCore when Dinomaly is not importable."""
+
+    def test_fallback_to_patchcore(self, trainer, tmp_path):
+        """If Dinomaly import fails, should fall back to PatchCore with warning."""
+        mock_patchcore_cls = MagicMock()
+        mock_patchcore_instance = MagicMock()
+        mock_patchcore_cls.return_value = mock_patchcore_instance
+        mock_engine_cls = MagicMock()
+        mock_folder_cls = MagicMock()
+
+        train_dir = tmp_path / "train" / "normal"
+        train_dir.mkdir(parents=True)
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        # Make Dinomaly import raise ImportError via builtins patching
+        import builtins
+        real_import = builtins.__import__
+
+        def patched_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "anomalib.models" and fromlist and "Dinomaly" in fromlist:
+                raise ImportError("Dinomaly not available in test")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("anomalib.data.Folder", mock_folder_cls, create=True), \
+             patch("anomalib.engine.Engine", mock_engine_cls, create=True), \
+             patch("anomalib.models.Patchcore", mock_patchcore_cls, create=True), \
+             patch.object(builtins, "__import__", side_effect=patched_import):
+            engine, model = trainer._train_anomalib(
+                data_dir=tmp_path / "train",
+                output_dir=output_dir,
+                model_type="dinomaly2",
+                image_size=256,
+            )
+
+        # Should have fallen back to PatchCore
+        assert model is mock_patchcore_instance
+        mock_patchcore_cls.assert_called_once_with(
+            backbone="wide_resnet50_2",
+            layers=["layer2", "layer3"],
+            coreset_sampling_ratio=0.1,
+        )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -268,6 +269,97 @@ async def baseline_list(request: Request):
     return HTMLResponse(html)
 
 
+@router.get("/list/json")
+async def baseline_list_json(request: Request):
+    """JSON API: list baselines by camera with version info."""
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    baselines_dir = Path(config.storage.baselines_dir)
+    if not baselines_dir.exists():
+        return JSONResponse({"baselines": []})
+
+    import json as _json
+
+    baselines = []
+    for cam_dir in sorted(baselines_dir.iterdir()):
+        if not cam_dir.is_dir():
+            continue
+        camera_id = cam_dir.name
+        for ver_dir in sorted(cam_dir.iterdir()):
+            if not ver_dir.is_dir():
+                continue
+            images = list(ver_dir.glob("*.png")) + list(ver_dir.glob("*.jpg"))
+            if not images:
+                continue
+            # Read capture metadata if available
+            meta = {}
+            meta_path = ver_dir / "capture_meta.json"
+            if meta_path.exists():
+                try:
+                    meta = _json.loads(meta_path.read_text())
+                except (ValueError, OSError):
+                    pass
+            baselines.append({
+                "camera_id": camera_id,
+                "version": ver_dir.name,
+                "image_count": len(images),
+                "session_label": meta.get("session_label", ""),
+                "status": "ready",
+            })
+
+    return JSONResponse({"baselines": baselines})
+
+
+@router.get("/models/json")
+async def models_list_json(request: Request):
+    """JSON API: list trained models found in data/models/."""
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    models_dir = Path(config.storage.models_dir)
+    if not models_dir.exists():
+        return JSONResponse({"models": []})
+
+    result = []
+    for cam_dir in sorted(models_dir.iterdir()):
+        if not cam_dir.is_dir():
+            continue
+        camera_id = cam_dir.name
+
+        for pattern, fmt in [("model.xml", "openvino"), ("model.onnx", "onnx"),
+                              ("model.pt", "pytorch"), ("model.ckpt", "checkpoint")]:
+            for model_file in sorted(cam_dir.rglob(pattern),
+                                     key=lambda p: p.stat().st_mtime, reverse=True):
+                mtime = time.strftime("%Y-%m-%dT%H:%M:%S",
+                                      time.localtime(model_file.stat().st_mtime))
+                size_mb = model_file.stat().st_size / (1024 * 1024)
+                rel_path = str(model_file.relative_to(Path(".")))
+                result.append({
+                    "camera_id": camera_id,
+                    "format": fmt,
+                    "size_mb": round(size_mb, 1),
+                    "trained_at": mtime,
+                    "model_path": rel_path,
+                })
+
+    return JSONResponse({"models": result})
+
+
+@router.get("/training-history/json")
+async def training_history_json(request: Request):
+    """JSON API: training history with quality grades."""
+    database = getattr(request.app.state, "database", None)
+    if not database:
+        return JSONResponse({"records": []})
+
+    camera_id = request.query_params.get("camera_id")
+    records = database.get_training_history(camera_id=camera_id, limit=50)
+    return JSONResponse({"records": [r.to_dict() for r in records]})
+
+
 @router.get("/{camera_id}/images", response_class=HTMLResponse)
 async def baseline_images(request: Request, camera_id: str):
     """Show baseline image thumbnails for a camera version."""
@@ -471,6 +563,11 @@ async def train_form(request: Request):
         ("onnx", "ONNX"),
         ("none", "不导出"),
     ], selected="openvino")
+    quantization_select = form_select("量化精度", "quantization", [
+        ("fp16", "FP16（半精度，默认）"),
+        ("fp32", "FP32（全精度）"),
+        ("int8", "INT8（量化，CPU推理最快）"),
+    ], selected="fp16")
 
     return HTMLResponse(f"""
     {task_html}
@@ -485,6 +582,9 @@ async def train_form(request: Request):
             <div class="form-row">
                 {model_select}
                 {export_select}
+            </div>
+            <div class="form-row">
+                {quantization_select}
             </div>
             <div class="form-actions">
                 <button type="submit" class="btn btn-primary">开始训练</button>
@@ -506,15 +606,26 @@ async def start_training(request: Request):
     camera_id = form.get("camera_id", "")
     model_type = form.get("model_type", "patchcore")
     export_format = form.get("export_format", "openvino")
+    quantization = form.get("quantization", "fp16")
 
     if not camera_id:
         return JSONResponse({"error": "请选择摄像头"}, status_code=400)
+
+    # Validate quantization value
+    if quantization not in ("fp32", "fp16", "int8"):
+        quantization = "fp16"
 
     # Get database if available
     database = getattr(request.app.state, "database", None)
     database_url = None
     if database:
         database_url = database._database_url
+
+    # Resolve anomaly config for the selected camera
+    anomaly_config = None
+    cam_cfg = next((c for c in config.cameras if c.camera_id == camera_id), None)
+    if cam_cfg is not None:
+        anomaly_config = cam_cfg.anomaly
 
     try:
         task_manager.submit(
@@ -525,7 +636,9 @@ async def start_training(request: Request):
             models_dir=str(config.storage.models_dir),
             model_type=model_type,
             export_format=export_format,
+            quantization=quantization,
             database_url=database_url,
+            anomaly_config=anomaly_config,
         )
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -1060,7 +1173,7 @@ def _capture_baseline_task(
 
 def _train_model_task(
     progress_callback, *, baselines_dir, models_dir, camera_id, model_type,
-    export_format, database_url=None
+    export_format, quantization="fp16", database_url=None, anomaly_config=None
 ):
     """Train an anomaly detection model with full validation pipeline.
 
@@ -1090,7 +1203,9 @@ def _train_model_task(
         zone_id="default",
         model_type=model_type,
         export_format=fmt,
+        quantization=quantization,
         progress_callback=progress_callback,
+        anomaly_config=anomaly_config,
     )
 
     if result.status == TrainingStatus.FAILED:
@@ -1202,3 +1317,114 @@ async def optimize_baseline(request: Request):
         f'<div class="success">优化完成: 保留 {len(selected)} 张, '
         f'移除 {moved} 张到 backup/</div>'
     )
+
+
+def _get_baseline_manager(request: Request):
+    """Get or create a BaselineManager from app state or config."""
+    baseline_mgr = getattr(request.app.state, "baseline_manager", None)
+    if baseline_mgr is not None:
+        return baseline_mgr
+    config = request.app.state.config
+    if config:
+        from argus.anomaly.baseline import BaselineManager
+        return BaselineManager(baselines_dir=str(config.storage.baselines_dir))
+    return None
+
+
+@router.get("/optimize/preview")
+async def optimize_preview(
+    request: Request,
+    camera_id: str = "",
+    zone_id: str = "default",
+    target_ratio: float = 0.2,
+):
+    """Preview how many images would be kept/moved by optimization."""
+    if not camera_id:
+        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+
+    baseline_mgr = _get_baseline_manager(request)
+    if baseline_mgr is None:
+        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+
+    baseline_dir = baseline_mgr.get_baseline_dir(camera_id, zone_id)
+    all_images = sorted(
+        list(baseline_dir.glob("*.png")) + list(baseline_dir.glob("*.jpg"))
+    )
+    total = len(all_images)
+    if total == 0:
+        return JSONResponse({"total": 0, "keep": 0, "move": 0})
+
+    target_count = max(30, int(total * target_ratio))
+    keep = min(target_count, total)
+    return JSONResponse({"total": total, "keep": keep, "move": total - keep})
+
+
+@router.post("/optimize/json")
+async def optimize_baseline_json(request: Request):
+    """JSON API: Optimize baseline by selecting most diverse subset (A4-2).
+
+    Params (JSON body):
+        camera_id: str (required)
+        zone_id: str (default "default")
+        target_ratio: float (default 0.2)
+
+    Returns: {"selected": N, "moved": M, "backup_dir": "..."}
+    """
+    data = await request.json()
+    camera_id = data.get("camera_id", "")
+    zone_id = data.get("zone_id", "default")
+    target_ratio = float(data.get("target_ratio", 0.2))
+
+    if not camera_id:
+        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+
+    baseline_mgr = _get_baseline_manager(request)
+    if baseline_mgr is None:
+        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+
+    baseline_dir = baseline_mgr.get_baseline_dir(camera_id, zone_id)
+    all_images = sorted(
+        list(baseline_dir.glob("*.png")) + list(baseline_dir.glob("*.jpg"))
+    )
+    if not all_images:
+        return JSONResponse({"error": "未找到基线图片"}, status_code=404)
+
+    target_count = max(30, int(len(all_images) * target_ratio))
+    selected = baseline_mgr.diversity_select(baseline_dir, target_count)
+    selected_set = set(selected)
+
+    # Move unselected to backup directory
+    backup_dir = baseline_dir / "backup"
+    backup_dir.mkdir(exist_ok=True)
+    moved = 0
+    for img_path in all_images:
+        if img_path not in selected_set:
+            shutil.move(str(img_path), str(backup_dir / img_path.name))
+            moved += 1
+
+    logger.info(
+        "baseline.optimized",
+        camera_id=camera_id,
+        zone_id=zone_id,
+        selected=len(selected),
+        moved=moved,
+    )
+
+    # Audit trail
+    audit = getattr(request.app.state, "audit_logger", None)
+    if audit:
+        client_ip = request.client.host if request.client else ""
+        audit.log(
+            user="operator",
+            action="optimize_baseline",
+            target_type="baseline",
+            target_id=f"{camera_id}/{zone_id}",
+            detail=f"保留 {len(selected)} 张, 移除 {moved} 张",
+            ip_address=client_ip,
+        )
+
+    return JSONResponse({
+        "selected": len(selected),
+        "moved": moved,
+        "backup_dir": str(backup_dir),
+    })
