@@ -84,74 +84,145 @@ async def alert_image(request: Request, alert_id: str, image_type: str):
     return Response(content=path.read_bytes(), media_type="image/jpeg")
 
 
+_FEEDBACK_CATEGORIES = [
+    ("lens_glare", "镜头反光"),
+    ("insect", "昆虫"),
+    ("shadow", "光影变化"),
+    ("vibration", "相机振动"),
+    ("insulation", "保温棉脱落"),
+    ("condensation", "冷凝水/雾气"),
+    ("other", "其他"),
+]
+
+
 @router.get("/{alert_id}/detail", response_class=HTMLResponse)
 async def alert_detail(request: Request, alert_id: str):
-    """Alert detail view with large image and metadata."""
+    """Alert detail view with evidence, baseline comparison, and feedback workflow."""
     db = request.app.state.db
     if not db:
-        return HTMLResponse('<p style="color:#f44336;">数据库不可用</p>')
+        return HTMLResponse('<p style="color:var(--status-critical);">数据库不可用</p>')
 
     alert = db.get_alert(alert_id)
     if alert is None:
-        return HTMLResponse('<p style="color:#f44336;">告警不存在</p>')
+        return HTMLResponse('<p style="color:var(--status-critical);">告警不存在</p>')
 
     ts = alert.timestamp.strftime("%Y-%m-%d %H:%M:%S") if alert.timestamp else "N/A"
 
+    # Image toggle buttons
     has_snapshot = bool(alert.snapshot_path)
     has_heatmap = bool(alert.heatmap_path)
     has_composite = has_snapshot and has_heatmap
     default_type = "composite" if has_composite else ("snapshot" if has_snapshot else "")
     img_url = f"/api/alerts/{alert_id}/image/{default_type}" if default_type else ""
 
-    toggle_buttons = ""
+    toggles = []
     if has_snapshot:
-        toggles = []
-        if has_snapshot:
-            toggles.append(
-                f'<span class="img-toggle" '
-                f'onclick="document.getElementById(\'detail-img\').src='
-                f"'/api/alerts/{alert_id}/image/snapshot'\">原图</span>"
-            )
-        if has_heatmap:
-            toggles.append(
-                f'<span class="img-toggle" '
-                f'onclick="document.getElementById(\'detail-img\').src='
-                f"'/api/alerts/{alert_id}/image/heatmap'\">热力图</span>"
-            )
-        if has_composite:
-            toggles.append(
-                f'<span class="img-toggle active" '
-                f'onclick="document.getElementById(\'detail-img\').src='
-                f"'/api/alerts/{alert_id}/image/composite'\">叠加图</span>"
-            )
-        toggle_buttons = '<div style="margin-bottom:12px;">' + "".join(toggles) + "</div>"
+        toggles.append(
+            f'<span class="img-toggle" '
+            f'onclick="document.getElementById(\'detail-img\').src='
+            f"'/api/alerts/{alert_id}/image/snapshot';"
+            f'document.querySelectorAll(\'.img-toggle\').forEach(t=>t.classList.remove(\'active\'));this.classList.add(\'active\')">原图</span>'
+        )
+    if has_heatmap:
+        toggles.append(
+            f'<span class="img-toggle" '
+            f'onclick="document.getElementById(\'detail-img\').src='
+            f"'/api/alerts/{alert_id}/image/heatmap';"
+            f'document.querySelectorAll(\'.img-toggle\').forEach(t=>t.classList.remove(\'active\'));this.classList.add(\'active\')">热力图</span>'
+        )
+    if has_composite:
+        toggles.append(
+            f'<span class="img-toggle active" '
+            f'onclick="document.getElementById(\'detail-img\').src='
+            f"'/api/alerts/{alert_id}/image/composite';"
+            f'document.querySelectorAll(\'.img-toggle\').forEach(t=>t.classList.remove(\'active\'));this.classList.add(\'active\')">叠加图</span>'
+        )
+    toggle_html = f'<div style="margin-bottom:var(--space-3);">{"".join(toggles)}</div>' if toggles else ""
 
     img_html = (
         f'<img id="detail-img" src="{img_url}" '
-        f'style="max-width:100%;border-radius:6px;border:1px solid #2a2d37;" />'
+        f'style="max-width:100%;border-radius:var(--radius-md);border:1px solid var(--border-subtle);" />'
         if img_url
         else '<div class="empty-state"><div class="message">暂无图片</div></div>'
     )
 
-    ack_btn = ""
-    if not alert.acknowledged:
-        ack_btn = (
-            f'<button class="btn btn-primary" '
-            f'hx-post="/api/alerts/{alert_id}/acknowledge" '
-            f'hx-swap="outerHTML">确认告警</button>'
-        )
-    else:
-        ack_btn = f'<span style="color:#4caf50;">已确认 ({alert.acknowledged_by or "operator"})</span>'
+    # Workflow status
+    wf_status = getattr(alert, "workflow_status", "new") or "new"
+    wf_labels = {
+        "new": ("待处理", "var(--status-warn)"),
+        "acknowledged": ("已确认", "var(--status-info)"),
+        "investigating": ("调查中", "var(--status-info)"),
+        "resolved": ("已解决", "var(--status-ok)"),
+        "closed": ("已关闭", "var(--text-tertiary)"),
+        "false_positive": ("误报", "var(--status-alert)"),
+    }
+    wf_label, wf_color = wf_labels.get(wf_status, ("未知", "var(--text-tertiary)"))
 
-    fp_btn = ""
-    if not alert.false_positive:
-        fp_btn = (
-            f'<button class="btn btn-ghost" style="margin-left:8px;" '
-            f'hx-post="/api/alerts/{alert_id}/false-positive" '
-            f'hx-swap="outerHTML">标记误报</button>'
-        )
-    else:
-        fp_btn = '<span style="color:#ff9800;margin-left:8px;">已标记误报</span>'
+    # Evidence section
+    score_pct = f"{alert.anomaly_score * 100:.1f}%" if alert.anomaly_score else "—"
+
+    # Action buttons based on current workflow state
+    actions_html = ""
+    if wf_status == "new":
+        actions_html = f"""
+        <div class="flex gap-8" style="flex-wrap:wrap;">
+            <button class="btn btn-primary"
+                    hx-post="/api/alerts/{alert_id}/workflow" hx-vals='{{"status":"acknowledged"}}'
+                    hx-target="#alert-modal-content" hx-swap="innerHTML">确认真实</button>
+            <button class="btn btn-ghost"
+                    onclick="document.getElementById('fp-form-{alert_id}').style.display='block'">标记误报</button>
+            <button class="btn btn-ghost"
+                    hx-post="/api/alerts/{alert_id}/workflow" hx-vals='{{"status":"investigating","assigned_to":"班组长"}}'
+                    hx-target="#alert-modal-content" hx-swap="innerHTML">升级给班组长</button>
+        </div>"""
+    elif wf_status == "acknowledged":
+        actions_html = f"""
+        <div class="flex gap-8">
+            <button class="btn btn-success btn-sm"
+                    hx-post="/api/alerts/{alert_id}/workflow" hx-vals='{{"status":"resolved"}}'
+                    hx-target="#alert-modal-content" hx-swap="innerHTML">标记已解决</button>
+        </div>"""
+    elif wf_status == "investigating":
+        actions_html = f"""
+        <div class="flex gap-8">
+            <button class="btn btn-success btn-sm"
+                    hx-post="/api/alerts/{alert_id}/workflow" hx-vals='{{"status":"resolved"}}'
+                    hx-target="#alert-modal-content" hx-swap="innerHTML">标记已解决</button>
+        </div>"""
+
+    # False positive feedback form (hidden by default)
+    fp_options = "".join(
+        f'<option value="{val}">{label}</option>' for val, label in _FEEDBACK_CATEGORIES
+    )
+    fp_form = f"""
+    <div id="fp-form-{alert_id}" class="card mt-16" style="display:none;border:1px solid var(--status-warn);">
+        <h3 style="color:var(--status-warn-text);">标记为误报</h3>
+        <form hx-post="/api/alerts/{alert_id}/workflow" hx-target="#alert-modal-content" hx-swap="innerHTML">
+            <input type="hidden" name="status" value="false_positive">
+            <div class="form-group">
+                <label class="form-label">误报分类</label>
+                <select name="category" class="form-select">{fp_options}</select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">备注（可选）</label>
+                <textarea name="notes" class="form-textarea" rows="2" placeholder="简要描述误报原因..."></textarea>
+            </div>
+            <div class="flex gap-8">
+                <button type="submit" class="btn btn-warning">确认标记误报</button>
+                <button type="button" class="btn btn-ghost"
+                        onclick="this.closest('[id^=fp-form]').style.display='none'">取消</button>
+            </div>
+        </form>
+    </div>"""
+
+    # Notes display
+    notes_html = ""
+    if alert.notes:
+        notes_html = f"""
+        <div class="card mt-16" style="border-left:3px solid var(--status-info);">
+            <h3>备注</h3>
+            <p style="font-size:var(--text-sm);color:var(--text-secondary);">{alert.notes}</p>
+        </div>"""
 
     close_btn = (
         '<button class="modal-close" '
@@ -161,30 +232,31 @@ async def alert_detail(request: Request, alert_id: str):
 
     return HTMLResponse(f"""
     {close_btn}
-    <div style="display:flex;gap:24px;flex-wrap:wrap;">
+    <div style="display:flex;gap:var(--space-5);flex-wrap:wrap;">
         <div style="flex:1;min-width:400px;">
-            {toggle_buttons}
+            {toggle_html}
             {img_html}
         </div>
-        <div style="flex:0 0 280px;">
-            <h3 style="color:#4fc3f7;margin-bottom:16px;">告警详情</h3>
-            <table style="font-size:13px;">
-                <tr><td style="color:#8890a0;padding:6px 12px 6px 0;">告警ID</td>
-                    <td style="padding:6px 0;font-size:12px;">{alert.alert_id}</td></tr>
-                <tr><td style="color:#8890a0;padding:6px 12px 6px 0;">时间</td>
-                    <td style="padding:6px 0;">{ts}</td></tr>
-                <tr><td style="color:#8890a0;padding:6px 12px 6px 0;">摄像头</td>
-                    <td style="padding:6px 0;">{alert.camera_id}</td></tr>
-                <tr><td style="color:#8890a0;padding:6px 12px 6px 0;">区域</td>
-                    <td style="padding:6px 0;">{alert.zone_id}</td></tr>
-                <tr><td style="color:#8890a0;padding:6px 12px 6px 0;">严重度</td>
-                    <td style="padding:6px 0;">{status_badge(alert.severity)}</td></tr>
-                <tr><td style="color:#8890a0;padding:6px 12px 6px 0;">异常分数</td>
-                    <td style="padding:6px 0;">{alert.anomaly_score:.4f}</td></tr>
+        <div style="flex:0 0 320px;">
+            <div class="flex-between mb-16">
+                <h3 style="color:var(--status-info-text);">告警详情</h3>
+                <span style="color:{wf_color};font-size:var(--text-sm);font-weight:var(--font-semibold);">{wf_label}</span>
+            </div>
+            <table>
+                <tr><td style="color:var(--text-secondary);">告警ID</td>
+                    <td class="mono" style="font-size:var(--text-xs);">{alert.alert_id}</td></tr>
+                <tr><td style="color:var(--text-secondary);">时间</td><td>{ts}</td></tr>
+                <tr><td style="color:var(--text-secondary);">摄像头</td><td>{alert.camera_id}</td></tr>
+                <tr><td style="color:var(--text-secondary);">区域</td><td>{alert.zone_id}</td></tr>
+                <tr><td style="color:var(--text-secondary);">严重度</td><td>{status_badge(alert.severity)}</td></tr>
+                <tr><td style="color:var(--text-secondary);">异常分数</td><td>{alert.anomaly_score:.4f} ({score_pct})</td></tr>
             </table>
-            <div style="margin-top:20px;">{ack_btn}{fp_btn}</div>
+
+            <div style="margin-top:var(--space-5);">{actions_html}</div>
         </div>
-    </div>""")
+    </div>
+    {fp_form}
+    {notes_html}""")
 
 
 # ── Main alerts list ──
@@ -215,8 +287,8 @@ async def alerts_list(
         cnt_low = db.get_alert_count(severity="low")
         cnt_info = db.get_alert_count(severity="info")
         stats_html = f"""
-        <div class="flex gap-16 mb-16" style="font-size:13px;color:#8890a0;">
-            <span>总计: <strong style="color:#e0e0e0;">{total_all}</strong></span>
+        <div class="flex gap-16 mb-16" style="font-size:var(--text-sm);color:var(--text-secondary);">
+            <span>总计: <strong style="color:var(--text-primary);">{total_all}</strong></span>
             <span>{status_badge("high")} {cnt_high}</span>
             <span>{status_badge("medium")} {cnt_medium}</span>
             <span>{status_badge("low")} {cnt_low}</span>
@@ -252,7 +324,7 @@ async def alerts_list(
                 onchange="window.location.href='{base_url}severity='+this.value+'{cam_param}'">
             {severity_options}
         </select>
-        <span style="color:#8890a0;font-size:13px;">共 {total} 条告警</span>
+        <span style="color:var(--text-secondary);font-size:var(--text-sm);">共 {total} 条告警</span>
         <div style="margin-left:auto;">
             <a href="/api/alerts/export-csv?{cam_param.lstrip('&')}{sev_param}" class="btn btn-ghost btn-sm" download>导出CSV</a>
         </div>
@@ -263,7 +335,7 @@ async def alerts_list(
     for a in alerts:
         ts = a.timestamp.strftime("%Y-%m-%d %H:%M:%S") if a.timestamp else ""
 
-        thumb = '<span style="color:#616161;font-size:11px;">—</span>'
+        thumb = '<span style="color:var(--text-tertiary);font-size:var(--text-xs);">—</span>'
         if a.snapshot_path:
             img_type = "composite" if a.heatmap_path else "snapshot"
             thumb = (
@@ -275,13 +347,13 @@ async def alerts_list(
             )
 
         ack_html = (
-            '<span style="color:#4caf50;font-size:12px;">已确认</span>'
+            '<span style="color:var(--status-ok-text);font-size:var(--text-xs);">已确认</span>'
             if a.acknowledged else
             f'<button class="btn btn-sm btn-primary" '
             f'hx-post="/api/alerts/{a.alert_id}/acknowledge" hx-swap="outerHTML">确认</button>'
         )
         fp_html = (
-            '<span style="color:#ff9800;font-size:12px;">误报</span>'
+            '<span style="color:var(--status-warn-text);font-size:var(--text-xs);">误报</span>'
             if a.false_positive else
             f'<button class="btn btn-sm btn-ghost" '
             f'hx-post="/api/alerts/{a.alert_id}/false-positive" hx-swap="outerHTML">标记</button>'
@@ -291,7 +363,7 @@ async def alerts_list(
         <tr>
             <td class="checkbox-cell"><input type="checkbox" name="alert_ids" value="{a.alert_id}" onchange="updateBulkBar()"></td>
             <td>{thumb}</td>
-            <td style="font-size:12px;">{a.alert_id[:24]}</td>
+            <td class="mono" style="font-size:var(--text-xs);">{a.alert_id[:24]}</td>
             <td>{ts}</td>
             <td>{a.camera_id}</td>
             <td>{a.zone_id}</td>
@@ -302,7 +374,7 @@ async def alerts_list(
         </tr>"""
 
     if not rows:
-        rows = '<tr><td colspan="10" style="color:#616161;text-align:center;padding:24px;">暂无告警记录</td></tr>'
+        rows = '<tr><td colspan="10" style="color:var(--text-tertiary);text-align:center;padding:var(--space-5);">暂无告警记录</td></tr>'
 
     # Pagination
     total_pages = max(1, (total + page_size - 1) // page_size)
@@ -314,7 +386,7 @@ async def alerts_list(
         pagination = f"""
         <div style="display:flex;justify-content:center;gap:12px;margin-top:16px;align-items:center;">
             <a href="/alerts?page={page-1}{params}" class="btn btn-sm btn-ghost"{prev_cls}>上一页</a>
-            <span style="color:#8890a0;font-size:13px;">第 {page}/{total_pages} 页</span>
+            <span style="color:var(--text-secondary);font-size:var(--text-sm);">第 {page}/{total_pages} 页</span>
             <a href="/alerts?page={page+1}{params}" class="btn btn-sm btn-ghost"{next_cls}>下一页</a>
         </div>"""
 
@@ -379,6 +451,47 @@ async def alerts_list(
         </div>
     </div>
     {bulk_js}""")
+
+
+# ── Workflow transition ──
+
+@router.post("/{alert_id}/workflow")
+async def alert_workflow_transition(request: Request, alert_id: str):
+    """Transition alert workflow status (confirm/false_positive/resolve/escalate)."""
+    db = request.app.state.db
+    if not db:
+        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+
+    # Accept both JSON and form data
+    content_type = request.headers.get("content-type", "")
+    if "json" in content_type:
+        data = await request.json()
+    else:
+        form = await request.form()
+        data = dict(form)
+
+    new_status = data.get("status", "")
+    notes = data.get("notes", "")
+    category = data.get("category", "")
+    assigned_to = data.get("assigned_to", "")
+
+    if category and notes:
+        notes = f"[{category}] {notes}"
+    elif category:
+        notes = f"[{category}]"
+
+    valid_statuses = {"acknowledged", "investigating", "resolved", "closed", "false_positive"}
+    if new_status not in valid_statuses:
+        return JSONResponse({"error": f"无效状态: {new_status}"}, status_code=400)
+
+    success = db.update_alert_workflow(
+        alert_id, new_status, notes=notes or None, assigned_to=assigned_to or None,
+    )
+    if not success:
+        return JSONResponse({"error": "告警不存在"}, status_code=404)
+
+    # Re-render the detail view
+    return await alert_detail(request, alert_id)
 
 
 # ── Bulk operations ──
