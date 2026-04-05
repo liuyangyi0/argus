@@ -531,6 +531,12 @@ tr:hover { background: var(--bg-raised); }
 
 .camera-card:hover { border-color: var(--border-strong); }
 
+.camera-list-card {
+  cursor: pointer;
+  transition: border-color var(--duration-fast) var(--easing-default);
+}
+.camera-list-card:hover { border-left-color: var(--status-info) !important; }
+
 .camera-card .header {
   padding: var(--space-3) var(--space-4);
   display: flex;

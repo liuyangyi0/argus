@@ -15,7 +15,6 @@ from argus.dashboard.components import (
     page_header,
     pipeline_stepper,
     status_dot,
-    tab_bar,
 )
 
 logger = structlog.get_logger()
@@ -35,20 +34,27 @@ class AddCameraRequest(BaseModel):
     resolution: list[int] = [1920, 1080]
 
 
-def _get_lifecycle_stages(request: Request, camera_id: str) -> list[dict]:
-    """Determine camera's current lifecycle stage for Pipeline Stepper."""
+_STAGE_IDS = ["capture", "review", "training", "deploy", "inference"]
+_STAGE_NAMES = {"capture": "采集", "review": "基线审查", "training": "训练", "deploy": "发布", "inference": "推理"}
+
+
+def _get_lifecycle_stages(request: Request, camera_id: str, *, cam_status=None) -> list[dict]:
+    """Determine camera's current lifecycle stage for Pipeline Stepper.
+
+    Args:
+        cam_status: Pre-fetched CameraStatus to avoid redundant get_status() calls.
+    """
     baseline_mgr = getattr(request.app.state, "baseline_manager", None)
     database = getattr(request.app.state, "database", None)
-    camera_manager = request.app.state.camera_manager
+    camera_manager = getattr(request.app.state, "camera_manager", None)
 
     # Stage 1: Capture
-    has_baselines = False
     baseline_count = 0
     if baseline_mgr:
         baseline_count = baseline_mgr.count_images(camera_id)
-        has_baselines = baseline_count > 0
+    has_baselines = baseline_count > 0
 
-    # Stage 2: Baseline verified (auto-pass for now)
+    # Stage 2: Baseline verified (auto-pass for now, future: explicit approval)
     baseline_verified = has_baselines
 
     # Stage 3: Training
@@ -68,43 +74,45 @@ def _get_lifecycle_stages(request: Request, camera_id: str) -> list[dict]:
             if det_status and det_status.get("mode") == "anomalib":
                 deployed = True
         except Exception:
-            pass
+            logger.debug("lifecycle.detector_status_failed", camera_id=camera_id, exc_info=True)
 
-    # Stage 5: Inference running
+    # Stage 5: Inference running (use pre-fetched status to avoid N+1)
     inferring = False
-    if camera_manager:
+    if cam_status is not None:
+        inferring = bool(cam_status.connected and cam_status.stats and cam_status.stats.frames_analyzed > 0)
+    elif camera_manager:
         for s in camera_manager.get_status():
             if s.camera_id == camera_id and s.connected and s.stats and s.stats.frames_analyzed > 0:
                 inferring = True
+                break
 
-    def _stage(done, active_check):
+    # Determine status per stage
+    stages_done = [has_baselines, baseline_verified, training_done, deployed, inferring]
+    first_incomplete = next((i for i, done in enumerate(stages_done) if not done), None)
+
+    def _status(idx, done):
         if done:
             return "completed"
-        if active_check:
-            return "active"
-        return "pending"
+        return "active" if first_incomplete == idx else "pending"
 
-    # Find the first incomplete stage
-    first_incomplete = None
-    stages_done = [has_baselines, baseline_verified, training_done, deployed, inferring]
-    for i, done in enumerate(stages_done):
-        if not done:
-            first_incomplete = i
-            break
-
-    steps = [
-        {"name": "采集", "status": "completed" if has_baselines else ("active" if first_incomplete == 0 else "pending"),
-         "info": f"{baseline_count} 帧" if baseline_count else ""},
-        {"name": "基线审查", "status": "completed" if baseline_verified else ("active" if first_incomplete == 1 else "pending"),
-         "info": "已通过" if baseline_verified else ""},
-        {"name": "训练", "status": "completed" if training_done else ("active" if first_incomplete == 2 else "pending"),
-         "info": training_info},
-        {"name": "发布", "status": "completed" if deployed else ("active" if first_incomplete == 3 else "pending"),
-         "info": "已部署" if deployed else ""},
-        {"name": "推理", "status": "completed" if inferring else ("active" if first_incomplete == 4 else "pending"),
-         "info": "运行中" if inferring else ""},
+    infos = [
+        f"{baseline_count} 帧" if baseline_count else "",
+        "已通过" if baseline_verified else "",
+        training_info,
+        "已部署" if deployed else "",
+        "运行中" if inferring else "",
     ]
-    return steps
+
+    return [
+        {"id": _STAGE_IDS[i], "name": _STAGE_NAMES[_STAGE_IDS[i]],
+         "status": _status(i, stages_done[i]), "info": infos[i]}
+        for i in range(5)
+    ]
+
+
+def _find_camera(camera_manager, camera_id: str):
+    """Find a single camera status from the manager. Returns None if not found."""
+    return next((s for s in camera_manager.get_status() if s.camera_id == camera_id), None)
 
 
 @router.get("", response_class=HTMLResponse)
@@ -123,8 +131,8 @@ async def cameras_page(request: Request):
         status_text = "在线" if cam.connected else "离线"
         border_var = "var(--status-ok)" if cam.connected else "var(--border-default)"
 
-        # Lifecycle stage summary
-        stages = _get_lifecycle_stages(request, cam.camera_id)
+        # Lifecycle stage summary (pass pre-fetched status to avoid N+1)
+        stages = _get_lifecycle_stages(request, cam.camera_id, cam_status=cam)
         active_stage = next((s for s in stages if s["status"] == "active"), None)
         stage_label = active_stage["name"] if active_stage else "就绪"
 
@@ -135,11 +143,9 @@ async def cameras_page(request: Request):
         latency = f"{cam.stats.avg_latency_ms:.0f}ms" if cam.stats and cam.stats.avg_latency_ms > 0 else "—"
 
         camera_cards += f"""
-        <div class="card" style="border-left:3px solid {border_var};cursor:pointer;transition:border-color 0.15s;"
+        <div class="card camera-list-card" style="border-left:3px solid {border_var};"
              hx-get="/api/cameras/{cam.camera_id}/detail" hx-target="#content" hx-swap="innerHTML"
-             hx-push-url="/cameras?cam={cam.camera_id}"
-             onmouseenter="this.style.borderColor='var(--status-info)'"
-             onmouseleave="this.style.borderColor='{border_var}'">
+             hx-push-url="/cameras?cam={cam.camera_id}">
             <div class="flex-between mb-8">
                 <div>
                     <span style="font-size:var(--text-lg);font-weight:var(--font-semibold);">
@@ -175,13 +181,7 @@ async def camera_detail(request: Request, camera_id: str):
     if not camera_manager:
         return HTMLResponse(empty_state("摄像头管理器不可用"))
 
-    # Find camera status
-    cam = None
-    for s in camera_manager.get_status():
-        if s.camera_id == camera_id:
-            cam = s
-            break
-
+    cam = _find_camera(camera_manager, camera_id)
     if cam is None:
         return HTMLResponse(empty_state(f"摄像头 {camera_id} 不存在"))
 
@@ -199,13 +199,13 @@ async def camera_detail(request: Request, camera_id: str):
     next_action = ""
     if active_stage:
         action_map = {
-            "采集": ("开始采集基线", f"/api/baseline/capture?camera_id={camera_id}"),
-            "基线审查": ("审查基线", f"/api/baseline/list?camera_id={camera_id}"),
-            "训练": ("开始训练", f"/api/baseline/train?camera_id={camera_id}"),
-            "发布": ("部署模型", f"/api/cameras/{camera_id}/deploy-panel"),
-            "推理": ("查看实时状态", f"/api/cameras/{camera_id}/live"),
+            "capture": ("开始采集基线", f"/api/baseline/capture?camera_id={camera_id}"),
+            "review": ("审查基线", f"/api/baseline/list?camera_id={camera_id}"),
+            "training": ("开始训练", f"/api/baseline/train?camera_id={camera_id}"),
+            "deploy": ("部署模型", f"/api/cameras/{camera_id}/deploy-panel"),
+            "inference": ("查看实时状态", f"/api/cameras/{camera_id}/live"),
         }
-        label, url = action_map.get(active_stage["name"], ("", ""))
+        label, url = action_map.get(active_stage["id"], ("", ""))
         if label:
             next_action = (
                 f'<button class="btn btn-primary" hx-get="{url}" '
@@ -274,12 +274,7 @@ async def camera_live_panel(request: Request, camera_id: str):
     if not camera_manager:
         return HTMLResponse(empty_state("不可用"))
 
-    cam = None
-    for s in camera_manager.get_status():
-        if s.camera_id == camera_id:
-            cam = s
-            break
-
+    cam = _find_camera(camera_manager, camera_id)
     if cam is None:
         return HTMLResponse(empty_state("摄像头未找到"))
 
@@ -369,7 +364,7 @@ async def camera_deploy_panel(request: Request, camera_id: str):
                     <tr><td style="color:var(--text-secondary);">阈值</td><td>{threshold}</td></tr>
                 </table>"""
         except Exception:
-            pass
+            logger.debug("deploy_panel.detector_status_failed", camera_id=camera_id, exc_info=True)
 
     # Latest training info
     train_html = ""
