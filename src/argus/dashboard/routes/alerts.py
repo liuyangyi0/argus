@@ -84,6 +84,15 @@ async def alert_image(request: Request, alert_id: str, image_type: str):
     return Response(content=path.read_bytes(), media_type="image/jpeg")
 
 
+_WF_LABELS = {
+    "new": ("待处理", "var(--status-warn)"),
+    "acknowledged": ("已确认", "var(--status-info)"),
+    "investigating": ("调查中", "var(--status-info)"),
+    "resolved": ("已解决", "var(--status-ok)"),
+    "closed": ("已关闭", "var(--text-tertiary)"),
+    "false_positive": ("误报", "var(--status-alert)"),
+}
+
 _FEEDBACK_CATEGORIES = [
     ("lens_glare", "镜头反光"),
     ("insect", "昆虫"),
@@ -148,15 +157,7 @@ async def alert_detail(request: Request, alert_id: str):
 
     # Workflow status
     wf_status = getattr(alert, "workflow_status", "new") or "new"
-    wf_labels = {
-        "new": ("待处理", "var(--status-warn)"),
-        "acknowledged": ("已确认", "var(--status-info)"),
-        "investigating": ("调查中", "var(--status-info)"),
-        "resolved": ("已解决", "var(--status-ok)"),
-        "closed": ("已关闭", "var(--text-tertiary)"),
-        "false_positive": ("误报", "var(--status-alert)"),
-    }
-    wf_label, wf_color = wf_labels.get(wf_status, ("未知", "var(--text-tertiary)"))
+    wf_label, wf_color = _WF_LABELS.get(wf_status, ("未知", "var(--text-tertiary)"))
 
     # Evidence section
     score_pct = f"{alert.anomaly_score * 100:.1f}%" if alert.anomaly_score else "—"

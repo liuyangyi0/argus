@@ -62,6 +62,7 @@ async def overview(request: Request):
     # Gather metrics
     total_alerts = 0
     high_alerts = 0
+    medium_alerts = 0
     cameras_status = []
     system_status = "offline"
     uptime = "0s"
@@ -75,6 +76,7 @@ async def overview(request: Request):
     if db:
         try:
             high_alerts = db.get_alert_count(severity="high")
+            medium_alerts = db.get_alert_count(severity="medium")
         except Exception:
             pass
 
@@ -139,24 +141,18 @@ async def overview(request: Request):
     # ── Pending actions — the "what to do right now" section ──
     pending_items = []
 
-    # Pending alerts (unacknowledged HIGH/MEDIUM)
-    if db:
-        try:
-            unack_high = db.get_alert_count(severity="high")
-            unack_med = db.get_alert_count(severity="medium")
-            pending_alert_count = unack_high + unack_med
-            if pending_alert_count > 0:
-                pending_items.append(
-                    f'<div class="flex-between" style="padding:var(--space-3) 0;'
-                    f'border-bottom:1px solid var(--border-subtle);">'
-                    f'<span style="color:var(--status-critical-text);">'
-                    f'待处理告警 <strong>{pending_alert_count}</strong> 条'
-                    f'</span>'
-                    f'<a href="/alerts" class="btn btn-sm btn-primary">处理</a>'
-                    f'</div>'
-                )
-        except Exception:
-            pass
+    # Pending alerts (HIGH/MEDIUM, reuse counts from above)
+    pending_alert_count = high_alerts + medium_alerts
+    if pending_alert_count > 0:
+        pending_items.append(
+            f'<div class="flex-between" style="padding:var(--space-3) 0;'
+            f'border-bottom:1px solid var(--border-subtle);">'
+            f'<span style="color:var(--status-critical-text);">'
+            f'待处理告警 <strong>{pending_alert_count}</strong> 条'
+            f'</span>'
+            f'<a href="/alerts" class="btn btn-sm btn-primary">处理</a>'
+            f'</div>'
+        )
 
     # Running tasks
     task_manager = getattr(request.app.state, "task_manager", None)
@@ -196,7 +192,7 @@ async def overview(request: Request):
             {"".join(pending_items)}
         </div>"""
     else:
-        pending_html = f"""
+        pending_html = """
         <div class="card" style="border-left:3px solid var(--status-ok);">
             <h3>待办事项</h3>
             <p style="color:var(--text-tertiary);padding:var(--space-2) 0;">暂无待办 — 一切正常</p>

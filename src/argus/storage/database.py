@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
@@ -163,8 +163,6 @@ class Database:
         assigned_to: str | None = None,
     ) -> bool:
         """Transition alert workflow status with optional notes/assignment."""
-        from datetime import datetime, timezone
-
         with self.get_session() as session:
             record = session.scalar(
                 select(AlertRecord).where(AlertRecord.alert_id == alert_id)
