@@ -36,9 +36,9 @@ Phase D: 高级检测
 
 ---
 
-### A1: CUSUM 时序证据累积
+### A1: CUSUM 时序证据累积 ✅ 已修改完
 
-#### A1-1: 修改 _AnomalyTracker 数据结构
+#### A1-1: 修改 _AnomalyTracker 数据结构 ✅ 已修改完
 
 **目标**: 将硬计数器 `consecutive_count` 替换为浮点证据 `evidence`。
 
@@ -72,7 +72,7 @@ Phase D: 高级检测
 
 ---
 
-#### A1-2: 重写 evaluate() 时序逻辑
+#### A1-2: 重写 evaluate() 时序逻辑 ✅ 已修改完
 
 **目标**: 用指数衰减证据替换硬计数。
 
@@ -152,7 +152,7 @@ if tracker.evidence < self._config.temporal.evidence_threshold:
 
 ---
 
-#### A1-3: 添加 CUSUM 配置参数
+#### A1-3: 添加 CUSUM 配置参数 ✅ 已修改完
 
 **目标**: 在 `TemporalConfirmation` 中添加 `evidence_lambda` 和 `evidence_threshold`。
 
@@ -194,7 +194,7 @@ if tracker.evidence < self._config.temporal.evidence_threshold:
 
 ---
 
-#### A1-4: 补充 CUSUM 单元测试
+#### A1-4: 补充 CUSUM 单元测试 ✅ 已修改完
 
 **目标**: 验证 CUSUM 行为的所有关键场景。
 
@@ -239,9 +239,9 @@ class TestCUSUMEvidence:
 
 ---
 
-### A2: Conformal Prediction 分数校准
+### A2: Conformal Prediction 分数校准 ✅ 已修改完
 
-#### A2-1: 创建 ConformalCalibrator 核心类
+#### A2-1: 创建 ConformalCalibrator 核心类 ✅ 已修改完
 
 **目标**: 实现 conformal prediction 的分位数校准逻辑。
 
@@ -393,7 +393,7 @@ class ConformalCalibrator:
 
 ---
 
-#### A2-2: 添加校准配置
+#### A2-2: 添加校准配置 ✅ 已修改完
 
 **目标**: 在 schema.py 中添加 `CalibrationConfig`。
 
@@ -429,7 +429,7 @@ class ConformalCalibrator:
 
 ---
 
-#### A2-3: 集成校准到训练流程
+#### A2-3: 集成校准到训练流程 ✅ 已修改完
 
 **目标**: 训练完成后自动跑校准，存储阈值。
 
@@ -473,7 +473,7 @@ if len(cal_scores) >= 50:
 
 ---
 
-#### A2-4: Grader 加载校准阈值
+#### A2-4: Grader 加载校准阈值 ✅ 已修改完
 
 **目标**: `AlertGrader` 初始化时尝试加载校准阈值，成功则覆盖手动阈值。
 
@@ -510,7 +510,7 @@ if len(cal_scores) >= 50:
 
 ---
 
-#### A2-5: 校准单元测试
+#### A2-5: 校准单元测试 ✅ 已修改完
 
 **新建文件**: `tests/unit/test_calibration.py`
 
@@ -539,9 +539,9 @@ def test_calibrate_with_uniform_scores():
 
 ---
 
-### A3: Simplex 双通道安全架构
+### A3: Simplex 双通道安全架构 ✅ 已修改完
 
-#### A3-1: 创建 SimplexDetector 核心类
+#### A3-1: 创建 SimplexDetector 核心类 ✅ 已修改完
 
 **目标**: 纯 OpenCV 的帧差分检测器，无 ML 依赖。
 
@@ -731,7 +731,7 @@ class SimplexDetector:
 
 ---
 
-#### A3-2: Simplex 配置
+#### A3-2: Simplex 配置 ✅ 已修改完
 
 **修改文件**: `src/argus/config/schema.py`
 
@@ -756,7 +756,7 @@ simplex: SimplexConfig = Field(default_factory=SimplexConfig)
 
 ---
 
-#### A3-3: 集成 Simplex 到 Pipeline
+#### A3-3: 集成 Simplex 到 Pipeline ✅ 已修改完
 
 **修改文件**: `src/argus/core/pipeline.py`
 
@@ -804,7 +804,7 @@ simplex: SimplexConfig = Field(default_factory=SimplexConfig)
 
 ---
 
-#### A3-4: Simplex 单元测试
+#### A3-4: Simplex 单元测试 ✅ 已修改完
 
 **新建文件**: `tests/unit/test_simplex.py`
 
@@ -833,9 +833,9 @@ def test_reference_frame_required():
 
 ---
 
-### A4: 主动学习基线采集
+### A4: 主动学习基线采集 ✅ 已修改完
 
-#### A4-1: 实现多样性选择算法
+#### A4-1: 实现多样性选择算法 ✅ 已修改完
 
 **修改文件**: `src/argus/anomaly/baseline.py`
 
@@ -914,7 +914,7 @@ def diversity_select(
 
 ---
 
-#### A4-2: Dashboard 集成优化按钮
+#### A4-2: Dashboard 集成优化按钮 ✅ 已修改完
 
 **修改文件**: `src/argus/dashboard/routes/baseline.py`
 
@@ -952,7 +952,7 @@ def diversity_select(
 
 ---
 
-#### A4-3: 基线多样性测试
+#### A4-3: 基线多样性测试 ✅ 已修改完
 
 **修改文件**: `tests/unit/test_baseline.py`
 
@@ -974,9 +974,9 @@ def test_diversity_select_returns_sorted_paths():
 
 ---
 
-### B1: Dinomaly2 配置与训练集成
+### B1: Dinomaly2 配置与训练集成 ✅ 已修改完
 
-#### B1-1: 验证 Anomalib 中 Dinomaly2 可用性
+#### B1-1: 验证 Anomalib 中 Dinomaly2 可用性 ✅ 已修改完
 
 **目标**: 确认当前 anomalib 版本是否包含 Dinomaly/Dinomaly2，如果不包含则确定升级路径。
 
@@ -1007,7 +1007,7 @@ python -c "from anomalib.models import get_model; help(get_model)"
 
 ---
 
-#### B1-2: 添加 Dinomaly2 配置
+#### B1-2: 添加 Dinomaly2 配置 ✅ 已修改完
 
 **修改文件**: `src/argus/config/schema.py`
 
@@ -1048,7 +1048,7 @@ python -c "from anomalib.models import get_model; help(get_model)"
 
 ---
 
-#### B1-3: 实现 Dinomaly2 训练路径
+#### B1-3: 实现 Dinomaly2 训练路径 ✅ 已修改完
 
 **修改文件**: `src/argus/anomaly/trainer.py`
 
@@ -1097,7 +1097,7 @@ elif model_type == "efficient_ad":
 
 ---
 
-#### B1-4: 验证 Dinomaly2 推理兼容性
+#### B1-4: 验证 Dinomaly2 推理兼容性 ✅ 已修改完
 
 **修改文件**: `src/argus/anomaly/detector.py`
 
@@ -1134,7 +1134,7 @@ elif model_type == "efficient_ad":
 
 ---
 
-#### B1-5: 多摄像头共享模型（可选）
+#### B1-5: 多摄像头共享模型（可选） ✅ 已修改完
 
 **目标**: Dinomaly2 的多类统一模型允许多台摄像头共享一个模型实例。
 
@@ -1169,7 +1169,7 @@ elif model_type == "efficient_ad":
 
 ---
 
-#### B1-6: Dinomaly2 集成测试
+#### B1-6: Dinomaly2 集成测试 ✅ 已修改完
 
 **修改文件**: `tests/unit/test_config.py` + 新建 `tests/unit/test_dinomaly.py`
 
@@ -1192,9 +1192,9 @@ def test_dinomaly2_predict_returns_valid_result():
 
 ---
 
-### B2: INT8 量化导出
+### B2: INT8 量化导出 ✅ 已修改完
 
-#### B2-1: 添加量化配置
+#### B2-1: 添加量化配置 ✅ 已修改完
 
 **修改文件**: `src/argus/config/schema.py`
 
@@ -1214,7 +1214,7 @@ quantization_calibration_images: int = Field(
 
 ---
 
-#### B2-2: 实现 INT8 PTQ 量化流程
+#### B2-2: 实现 INT8 PTQ 量化流程 ✅ 已修改完
 
 **修改文件**: `scripts/export_model.py` + `src/argus/anomaly/trainer.py`
 
@@ -1258,7 +1258,7 @@ quantization_calibration_images: int = Field(
 
 ---
 
-#### B2-3: 量化精度验证
+#### B2-3: 量化精度验证 ✅ 已修改完
 
 **修改文件**: `src/argus/anomaly/trainer.py`
 
@@ -1287,7 +1287,7 @@ if max_diff > 0.1:  # 10% max score deviation
 
 ---
 
-#### B2-4: 量化测试
+#### B2-4: 量化测试 ✅ 已修改完
 
 **新建文件**: `tests/unit/test_quantization.py`
 
@@ -1305,9 +1305,9 @@ def test_int8_requires_calibration_images():
 
 ---
 
-### C1: 摄像头健康层
+### C1: 摄像头健康层 ✅ 已修改完
 
-#### C1-1: 创建 CameraHealthAnalyzer 核心类
+#### C1-1: ✅ 创建 CameraHealthAnalyzer 核心类
 
 **新建文件**: `src/argus/capture/health.py`
 
@@ -1510,7 +1510,7 @@ class CameraHealthAnalyzer:
 
 ---
 
-#### C1-2: 健康层配置
+#### C1-2: ✅ 健康层配置
 
 **修改文件**: `src/argus/config/schema.py`
 
@@ -1538,7 +1538,7 @@ health: CameraHealthConfig = Field(default_factory=CameraHealthConfig)
 
 ---
 
-#### C1-3: 集成到 Pipeline
+#### C1-3: ✅ 集成到 Pipeline
 
 **修改文件**: `src/argus/core/pipeline.py`
 
@@ -1560,7 +1560,7 @@ if self._health_analyzer:
 
 ---
 
-#### C1-4: HealthMonitor 扩展
+#### C1-4: ✅ HealthMonitor 扩展
 
 **修改文件**: `src/argus/core/health.py`
 
@@ -1575,7 +1575,7 @@ health_warnings: list[str] = field(default_factory=list)
 
 ---
 
-#### C1-5: Dashboard 健康指标显示
+#### C1-5: ✅ Dashboard 健康指标显示
 
 **修改文件**: `src/argus/dashboard/routes/cameras.py`
 
@@ -1587,7 +1587,7 @@ health_warnings: list[str] = field(default_factory=list)
 
 ---
 
-#### C1-6: 健康层测试
+#### C1-6: ✅ 健康层测试
 
 **新建文件**: `tests/unit/test_camera_health.py`
 
@@ -1613,9 +1613,9 @@ def test_displacement_accumulation():
 
 ---
 
-### C2: KS 漂移监控
+### C2: KS 漂移监控 ✅ 已修改完
 
-#### C2-1: 创建 DriftDetector 核心类
+#### C2-1: ✅ 创建 DriftDetector 核心类
 
 **新建文件**: `src/argus/anomaly/drift.py`
 
@@ -1762,7 +1762,7 @@ class DriftDetector:
 
 ---
 
-#### C2-2: 漂移配置
+#### C2-2: ✅ 漂移配置
 
 **修改文件**: `src/argus/config/schema.py`
 
@@ -1783,7 +1783,7 @@ drift: DriftConfig = Field(default_factory=DriftConfig)
 
 ---
 
-#### C2-3: 集成到 Pipeline
+#### C2-3: ✅ 集成到 Pipeline
 
 **修改文件**: `src/argus/core/pipeline.py`
 
@@ -1795,7 +1795,7 @@ if self._drift_detector:
 
 ---
 
-#### C2-4: 漂移测试
+#### C2-4: ✅ 漂移测试
 
 **新建文件**: `tests/unit/test_drift.py`
 
@@ -1815,9 +1815,9 @@ def test_insufficient_samples_no_check():
 
 ---
 
-### C3: 跨摄像头关联
+### C3: 跨摄像头关联 ✅ 已修改完
 
-#### C3-1: 创建 CrossCameraCorrelator
+#### C3-1: ✅ 创建 CrossCameraCorrelator
 
 **新建文件**: `src/argus/core/correlation.py`
 
@@ -1962,7 +1962,7 @@ class CrossCameraCorrelator:
 
 ---
 
-#### C3-2: 跨摄像头配置
+#### C3-2: ✅ 跨摄像头配置
 
 **修改文件**: `src/argus/config/schema.py`
 
@@ -1992,7 +1992,7 @@ cross_camera: CrossCameraConfig = Field(default_factory=CrossCameraConfig)
 
 ---
 
-#### C3-3: 集成到 CameraManager
+#### C3-3: ✅ 集成到 CameraManager
 
 **修改文件**: `src/argus/capture/manager.py`
 
@@ -2010,7 +2010,7 @@ if self._correlator and alert:
 
 ---
 
-#### C3-4: Alert 加 corroborated 字段
+#### C3-4: ✅ Alert 加 corroborated 字段
 
 **修改文件**: `src/argus/alerts/grader.py`
 
@@ -2024,7 +2024,7 @@ class Alert:
 
 ---
 
-#### C3-5: 跨摄像头测试
+#### C3-5: ✅ 跨摄像头测试
 
 **新建文件**: `tests/unit/test_correlation.py`
 
@@ -2049,7 +2049,7 @@ def test_homography_projection_correct():
 
 ### C4: 最小可行 MLOps
 
-#### C4-1: 创建 ModelRecord ORM 和 Registry
+#### C4-1: ✅ 创建 ModelRecord ORM 和 Registry
 
 **修改文件**: `src/argus/storage/models.py` + NEW `src/argus/storage/model_registry.py`
 
@@ -2085,7 +2085,7 @@ class ModelRegistry:
 
 ---
 
-#### C4-2: 训练后自动注册
+#### C4-2: ✅ 训练后自动注册
 
 **修改文件**: `src/argus/anomaly/trainer.py`
 
@@ -2093,7 +2093,7 @@ class ModelRegistry:
 
 ---
 
-#### C4-3: Alert 带 model_version_id
+#### C4-3: ✅ Alert 带 model_version_id
 
 **修改文件**: `src/argus/alerts/grader.py`
 
@@ -2101,7 +2101,7 @@ class ModelRegistry:
 
 ---
 
-#### C4-4: MLOps 测试
+#### C4-4: ✅ MLOps 测试
 
 ```python
 def test_register_and_activate_model():
@@ -2115,9 +2115,9 @@ def test_model_hash_changes_on_retrain():
 
 ---
 
-### D1: 开放词汇检测 OVD
+### D1: 开放词汇检测 OVD ✅ 已修改完
 
-#### D1-1: 创建 OpenVocabClassifier
+#### D1-1: ✅ 创建 OpenVocabClassifier
 
 **新建文件**: `src/argus/anomaly/classifier.py`
 
@@ -2160,7 +2160,7 @@ FOE_VOCAB = [
 
 ---
 
-#### D1-2: OVD 配置
+#### D1-2: ✅ OVD 配置
 
 ```python
 class ClassifierConfig(BaseModel):
@@ -2174,7 +2174,7 @@ class ClassifierConfig(BaseModel):
 
 ---
 
-#### D1-3: Pipeline 集成
+#### D1-3: ✅ Pipeline 集成
 
 在 anomaly detection 后、alert grading 前:
 ```python
@@ -2185,7 +2185,7 @@ if classifier and anomaly_result.anomaly_score >= classifier_config.min_anomaly_
 
 ---
 
-#### D1-4: OVD 测试
+#### D1-4: ✅ OVD 测试
 
 ```python
 def test_classify_returns_label_and_confidence():
@@ -2196,9 +2196,9 @@ def test_low_risk_label_suppresses():
 
 ---
 
-### D2: SAM 2 实例分割
+### D2: SAM 2 实例分割 ✅ 已修改完
 
-#### D2-1: 创建 InstanceSegmenter
+#### D2-1: ✅ 创建 InstanceSegmenter
 
 **新建文件**: `src/argus/anomaly/segmenter.py`
 
@@ -2215,15 +2215,15 @@ class InstanceSegmenter:
         ...
 ```
 
-#### D2-2: 配置 + D2-3: Pipeline 集成 + D2-4: 测试
+#### D2-2: ✅ 配置 + D2-3: Pipeline 集成 + D2-4: 测试
 
 （结构同 D1，细节取决于 SAM 2 的 Python API 和 Jetson 兼容性。）
 
 ---
 
-### D3: 合成异常数据
+### D3: 合成异常数据 ✅ 已修改完
 
-#### D3-1: 合成管线脚本
+#### D3-1: ✅ 合成管线脚本
 
 **新建文件**: `scripts/generate_synthetic.py`
 
@@ -2249,7 +2249,7 @@ Usage:
 
 ---
 
-#### D3-2: Recall 评估工具
+#### D3-2: ✅ Recall 评估工具
 
 **新建文件**: `src/argus/validation/recall_test.py`
 
@@ -2268,7 +2268,7 @@ def evaluate_recall(detector, synthetic_dir) -> dict:
 
 ---
 
-#### D3-3: 配置 + D3-4: 测试
+#### D3-3: ✅ 配置 + D3-4: 测试
 
 ```python
 def test_synthetic_generation_produces_valid_images():

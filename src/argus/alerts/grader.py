@@ -18,7 +18,9 @@ from enum import Enum
 import numpy as np
 import structlog
 
-from argus.config.schema import AlertConfig, AlertSeverity, ZonePriority
+from pathlib import Path
+
+from argus.config.schema import AlertConfig, AlertSeverity, SeverityThresholds, ZonePriority
 
 logger = structlog.get_logger()
 
@@ -39,6 +41,11 @@ class Alert:
     # YOLO-005: Semantic detection context
     detection_type: str = "anomaly"  # DetectionType value: "anomaly", "object", "hybrid"
     detected_objects: list[dict] = field(default_factory=list)
+    # C3-4: Cross-camera correlation
+    corroborated: bool = True
+    correlation_partner: str | None = None
+    # C4-3: Model version tracking
+    model_version_id: str | None = None
 
 
 class DetectionType(str, Enum):
@@ -51,9 +58,9 @@ class DetectionType(str, Enum):
 
 @dataclass
 class _AnomalyTracker:
-    """Tracks consecutive anomaly detections for a specific zone."""
+    """Tracks anomaly evidence for a specific zone using exponential accumulation."""
 
-    consecutive_count: int = 0
+    evidence: float = 0.0
     first_seen: float = 0.0
     last_seen: float = 0.0
     max_score: float = 0.0
@@ -71,13 +78,35 @@ class AlertGrader:
     5. Suppress duplicate alerts within configurable time windows
     """
 
-    def __init__(self, config: AlertConfig, node_id: str = "edge"):
+    def __init__(
+        self,
+        config: AlertConfig,
+        node_id: str = "edge",
+        calibration_path: Path | None = None,
+    ):
         self._config = config
         self._node_id = node_id
         self._trackers: dict[str, _AnomalyTracker] = defaultdict(_AnomalyTracker)
         self._last_alerts: dict[str, float] = {}  # zone_key -> last alert timestamp
         self._alert_counter = 0
         self._counter_lock = threading.Lock()
+
+        # Load calibrated thresholds if available and enabled
+        if calibration_path and self._config.calibration.enabled:
+            from argus.alerts.calibration import ConformalCalibrator
+
+            calibrator = ConformalCalibrator()
+            cal = calibrator.load(calibration_path)
+            if cal:
+                self._config.severity_thresholds = SeverityThresholds(
+                    info=cal.info_threshold,
+                    low=cal.low_threshold,
+                    medium=cal.medium_threshold,
+                    high=cal.high_threshold,
+                )
+                logger.info("grader.using_calibrated_thresholds", thresholds=str(cal))
+            else:
+                logger.warning("grader.calibration_not_found", path=str(calibration_path))
 
     def evaluate(
         self,
@@ -114,30 +143,32 @@ class AlertGrader:
         multiplier = self._config.zone_multipliers.get(zone_priority.value, 1.0)
         adjusted_score = max(0.0, min(anomaly_score * multiplier, 1.0))
 
-        # Step 2: Determine severity
+        # Step 2: Determine severity (None if below info threshold)
         severity = self._score_to_severity(adjusted_score)
+
+        # Step 3: CUSUM temporal evidence accumulation
+        tracker = self._trackers[zone_key]
+        gap = now - tracker.last_seen if tracker.last_seen > 0 else 0
+        lam = self._config.temporal.evidence_lambda
+
+        # Sub-threshold frame: pure decay, clean up if negligible
         if severity is None:
-            # Score below minimum threshold, reset tracker
-            self._trackers[zone_key] = _AnomalyTracker()
+            tracker.evidence *= lam
+            if tracker.evidence < 0.01:
+                self._trackers[zone_key] = _AnomalyTracker()
             logger.debug(
                 "grader.below_threshold",
                 zone=zone_key,
                 score=round(adjusted_score, 3),
+                evidence=round(tracker.evidence, 3),
             )
             return None
 
-        # Step 3: Temporal confirmation
-        tracker = self._trackers[zone_key]
-        gap = now - tracker.last_seen if tracker.last_seen > 0 else 0
-
+        # Gap timeout: reset evidence entirely
         if gap > self._config.temporal.max_gap_seconds:
-            # Too much time between detections, reset
-            tracker.consecutive_count = 1
+            tracker.evidence = 0.0
             tracker.first_seen = now
             tracker.max_score = adjusted_score
-        else:
-            tracker.consecutive_count += 1
-            tracker.max_score = max(tracker.max_score, adjusted_score)
 
         tracker.last_seen = now
 
@@ -157,16 +188,20 @@ class AlertGrader:
                         iou=round(iou, 3),
                         threshold=min_overlap,
                     )
-                    tracker.consecutive_count = 1
+                    tracker.evidence = 0.0
                     tracker.max_score = adjusted_score
             tracker.prev_anomaly_mask = curr_mask
 
-        if tracker.consecutive_count < self._config.temporal.min_consecutive_frames:
+        # Exponential evidence accumulation
+        tracker.evidence = lam * tracker.evidence + adjusted_score
+        tracker.max_score = max(tracker.max_score, adjusted_score)
+
+        if tracker.evidence < self._config.temporal.evidence_threshold:
             logger.debug(
-                "grader.awaiting_confirmation",
+                "grader.accumulating_evidence",
                 zone=zone_key,
-                count=tracker.consecutive_count,
-                needed=self._config.temporal.min_consecutive_frames,
+                evidence=round(tracker.evidence, 3),
+                threshold=self._config.temporal.evidence_threshold,
             )
             return None
 

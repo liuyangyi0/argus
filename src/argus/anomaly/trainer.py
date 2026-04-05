@@ -294,6 +294,26 @@ class ModelTrainer:
             threshold=round(threshold_recommended, 3),
         )
 
+        # Conformal calibration (A2-3): run on val set scores if detector available
+        if detector is not None and val_stats.get("scores"):
+            try:
+                from argus.alerts.calibration import ConformalCalibrator
+
+                cal_scores = np.array(val_stats["scores"])
+                if len(cal_scores) >= 50:
+                    calibrator = ConformalCalibrator()
+                    cal_result = calibrator.calibrate(cal_scores)
+                    cal_path = output_dir / "calibration.json"
+                    calibrator.save(cal_result, cal_path)
+                    logger.info("trainer.calibration_saved", path=str(cal_path))
+                else:
+                    logger.warning(
+                        "trainer.calibration_skipped",
+                        reason=f"Not enough scores for calibration ({len(cal_scores)} < 50)",
+                    )
+            except Exception as e:
+                logger.warning("trainer.calibration_failed", error=str(e))
+
         # Cleanup split directory
         split_dir = output_dir / "_split"
         if split_dir.exists():
@@ -724,6 +744,23 @@ class ModelTrainer:
                 backbone="resnet18",
                 layers=["layer1", "layer2", "layer3"],
             )
+        elif model_type == "dinomaly2":
+            # Dinomaly2 uses DINOv2 backbone with reconstruction-based anomaly detection
+            try:
+                from anomalib.models import Dinomaly
+                model = Dinomaly()
+            except ImportError:
+                # Fallback: if Dinomaly not in current anomalib version, use PatchCore
+                logger.warning(
+                    "trainer.dinomaly_not_available",
+                    msg="Dinomaly not found in anomalib, falling back to PatchCore",
+                )
+                from anomalib.models import Patchcore
+                model = Patchcore(
+                    backbone="wide_resnet50_2",
+                    layers=["layer2", "layer3"],
+                    coreset_sampling_ratio=0.1,
+                )
         else:  # patchcore (default)
             from anomalib.models import Patchcore
             model = Patchcore(
@@ -732,11 +769,11 @@ class ModelTrainer:
                 coreset_sampling_ratio=0.1,
             )
 
-        # FastFlow and EfficientAD need multiple epochs; PatchCore and Padim need 1
+        # FastFlow and EfficientAD need multiple epochs; PatchCore/Padim/Dinomaly need 1
         if model_type in ("efficient_ad", "fastflow"):
             max_epochs = 70
         else:
-            max_epochs = 1  # PatchCore and Padim only need feature extraction
+            max_epochs = 1  # PatchCore, Padim, and Dinomaly only need feature extraction
 
         engine = Engine(
             default_root_dir=str(output_dir),

@@ -36,6 +36,8 @@ alerts:
     min_consecutive_frames: 3
     max_gap_seconds: 10.0
     min_spatial_overlap: 0.3   # 连续帧异常区域IoU需≥30%，过滤飘动物误报（0=关闭）
+    evidence_lambda: 0.95      # CUSUM指数衰减因子（0.8-0.99），越大衰减越慢
+    evidence_threshold: 3.0    # 累积证据阈值（0.5-20.0），超过此值触发告警
   suppression:
     same_zone_window_seconds: 300
     same_camera_window_seconds: 60

@@ -185,6 +185,24 @@ class AuditLog(Base):
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
 
 
+class ModelRecord(Base):
+    """Registered model version for MLOps tracking (C4-1)."""
+
+    __tablename__ = "models"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_version_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    model_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    model_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    data_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    code_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    training_params: Mapped[str | None] = mapped_column(Text, nullable=True)
+    calibration_thresholds: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class User(Base):
     """System user with role-based access."""
 

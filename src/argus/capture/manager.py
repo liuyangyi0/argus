@@ -65,6 +65,9 @@ class CameraManager:
         self._alert_count = 0
         self._last_frame_counts: dict[str, int] = {}  # camera_id -> last known frame count
 
+        # B1-5: Shared anomaly detector for dinomaly_multi_class mode
+        self._shared_anomaly_detector = None
+
         # DET-012: Pre-load shared YOLO model for all pipelines
         self._shared_yolo = None
         if cameras:

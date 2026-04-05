@@ -149,6 +149,20 @@ class DetectionPipeline:
         else:
             self._anomaly_detector = base_detector
 
+        # Simplex safety channel (A3)
+        if camera_config.simplex.enabled:
+            from argus.prefilter.simple_detector import SimplexDetector
+
+            self._simplex = SimplexDetector(
+                diff_threshold=camera_config.simplex.diff_threshold,
+                min_area_px=camera_config.simplex.min_area_px,
+                min_static_seconds=camera_config.simplex.min_static_seconds,
+                morph_kernel_size=camera_config.simplex.morph_kernel_size,
+                match_radius_px=camera_config.simplex.match_radius_px,
+            )
+        else:
+            self._simplex = None
+
         # Alert grading
         self._alert_grader = AlertGrader(config=alert_config)
 
