@@ -25,6 +25,7 @@ class AnomalyResult:
     anomaly_map: np.ndarray | None  # per-pixel anomaly heatmap (H, W), 0-1
     is_anomalous: bool
     threshold: float
+    detection_failed: bool = False  # True when prediction errored out
 
 
 class AnomalibDetector:
@@ -173,12 +174,17 @@ class AnomalibDetector:
             return self._safe_result()
 
     def _safe_result(self) -> AnomalyResult:
-        """Return a safe default result when prediction fails."""
+        """Return a safe default result when prediction fails.
+
+        Sets detection_failed=True so the pipeline can distinguish between
+        'no anomaly detected' and 'detection itself failed'.
+        """
         return AnomalyResult(
             anomaly_score=0.0,
             anomaly_map=None,
             is_anomalous=False,
             threshold=self.threshold,
+            detection_failed=True,
         )
 
     def _predict_ssim_fallback(self, frame: np.ndarray) -> AnomalyResult:
@@ -210,7 +216,10 @@ class AnomalibDetector:
             self._ssim_noise_floor = 0.0
             self._ssim_frame_diffs = []
             logger.info("anomaly.ssim_calibrating", msg="Collecting baseline frames...")
-            return self._safe_result()
+            return AnomalyResult(
+                anomaly_score=0.0, anomaly_map=None, is_anomalous=False,
+                threshold=self.threshold, detection_failed=False,
+            )
 
         if baseline_count < BASELINE_FRAMES:
             # Track frame-to-frame differences to learn noise level
@@ -227,17 +236,21 @@ class AnomalibDetector:
             if baseline_count == BASELINE_FRAMES - 1:
                 # Finalize baseline and noise floor
                 self._ssim_baseline = (self._ssim_baseline_acc / self._ssim_baseline_count).astype(np.float32)
-                # Noise floor = median of inter-frame diffs (robust to outliers)
-                # Use median rather than 95th percentile because early frames may contain
-                # actual scene changes that would inflate the noise estimate
-                self._ssim_noise_floor = float(np.median(self._ssim_frame_diffs)) * 1.5
+                # Noise floor = IQR-based estimation (robust to outliers from early motion)
+                diffs = np.array(self._ssim_frame_diffs)
+                q25, q75 = float(np.percentile(diffs, 25)), float(np.percentile(diffs, 75))
+                iqr = q75 - q25
+                self._ssim_noise_floor = q75 + 1.5 * iqr if iqr > 0 else float(np.median(diffs)) * 1.5
                 logger.info(
                     "anomaly.ssim_calibrated",
                     baseline_frames=self._ssim_baseline_count,
                     noise_floor=round(self._ssim_noise_floor, 4),
                     diffs=str([round(d, 4) for d in self._ssim_frame_diffs]),
                 )
-            return self._safe_result()
+            return AnomalyResult(
+                anomaly_score=0.0, anomaly_map=None, is_anomalous=False,
+                threshold=self.threshold, detection_failed=False,
+            )
 
         # Phase 2: Detection — compare against learned baseline
         diff = cv2.absdiff(gray, self._ssim_baseline)
