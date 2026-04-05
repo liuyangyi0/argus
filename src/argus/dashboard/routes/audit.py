@@ -112,7 +112,8 @@ async def audit_logs(
             <a href="/audit?page={page+1}{params}" class="btn btn-sm btn-ghost"{next_cls}>下一页</a>
         </div>"""
 
-    header = page_header("审计日志", "系统操作记录与追踪")
+    is_htmx = request.headers.get("HX-Request") == "true"
+    header = "" if is_htmx else page_header("审计日志", "系统操作记录与追踪")
 
     return HTMLResponse(f"""
     {header}

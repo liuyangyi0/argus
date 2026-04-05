@@ -85,7 +85,8 @@ async def users_page(request: Request):
         f'<option value="{k}">{v}</option>' for k, v in _ROLE_LABELS.items()
     )
 
-    header = page_header("用户管理", "管理系统用户和角色权限")
+    is_htmx = request.headers.get("HX-Request") == "true"
+    header = "" if is_htmx else page_header("用户管理", "管理系统用户和角色权限")
 
     return HTMLResponse(f"""
     {header}

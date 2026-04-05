@@ -49,7 +49,9 @@ class ModelReloadRequest(BaseModel):
 @router.get("", response_class=HTMLResponse)
 async def config_page(request: Request):
     """Configuration page with tabbed interface."""
-    header = page_header(
+    # When loaded as HTMX fragment (e.g. inside system page tab), skip page header
+    is_htmx = request.headers.get("HX-Request") == "true"
+    header = "" if is_htmx else page_header(
         "系统设置",
         "调整检测参数、通知设置和系统维护",
         '<button class="btn btn-primary" hx-post="/api/config/save" hx-swap="none">保存到配置文件</button>',
@@ -58,11 +60,7 @@ async def config_page(request: Request):
     return HTMLResponse(f"""
     {header}
     {tabs}
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {{
-            htmx.ajax('GET', '/api/config/detection', {{target: '#tab-content', swap: 'innerHTML'}});
-        }});
-    </script>""")
+    <div hx-get="/api/config/detection" hx-trigger="load" hx-target="#tab-content" hx-swap="innerHTML"></div>""")
 
 
 @router.get("/detection", response_class=HTMLResponse)

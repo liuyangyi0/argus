@@ -36,7 +36,8 @@ async def reports_page(request: Request):
     ack_count = sum(1 for a in all_alerts if a.acknowledged)
     ack_rate = f"{ack_count / total * 100:.1f}%" if total > 0 else "0%"
 
-    header = page_header("报表统计", "告警趋势、误报率和系统运行统计")
+    is_htmx = request.headers.get("HX-Request") == "true"
+    header = "" if is_htmx else page_header("报表统计", "告警趋势、误报率和系统运行统计")
 
     stats_html = f"""
     <div class="grid-4 mb-16">

@@ -24,7 +24,8 @@ async def backup_page(request: Request):
     """Backup management page."""
     backup_manager = getattr(request.app.state, "backup_manager", None)
 
-    header = page_header(
+    is_htmx = request.headers.get("HX-Request") == "true"
+    header = "" if is_htmx else page_header(
         "数据备份",
         "数据库与配置的备份与恢复",
         '<button class="btn btn-primary" hx-post="/api/backup/create" '

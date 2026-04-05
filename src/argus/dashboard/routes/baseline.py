@@ -774,10 +774,10 @@ async def training_history(request: Request):
     </div>""")
 
 
-def _metric_bar(label: str, value: float, threshold: float, max_val: float = 1.0, invert: bool = False) -> str:
+def _metric_bar(label: str, value: float, threshold: float, max_val: float = 1.0, lower_is_better: bool = False) -> str:
     """Render a metric with progress bar visualization."""
     pct = min(value / max_val * 100, 100) if max_val > 0 else 0
-    passed = (value <= threshold) if invert else (value >= threshold)
+    passed = (value <= threshold) if lower_is_better else (value >= threshold)
     color = "var(--status-ok)" if passed else "var(--status-critical)"
     icon = "&#10003;" if passed else "&#10007;"
     return f"""
@@ -834,10 +834,10 @@ async def training_report(request: Request, record_id: int):
         score_html = f"""
         <div class="card">
             <h3>验证集分数分布</h3>
-            {_metric_bar("均值 (越低越好)", record.val_score_mean, 0.3, max_val=1.0, invert=True)}
-            {_metric_bar("标准差 (越低越好)", record.val_score_std, 0.1, max_val=0.5, invert=True)}
-            {_metric_bar("最大值", record.val_score_max, 0.5, max_val=1.0, invert=True)}
-            {_metric_bar("P95", record.val_score_p95, 0.4, max_val=1.0, invert=True)}
+            {_metric_bar("均值 (越低越好)", record.val_score_mean, 0.3, max_val=1.0, lower_is_better=True)}
+            {_metric_bar("标准差 (越低越好)", record.val_score_std, 0.1, max_val=0.5, lower_is_better=True)}
+            {_metric_bar("最大值", record.val_score_max, 0.5, max_val=1.0, lower_is_better=True)}
+            {_metric_bar("P95", record.val_score_p95, 0.4, max_val=1.0, lower_is_better=True)}
         </div>"""
 
     # Output validation section
