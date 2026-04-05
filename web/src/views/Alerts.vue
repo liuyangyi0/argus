@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import {
   Table, Tag, Button, Space, Typography, Select, Drawer,
   Descriptions, Image, Divider, message,
 } from 'ant-design-vue'
 import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive } from '../api'
+import { useWebSocket } from '../composables/useWebSocket'
 
 const alerts = ref<any[]>([])
 const cameras = ref<any[]>([])
@@ -12,7 +13,6 @@ const loading = ref(true)
 const filters = ref({ camera_id: '', severity: '' })
 const detailVisible = ref(false)
 const selectedAlert = ref<any>(null)
-let timer: ReturnType<typeof setInterval>
 
 async function fetchData() {
   try {
@@ -27,11 +27,16 @@ async function fetchData() {
   }
 }
 
-onMounted(() => {
-  fetchData()
-  timer = setInterval(fetchData, 15000)
+const { } = useWebSocket({
+  topics: ['alerts'],
+  onMessage(topic, data) {
+    if (topic === 'alerts') alerts.value = data
+  },
+  fallbackPoll: fetchData,
+  fallbackInterval: 15000,
 })
-onUnmounted(() => clearInterval(timer))
+
+onMounted(fetchData)
 
 function showDetail(record: any) {
   selectedAlert.value = record

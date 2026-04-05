@@ -46,6 +46,14 @@ class Alert:
     correlation_partner: str | None = None
     # C4-3: Model version tracking
     model_version_id: str | None = None
+    # D1: Open vocabulary classification
+    classification_label: str | None = None
+    classification_confidence: float | None = None
+    severity_adjusted_by_classifier: bool = False
+    # D2: Instance segmentation
+    segmentation_count: int = 0
+    segmentation_total_area_px: int = 0
+    segmentation_objects: list[dict] = field(default_factory=list)
 
 
 class DetectionType(str, Enum):

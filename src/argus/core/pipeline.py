@@ -26,6 +26,7 @@ import structlog
 
 from argus.alerts.grader import Alert, AlertGrader, DetectionType
 from argus.anomaly.detector import AnomalibDetector, AnomalyResult, DetectorStatus
+from argus.anomaly.drift import DriftDetector, DriftStatus
 from argus.core.diagnostics import (
     DiagnosticsBuffer,
     FrameDiagnostics,
@@ -33,7 +34,7 @@ from argus.core.diagnostics import (
     StageResult,
 )
 from argus.capture.camera import CameraCapture, FrameData
-from argus.config.schema import AlertConfig, CameraConfig, ZonePriority
+from argus.config.schema import AlertConfig, CameraConfig, ClassifierConfig, SegmenterConfig, ZonePriority
 from argus.core.zone_mask import ZoneMaskEngine
 from argus.person.detector import ObjectDetectionResult, YOLOObjectDetector
 from argus.prefilter.mog2 import MOG2PreFilter, PreFilterResult
@@ -90,10 +91,19 @@ class DetectionPipeline:
         alert_config: AlertConfig,
         on_alert: Callable[[Alert], None] | None = None,
         shared_yolo_model: object | None = None,
+        on_drift: Callable[[str, dict], None] | None = None,
+        classifier_config: ClassifierConfig | None = None,
+        segmenter_config: SegmenterConfig | None = None,
+        model_version_id: str | None = None,
+        shared_anomaly_detector: object | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
+        self._on_drift = on_drift
+        self._model_version_id = model_version_id
         self.stats = PipelineStats()
+        self._classifier_config = classifier_config
+        self._segmenter_config = segmenter_config
 
         # Stage 0: Zone masking
         self._zone_mask = ZoneMaskEngine(
@@ -123,15 +133,24 @@ class DetectionPipeline:
         )
 
         # Stage 3: Anomaly detector — auto-discover trained model
-        model_path = self._find_model(camera_config.camera_id)
-        base_detector = AnomalibDetector(
-            model_path=model_path,
-            threshold=camera_config.anomaly.threshold,
-            image_size=camera_config.anomaly.image_size,
-            ssim_baseline_frames=camera_config.anomaly.ssim_baseline_frames,
-            ssim_sensitivity=camera_config.anomaly.ssim_sensitivity,
-            ssim_midpoint=camera_config.anomaly.ssim_midpoint,
-        )
+        # Use shared detector for multi-class dinomaly mode, else create per-camera
+        if shared_anomaly_detector is not None:
+            base_detector = shared_anomaly_detector
+            logger.info(
+                "pipeline.using_shared_detector",
+                camera_id=camera_config.camera_id,
+            )
+        else:
+            model_path = self._find_model(camera_config.camera_id)
+            base_detector = AnomalibDetector(
+                model_path=model_path,
+                threshold=camera_config.anomaly.threshold,
+                image_size=camera_config.anomaly.image_size,
+                ssim_baseline_frames=camera_config.anomaly.ssim_baseline_frames,
+                ssim_sensitivity=camera_config.anomaly.ssim_sensitivity,
+                ssim_midpoint=camera_config.anomaly.ssim_midpoint,
+                enable_calibration=camera_config.anomaly.enable_calibration,
+            )
         if camera_config.anomaly.enable_multiscale:
             from argus.anomaly.detector import MultiScaleDetector
 
@@ -149,7 +168,7 @@ class DetectionPipeline:
         else:
             self._anomaly_detector = base_detector
 
-        # Simplex safety channel (A3)
+        # Simplex safety channel (A3): dual-channel architecture
         if camera_config.simplex.enabled:
             from argus.prefilter.simple_detector import SimplexDetector
 
@@ -162,6 +181,7 @@ class DetectionPipeline:
             )
         else:
             self._simplex = None
+        self._simplex_reference_set = False
 
         # Alert grading
         self._alert_grader = AlertGrader(config=alert_config)
@@ -221,6 +241,75 @@ class DetectionPipeline:
         self._learning_start_time: float | None = None
         self._learning_duration: float = 0.0
         self._auto_learning_complete = False
+
+        # Drift monitoring: KS test on anomaly score distribution
+        drift_cfg = camera_config.drift
+        if drift_cfg.enabled:
+            self._drift_detector = DriftDetector(
+                reference_scores=None,  # collected during initial operation
+                window_size=drift_cfg.test_window,
+                check_interval=drift_cfg.test_window,
+                ks_threshold=drift_cfg.ks_threshold,
+                p_value_threshold=drift_cfg.p_value_threshold,
+            )
+            self._drift_reference_scores: list[float] = []
+            self._drift_reference_size = drift_cfg.reference_window
+            self._drift_reference_ready = False
+            self._drift_cooldown_seconds = drift_cfg.cooldown_minutes * 60
+            self._drift_last_alert_time = 0.0
+        else:
+            self._drift_detector = None
+
+        # D1: Open vocabulary classifier (optional)
+        self._classifier = None
+        if classifier_config and classifier_config.enabled:
+            try:
+                from argus.anomaly.classifier import OpenVocabClassifier
+
+                self._classifier = OpenVocabClassifier(
+                    model_name=classifier_config.model_name,
+                    vocabulary=classifier_config.vocabulary,
+                )
+                self._classifier_min_score = classifier_config.min_anomaly_score_to_classify
+                self._classifier_high_risk = set(classifier_config.high_risk_labels)
+                self._classifier_low_risk = set(classifier_config.low_risk_labels)
+                logger.info(
+                    "pipeline.classifier_configured",
+                    camera_id=camera_config.camera_id,
+                    model=classifier_config.model_name,
+                    vocab_size=len(classifier_config.vocabulary),
+                )
+            except Exception as e:
+                logger.warning(
+                    "pipeline.classifier_init_failed",
+                    camera_id=camera_config.camera_id,
+                    error=str(e),
+                )
+
+        # D2: Instance segmentation (optional)
+        self._segmenter = None
+        if segmenter_config and segmenter_config.enabled:
+            try:
+                from argus.anomaly.segmenter import InstanceSegmenter
+
+                self._segmenter = InstanceSegmenter(
+                    model_size=segmenter_config.model_size,
+                    min_mask_area_px=segmenter_config.min_mask_area_px,
+                )
+                self._segmenter_max_points = segmenter_config.max_points
+                self._segmenter_min_score = segmenter_config.min_anomaly_score
+                logger.info(
+                    "pipeline.segmenter_configured",
+                    camera_id=camera_config.camera_id,
+                    model_size=segmenter_config.model_size,
+                    max_points=segmenter_config.max_points,
+                )
+            except Exception as e:
+                logger.warning(
+                    "pipeline.segmenter_init_failed",
+                    camera_id=camera_config.camera_id,
+                    error=str(e),
+                )
 
     @staticmethod
     def _find_model(camera_id: str) -> Path | None:
@@ -422,6 +511,12 @@ class DetectionPipeline:
         diag.anomaly_score = anomaly_result.anomaly_score
         diag.is_anomalous = anomaly_result.is_anomalous
 
+        # Feed anomaly score to drift detector
+        if self._drift_detector is not None:
+            self._feed_drift_score(
+                anomaly_result.anomaly_score, frame_data.camera_id
+            )
+
         # CRIT-04: Log detection failures
         if anomaly_result.detection_failed:
             logger.error(
@@ -430,6 +525,87 @@ class DetectionPipeline:
                 frame_number=frame_data.frame_number,
                 msg="Anomaly detection returned failure — frame not analyzed",
             )
+
+        # Stage 3b: Simplex safety channel (dual-channel architecture)
+        # Runs in parallel with Anomalib as a lightweight safety backup.
+        # If Anomalib is unavailable, Simplex becomes the primary detector.
+        simplex_detected = False
+        if self._simplex is not None:
+            try:
+                t3b = time.monotonic()
+                # Set reference frame from the first processed frame
+                if not self._simplex_reference_set:
+                    self._simplex.set_reference(frame)
+                    self._simplex_reference_set = True
+                    logger.info(
+                        "pipeline.simplex_reference_set",
+                        camera_id=frame_data.camera_id,
+                    )
+
+                simplex_result = self._simplex.detect(frame)
+                simplex_detected = simplex_result.has_detection
+                simplex_duration_ms = (time.monotonic() - t3b) * 1000
+
+                diag.stages.append(StageResult(
+                    stage_name="simplex",
+                    duration_ms=simplex_duration_ms,
+                    metadata={
+                        "has_detection": simplex_detected,
+                        "max_static_seconds": round(simplex_result.max_static_seconds, 1),
+                        "static_region_count": len(simplex_result.static_regions),
+                    },
+                ))
+
+                # Dual-channel result merging:
+                # 1. If both detect anomaly -> boost confidence (multiply by 1.1, cap at 1.0)
+                # 2. If only Simplex detects -> mark as anomalous (safety fallback)
+                # 3. If Anomalib model not loaded (SSIM fallback) -> Simplex is primary
+                if simplex_detected:
+                    if anomaly_result.is_anomalous:
+                        # Both channels agree: boost score
+                        boosted = min(anomaly_result.anomaly_score * 1.1, 1.0)
+                        anomaly_result = AnomalyResult(
+                            anomaly_score=boosted,
+                            anomaly_map=anomaly_result.anomaly_map,
+                            is_anomalous=True,
+                            threshold=anomaly_result.threshold,
+                            detection_failed=anomaly_result.detection_failed,
+                        )
+                        diag.anomaly_score = boosted
+                        logger.debug(
+                            "pipeline.simplex_boost",
+                            camera_id=frame_data.camera_id,
+                            original_score=round(boosted / 1.1, 4),
+                            boosted_score=round(boosted, 4),
+                        )
+                    else:
+                        # Only Simplex detected: use as safety fallback
+                        # Set a minimum anomaly score so the alert system can grade it
+                        fallback_score = max(anomaly_result.anomaly_score, 0.6)
+                        anomaly_result = AnomalyResult(
+                            anomaly_score=fallback_score,
+                            anomaly_map=anomaly_result.anomaly_map,
+                            is_anomalous=True,
+                            threshold=anomaly_result.threshold,
+                            detection_failed=anomaly_result.detection_failed,
+                        )
+                        diag.anomaly_score = fallback_score
+                        diag.is_anomalous = True
+                        logger.info(
+                            "pipeline.simplex_safety_detection",
+                            camera_id=frame_data.camera_id,
+                            anomalib_score=round(anomaly_result.anomaly_score, 4),
+                            static_regions=len(simplex_result.static_regions),
+                            max_static_seconds=round(simplex_result.max_static_seconds, 1),
+                        )
+            except Exception as e:
+                # Simplex failure must never crash the pipeline
+                logger.warning(
+                    "pipeline.simplex_error",
+                    camera_id=frame_data.camera_id,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
 
         # Cache anomaly heatmap for overlay stream
         with self._latest_anomaly_map_lock:
@@ -488,6 +664,42 @@ class DetectionPipeline:
 
         self.stats.anomalies_detected += 1
 
+        # D1: Open vocabulary classification on anomaly region
+        classification_result: tuple[str, float] | None = None
+        if (
+            self._classifier is not None
+            and anomaly_result.is_anomalous
+            and anomaly_result.anomaly_score >= self._classifier_min_score
+        ):
+            try:
+                t_cls = time.monotonic()
+                bbox = self._extract_anomaly_bbox(anomaly_result.anomaly_map, frame.shape)
+                classification_result = self._classifier.classify(frame, bbox=bbox)
+                cls_duration_ms = (time.monotonic() - t_cls) * 1000
+                diag.stages.append(StageResult(
+                    stage_name="classifier",
+                    duration_ms=cls_duration_ms,
+                    metadata={
+                        "label": classification_result[0] if classification_result else None,
+                        "confidence": round(classification_result[1], 3) if classification_result else None,
+                        "bbox": list(bbox) if bbox else None,
+                    },
+                ))
+                if classification_result:
+                    logger.info(
+                        "pipeline.classified",
+                        camera_id=frame_data.camera_id,
+                        label=classification_result[0],
+                        confidence=round(classification_result[1], 3),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "pipeline.classifier_error",
+                    camera_id=frame_data.camera_id,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+
         # Multi-zone alert grading with semantic context
         alert = self._evaluate_zones(
             frame_data, anomaly_result, frame,
@@ -495,9 +707,101 @@ class DetectionPipeline:
             detected_objects=detected_objects,
         )
 
+        # D1: Attach classification to alert and adjust severity
+        if alert is not None and classification_result is not None:
+            label, conf = classification_result
+            alert.classification_label = label
+            alert.classification_confidence = conf
+            if label in self._classifier_high_risk:
+                # Escalate: bump severity up one level
+                alert = self._adjust_alert_severity(alert, escalate=True)
+                alert.severity_adjusted_by_classifier = True
+                logger.info(
+                    "pipeline.classifier_escalated",
+                    camera_id=frame_data.camera_id,
+                    label=label,
+                    severity=alert.severity.value,
+                )
+            elif label in self._classifier_low_risk:
+                # Suppress: downgrade severity one level
+                alert = self._adjust_alert_severity(alert, escalate=False)
+                alert.severity_adjusted_by_classifier = True
+                logger.info(
+                    "pipeline.classifier_suppressed",
+                    camera_id=frame_data.camera_id,
+                    label=label,
+                    severity=alert.severity.value,
+                )
+
+        # D2: Instance segmentation on anomaly peaks
+        if (
+            alert is not None
+            and self._segmenter is not None
+            and anomaly_result.is_anomalous
+            and anomaly_result.anomaly_score >= self._segmenter_min_score
+            and anomaly_result.anomaly_map is not None
+        ):
+            try:
+                from argus.anomaly.segmenter import extract_peak_points
+
+                t_seg = time.monotonic()
+                peak_points = extract_peak_points(
+                    anomaly_result.anomaly_map,
+                    max_points=self._segmenter_max_points,
+                    min_score=self._segmenter_min_score,
+                )
+                if peak_points:
+                    # Scale peak points from anomaly map to frame coordinates
+                    map_h, map_w = anomaly_result.anomaly_map.shape[:2]
+                    frame_h, frame_w = frame.shape[:2]
+                    scaled_points = [
+                        (int(px * frame_w / map_w), int(py * frame_h / map_h))
+                        for px, py in peak_points
+                    ]
+                    seg_result = self._segmenter.segment(frame, scaled_points)
+                    seg_duration_ms = (time.monotonic() - t_seg) * 1000
+
+                    diag.stages.append(StageResult(
+                        stage_name="segmenter",
+                        duration_ms=seg_duration_ms,
+                        metadata={
+                            "peak_points": len(peak_points),
+                            "segments": seg_result.num_objects,
+                            "total_area_px": seg_result.total_area_px,
+                        },
+                    ))
+
+                    if seg_result.num_objects > 0:
+                        alert.segmentation_count = seg_result.num_objects
+                        alert.segmentation_total_area_px = seg_result.total_area_px
+                        alert.segmentation_objects = [
+                            {
+                                "bbox": list(obj.bbox),
+                                "area_px": obj.area_px,
+                                "centroid": list(obj.centroid),
+                                "confidence": round(obj.confidence, 3),
+                            }
+                            for obj in seg_result.objects
+                        ]
+                        logger.debug(
+                            "pipeline.segmented",
+                            camera_id=frame_data.camera_id,
+                            segments=seg_result.num_objects,
+                            total_area_px=seg_result.total_area_px,
+                        )
+            except Exception as e:
+                # Segmentation failure must never block the pipeline
+                logger.warning(
+                    "pipeline.segmenter_error",
+                    camera_id=frame_data.camera_id,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+
         self._update_latency(start)
 
         if alert is not None:
+            alert.model_version_id = self._model_version_id
             self.stats.alerts_emitted += 1
             if self._on_alert:
                 self._on_alert(alert)
@@ -719,3 +1023,136 @@ class DetectionPipeline:
         n = self.stats.frames_analyzed
         self.stats._latency_sum += elapsed_ms
         self.stats.avg_latency_ms = self.stats._latency_sum / n if n > 0 else 0
+
+    # --- D1: Classifier helpers ----------------------------------------------
+
+    @staticmethod
+    def _extract_anomaly_bbox(
+        anomaly_map: np.ndarray | None, frame_shape: tuple
+    ) -> tuple[int, int, int, int] | None:
+        """Extract bounding box around the peak anomaly region from heatmap.
+
+        Returns (x, y, w, h) in frame coordinates, or None if no heatmap.
+        """
+        if anomaly_map is None or anomaly_map.size == 0:
+            return None
+
+        import cv2
+
+        # Normalize heatmap to 0-255
+        hmap = anomaly_map
+        if hmap.ndim == 3:
+            hmap = hmap.mean(axis=2)
+        hmin, hmax = hmap.min(), hmap.max()
+        if hmax - hmin < 1e-6:
+            return None
+        normalized = ((hmap - hmin) / (hmax - hmin) * 255).astype(np.uint8)
+
+        # Threshold at 50% of peak to find anomaly region
+        _, binary = cv2.threshold(normalized, 127, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return None
+
+        # Take the largest contour
+        largest = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest)
+
+        # Scale from heatmap to frame coordinates
+        h_scale = frame_shape[0] / hmap.shape[0]
+        w_scale = frame_shape[1] / hmap.shape[1]
+        x = int(x * w_scale)
+        y = int(y * h_scale)
+        w = max(int(w * w_scale), 1)
+        h = max(int(h * h_scale), 1)
+
+        # Pad by 10% for context
+        pad_x = int(w * 0.1)
+        pad_y = int(h * 0.1)
+        x = max(0, x - pad_x)
+        y = max(0, y - pad_y)
+        w = min(frame_shape[1] - x, w + 2 * pad_x)
+        h = min(frame_shape[0] - y, h + 2 * pad_y)
+
+        return x, y, w, h
+
+    @staticmethod
+    def _adjust_alert_severity(alert: Alert, escalate: bool) -> Alert:
+        """Adjust alert severity up or down by one level based on classifier output."""
+        from argus.config.schema import AlertSeverity
+
+        levels = [AlertSeverity.INFO, AlertSeverity.LOW, AlertSeverity.MEDIUM, AlertSeverity.HIGH]
+        current_idx = levels.index(alert.severity) if alert.severity in levels else 0
+        if escalate:
+            new_idx = min(current_idx + 1, len(levels) - 1)
+        else:
+            new_idx = max(current_idx - 1, 0)
+        alert.severity = levels[new_idx]
+        return alert
+
+    # --- Drift monitoring ---------------------------------------------------
+
+    def _feed_drift_score(self, score: float, camera_id: str) -> None:
+        """Feed an anomaly score to the drift detector.
+
+        During the reference window collection phase, scores are accumulated
+        to build the reference distribution. Once the reference is ready,
+        the DriftDetector runs the KS test periodically (every test_window
+        scores) and emits warnings when drift is detected.
+        """
+        if not self._drift_reference_ready:
+            # Still collecting reference distribution
+            self._drift_reference_scores.append(score)
+            if len(self._drift_reference_scores) >= self._drift_reference_size:
+                ref = np.array(self._drift_reference_scores)
+                self._drift_detector.set_reference(ref)
+                self._drift_reference_ready = True
+                logger.info(
+                    "drift.reference_ready",
+                    camera_id=camera_id,
+                    samples=len(self._drift_reference_scores),
+                    mean=round(float(ref.mean()), 4),
+                    std=round(float(ref.std()), 4),
+                )
+                # Clear the list to free memory
+                self._drift_reference_scores.clear()
+            return
+
+        # Reference is ready — feed score to detector
+        self._drift_detector.update(score)
+        status = self._drift_detector.get_status()
+
+        if status.is_drifted:
+            now = time.monotonic()
+            if (now - self._drift_last_alert_time) >= self._drift_cooldown_seconds:
+                self._drift_last_alert_time = now
+                logger.warning(
+                    "drift.detected",
+                    camera_id=camera_id,
+                    p_value=round(status.p_value, 6),
+                    ks_stat=round(status.ks_statistic, 4),
+                    reference_mean=round(status.reference_mean, 4),
+                    current_mean=round(status.current_mean, 4),
+                )
+                # Broadcast via WebSocket on "health" topic
+                if self._on_drift:
+                    self._on_drift("health", {
+                        "type": "drift_warning",
+                        "camera_id": camera_id,
+                        "p_value": round(status.p_value, 6),
+                        "ks_statistic": round(status.ks_statistic, 4),
+                        "reference_mean": round(status.reference_mean, 4),
+                        "current_mean": round(status.current_mean, 4),
+                        "samples_collected": status.samples_collected,
+                    })
+
+    def get_drift_status(self) -> DriftStatus | None:
+        """Get current drift detection status, or None if disabled."""
+        if self._drift_detector is None:
+            return None
+        status = self._drift_detector.get_status()
+        # Include reference readiness info
+        if not self._drift_reference_ready:
+            status.samples_collected = len(self._drift_reference_scores)
+        return status

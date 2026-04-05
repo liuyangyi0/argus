@@ -202,6 +202,21 @@ class ModelRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "model_version_id": self.model_version_id,
+            "camera_id": self.camera_id,
+            "model_type": self.model_type,
+            "model_hash": self.model_hash,
+            "data_hash": self.data_hash,
+            "code_version": self.code_version,
+            "training_params": self.training_params,
+            "calibration_thresholds": self.calibration_thresholds,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "is_active": self.is_active,
+        }
+
 
 class User(Base):
     """System user with role-based access."""

@@ -112,6 +112,9 @@ def create_app(
     app.include_router(users_router, prefix="/api/users", tags=["users"])
     app.include_router(reports_router, prefix="/api/reports", tags=["reports"])
 
+    from argus.dashboard.routes.models import router as models_router
+    app.include_router(models_router, prefix="/api/models", tags=["models"])
+
     try:
         from argus.dashboard.routes.baseline import router as baseline_router
         app.include_router(baseline_router, prefix="/api/baseline", tags=["baseline"])

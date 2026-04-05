@@ -74,8 +74,10 @@ class OpenVocabClassifier:
         try:
             results = self._model(crop, verbose=False)
             if results and results[0].boxes and len(results[0].boxes) > 0:
-                cls_id = int(results[0].boxes[0].cls)
-                conf = float(results[0].boxes[0].conf)
+                cls_val = results[0].boxes[0].cls
+                conf_val = results[0].boxes[0].conf
+                cls_id = int(cls_val.item() if hasattr(cls_val, 'item') else cls_val)
+                conf = float(conf_val.item() if hasattr(conf_val, 'item') else conf_val)
                 label = results[0].names[cls_id]
                 return label, conf
         except Exception as e:

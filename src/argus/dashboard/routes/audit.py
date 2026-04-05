@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from argus.dashboard.components import empty_state, page_header
 
@@ -24,6 +24,53 @@ _ACTION_LABELS: dict[str, str] = {
     "bulk_acknowledge": "批量确认",
     "bulk_false_positive": "批量标记误报",
 }
+
+
+def _audit_entry_to_dict(entry) -> dict:
+    """Convert an AuditLog ORM object to a JSON-serializable dict."""
+    return {
+        "id": entry.id,
+        "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+        "user": entry.user,
+        "action": entry.action,
+        "target_type": entry.target_type,
+        "target_id": entry.target_id or "",
+        "details": entry.detail or "",
+        "ip_address": entry.ip_address or "",
+    }
+
+
+# ── JSON API endpoint (for Vue frontend) ──
+
+
+@router.get("/json")
+async def audit_json(
+    request: Request,
+    user: str | None = Query(None),
+    action: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """JSON API: paginated audit log entries with optional filters."""
+    audit = getattr(request.app.state, "audit_logger", None)
+    if not audit:
+        return JSONResponse({"error": "审计日志不可用"}, status_code=503)
+
+    offset = (page - 1) * page_size
+    logs = audit.get_logs(
+        user=user or None, action=action or None, limit=page_size, offset=offset
+    )
+    total = audit.count_logs(user=user or None, action=action or None)
+
+    return JSONResponse({
+        "entries": [_audit_entry_to_dict(e) for e in logs],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    })
+
+
+# ── HTML endpoint (legacy HTMX) ──
 
 
 @router.get("", response_class=HTMLResponse)

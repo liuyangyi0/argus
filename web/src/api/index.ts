@@ -34,11 +34,48 @@ export const bulkFalsePositive = (ids: string[]) =>
 // ── System ──
 export const getHealth = () => api.get('/system/health')
 
+// ── Baselines ──
+export const getBaselines = () => api.get('/baseline/list/json')
+export const startCapture = (data: FormData) => api.post('/baseline/capture', data)
+export const optimizeBaseline = (data: { camera_id: string; zone_id?: string; target_ratio?: number }) =>
+  api.post('/baseline/optimize/json', data)
+export const previewOptimize = (params: { camera_id: string; zone_id?: string; target_ratio?: number }) =>
+  api.get('/baseline/optimize/preview', { params })
+
 // ── Training ──
-export const startTraining = (data: Record<string, any>) => api.post('/baseline/train', data)
+export const startTraining = (data: FormData) => api.post('/baseline/train', data)
+export const getTrainingHistory = (params?: Record<string, any>) =>
+  api.get('/baseline/training-history/json', { params })
+export const compareModels = (data: { old_record_id: number; new_record_id: number }) =>
+  api.post('/baseline/compare', data, { timeout: 120000 })
+
+// ── Models ──
+export const getModels = () => api.get('/baseline/models/json')
 export const deployModel = (data: Record<string, any>) => api.post('/baseline/deploy', data)
+export const getModelRegistry = (cameraId?: string) =>
+  api.get('/models/json', { params: cameraId ? { camera_id: cameraId } : {} })
+export const activateModel = (versionId: string) =>
+  api.post(`/models/${versionId}/activate`)
+export const rollbackModel = (versionId: string) =>
+  api.post(`/models/${versionId}/rollback`)
+
+// ── Tasks ──
+export const getTasks = () => api.get('/tasks/json')
+export const dismissTask = (taskId: string) => api.delete(`/tasks/${taskId}`)
 
 // ── Config ──
 export const reloadConfig = () => api.post('/config/reload')
+
+// ── Users ──
+export const getUsers = () => api.get('/users/json')
+export const createUser = (data: { username: string; password: string; role: string; display_name: string }) =>
+  api.post('/users/json', data)
+export const deleteUser = (username: string) => api.delete(`/users/${username}/json`)
+export const toggleUserActive = (username: string) =>
+  api.post(`/users/${username}/toggle-active/json`)
+
+// ── Audit ──
+export const getAuditLogs = (params?: { page?: number; page_size?: number; user?: string; action?: string }) =>
+  api.get('/audit/json', { params })
 
 export default api

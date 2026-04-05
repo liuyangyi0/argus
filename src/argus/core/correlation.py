@@ -44,8 +44,13 @@ class CrossCameraCorrelator:
     3. Query correlation before emitting alert
     """
 
-    def __init__(self, pairs: list[CameraOverlapPair]):
+    def __init__(
+        self,
+        pairs: list[CameraOverlapPair],
+        corroboration_threshold: float = 0.3,
+    ):
         self._pairs: dict[str, list[tuple[str, np.ndarray]]] = {}
+        self._corroboration_threshold = corroboration_threshold
         for pair in pairs:
             H = np.array(pair.homography, dtype=np.float64)
             self._pairs.setdefault(pair.camera_a, []).append((pair.camera_b, H))
@@ -92,7 +97,7 @@ class CrossCameraCorrelator:
                 x1, x2 = max(0, px - r), min(w, px + r)
                 region_score = float(partner_map[y1:y2, x1:x2].max())
 
-                if region_score > 0.3:
+                if region_score > self._corroboration_threshold:
                     return CorrelationResult(
                         corroborated=True,
                         partner_camera=partner_id,

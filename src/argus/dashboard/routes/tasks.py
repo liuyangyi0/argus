@@ -42,6 +42,29 @@ async def tasks_list(request: Request):
     return HTMLResponse(html)
 
 
+@router.get("/json")
+async def tasks_list_json(request: Request):
+    """JSON API: active tasks with progress."""
+    task_manager = getattr(request.app.state, "task_manager", None)
+    if not task_manager:
+        return JSONResponse({"tasks": []})
+
+    tasks = task_manager.get_active_tasks()
+    return JSONResponse({"tasks": [
+        {
+            "task_id": t.task_id,
+            "task_type": t.task_type,
+            "camera_id": t.camera_id,
+            "status": t.status.value,
+            "progress": t.progress,
+            "message": t.message,
+            "error": t.error,
+            "result": t.result if isinstance(t.result, dict) else None,
+        }
+        for t in tasks
+    ]})
+
+
 @router.get("/{task_id}", response_class=HTMLResponse)
 async def task_detail(request: Request, task_id: str):
     """Single task progress - HTMX polls this for live updates."""

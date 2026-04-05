@@ -27,6 +27,7 @@ class AnomalyResult:
     is_anomalous: bool
     threshold: float
     detection_failed: bool = False  # True when prediction errored out
+    raw_score: float | None = None  # Pre-calibration score (None if no calibration)
 
 
 @dataclass
@@ -40,6 +41,7 @@ class DetectorStatus:
     ssim_calibration_progress: float  # 0.0 to 1.0, relevant in SSIM mode
     ssim_calibrated: bool
     ssim_noise_floor: float | None
+    is_quantized: bool = False  # True when the loaded model contains INT8 ops
 
 
 class AnomalibDetector:
@@ -60,12 +62,16 @@ class AnomalibDetector:
         ssim_baseline_frames: int = 15,
         ssim_sensitivity: float = 50.0,
         ssim_midpoint: float = 0.015,
+        enable_calibration: bool = True,
     ):
         self.threshold = threshold
         self.image_size = image_size
         self._model_path = Path(model_path) if model_path else None
         self._engine = None
         self._loaded = False
+        self._enable_calibration = enable_calibration
+        self._calibration_scores: np.ndarray | None = None  # sorted scores for p-value
+        self._calibration_n: int = 0
         self._ssim_baseline_frames = ssim_baseline_frames
         self._ssim_sensitivity = ssim_sensitivity
         self._ssim_midpoint = ssim_midpoint
@@ -98,6 +104,7 @@ class AnomalibDetector:
                 self._engine = OpenVINOInferencer(path=self._model_path)
                 self._loaded = True
                 logger.info("anomaly.model_loaded_openvino", path=str(self._model_path))
+                self._load_calibration()
                 return True
             except Exception as e:
                 logger.warning("anomaly.openvino_failed", error=str(e))
@@ -113,10 +120,71 @@ class AnomalibDetector:
             self._engine = TorchInferencer(path=self._model_path)
             self._loaded = True
             logger.info("anomaly.model_loaded_torch", path=str(self._model_path))
+            self._load_calibration()
             return True
         except Exception as e:
             logger.error("anomaly.load_failed", error=str(e))
             return False
+
+    def _load_calibration(self) -> None:
+        """Load conformal calibration data from calibration.json near the model.
+
+        Searches for calibration.json in the model file's directory and up to
+        3 parent directories (covers model files nested in subdirectories).
+        """
+        if not self._enable_calibration or self._model_path is None:
+            return
+
+        try:
+            from argus.alerts.calibration import ConformalCalibrator
+
+            # Search model dir and parents for calibration.json
+            search_dir = self._model_path.parent
+            for _ in range(4):  # current dir + 3 parents
+                cal_path = search_dir / "calibration.json"
+                if cal_path.exists():
+                    scores = ConformalCalibrator.load_sorted_scores(cal_path)
+                    if scores is not None and len(scores) > 0:
+                        self._calibration_scores = scores
+                        self._calibration_n = len(scores)
+                        logger.info(
+                            "anomaly.calibration_loaded",
+                            path=str(cal_path),
+                            n_samples=self._calibration_n,
+                        )
+                    else:
+                        logger.info(
+                            "anomaly.calibration_no_scores",
+                            path=str(cal_path),
+                            msg="calibration.json found but no sorted_scores, skipping p-value calibration",
+                        )
+                    return
+                search_dir = search_dir.parent
+
+            logger.debug("anomaly.no_calibration", msg="No calibration.json found near model")
+        except Exception as e:
+            logger.warning("anomaly.calibration_load_failed", error=str(e))
+
+    def _apply_calibration(self, raw_score: float) -> float:
+        """Convert a raw anomaly score to a calibrated p-value.
+
+        p_value = (number of calibration scores >= raw_score) / n_samples
+
+        Higher p-value means more calibration samples had scores at or above
+        this level, so the observation is more "normal". We invert it so that
+        a higher calibrated score still means more anomalous:
+        calibrated_score = 1 - p_value
+        """
+        if self._calibration_scores is None:
+            return raw_score
+
+        # searchsorted with side='left' gives the index of the first score >= raw_score
+        # So n - index = number of scores >= raw_score
+        idx = np.searchsorted(self._calibration_scores, raw_score, side="left")
+        n_ge = self._calibration_n - idx
+        p_value = n_ge / self._calibration_n
+        calibrated = 1.0 - p_value
+        return max(0.0, min(calibrated, 1.0))
 
     def predict(self, frame: np.ndarray) -> AnomalyResult:
         """Run anomaly detection on a frame.
@@ -165,6 +233,12 @@ class AnomalibDetector:
             # Clamp to valid range
             anomaly_score = max(0.0, min(anomaly_score, 1.0))
 
+            # Apply conformal calibration if available
+            raw_score_out = None
+            if self._calibration_scores is not None:
+                raw_score_out = anomaly_score
+                anomaly_score = self._apply_calibration(anomaly_score)
+
             anomaly_map = None
             if prediction.anomaly_map is not None:
                 amap = prediction.anomaly_map.squeeze()
@@ -188,6 +262,7 @@ class AnomalibDetector:
                 anomaly_map=anomaly_map,
                 is_anomalous=anomaly_score >= self.threshold,
                 threshold=self.threshold,
+                raw_score=raw_score_out,
             )
         except Exception as e:
             logger.error("anomaly.predict_failed", error=str(e), error_type=type(e).__name__)
@@ -322,6 +397,11 @@ class AnomalibDetector:
         else:
             calibration_progress = 0.0
 
+        # Detect INT8 quantization by inspecting OpenVINO model ops
+        is_quantized = False
+        if self._loaded and self._engine is not None:
+            is_quantized = self._detect_quantization()
+
         return DetectorStatus(
             mode="anomalib" if self._loaded else "ssim_fallback",
             model_path=str(self._model_path) if self._model_path else None,
@@ -330,7 +410,37 @@ class AnomalibDetector:
             ssim_calibration_progress=calibration_progress,
             ssim_calibrated=calibrated,
             ssim_noise_floor=self._ssim_noise_floor,
+            is_quantized=is_quantized,
         )
+
+    def _detect_quantization(self) -> bool:
+        """Check if the loaded OpenVINO model contains INT8 quantized ops."""
+        try:
+            import openvino as ov
+
+            if self._model_path is None:
+                return False
+
+            model_xml = self._model_path
+            if model_xml.suffix.lower() != ".xml":
+                return False
+
+            core = ov.Core()
+            model = core.read_model(str(model_xml))
+
+            # Check for FakeQuantize or i8 element types indicating INT8
+            for op in model.get_ordered_ops():
+                op_type = op.get_type_name()
+                if op_type == "FakeQuantize":
+                    return True
+                # Check for INT8 element types in outputs
+                for output in op.outputs():
+                    et = output.get_element_type()
+                    if "i8" in str(et) or "u8" in str(et):
+                        return True
+            return False
+        except Exception:
+            return False
 
     def hot_reload(self, new_model_path: Path) -> bool:
         """Hot-reload the anomaly model without stopping inference.
@@ -355,6 +465,11 @@ class AnomalibDetector:
                 self._engine = new_engine
                 self._model_path = new_model_path
                 self._loaded = True
+
+            # Reload calibration data for the new model
+            self._calibration_scores = None
+            self._calibration_n = 0
+            self._load_calibration()
 
             logger.info("anomaly.hot_reload_success", path=str(new_model_path))
             return True

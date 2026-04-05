@@ -1,15 +1,15 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Row, Col, Card, Statistic, Alert, Tag, List, Badge, Typography } from 'ant-design-vue'
 import { getHealth, getCameras, getAlerts } from '../api'
+import { useWebSocket } from '../composables/useWebSocket'
 
 const router = useRouter()
 const health = ref<any>(null)
 const cameras = ref<any[]>([])
 const alerts = ref<any[]>([])
 const loading = ref(true)
-let timer: ReturnType<typeof setInterval>
 
 async function fetchData() {
   try {
@@ -28,11 +28,18 @@ async function fetchData() {
   }
 }
 
-onMounted(() => {
-  fetchData()
-  timer = setInterval(fetchData, 15000)
+const { } = useWebSocket({
+  topics: ['health', 'cameras', 'alerts'],
+  onMessage(topic, data) {
+    if (topic === 'health') health.value = data
+    else if (topic === 'cameras') cameras.value = data
+    else if (topic === 'alerts') alerts.value = data
+  },
+  fallbackPoll: fetchData,
+  fallbackInterval: 15000,
 })
-onUnmounted(() => clearInterval(timer))
+
+onMounted(fetchData)
 
 const connected = () => cameras.value.filter((c: any) => c.connected).length
 const severityColor: Record<string, string> = {
