@@ -152,6 +152,18 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
     current_zones.append(new_zone)
     pipeline.update_zones(current_zones)
 
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="update_zone",
+            target_type="zone",
+            target_id=f"{zone_req.camera_id}/{zone_req.zone_id}",
+            detail=f"添加区域 {zone_req.name}",
+            ip_address=client_ip,
+        )
+
     return JSONResponse(
         {"status": "ok", "zone_id": zone_req.zone_id},
         headers={"HX-Trigger": '{"showToast": {"message": "区域已添加", "type": "success"}}'},
@@ -171,6 +183,18 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
 
     new_zones = [z for z in pipeline.camera_config.zones if z.zone_id != zone_id]
     pipeline.update_zones(new_zones)
+
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="update_zone",
+            target_type="zone",
+            target_id=f"{camera_id}/{zone_id}",
+            detail="删除区域",
+            ip_address=client_ip,
+        )
 
     return JSONResponse(
         {"status": "ok"},
