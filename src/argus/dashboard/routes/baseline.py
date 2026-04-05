@@ -45,7 +45,12 @@ logger = structlog.get_logger()
 
 router = APIRouter()
 
-_GRADE_COLORS = {"A": "#4caf50", "B": "#8bc34a", "C": "#ff9800", "F": "#f44336"}
+_GRADE_COLORS = {
+    "A": "var(--status-ok)",
+    "B": "var(--status-ok-text)",
+    "C": "var(--status-warn)",
+    "F": "var(--status-critical)",
+}
 
 _TABS = [
     ("capture", "基线采集", "/api/baseline/capture"),
@@ -58,15 +63,13 @@ _TABS = [
 
 @router.get("", response_class=HTMLResponse)
 async def baseline_main(request: Request):
-    """Baseline & model management page with tabs."""
-    header = page_header("基线与模型管理", "采集基线图片、训练检测模型、部署到摄像头")
+    """Model management page with tabs."""
+    header = page_header("模型", "采集基线、训练检测模型、部署到摄像头")
     tabs = tab_bar(_TABS, "capture")
-    # Load first tab content on page load
     return HTMLResponse(f"""
     {header}
     {tabs}
     <script>
-        // Auto-load first tab
         document.addEventListener('DOMContentLoaded', function() {{
             htmx.ajax('GET', '/api/baseline/capture', {{target: '#tab-content', swap: 'innerHTML'}});
         }});
@@ -458,7 +461,7 @@ async def train_form(request: Request):
         active = [t for t in task_manager.get_active_tasks()
                   if t.task_type == "model_training" and t.status.value in ("pending", "running")]
         if active:
-            task_html = '<div class="card" style="border-left:3px solid #4fc3f7;"><h3>正在训练</h3>'
+            task_html = '<div class="card" style="border-left:3px solid var(--status-info);"><h3>正在训练</h3>'
             task_html += f'<div hx-get="/api/tasks/{active[0].task_id}" data-ws-topic="tasks" data-ws-refresh-url="/api/tasks/{active[0].task_id}" hx-trigger="every 30s" hx-swap="outerHTML"></div>'
             task_html += '</div>'
 
@@ -477,7 +480,7 @@ async def train_form(request: Request):
     {task_html}
     <div class="card">
         <h3>训练异常检测模型</h3>
-        <p style="color:#8890a0;font-size:13px;margin-bottom:16px;">
+        <p style="color:var(--text-secondary);font-size:var(--text-sm);margin-bottom:var(--space-4);">
             使用基线图片训练异常检测模型。训练完成后可直接部署到摄像头。
             训练耗时通常为 5-15 分钟，取决于图片数量和模型类型。
         </p>
@@ -568,7 +571,7 @@ async def models_list(request: Request):
                     <td>{fmt}</td>
                     <td>{size_mb:.1f} MB</td>
                     <td>{mtime}</td>
-                    <td style="font-size:12px;color:#8890a0;">{rel_path}</td>
+                    <td class="mono" style="font-size:var(--text-xs);color:var(--text-tertiary);">{rel_path}</td>
                     <td>
                         <button class="btn btn-primary btn-sm"
                             hx-post="/api/baseline/deploy"
@@ -771,9 +774,27 @@ async def training_history(request: Request):
     </div>""")
 
 
+def _metric_bar(label: str, value: float, threshold: float, max_val: float = 1.0, invert: bool = False) -> str:
+    """Render a metric with progress bar visualization."""
+    pct = min(value / max_val * 100, 100) if max_val > 0 else 0
+    passed = (value <= threshold) if invert else (value >= threshold)
+    color = "var(--status-ok)" if passed else "var(--status-critical)"
+    icon = "&#10003;" if passed else "&#10007;"
+    return f"""
+    <div style="margin-bottom:var(--space-3);">
+        <div class="flex-between" style="font-size:var(--text-sm);margin-bottom:var(--space-1);">
+            <span style="color:var(--text-secondary);">{label}</span>
+            <span style="color:{color};font-weight:var(--font-semibold);">{icon} {value:.4f}</span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-fill" style="width:{pct:.0f}%;background:{color};"></div>
+        </div>
+    </div>"""
+
+
 @router.get("/training-report/{record_id}", response_class=HTMLResponse)
 async def training_report(request: Request, record_id: int):
-    """Show detailed training report for a specific record."""
+    """Show detailed training report with metric bars and validation results."""
     database = getattr(request.app.state, "database", None)
     if not database:
         return HTMLResponse(empty_state("数据库不可用"))
@@ -785,76 +806,85 @@ async def training_report(request: Request, record_id: int):
     back_btn = (
         '<button class="btn btn-ghost btn-sm mb-16" '
         'hx-get="/api/baseline/training-history" hx-target="#tab-content" hx-swap="innerHTML">'
-        '← 返回列表</button>'
+        '&larr; 返回列表</button>'
     )
 
-
-    grade_color = _GRADE_COLORS.get(record.quality_grade, "#888")
+    grade_color = _GRADE_COLORS.get(record.quality_grade, "var(--text-tertiary)")
 
     # Pre-validation section
     pre_val_html = ""
     if record.corruption_rate is not None:
+        pass_icon = "&#10003;" if record.pre_validation_passed else "&#10007;"
+        pass_color = "var(--status-ok-text)" if record.pre_validation_passed else "var(--status-critical-text)"
         pre_val_html = f"""
         <div class="card">
-            <h3>基线质量验证 (TRN-001)</h3>
+            <h3>基线质量验证</h3>
             <table>
-                <tr><td>验证结果</td><td>{"通过" if record.pre_validation_passed else "失败"}</td></tr>
-                <tr><td>损坏率</td><td>{record.corruption_rate:.1%}</td></tr>
-                <tr><td>近似重复率</td><td>{record.near_duplicate_rate:.1%}</td></tr>
-                <tr><td>亮度标准差</td><td>{record.brightness_std:.1f}</td></tr>
+                <tr><td style="color:var(--text-secondary);">验证结果</td>
+                    <td style="color:{pass_color};">{pass_icon} {"通过" if record.pre_validation_passed else "失败"}</td></tr>
+                <tr><td style="color:var(--text-secondary);">损坏率</td><td>{record.corruption_rate:.1%}</td></tr>
+                <tr><td style="color:var(--text-secondary);">近似重复率</td><td>{record.near_duplicate_rate:.1%}</td></tr>
+                <tr><td style="color:var(--text-secondary);">亮度标准差</td><td>{record.brightness_std:.1f}</td></tr>
             </table>
         </div>"""
 
-    # Score distribution section
+    # Score distribution with metric bars
     score_html = ""
     if record.val_score_mean is not None:
         score_html = f"""
         <div class="card">
-            <h3>验证集分数分布 (TRN-003)</h3>
-            <table>
-                <tr><td>均值</td><td>{record.val_score_mean:.4f}</td></tr>
-                <tr><td>标准差</td><td>{record.val_score_std:.4f}</td></tr>
-                <tr><td>最大值</td><td>{record.val_score_max:.4f}</td></tr>
-                <tr><td>P95</td><td>{record.val_score_p95:.4f}</td></tr>
-            </table>
+            <h3>验证集分数分布</h3>
+            {_metric_bar("均值 (越低越好)", record.val_score_mean, 0.3, max_val=1.0, invert=True)}
+            {_metric_bar("标准差 (越低越好)", record.val_score_std, 0.1, max_val=0.5, invert=True)}
+            {_metric_bar("最大值", record.val_score_max, 0.5, max_val=1.0, invert=True)}
+            {_metric_bar("P95", record.val_score_p95, 0.4, max_val=1.0, invert=True)}
         </div>"""
 
     # Output validation section
     output_html = ""
     if record.checkpoint_valid is not None:
-        smoke_str = "通过" if record.smoke_test_passed else "失败"
+        def _check(val, label_ok, label_fail):
+            if val:
+                return f'<span style="color:var(--status-ok-text);">&#10003; {label_ok}</span>'
+            return f'<span style="color:var(--status-critical-text);">&#10007; {label_fail}</span>'
+
         latency_str = f"{record.inference_latency_ms:.1f}ms" if record.inference_latency_ms else "—"
         output_html = f"""
         <div class="card">
-            <h3>输出验证 (TRN-006)</h3>
+            <h3>输出验证</h3>
             <table>
-                <tr><td>模型文件</td><td>{"有效" if record.checkpoint_valid else "无效"}</td></tr>
-                <tr><td>导出文件</td><td>{"有效" if record.export_valid else "无效/未导出"}</td></tr>
-                <tr><td>冒烟测试</td><td>{smoke_str}</td></tr>
-                <tr><td>推理延迟</td><td>{latency_str}</td></tr>
+                <tr><td style="color:var(--text-secondary);">模型文件</td><td>{_check(record.checkpoint_valid, "有效", "无效")}</td></tr>
+                <tr><td style="color:var(--text-secondary);">导出文件</td><td>{_check(record.export_valid, "有效", "无效/未导出")}</td></tr>
+                <tr><td style="color:var(--text-secondary);">冒烟测试</td><td>{_check(record.smoke_test_passed, "通过", "失败")}</td></tr>
+                <tr><td style="color:var(--text-secondary);">推理延迟</td><td>{latency_str}</td></tr>
             </table>
         </div>"""
 
     trained_at = record.trained_at.strftime("%Y-%m-%d %H:%M:%S") if record.trained_at else "—"
     threshold_str = f"{record.threshold_recommended:.4f}" if record.threshold_recommended else "—"
+    error_html = (
+        f'<div style="color:var(--status-critical-text);margin-top:var(--space-3);">'
+        f'<strong>错误:</strong> {record.error}</div>'
+        if record.error else ""
+    )
 
     return HTMLResponse(f"""
     {back_btn}
     <div class="card" style="border-left:4px solid {grade_color};">
         <h3>训练报告 #{record.id}</h3>
-        <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;">
-            <span style="font-size:48px;font-weight:bold;color:{grade_color};">
+        <div style="display:flex;align-items:center;gap:var(--space-5);margin-bottom:var(--space-4);">
+            <span style="font-size:var(--text-4xl);font-weight:var(--font-semibold);color:{grade_color};line-height:1;">
                 {record.quality_grade or "—"}
             </span>
-            <div>
+            <div style="font-size:var(--text-sm);">
                 <div><strong>摄像头:</strong> {record.camera_id}</div>
                 <div><strong>模型:</strong> {record.model_type} | {record.export_format or "未导出"}</div>
-                <div><strong>数据:</strong> {record.baseline_count} 基线 → {record.train_count} 训练 + {record.val_count} 验证</div>
-                <div><strong>推荐阈值:</strong> {threshold_str}</div>
+                <div><strong>数据:</strong> {record.baseline_count} 基线 &rarr; {record.train_count} 训练 + {record.val_count} 验证</div>
+                <div><strong>推荐阈值:</strong> <span class="mono">{threshold_str}</span></div>
                 <div><strong>耗时:</strong> {record.duration_seconds:.0f} 秒 | {trained_at}</div>
             </div>
         </div>
-        {f'<div style="color:#f44336;margin-bottom:12px;"><strong>错误:</strong> {record.error}</div>' if record.error else ''}
+        {error_html}
     </div>
     {pre_val_html}
     {score_html}
