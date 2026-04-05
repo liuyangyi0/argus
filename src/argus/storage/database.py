@@ -6,10 +6,10 @@ from datetime import datetime
 from pathlib import Path
 
 import structlog
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, func as sa_func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from argus.storage.models import AlertRecord, Base, BaselineRecord
+from argus.storage.models import AlertRecord, Base, BaselineRecord, TrainingRecord
 
 logger = structlog.get_logger()
 
@@ -162,12 +162,12 @@ class Database:
     ) -> int:
         """Get total alert count with optional filters."""
         with self.get_session() as session:
-            stmt = select(AlertRecord)
+            stmt = select(sa_func.count()).select_from(AlertRecord)
             if camera_id:
                 stmt = stmt.where(AlertRecord.camera_id == camera_id)
             if severity:
                 stmt = stmt.where(AlertRecord.severity == severity)
-            return len(list(session.scalars(stmt).all()))
+            return session.scalar(stmt) or 0
 
     def delete_old_alerts(self, days: int = 90) -> tuple[int, list[str]]:
         """Delete alerts older than N days. Returns (count_deleted, image_paths).
@@ -206,6 +206,54 @@ class Database:
                 images=len(image_paths),
             )
             return len(old_alerts), image_paths
+
+    # ── Training records ──
+
+    def save_training_record(self, record: TrainingRecord) -> TrainingRecord:
+        """Save a training record to the database."""
+        with self.get_session() as session:
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            logger.debug("database.training_record_saved", camera_id=record.camera_id)
+            return record
+
+    def get_training_history(
+        self,
+        camera_id: str | None = None,
+        zone_id: str | None = None,
+        limit: int = 20,
+    ) -> list[TrainingRecord]:
+        """Query training records with optional filters."""
+        with self.get_session() as session:
+            stmt = select(TrainingRecord).order_by(TrainingRecord.trained_at.desc())
+            if camera_id:
+                stmt = stmt.where(TrainingRecord.camera_id == camera_id)
+            if zone_id:
+                stmt = stmt.where(TrainingRecord.zone_id == zone_id)
+            stmt = stmt.limit(limit)
+            return list(session.scalars(stmt).all())
+
+    def get_latest_training(
+        self, camera_id: str, zone_id: str = "default"
+    ) -> TrainingRecord | None:
+        """Get the most recent successful training record for a camera/zone."""
+        with self.get_session() as session:
+            return session.scalar(
+                select(TrainingRecord)
+                .where(TrainingRecord.camera_id == camera_id)
+                .where(TrainingRecord.zone_id == zone_id)
+                .where(TrainingRecord.status == "complete")  # TrainingStatus.COMPLETE.value
+                .order_by(TrainingRecord.trained_at.desc())
+                .limit(1)
+            )
+
+    def get_training_record(self, record_id: int) -> TrainingRecord | None:
+        """Get a single training record by ID."""
+        with self.get_session() as session:
+            return session.scalar(
+                select(TrainingRecord).where(TrainingRecord.id == record_id)
+            )
 
     def close(self) -> None:
         """Close the database engine."""
