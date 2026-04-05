@@ -2047,7 +2047,7 @@ def test_homography_projection_correct():
 
 ---
 
-### C4: 最小可行 MLOps
+### C4: 最小可行 MLOps ✅ 已修改完
 
 #### C4-1: ✅ 创建 ModelRecord ORM 和 Registry
 
