@@ -121,12 +121,16 @@ class CameraCapture:
             return None
 
         ret, frame = self._cap.read()
+        # CRIT-05: Copy immediately to decouple from VideoCapture's internal buffer
+        if ret and frame is not None:
+            frame = frame.copy()
         if not ret or frame is None:
             # For video files: loop back to beginning instead of disconnecting
             if self.protocol == "file" and self._cap is not None:
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = self._cap.read()
                 if ret and frame is not None:
+                    frame = frame.copy()
                     logger.debug("camera.file_loop", camera_id=self.camera_id)
                     # Fall through to normal processing
                 else:

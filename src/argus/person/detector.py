@@ -37,6 +37,7 @@ class PersonFilterResult:
     persons: list[PersonDetection]
     has_persons: bool
     masked_frame: np.ndarray | None = None  # frame with persons blacked out
+    filter_available: bool = True  # False when YOLO model failed to load
 
 
 class YOLOPersonDetector:
@@ -73,10 +74,10 @@ class YOLOPersonDetector:
             logger.info("yolo.loaded", model=self._model_name)
         except Exception as e:
             self._available = False
-            logger.warning(
+            logger.error(
                 "yolo.unavailable",
                 error=str(e),
-                msg="Person filtering disabled — all frames will be analyzed",
+                msg="Person filtering OFFLINE — all frames will be analyzed unfiltered",
             )
 
     def detect(self, frame: np.ndarray) -> PersonFilterResult:
@@ -87,7 +88,7 @@ class YOLOPersonDetector:
         self._ensure_model()
 
         if not self._available:
-            return PersonFilterResult(persons=[], has_persons=False)
+            return PersonFilterResult(persons=[], has_persons=False, filter_available=False)
 
         results = self._model.predict(
             frame,

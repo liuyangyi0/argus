@@ -28,12 +28,14 @@ async def tasks_list(request: Request):
     tasks = task_manager.get_active_tasks()
     if not tasks:
         return HTMLResponse(
-            '<div hx-get="/api/tasks" hx-trigger="every 3s" hx-swap="outerHTML">'
+            '<div data-ws-topic="tasks" data-ws-refresh-url="/api/tasks"'
+            ' hx-get="/api/tasks" hx-trigger="every 30s" hx-swap="outerHTML">'
             + empty_state("暂无活跃任务")
             + "</div>"
         )
 
-    html = '<div hx-get="/api/tasks" hx-trigger="every 3s" hx-swap="outerHTML">'
+    html = ('<div data-ws-topic="tasks" data-ws-refresh-url="/api/tasks"'
+            ' hx-get="/api/tasks" hx-trigger="every 30s" hx-swap="outerHTML">')
     for t in tasks:
         html += _render_task_card(t)
     html += "</div>"
@@ -82,7 +84,10 @@ def _render_task_card(task) -> str:
     # Only poll when running
     poll_attr = ""
     if task.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
-        poll_attr = f'hx-get="/api/tasks/{task.task_id}" hx-trigger="every 1s" hx-swap="outerHTML"'
+        poll_attr = (
+            f'data-ws-topic="tasks" data-ws-refresh-url="/api/tasks/{task.task_id}" '
+            f'hx-get="/api/tasks/{task.task_id}" hx-trigger="every 30s" hx-swap="outerHTML"'
+        )
 
     dismiss_btn = ""
     if task.status in (TaskStatus.COMPLETE, TaskStatus.FAILED):

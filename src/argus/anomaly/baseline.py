@@ -7,6 +7,7 @@ live cameras and versioned storage.
 
 from __future__ import annotations
 
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -60,13 +61,15 @@ class BaselineManager:
         base = self.baselines_dir / camera_id / zone_id
         base.mkdir(parents=True, exist_ok=True)
 
-        # Find next version number
+        # Find next version number (MED-04: robust parsing)
         existing = sorted(base.glob("v*"))
-        if existing:
-            last_num = int(existing[-1].name[1:])
-            version = f"v{last_num + 1:03d}"
-        else:
-            version = "v001"
+        last_num = 0
+        for d in reversed(existing):
+            m = re.match(r"^v(\d+)$", d.name)
+            if m:
+                last_num = int(m.group(1))
+                break
+        version = f"v{last_num + 1:03d}"
 
         version_dir = base / version
         version_dir.mkdir()

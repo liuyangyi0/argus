@@ -52,10 +52,12 @@ class CameraManager:
         cameras: list[CameraConfig],
         alert_config: AlertConfig,
         on_alert: Callable[[Alert], None] | None = None,
+        on_status_change: Callable[[str, dict], None] | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
         self._on_alert = on_alert
+        self._on_status_change = on_status_change
         self._pipelines: dict[str, DetectionPipeline] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stop_event = threading.Event()
@@ -157,6 +159,32 @@ class CameraManager:
             return None
         return pipeline.get_latest_anomaly_map()
 
+    def _notify_camera_status(self, camera_id: str) -> None:
+        """Notify WebSocket subscribers of camera status change."""
+        if not self._on_status_change:
+            return
+        try:
+            pipeline = self._pipelines.get(camera_id)
+            if not pipeline:
+                return
+            cam_config = next((c for c in self._cameras if c.camera_id == camera_id), None)
+            s = pipeline.stats
+            self._on_status_change("cameras", {
+                "camera_id": camera_id,
+                "name": cam_config.name if cam_config else camera_id,
+                "connected": pipeline._camera.state.connected,
+                "running": camera_id in self._threads,
+                "stats": {
+                    "frames_captured": s.frames_captured,
+                    "frames_analyzed": s.frames_analyzed,
+                    "anomalies_detected": s.anomalies_detected,
+                    "alerts_emitted": s.alerts_emitted,
+                    "avg_latency_ms": round(s.avg_latency_ms, 1),
+                } if s else None,
+            })
+        except Exception as e:
+            logger.debug("manager.notify_failed", error=str(e))
+
     @property
     def alert_count(self) -> int:
         return self._alert_count
@@ -204,7 +232,9 @@ class CameraManager:
         """Main loop for a single camera thread with frame-rate watchdog."""
         logger.info("camera_loop.started", camera_id=camera_id)
         last_frame_time = time.monotonic()
-        watchdog_timeout = 30.0  # seconds without frames before forced reconnect
+        # MED-03: Configurable watchdog timeout from camera config
+        cam_config = next((c for c in self._cameras if c.camera_id == camera_id), None)
+        watchdog_timeout = cam_config.watchdog_timeout if cam_config else 30.0
 
         try:
             while not self._stop_event.is_set():
@@ -218,6 +248,9 @@ class CameraManager:
                         if current > prev:
                             last_frame_time = time.monotonic()
                             self._last_frame_counts[camera_id] = current
+                            # Notify every 25 frames (~5s at 5fps) to avoid flooding
+                            if current % 25 == 0:
+                                self._notify_camera_status(camera_id)
 
                     # Watchdog: force reconnect on stale stream
                     if time.monotonic() - last_frame_time > watchdog_timeout:

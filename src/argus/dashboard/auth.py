@@ -120,6 +120,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def verify_token(token: str, config: AuthConfig) -> bool:
+    """Verify an API token against the configured token.
+
+    Shared by both HTTP auth middleware and WebSocket auth.
+    Uses constant-time comparison to prevent timing attacks.
+    """
+    if not config.enabled:
+        return True
+    if not config.api_token or not token:
+        return False
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expected_hash = hashlib.sha256(config.api_token.encode()).hexdigest()
+    return secrets.compare_digest(token_hash, expected_hash)
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Adds security headers to all responses."""
 
