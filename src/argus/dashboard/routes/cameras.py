@@ -176,7 +176,8 @@ async def cameras_page(request: Request):
     )
 
     return HTMLResponse(f"""
-    <div id="cameras-list" hx-get="/api/cameras" hx-trigger="every 5s" hx-swap="outerHTML">
+    <div id="cameras-list" data-ws-topic="cameras" data-ws-refresh-url="/api/cameras"
+         hx-get="/api/cameras" hx-trigger="every 30s" hx-swap="outerHTML">
         {header}
         {add_form}
         <div class="grid-2">{camera_cards}</div>

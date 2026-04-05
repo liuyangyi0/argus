@@ -163,15 +163,20 @@ class DetectionPipeline:
             max_reconnect_attempts=camera_config.max_reconnect_attempts,
         )
 
-        # Anti-absorption: heartbeat counter
-        self._heartbeat_interval = camera_config.mog2.heartbeat_frames
+        # Anti-absorption: time-based heartbeat (MED-05)
+        self._heartbeat_seconds = camera_config.mog2.heartbeat_frames / max(camera_config.fps_target, 1)
+        self._last_heartbeat_time = 0.0
         self._frame_counter = 0
 
-        # Anti-absorption: anomaly region lock (from config)
-        self._locked = False  # True when a high-confidence anomaly is active
+        # Anti-absorption: anomaly region lock with time-based clearing (HIGH-03)
+        self._locked = False
         self._lock_score_threshold = camera_config.mog2.lock_score_threshold
-        self._lock_clear_count = 0  # Consecutive normal frames needed to clear lock
-        self._lock_clear_target = camera_config.mog2.lock_clear_frames
+        self._lock_clear_threshold = camera_config.mog2.lock_score_threshold * 0.8  # HIGH-05: hysteresis
+        self._lock_clear_seconds = camera_config.mog2.lock_clear_frames / max(camera_config.fps_target, 1)
+        self._lock_last_below_time: float | None = None  # when score first dropped below clear threshold
+
+        # Track person filter degradation (HIGH-04)
+        self._person_filter_warned = False
 
         # Thread safety for hot-updates
         self._config_lock = threading.Lock()
@@ -277,21 +282,27 @@ class DetectionPipeline:
             )
             return None
 
-        # DET-010: Check learning mode auto-expiry
-        if self._learning_start_time is not None:
-            elapsed = time.monotonic() - self._learning_start_time
-            if elapsed >= self._learning_duration:
-                self._learning_start_time = None
-                self._auto_learning_complete = True
-                self.set_mode(PipelineMode.ACTIVE)
-                logger.info("pipeline.learning_complete", camera_id=self.camera_config.camera_id)
+        try:
+            return self._process_frame_inner(frame_data, frame, start)
+        except Exception as e:
+            # CRIT-03: Clear buffers on exception to prevent memory leak
+            with self._latest_raw_frame_lock:
+                self._latest_raw_frame = None
+            with self._latest_frame_lock:
+                self._latest_frame = None
+            logger.error(
+                "pipeline.process_error",
+                camera_id=frame_data.camera_id,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return None
 
-        # DET-006: Snapshot current mode for this frame
-        current_mode = self.mode
-        diag.pipeline_mode = current_mode.value
-
-        # Save raw frame reference before zone masking (CRIT-05)
-        # No copy here — get_raw_frame() copies on read
+    def _process_frame_inner(
+        self, frame_data: FrameData, frame: np.ndarray, start: float
+    ) -> Alert | None:
+        """Inner frame processing logic (extracted for CRIT-03 exception safety)."""
+        # Save raw frame before zone masking (need copy since zone_mask mutates frame)
         with self._latest_raw_frame_lock:
             self._latest_raw_frame = frame
 
@@ -307,11 +318,16 @@ class DetectionPipeline:
             self._latest_frame = frame
 
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
-        t1 = time.monotonic()
-        is_heartbeat = (self._frame_counter % self._heartbeat_interval) == 0
+        # MED-05: Time-based heartbeat instead of frame-count
+        now = time.monotonic()
+        is_heartbeat = (now - self._last_heartbeat_time) >= self._heartbeat_seconds
+        if is_heartbeat:
+            self._last_heartbeat_time = now
+
+        # CRIT-01/02: Read lock state atomically for prefilter decision
         with self._lock_state_lock:
-            locked_snapshot = self._locked
-        skip_prefilter = is_heartbeat or locked_snapshot
+            is_locked = self._locked
+        skip_prefilter = is_heartbeat or is_locked
 
         # DET-006: MAINTENANCE mode freezes MOG2 learning on all frames
         freeze_mog2 = current_mode == PipelineMode.MAINTENANCE
@@ -337,41 +353,29 @@ class DetectionPipeline:
                 self._diagnostics.append(diag)
                 return None
         else:
-            if locked_snapshot or freeze_mog2:
+            if is_locked:
                 self._prefilter.process(frame, learning_rate_override=0.0)
             else:
                 self._prefilter.process(frame)
             if is_heartbeat:
                 self.stats.frames_heartbeat += 1
 
-        if not mog2_skipped:
-            diag.stages.append(StageResult(
-                stage_name="mog2",
-                duration_ms=(time.monotonic() - t1) * 1000,
-                metadata={
-                    "heartbeat": is_heartbeat,
-                    "locked": locked_snapshot,
-                    "frozen": freeze_mog2,
-                },
-            ))
+        # Stage 2: Person filter
+        person_result: PersonFilterResult = self._person_detector.detect(frame)
 
-        # Stage 2: Object detection (YOLO-003: multi-class + tracking)
-        t2 = time.monotonic()
-        detection_result: ObjectDetectionResult = self._object_detector.detect(frame)
-        if detection_result.has_persons and self.camera_config.person_filter.skip_frame_on_person:
+        # HIGH-04: Warn once if person filter is unavailable
+        if not person_result.filter_available and not self._person_filter_warned:
+            self._person_filter_warned = True
+            logger.warning(
+                "pipeline.person_filter_offline",
+                camera_id=self.camera_config.camera_id,
+                msg="YOLO person filter unavailable — frames will not be filtered for humans",
+            )
+
+        if person_result.has_persons and self.camera_config.person_filter.skip_frame_on_person:
             self.stats.frames_skipped_person += 1
-            diag.stages.append(StageResult(
-                stage_name="yolo",
-                duration_ms=(time.monotonic() - t2) * 1000,
-                skipped=True,
-                skip_reason="person_detected",
-                metadata={
-                    "person_count": len(detection_result.persons),
-                    "object_count": len(detection_result.objects),
-                },
-            ))
-            diag.total_duration_ms = (time.monotonic() - start) * 1000
-            self._diagnostics.append(diag)
+            # HIGH-03: Still update lock state even when person filter skips
+            self._update_lock_state_time(time.monotonic())
             return None
 
         diag.stages.append(StageResult(
@@ -400,6 +404,15 @@ class DetectionPipeline:
         ))
         diag.anomaly_score = anomaly_result.anomaly_score
         diag.is_anomalous = anomaly_result.is_anomalous
+
+        # CRIT-04: Log detection failures
+        if anomaly_result.detection_failed:
+            logger.error(
+                "pipeline.detection_failed",
+                camera_id=frame_data.camera_id,
+                frame_number=frame_data.frame_number,
+                msg="Anomaly detection returned failure — frame not analyzed",
+            )
 
         # Cache anomaly heatmap for overlay stream
         with self._latest_anomaly_map_lock:
@@ -512,7 +525,9 @@ class DetectionPipeline:
         """Operator action: clear the anomaly region lock."""
         with self._lock_state_lock:
             self._locked = False
-            self._lock_clear_count = 0
+            self._lock_last_below_time = None
+        # HIGH-01: Reset MOG2 background model after lock release
+        self._prefilter.reset()
         logger.info("pipeline.lock_cleared", camera_id=self.camera_config.camera_id)
 
     @property
@@ -611,8 +626,9 @@ class DetectionPipeline:
                 detected_objects=detected_objects,
             )
 
-        # Evaluate all zones and return the highest-severity alert (HIGH-06)
+        # Evaluate all zones and return highest-severity alert; break ties by score (HIGH-06)
         best_alert = None
+        best_rank = -1
         for zone in include_zones:
             alert = self._alert_grader.evaluate(
                 camera_id=frame_data.camera_id,
@@ -626,13 +642,23 @@ class DetectionPipeline:
                 detected_objects=detected_objects,
             )
             if alert is not None:
-                if best_alert is None or _severity_rank(alert.severity) > _severity_rank(best_alert.severity):
+                rank = _severity_rank(alert.severity)
+                if best_alert is None or rank > best_rank or (
+                    rank == best_rank and alert.anomaly_score > best_alert.anomaly_score
+                ):
                     best_alert = alert
+                    best_rank = rank
 
         return best_alert
 
     def _update_lock_state(self, anomaly_result: AnomalyResult) -> None:
-        """Update the anomaly region lock based on detection results."""
+        """Update the anomaly region lock based on detection results.
+
+        HIGH-05: Uses hysteresis — lock engages at lock_score_threshold,
+        clears only when score drops below lock_clear_threshold (80% of lock threshold).
+        HIGH-03: Uses time-based clearing instead of frame count.
+        """
+        now = time.monotonic()
         with self._lock_state_lock:
             if anomaly_result.anomaly_score >= self._lock_score_threshold:
                 if not self._locked:
@@ -642,12 +668,30 @@ class DetectionPipeline:
                         score=round(anomaly_result.anomaly_score, 3),
                     )
                 self._locked = True
-                self._lock_clear_count = 0
+                self._lock_last_below_time = None  # reset clear timer
             elif self._locked:
-                self._lock_clear_count += 1
-                if self._lock_clear_count >= self._lock_clear_target:
+                # HIGH-05: Use lower hysteresis threshold for clearing
+                if anomaly_result.anomaly_score < self._lock_clear_threshold:
+                    if self._lock_last_below_time is None:
+                        self._lock_last_below_time = now
+                    elif (now - self._lock_last_below_time) >= self._lock_clear_seconds:
+                        self._locked = False
+                        self._lock_last_below_time = None
+                        logger.info(
+                            "pipeline.lock_auto_cleared",
+                            camera_id=self.camera_config.camera_id,
+                        )
+
+    def _update_lock_state_time(self, now: float) -> None:
+        """Update lock clear timer without a detection result (e.g., person-skipped frames).
+
+        HIGH-03: Ensures lock can still clear even when frames are skipped by person filter.
+        """
+        with self._lock_state_lock:
+            if self._locked and self._lock_last_below_time is not None:
+                if (now - self._lock_last_below_time) >= self._lock_clear_seconds:
                     self._locked = False
-                    self._lock_clear_count = 0
+                    self._lock_last_below_time = None
                     logger.info(
                         "pipeline.lock_auto_cleared",
                         camera_id=self.camera_config.camera_id,

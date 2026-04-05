@@ -169,6 +169,10 @@ class CameraConfig(BaseModel):
     zones: list[ZoneConfig] = Field(default_factory=list)
     reconnect_delay: float = Field(default=5.0, ge=1.0, le=300.0)
     max_reconnect_attempts: int = Field(default=-1, ge=-1)
+    watchdog_timeout: float = Field(
+        default=30.0, ge=5.0, le=300.0,
+        description="Seconds without frames before forced reconnect (5-300)",
+    )
     mog2: MOG2Config = Field(default_factory=MOG2Config)
     person_filter: PersonFilterConfig = Field(default_factory=PersonFilterConfig)
     anomaly: AnomalyConfig = Field(default_factory=AnomalyConfig)
@@ -267,6 +271,14 @@ class DashboardConfig(BaseModel):
     mjpeg_fps: float = Field(
         default=5.0, ge=1.0, le=30.0,
         description="MJPEG stream target FPS",
+    )
+    websocket_heartbeat_seconds: int = Field(
+        default=30, ge=5, le=300,
+        description="WebSocket ping interval in seconds",
+    )
+    websocket_max_connections: int = Field(
+        default=100, ge=1, le=1000,
+        description="Maximum concurrent WebSocket connections",
     )
 
 

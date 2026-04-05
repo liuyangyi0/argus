@@ -10,6 +10,7 @@ import platform
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 import structlog
 
@@ -54,10 +55,13 @@ class HealthMonitor:
     a unified view for the dashboard.
     """
 
-    def __init__(self):
+    def __init__(self, on_change: Callable[[str, dict], None] | None = None):
         self._start_time = time.monotonic()
         self._camera_health: dict[str, CameraHealth] = {}
         self._total_alerts = 0
+        self._on_change = on_change
+        self._last_status: str = ""
+        self._last_connected_count: int = -1
 
     def update_camera(
         self,
@@ -78,10 +82,44 @@ class HealthMonitor:
             last_frame_time=time.monotonic(),
             error=error,
         )
+        self._notify_change()
 
     def record_alert(self) -> None:
         """Increment the total alert counter."""
         self._total_alerts += 1
+        self._notify_change()
+
+    def _notify_change(self) -> None:
+        """Notify WebSocket subscribers of health state change.
+
+        Only broadcasts when status or connected camera count actually changes.
+        """
+        if not self._on_change:
+            return
+        try:
+            h = self.get_health()
+            connected = sum(1 for c in h.cameras if c.connected)
+            if h.status.value == self._last_status and connected == self._last_connected_count:
+                return  # no meaningful change
+            self._last_status = h.status.value
+            self._last_connected_count = connected
+            self._on_change("health", {
+                "status": h.status.value,
+                "uptime_seconds": round(h.uptime_seconds, 1),
+                "total_alerts": h.total_alerts,
+                "cameras": [
+                    {
+                        "camera_id": c.camera_id,
+                        "connected": c.connected,
+                        "frames_captured": c.frames_captured,
+                        "avg_latency_ms": round(c.avg_latency_ms, 1),
+                        "reconnect_count": c.reconnect_count,
+                    }
+                    for c in h.cameras
+                ],
+            })
+        except Exception as e:
+            logger.debug("health.notify_failed", error=str(e))
 
     def get_health(self) -> SystemHealth:
         """Get the current system health snapshot."""

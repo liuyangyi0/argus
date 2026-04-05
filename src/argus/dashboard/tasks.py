@@ -51,10 +51,11 @@ class TaskManager:
         info = manager.get_task(task_id)  # poll for progress
     """
 
-    def __init__(self, max_concurrent: int = 2):
+    def __init__(self, max_concurrent: int = 2, on_change: Callable[[str, dict], None] | None = None):
         self._tasks: dict[str, TaskInfo] = {}
         self._lock = threading.Lock()
         self._max_concurrent = max_concurrent
+        self._on_change = on_change
 
     def submit(
         self,
@@ -94,6 +95,7 @@ class TaskManager:
             with self._lock:
                 info.progress = min(max(progress, 0), 100)
                 info.message = message
+            self._notify_task_change(info)
 
         def _run():
             with self._lock:
@@ -108,6 +110,7 @@ class TaskManager:
                     info.message = "完成"
                     info.result = result
                     info.completed_at = time.monotonic()
+                self._notify_task_change(info)
                 logger.info("task.complete", task_id=task_id, task_type=task_type)
             except Exception as e:
                 with self._lock:
@@ -115,6 +118,7 @@ class TaskManager:
                     info.error = str(e)
                     info.message = f"失败: {e}"
                     info.completed_at = time.monotonic()
+                self._notify_task_change(info)
                 logger.error("task.failed", task_id=task_id, error=str(e))
 
         thread = threading.Thread(target=_run, name=f"argus-task-{task_id}", daemon=True)
@@ -122,6 +126,31 @@ class TaskManager:
 
         logger.info("task.submitted", task_id=task_id, task_type=task_type, camera_id=camera_id)
         return task_id
+
+    def _notify_task_change(self, info: TaskInfo) -> None:
+        """Notify WebSocket subscribers of task progress change.
+
+        Throttled: only fires on status change, completion, or every 5% progress.
+        """
+        if not self._on_change:
+            return
+        last_progress = getattr(info, "_last_notified_progress", -10)
+        is_terminal = info.status in (TaskStatus.COMPLETE, TaskStatus.FAILED)
+        if not is_terminal and abs(info.progress - last_progress) < 5:
+            return
+        info._last_notified_progress = info.progress
+        try:
+            self._on_change("tasks", {
+                "task_id": info.task_id,
+                "task_type": info.task_type,
+                "camera_id": info.camera_id,
+                "status": info.status.value,
+                "progress": info.progress,
+                "message": info.message,
+                "error": info.error,
+            })
+        except Exception as e:
+            logger.debug("task.notify_failed", error=str(e))
 
     def get_task(self, task_id: str) -> TaskInfo | None:
         """Get task info by ID."""

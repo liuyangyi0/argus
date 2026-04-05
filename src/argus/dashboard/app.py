@@ -7,11 +7,12 @@ minimal JavaScript. Full Chinese language interface.
 
 from __future__ import annotations
 
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -26,6 +27,7 @@ from argus.dashboard.routes.tasks import router as tasks_router
 from argus.dashboard.routes.reports import router as reports_router
 from argus.dashboard.routes.users import router as users_router
 from argus.dashboard.routes.zones import router as zones_router
+from argus.dashboard.websocket import ConnectionManager, verify_ws_token
 
 if TYPE_CHECKING:
     from argus.capture.manager import CameraManager
@@ -47,11 +49,19 @@ def create_app(
 
     Dependencies are injected via app.state so route handlers can access them.
     """
-    from argus.config.schema import AuthConfig
+    from argus.config.schema import AuthConfig, DashboardConfig
+
+    dashboard_config = getattr(config, "dashboard", None) or DashboardConfig()
+    ws_manager = ConnectionManager(
+        heartbeat_seconds=dashboard_config.websocket_heartbeat_seconds,
+        max_connections=dashboard_config.websocket_max_connections,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await ws_manager.start()
         yield
+        await ws_manager.stop()
 
     app = FastAPI(
         title="Argus - 核电站异物检测系统",
@@ -68,14 +78,7 @@ def create_app(
     app.state.config = config
     app.state.config_path = config_path
     app.state.task_manager = task_manager
-    app.state.audit_logger = None  # Will be set from __main__
-    app.state.backup_manager = None  # Will be set from __main__
-
-    # Generate a session secret for cookie signing
-    import secrets as _secrets
-    session_secret = _secrets.token_hex(32)
-    app.state.session_secret = session_secret
-    app.state.auth_enabled = getattr(getattr(config, "auth", None), "enabled", False)
+    app.state.ws_manager = ws_manager
 
     # Security middleware (order matters: outermost first)
     from argus.dashboard.auth import (
@@ -123,6 +126,25 @@ def create_app(
         app.include_router(baseline_router, prefix="/api/baseline", tags=["baseline"])
     except ImportError:
         pass
+
+    # WebSocket endpoint
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        # Authenticate via query param
+        token = websocket.query_params.get("token", "")
+        auth_cfg = getattr(config, "auth", None) or AuthConfig()
+        if not verify_ws_token(token, auth_cfg):
+            await websocket.close(code=4401, reason="Authentication required")
+            return
+
+        client_id = f"ws-{uuid.uuid4().hex[:8]}"
+        try:
+            client = await ws_manager.accept(websocket, client_id)
+            await ws_manager.handle_client(client)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await ws_manager.disconnect(client_id)
 
     # Page routes
     @app.get("/", response_class=HTMLResponse)
@@ -277,6 +299,7 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
     </div>
     <div id="toast-container" class="toast-container"></div>
     <script src="/static/js/toast.js"></script>
+    <script src="/static/js/ws-client.js"></script>
     <script src="/static/js/zone_editor.js"></script>
     <script src="/static/js/notifications.js"></script>
     <script src="/static/js/keyboard.js"></script>
