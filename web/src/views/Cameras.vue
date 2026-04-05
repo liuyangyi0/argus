@@ -1,12 +1,22 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Table, Badge, Button, Typography, Space } from 'ant-design-vue'
-import { getCameras, startCamera, stopCamera } from '../api'
+import { Table, Badge, Button, Typography, Space, Modal, Form, Input, Select, InputNumber, message } from 'ant-design-vue'
+import { PlusOutlined } from '@ant-design/icons-vue'
+import api, { getCameras, startCamera, stopCamera } from '../api'
 
 const router = useRouter()
 const cameras = ref<any[]>([])
 const loading = ref(true)
+const addModalVisible = ref(false)
+const addForm = ref({
+  camera_id: '',
+  name: '',
+  source: '',
+  protocol: 'rtsp',
+  fps_target: 5,
+  resolution: '1920,1080',
+})
 let timer: ReturnType<typeof setInterval>
 
 async function fetchData() {
@@ -32,6 +42,20 @@ async function handleStart(id: string) {
 async function handleStop(id: string) {
   await stopCamera(id)
   fetchData()
+}
+
+async function handleAddCamera() {
+  try {
+    const form = new FormData()
+    Object.entries(addForm.value).forEach(([k, v]) => form.append(k, String(v)))
+    await api.post('/cameras', form)
+    message.success('摄像头已添加')
+    addModalVisible.value = false
+    addForm.value = { camera_id: '', name: '', source: '', protocol: 'rtsp', fps_target: 5, resolution: '1920,1080' }
+    fetchData()
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '添加失败')
+  }
 }
 
 const columns = [
@@ -73,7 +97,44 @@ const columns = [
   <div>
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px">
       <Typography.Title :level="3" style="margin: 0">摄像头</Typography.Title>
+      <Button type="primary" @click="addModalVisible = true">
+        <PlusOutlined /> 新增摄像头
+      </Button>
     </div>
+
+    <!-- Add Camera Modal -->
+    <Modal v-model:open="addModalVisible" title="新增摄像头" @ok="handleAddCamera" ok-text="添加" cancel-text="取消">
+      <Form layout="vertical" style="margin-top: 16px">
+        <Form.Item label="摄像头 ID" required>
+          <Input v-model:value="addForm.camera_id" placeholder="cam_02" />
+        </Form.Item>
+        <Form.Item label="名称" required>
+          <Input v-model:value="addForm.name" placeholder="反应堆厂房入口" />
+        </Form.Item>
+        <Form.Item label="视频源" required>
+          <Input v-model:value="addForm.source" placeholder="rtsp://admin:pass@192.168.1.100:554/stream" />
+        </Form.Item>
+        <Space>
+          <Form.Item label="协议">
+            <Select v-model:value="addForm.protocol" style="width: 120px">
+              <Select.Option value="rtsp">RTSP</Select.Option>
+              <Select.Option value="usb">USB</Select.Option>
+              <Select.Option value="file">文件</Select.Option>
+            </Select>
+          </Form.Item>
+          <Form.Item label="目标帧率">
+            <InputNumber v-model:value="addForm.fps_target" :min="1" :max="30" />
+          </Form.Item>
+          <Form.Item label="分辨率">
+            <Select v-model:value="addForm.resolution" style="width: 140px">
+              <Select.Option value="1920,1080">1920x1080</Select.Option>
+              <Select.Option value="1280,720">1280x720</Select.Option>
+              <Select.Option value="640,480">640x480</Select.Option>
+            </Select>
+          </Form.Item>
+        </Space>
+      </Form>
+    </Modal>
 
     <Table
       :columns="columns"
