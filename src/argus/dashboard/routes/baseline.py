@@ -64,16 +64,13 @@ _TABS = [
 @router.get("", response_class=HTMLResponse)
 async def baseline_main(request: Request):
     """Model management page with tabs."""
-    header = page_header("模型", "采集基线、训练检测模型、部署到摄像头")
+    is_htmx = request.headers.get("HX-Request") == "true"
+    header = "" if is_htmx else page_header("模型", "采集基线、训练检测模型、部署到摄像头")
     tabs = tab_bar(_TABS, "capture")
     return HTMLResponse(f"""
     {header}
     {tabs}
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {{
-            htmx.ajax('GET', '/api/baseline/capture', {{target: '#tab-content', swap: 'innerHTML'}});
-        }});
-    </script>""")
+    <div hx-get="/api/baseline/capture" hx-trigger="load" hx-target="#tab-content" hx-swap="innerHTML"></div>""")
 
 
 @router.get("/capture", response_class=HTMLResponse)
@@ -160,8 +157,6 @@ async def capture_form(request: Request):
                 {count_input}
                 {interval_input}
             </div>
-            {session_select}
-            {quality_checkbox}
             <div class="form-actions">
                 <button type="submit" class="btn btn-primary">开始采集</button>
             </div>

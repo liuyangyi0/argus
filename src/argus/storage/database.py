@@ -43,7 +43,26 @@ class Database:
                 conn.execute(text("PRAGMA journal_mode=WAL"))
                 conn.commit()
 
+        # Auto-migrate: add missing columns to existing tables
+        self._auto_migrate()
+
         logger.info("database.initialized", url=self._database_url)
+
+    def _auto_migrate(self) -> None:
+        """Add missing columns to existing SQLite tables (lightweight migration)."""
+        migrations = [
+            ("alerts", "workflow_status", "VARCHAR(20) DEFAULT 'new'"),
+            ("alerts", "assigned_to", "VARCHAR(100)"),
+            ("alerts", "resolved_at", "DATETIME"),
+        ]
+        with self._engine.connect() as conn:
+            for table, column, col_type in migrations:
+                try:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
+                    conn.commit()
+                    logger.info("database.migration", table=table, column=column)
+                except Exception:
+                    pass  # Column already exists
 
     def get_session(self) -> Session:
         """Get a new database session."""
