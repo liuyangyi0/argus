@@ -218,7 +218,7 @@ def pipeline_stepper(steps: list[dict]) -> str:
         dot = dot_content.get(status, "")
         info_html = f'<div class="step-info">{info}</div>' if info else ""
 
-        wrapper_start = f'<a href="{url}" style="text-decoration:none;color:inherit;">' if url else ""
+        wrapper_start = f'<a href="{url}" class="stepper-link">' if url else ""
         wrapper_end = "</a>" if url else ""
 
         html_parts.append(f"""

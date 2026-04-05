@@ -323,12 +323,12 @@ a:hover { color: var(--status-info); }
 
 .stepper-step.completed .step-dot {
   background: var(--status-ok);
-  color: var(--text-inverse);
+  color: #fff;
 }
 
 .stepper-step.active .step-dot {
   background: var(--status-info);
-  color: white;
+  color: #fff;
   animation: stepper-pulse 3s ease-in-out infinite;
 }
 
@@ -339,12 +339,12 @@ a:hover { color: var(--status-info); }
 
 .stepper-step.warning .step-dot {
   background: var(--status-warn);
-  color: var(--text-inverse);
+  color: #fff;
 }
 
 .stepper-step.error .step-dot {
   background: var(--status-critical);
-  color: white;
+  color: #fff;
 }
 
 @keyframes stepper-pulse {
@@ -375,6 +375,7 @@ a:hover { color: var(--status-info); }
   margin-bottom: var(--space-5);
 }
 
+.stepper-link { text-decoration: none; color: inherit; }
 .stepper-connector.completed { background: var(--status-ok); }
 
 /* ========== Tables ========== */
@@ -416,14 +417,14 @@ tr:hover { background: var(--bg-raised); }
   min-height: 40px;
 }
 
-.btn-primary { background: var(--status-info); color: white; }
-.btn-primary:hover { background: #2563EB; }
-.btn-success { background: #059669; color: white; }
-.btn-success:hover { background: #047857; }
-.btn-warning { background: var(--status-alert); color: white; }
-.btn-warning:hover { background: #EA580C; }
-.btn-danger { background: var(--status-critical); color: white; }
-.btn-danger:hover { background: #DC2626; }
+.btn-primary { background: var(--status-info); color: #fff; }
+.btn-primary:hover { filter: brightness(0.85); }
+.btn-success { background: var(--status-ok); color: #fff; }
+.btn-success:hover { filter: brightness(0.85); }
+.btn-warning { background: var(--status-alert); color: #fff; }
+.btn-warning:hover { filter: brightness(0.85); }
+.btn-danger { background: var(--status-critical); color: #fff; }
+.btn-danger:hover { filter: brightness(0.85); }
 .btn-ghost {
   background: transparent;
   color: var(--text-secondary);
@@ -610,7 +611,7 @@ tr:hover { background: var(--bg-raised); }
 }
 
 .bulk-bar.active { display: flex; }
-.bulk-bar .count { color: white; font-weight: var(--font-medium); }
+.bulk-bar .count { color: #fff; font-weight: var(--font-medium); }
 
 /* ========== Toast Notifications ========== */
 .toast-container {
@@ -635,10 +636,10 @@ tr:hover { background: var(--bg-raised); }
   gap: var(--space-2);
 }
 
-.toast.success { background: #059669; color: white; }
-.toast.error { background: var(--status-critical); color: white; }
-.toast.warning { background: var(--status-alert); color: white; }
-.toast.info { background: var(--status-info); color: white; }
+.toast.success { background: var(--status-ok); color: #fff; }
+.toast.error { background: var(--status-critical); color: #fff; }
+.toast.warning { background: var(--status-alert); color: #fff; }
+.toast.info { background: var(--status-info); color: #fff; }
 .toast.fade-out { animation: toast-out var(--duration-slow) var(--easing-default) forwards; }
 
 @keyframes toast-in {

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from argus.dashboard.routes.alerts import router as alerts_router
@@ -167,40 +167,23 @@ def create_app(
     async def system_page(request: Request):
         return _render_page(request, "system")
 
-    # Legacy routes — redirect to new merged locations
-    from fastapi.responses import RedirectResponse
-
-    @app.get("/baseline", response_class=RedirectResponse)
-    async def baseline_redirect():
-        return RedirectResponse("/models", status_code=301)
-
-    @app.get("/zones", response_class=RedirectResponse)
-    async def zones_redirect():
-        return RedirectResponse("/cameras", status_code=301)
-
-    @app.get("/detection", response_class=RedirectResponse)
-    async def detection_redirect():
-        return RedirectResponse("/cameras", status_code=301)
-
-    @app.get("/config", response_class=RedirectResponse)
-    async def config_redirect():
-        return RedirectResponse("/system", status_code=301)
-
-    @app.get("/backup", response_class=RedirectResponse)
-    async def backup_redirect():
-        return RedirectResponse("/system", status_code=301)
-
-    @app.get("/audit", response_class=RedirectResponse)
-    async def audit_redirect():
-        return RedirectResponse("/system", status_code=301)
-
-    @app.get("/reports", response_class=RedirectResponse)
-    async def reports_redirect():
-        return RedirectResponse("/system", status_code=301)
-
-    @app.get("/users", response_class=RedirectResponse)
-    async def users_redirect():
-        return RedirectResponse("/system", status_code=301)
+    # Legacy routes — redirect to merged locations
+    _LEGACY_REDIRECTS = {
+        "/baseline": "/models",
+        "/zones": "/cameras",
+        "/detection": "/cameras",
+        "/config": "/system",
+        "/backup": "/system",
+        "/audit": "/system",
+        "/reports": "/system",
+        "/users": "/system",
+    }
+    for old_path, new_path in _LEGACY_REDIRECTS.items():
+        app.add_api_route(
+            old_path,
+            lambda target=new_path: RedirectResponse(target, status_code=301),
+            response_class=RedirectResponse,
+        )
 
     return app
 
@@ -214,58 +197,48 @@ def _render_user_info(request: Request) -> str:
     role = role_labels.get(user.get("role", ""), user.get("role", ""))
     username = user.get("username", "")
     return (
-        f'<span style="color:#8890a0;font-size:12px;">'
+        f'<span style="color:var(--text-secondary);font-size:var(--text-xs);">'
         f'{username} ({role})</span>'
-        f'<a href="/logout" style="color:#8890a0;font-size:12px;margin-left:8px;text-decoration:none;">退出</a>'
+        f'<a href="/logout" style="color:var(--text-secondary);font-size:var(--text-xs);'
+        f'margin-left:var(--space-2);text-decoration:none;">退出</a>'
     )
+
+
+_NAV_ICONS: dict[str, str] = {
+    "overview": '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
+    "cameras": '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+    "alerts": '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
+    "models": '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+    "system": '<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>',
+}
+
+_NAV_ITEMS = [
+    ("overview", "/", "总览"),
+    ("cameras", "/cameras", "摄像头"),
+    ("alerts", "/alerts", "告警"),
+    ("models", "/models", "模型"),
+    ("system", "/system", "系统"),
+]
+
+_CONTENT_URL_MAP = {
+    "overview": "/api/system/overview",
+    "cameras": "/api/cameras",
+    "alerts": "/api/alerts",
+    "models": "/api/baseline",
+    "system": "/api/system",
+}
 
 
 def _render_page(request: Request, active_page: str) -> HTMLResponse:
     """Render the main HTML shell with sidebar layout and 5-page navigation."""
-
-    # Lucide icon SVGs (inline, stroke-based, 20x20)
-    _ICONS = {
-        "overview": '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
-        "cameras": '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
-        "alerts": '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
-        "models": '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
-        "system": '<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>',
-    }
-
-    # 5 top-level nav items (sidebar)
-    nav_items = [
-        ("overview", "/", "总览"),
-        ("cameras", "/cameras", "摄像头"),
-        ("alerts", "/alerts", "告警"),
-        ("models", "/models", "模型"),
-        ("system", "/system", "系统"),
-    ]
-
     nav_html = ""
-    for page_id, href, label in nav_items:
+    for page_id, href, label in _NAV_ITEMS:
         active_cls = ' class="active"' if page_id == active_page else ""
-        icon_path = _ICONS.get(page_id, "")
+        icon_path = _NAV_ICONS.get(page_id, "")
         icon_svg = f'<svg viewBox="0 0 24 24">{icon_path}</svg>' if icon_path else ""
         nav_html += f'<a href="{href}"{active_cls}>{icon_svg}{label}</a>\n'
 
-    # Map active page to content URL
-    content_url_map = {
-        "overview": "/api/system/overview",
-        "cameras": "/api/cameras",
-        "alerts": "/api/alerts",
-        "models": "/api/baseline",
-        "system": "/api/system",
-        # Legacy pages redirect to merged locations
-        "baseline": "/api/baseline",
-        "zones": "/api/zones",
-        "detection": "/api/detection",
-        "config": "/api/config",
-        "backup": "/api/backup",
-        "audit": "/api/audit",
-        "reports": "/api/reports",
-        "users": "/api/users",
-    }
-    content_url = content_url_map.get(active_page, f"/api/{active_page}")
+    content_url = _CONTENT_URL_MAP.get(active_page, f"/api/{active_page}")
 
     # Task indicator in sidebar footer
     task_manager = getattr(request.app.state, "task_manager", None)
@@ -287,8 +260,6 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Argus - 核电站异物检测系统</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/tokens.css">
     <link rel="stylesheet" href="/static/css/argus.css">
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
