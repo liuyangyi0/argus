@@ -1,0 +1,15 @@
+/* Argus global styles — minimal, Ant Design handles components */
+body {
+  margin: 0;
+  background: #141414;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+/* Scrollbar styling for dark theme */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #555; }
