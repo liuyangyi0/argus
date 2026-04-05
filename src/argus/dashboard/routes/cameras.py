@@ -10,7 +10,13 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from argus.dashboard.components import empty_state, page_header, status_dot
+from argus.dashboard.components import (
+    empty_state,
+    page_header,
+    pipeline_stepper,
+    status_dot,
+    tab_bar,
+)
 
 logger = structlog.get_logger()
 
@@ -29,9 +35,81 @@ class AddCameraRequest(BaseModel):
     resolution: list[int] = [1920, 1080]
 
 
+def _get_lifecycle_stages(request: Request, camera_id: str) -> list[dict]:
+    """Determine camera's current lifecycle stage for Pipeline Stepper."""
+    baseline_mgr = getattr(request.app.state, "baseline_manager", None)
+    database = getattr(request.app.state, "database", None)
+    camera_manager = request.app.state.camera_manager
+
+    # Stage 1: Capture
+    has_baselines = False
+    baseline_count = 0
+    if baseline_mgr:
+        baseline_count = baseline_mgr.count_images(camera_id)
+        has_baselines = baseline_count > 0
+
+    # Stage 2: Baseline verified (auto-pass for now)
+    baseline_verified = has_baselines
+
+    # Stage 3: Training
+    training_done = False
+    training_info = ""
+    if database:
+        latest = database.get_latest_training(camera_id)
+        if latest and latest.status == "complete":
+            training_done = True
+            training_info = f"等级 {latest.quality_grade}" if latest.quality_grade else ""
+
+    # Stage 4: Deployment
+    deployed = False
+    if camera_manager:
+        try:
+            det_status = camera_manager.get_detector_status(camera_id)
+            if det_status and det_status.get("mode") == "anomalib":
+                deployed = True
+        except Exception:
+            pass
+
+    # Stage 5: Inference running
+    inferring = False
+    if camera_manager:
+        for s in camera_manager.get_status():
+            if s.camera_id == camera_id and s.connected and s.stats and s.stats.frames_analyzed > 0:
+                inferring = True
+
+    def _stage(done, active_check):
+        if done:
+            return "completed"
+        if active_check:
+            return "active"
+        return "pending"
+
+    # Find the first incomplete stage
+    first_incomplete = None
+    stages_done = [has_baselines, baseline_verified, training_done, deployed, inferring]
+    for i, done in enumerate(stages_done):
+        if not done:
+            first_incomplete = i
+            break
+
+    steps = [
+        {"name": "采集", "status": "completed" if has_baselines else ("active" if first_incomplete == 0 else "pending"),
+         "info": f"{baseline_count} 帧" if baseline_count else ""},
+        {"name": "基线审查", "status": "completed" if baseline_verified else ("active" if first_incomplete == 1 else "pending"),
+         "info": "已通过" if baseline_verified else ""},
+        {"name": "训练", "status": "completed" if training_done else ("active" if first_incomplete == 2 else "pending"),
+         "info": training_info},
+        {"name": "发布", "status": "completed" if deployed else ("active" if first_incomplete == 3 else "pending"),
+         "info": "已部署" if deployed else ""},
+        {"name": "推理", "status": "completed" if inferring else ("active" if first_incomplete == 4 else "pending"),
+         "info": "运行中" if inferring else ""},
+    ]
+    return steps
+
+
 @router.get("", response_class=HTMLResponse)
 async def cameras_page(request: Request):
-    """Camera list and status page."""
+    """Camera list page — compact cards with lifecycle stage indicator."""
     camera_manager = request.app.state.camera_manager
 
     if not camera_manager:
@@ -39,148 +117,283 @@ async def cameras_page(request: Request):
 
     statuses = camera_manager.get_status()
 
-    # Add camera form (collapsible)
-    add_form = """
-    <div class="card" id="add-camera-form" style="display:none;">
-        <h3>添加摄像头</h3>
-        <form hx-post="/api/cameras" hx-target="#cameras-list" hx-swap="outerHTML"
-              hx-on::after-request="if(event.detail.successful)this.parentElement.style.display='none'">
-            <div class="form-row">
-                <div class="form-group">
-                    <label class="form-label">摄像头ID</label>
-                    <input type="text" name="camera_id" class="form-input" placeholder="cam_02" required>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">名称</label>
-                    <input type="text" name="name" class="form-input" placeholder="反应堆厂房入口" required>
-                </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label class="form-label">视频源</label>
-                    <input type="text" name="source" class="form-input"
-                           placeholder="rtsp://admin:pass@192.168.1.100:554/stream" required>
-                    <div class="form-hint">支持 RTSP URL、USB 设备号（0, 1）或本地视频文件路径</div>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">协议</label>
-                    <select name="protocol" class="form-select">
-                        <option value="rtsp">RTSP</option>
-                        <option value="usb">USB</option>
-                        <option value="file">文件</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label class="form-label">目标帧率</label>
-                    <input type="number" name="fps_target" class="form-input" value="5" min="1" max="30">
-                </div>
-                <div class="form-group">
-                    <label class="form-label">分辨率</label>
-                    <select name="resolution" class="form-select">
-                        <option value="1920,1080">1920x1080</option>
-                        <option value="1280,720">1280x720</option>
-                        <option value="640,480">640x480</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-actions">
-                <button type="submit" class="btn btn-primary">添加摄像头</button>
-                <button type="button" class="btn btn-ghost"
-                        onclick="document.getElementById('add-camera-form').style.display='none'">取消</button>
-            </div>
-        </form>
-    </div>"""
-
     camera_cards = ""
     for cam in statuses:
         dot_status = "connected" if cam.connected else "offline"
         status_text = "在线" if cam.connected else "离线"
-        border_color = "#2e7d32" if cam.connected else "#424242"
+        border_var = "var(--status-ok)" if cam.connected else "var(--border-default)"
 
-        stats_html = ""
-        if cam.stats:
-            s = cam.stats
-            skip_pct = (
-                (s.frames_skipped_no_change / s.frames_captured * 100)
-                if s.frames_captured > 0 else 0
-            )
-            stats_html = f"""
-            <table style="font-size:13px;width:100%;">
-                <tr><td style="color:#8890a0;">已采集帧</td><td>{s.frames_captured}</td></tr>
-                <tr><td style="color:#8890a0;">跳过（无变化）</td><td>{s.frames_skipped_no_change} ({skip_pct:.0f}%)</td></tr>
-                <tr><td style="color:#8890a0;">跳过（有人）</td><td>{s.frames_skipped_person}</td></tr>
-                <tr><td style="color:#8890a0;">已分析帧</td><td>{s.frames_analyzed}</td></tr>
-                <tr><td style="color:#8890a0;">检测到异常</td><td>{s.anomalies_detected}</td></tr>
-                <tr><td style="color:#8890a0;">已发出告警</td><td>{s.alerts_emitted}</td></tr>
-                <tr><td style="color:#8890a0;">平均延迟</td><td>{s.avg_latency_ms:.1f}ms</td></tr>
-            </table>"""
-        else:
-            stats_html = '<p style="color:#616161;font-size:13px;">暂无统计数据</p>'
+        # Lifecycle stage summary
+        stages = _get_lifecycle_stages(request, cam.camera_id)
+        active_stage = next((s for s in stages if s["status"] == "active"), None)
+        stage_label = active_stage["name"] if active_stage else "就绪"
 
-        # Live preview
-        preview_html = (
-            f'<div style="margin-bottom:12px;border-radius:6px;overflow:hidden;'
-            f'background:#000;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;">'
-            f'<img src="/api/cameras/{cam.camera_id}/stream" '
-            f'style="width:100%;height:auto;" alt="实时画面" '
-            f'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" />'
-            f'<span style="color:#616161;font-size:14px;display:none;">无信号</span>'
-            f'</div>'
-            if cam.connected else
-            f'<div style="margin-bottom:12px;border-radius:6px;background:#000;'
-            f'aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;">'
-            f'<span style="color:#616161;font-size:14px;">离线</span></div>'
-        )
+        # Alert count
+        alerts_count = cam.stats.alerts_emitted if cam.stats else 0
 
-        # Action buttons
-        actions = ""
-        if cam.connected:
-            actions += (
-                f'<button class="btn btn-warning btn-sm" '
-                f'hx-post="/api/cameras/{cam.camera_id}/stop" hx-swap="none" '
-                f'hx-confirm="确定停止摄像头 {cam.camera_id}？">停止</button>'
-            )
-        else:
-            actions += (
-                f'<button class="btn btn-success btn-sm" '
-                f'hx-post="/api/cameras/{cam.camera_id}/start" hx-swap="none">启动</button>'
-            )
-        actions += (
-            f' <button class="btn btn-ghost btn-sm" '
-            f'hx-post="/api/config/camera/{cam.camera_id}/restart" hx-swap="none">重启</button>'
-        )
+        # Stats summary
+        latency = f"{cam.stats.avg_latency_ms:.0f}ms" if cam.stats and cam.stats.avg_latency_ms > 0 else "—"
 
         camera_cards += f"""
-        <div class="card" style="border-left:3px solid {border_color};">
+        <div class="card" style="border-left:3px solid {border_var};cursor:pointer;transition:border-color 0.15s;"
+             hx-get="/api/cameras/{cam.camera_id}/detail" hx-target="#content" hx-swap="innerHTML"
+             hx-push-url="/cameras?cam={cam.camera_id}"
+             onmouseenter="this.style.borderColor='var(--status-info)'"
+             onmouseleave="this.style.borderColor='{border_var}'">
             <div class="flex-between mb-8">
-                <h3 style="margin:0;">{status_dot(dot_status)}{cam.camera_id} — {cam.name}</h3>
-                <div class="flex gap-8">
-                    <span style="font-size:12px;color:#8890a0;line-height:28px;">{status_text}</span>
-                    {actions}
+                <div>
+                    <span style="font-size:var(--text-lg);font-weight:var(--font-semibold);">
+                        {status_dot(dot_status)}{cam.camera_id}
+                    </span>
+                    <span style="color:var(--text-secondary);margin-left:var(--space-2);">{cam.name}</span>
                 </div>
+                <span class="badge badge-info">{stage_label}</span>
             </div>
-            {preview_html}
-            {stats_html}
+            <div class="flex-between" style="color:var(--text-tertiary);font-size:var(--text-sm);">
+                <span>{status_text}</span>
+                <span>告警 {alerts_count} | 延迟 {latency}</span>
+            </div>
         </div>"""
 
     if not camera_cards:
-        camera_cards = empty_state("暂无摄像头", "点击右上角按钮添加摄像头")
+        camera_cards = empty_state("暂无摄像头", "在系统设置中添加摄像头")
 
-    header = page_header(
-        "摄像头管理",
-        f"{len(statuses)} 台摄像头",
-        '<button class="btn btn-primary" '
-        'onclick="document.getElementById(\'add-camera-form\').style.display=\'block\'">添加摄像头</button>',
-    )
+    header = page_header("摄像头", f"{len(statuses)} 台")
 
     return HTMLResponse(f"""
     <div id="cameras-list" data-ws-topic="cameras" data-ws-refresh-url="/api/cameras"
          hx-get="/api/cameras" hx-trigger="every 30s" hx-swap="outerHTML">
         {header}
-        {add_form}
-        <div class="grid-2">{camera_cards}</div>
+        <div class="grid-3">{camera_cards}</div>
+    </div>""")
+
+
+@router.get("/{camera_id}/detail", response_class=HTMLResponse)
+async def camera_detail(request: Request, camera_id: str):
+    """Camera detail page with Pipeline Stepper and sub-tabs."""
+    camera_manager = request.app.state.camera_manager
+    if not camera_manager:
+        return HTMLResponse(empty_state("摄像头管理器不可用"))
+
+    # Find camera status
+    cam = None
+    for s in camera_manager.get_status():
+        if s.camera_id == camera_id:
+            cam = s
+            break
+
+    if cam is None:
+        return HTMLResponse(empty_state(f"摄像头 {camera_id} 不存在"))
+
+    # Camera name from config
+    cam_name = cam.name or camera_id
+    dot_status = "connected" if cam.connected else "offline"
+    status_text = "在线" if cam.connected else "离线"
+
+    # Pipeline Stepper
+    stages = _get_lifecycle_stages(request, camera_id)
+    stepper_html = pipeline_stepper(stages)
+
+    # Next action suggestion
+    active_stage = next((s for s in stages if s["status"] == "active"), None)
+    next_action = ""
+    if active_stage:
+        action_map = {
+            "采集": ("开始采集基线", f"/api/baseline/capture?camera_id={camera_id}"),
+            "基线审查": ("审查基线", f"/api/baseline/list?camera_id={camera_id}"),
+            "训练": ("开始训练", f"/api/baseline/train?camera_id={camera_id}"),
+            "发布": ("部署模型", f"/api/cameras/{camera_id}/deploy-panel"),
+            "推理": ("查看实时状态", f"/api/cameras/{camera_id}/live"),
+        }
+        label, url = action_map.get(active_stage["name"], ("", ""))
+        if label:
+            next_action = (
+                f'<button class="btn btn-primary" hx-get="{url}" '
+                f'hx-target="#cam-tab-content" hx-swap="innerHTML">{label}</button>'
+            )
+
+    # Sub-tabs
+    detail_tabs = [
+        ("live", "实时画面", f"/api/cameras/{camera_id}/live"),
+        ("capture", "采集", f"/api/baseline/capture?camera_id={camera_id}"),
+        ("baselines", "基线", f"/api/baseline/list?camera_id={camera_id}"),
+        ("train", "训练", f"/api/baseline/train?camera_id={camera_id}"),
+        ("deploy", "发布", f"/api/cameras/{camera_id}/deploy-panel"),
+        ("zones", "检测区域", f"/api/zones?camera_id={camera_id}"),
+    ]
+    tabs_html = ""
+    for tab_id, label, url in detail_tabs:
+        tabs_html += (
+            f'<button class="tab-item" '
+            f'hx-get="{url}" hx-target="#cam-tab-content" hx-swap="innerHTML" '
+            f'onclick="document.querySelectorAll(\'.cam-tabs .tab-item\').forEach(t=>t.classList.remove(\'active\'));this.classList.add(\'active\')">'
+            f'{label}</button>'
+        )
+
+    # Back button
+    back_btn = (
+        '<button class="btn btn-ghost btn-sm" '
+        'hx-get="/api/cameras" hx-target="#content" hx-swap="innerHTML">'
+        '&larr; 返回列表</button>'
+    )
+
+    return HTMLResponse(f"""
+    <div>
+        <div class="flex-between mb-16">
+            <div class="flex-center gap-12">
+                {back_btn}
+                <h2 style="font-size:var(--text-2xl);font-weight:var(--font-semibold);">
+                    {status_dot(dot_status)}{camera_id}
+                    <span style="color:var(--text-secondary);font-weight:var(--font-normal);font-size:var(--text-lg);">
+                        {cam_name}
+                    </span>
+                </h2>
+                <span style="color:var(--text-tertiary);font-size:var(--text-sm);">{status_text}</span>
+            </div>
+            <div class="flex gap-8">{next_action}</div>
+        </div>
+
+        {stepper_html}
+
+        <div class="cam-tabs tab-bar" style="margin-top:var(--space-4);">
+            {tabs_html}
+        </div>
+        <div id="cam-tab-content"
+             hx-get="/api/cameras/{camera_id}/live"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+            <div class="empty-state"><div class="spinner"></div></div>
+        </div>
+    </div>""")
+
+
+@router.get("/{camera_id}/live", response_class=HTMLResponse)
+async def camera_live_panel(request: Request, camera_id: str):
+    """Live monitoring sub-tab for camera detail page."""
+    camera_manager = request.app.state.camera_manager
+    if not camera_manager:
+        return HTMLResponse(empty_state("不可用"))
+
+    cam = None
+    for s in camera_manager.get_status():
+        if s.camera_id == camera_id:
+            cam = s
+            break
+
+    if cam is None:
+        return HTMLResponse(empty_state("摄像头未找到"))
+
+    # Live preview
+    if cam.connected:
+        preview = (
+            f'<div class="camera-card">'
+            f'<div class="preview">'
+            f'<img src="/api/cameras/{camera_id}/stream" style="width:100%;height:auto;" alt="实时画面" '
+            f'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" />'
+            f'<span style="color:var(--text-tertiary);display:none;">无信号</span>'
+            f'</div></div>'
+        )
+    else:
+        preview = (
+            f'<div class="camera-card"><div class="preview">'
+            f'<span style="color:var(--text-tertiary);">离线</span></div></div>'
+        )
+
+    # Stats table
+    stats_html = ""
+    if cam.stats:
+        s = cam.stats
+        skip_pct = (s.frames_skipped_no_change / max(s.frames_captured, 1) * 100)
+        stats_html = f"""
+        <div class="card mt-16">
+            <h3>运行统计</h3>
+            <table>
+                <tr><td style="color:var(--text-secondary);">已采集帧</td><td>{s.frames_captured}</td></tr>
+                <tr><td style="color:var(--text-secondary);">跳过（无变化）</td><td>{s.frames_skipped_no_change} ({skip_pct:.0f}%)</td></tr>
+                <tr><td style="color:var(--text-secondary);">跳过（有人）</td><td>{s.frames_skipped_person}</td></tr>
+                <tr><td style="color:var(--text-secondary);">已分析帧</td><td>{s.frames_analyzed}</td></tr>
+                <tr><td style="color:var(--text-secondary);">检测到异常</td><td>{s.anomalies_detected}</td></tr>
+                <tr><td style="color:var(--text-secondary);">已发出告警</td><td>{s.alerts_emitted}</td></tr>
+                <tr><td style="color:var(--text-secondary);">平均延迟</td><td>{s.avg_latency_ms:.1f}ms</td></tr>
+            </table>
+        </div>"""
+
+    # Action buttons
+    actions = ""
+    if cam.connected:
+        actions = (
+            f'<button class="btn btn-warning btn-sm" '
+            f'hx-post="/api/cameras/{camera_id}/stop" hx-swap="none" '
+            f'hx-confirm="确定停止摄像头？">停止</button>'
+            f' <button class="btn btn-ghost btn-sm" '
+            f'hx-post="/api/config/camera/{camera_id}/restart" hx-swap="none">重启</button>'
+        )
+    else:
+        actions = (
+            f'<button class="btn btn-success btn-sm" '
+            f'hx-post="/api/cameras/{camera_id}/start" hx-swap="none">启动</button>'
+        )
+
+    return HTMLResponse(f"""
+    <div>
+        <div class="flex-between mb-8">
+            <span style="font-size:var(--text-sm);color:var(--text-secondary);">
+                实时画面 · {camera_id}
+            </span>
+            <div class="flex gap-8">{actions}</div>
+        </div>
+        {preview}
+        {stats_html}
+    </div>""")
+
+
+@router.get("/{camera_id}/deploy-panel", response_class=HTMLResponse)
+async def camera_deploy_panel(request: Request, camera_id: str):
+    """Model deployment sub-tab for camera detail page."""
+    camera_manager = request.app.state.camera_manager
+    database = getattr(request.app.state, "database", None)
+
+    # Current detector status
+    det_html = '<p style="color:var(--text-tertiary);">检测器状态不可用</p>'
+    if camera_manager:
+        try:
+            det = camera_manager.get_detector_status(camera_id)
+            if det:
+                mode = det.get("mode", "unknown")
+                model_path = det.get("model_path", "—")
+                threshold = det.get("threshold", "—")
+                det_html = f"""
+                <table>
+                    <tr><td style="color:var(--text-secondary);">检测模式</td><td>{mode}</td></tr>
+                    <tr><td style="color:var(--text-secondary);">模型路径</td><td class="mono">{model_path}</td></tr>
+                    <tr><td style="color:var(--text-secondary);">阈值</td><td>{threshold}</td></tr>
+                </table>"""
+        except Exception:
+            pass
+
+    # Latest training info
+    train_html = ""
+    if database:
+        latest = database.get_latest_training(camera_id)
+        if latest and latest.status == "complete":
+            train_html = f"""
+            <div class="card mt-16">
+                <h3>最近训练</h3>
+                <table>
+                    <tr><td style="color:var(--text-secondary);">模型类型</td><td>{latest.model_type}</td></tr>
+                    <tr><td style="color:var(--text-secondary);">质量等级</td><td>{latest.quality_grade or '—'}</td></tr>
+                    <tr><td style="color:var(--text-secondary);">推荐阈值</td><td>{latest.threshold_recommended or '—'}</td></tr>
+                    <tr><td style="color:var(--text-secondary);">训练时间</td><td>{latest.trained_at or '—'}</td></tr>
+                </table>
+            </div>"""
+
+    return HTMLResponse(f"""
+    <div>
+        <div class="card">
+            <h3>当前部署状态</h3>
+            {det_html}
+        </div>
+        {train_html}
     </div>""")
 
 

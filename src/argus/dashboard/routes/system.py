@@ -119,15 +119,17 @@ async def overview(request: Request):
         )
 
         camera_cards += f"""
-        <div class="camera-card">
+        <div class="camera-card" style="cursor:pointer;"
+             hx-get="/api/cameras/{cam.camera_id}/detail" hx-target="#content" hx-swap="innerHTML"
+             hx-push-url="/cameras?cam={cam.camera_id}">
             <div class="header">
                 <span>{status_dot("connected" if cam.connected else "offline")}{cam.camera_id} — {cam.name}</span>
-                <span style="font-size:12px;color:#8890a0;">{status_text}</span>
+                <span style="font-size:var(--text-xs);color:var(--text-secondary);">{status_text}</span>
             </div>
             <div class="preview" style="position:relative;">
-                {preview_img if cam.connected else '<span style="color:#616161;">离线</span>'}
+                {preview_img if cam.connected else '<span style="color:var(--text-tertiary);">离线</span>'}
             </div>
-            <div style="padding:8px 12px;font-size:12px;color:#8890a0;">
+            <div style="padding:var(--space-2) var(--space-3);font-size:var(--text-xs);color:var(--text-secondary);">
                 帧数: {frames} | 延迟: {latency} | 告警: {alerts_count}
             </div>
         </div>"""
