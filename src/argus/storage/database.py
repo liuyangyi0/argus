@@ -9,7 +9,7 @@ import structlog
 from sqlalchemy import create_engine, func as sa_func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from argus.storage.models import AlertRecord, AlertWorkflowStatus, Base, BaselineRecord, TrainingRecord
+from argus.storage.models import AlertRecord, Base, BaselineRecord, User
 
 logger = structlog.get_logger()
 
@@ -207,79 +207,66 @@ class Database:
             )
             return len(old_alerts), image_paths
 
-    # ── Training history (TRN-007) ──
+    # ── User management ──
 
-    def save_training_record(self, **kwargs) -> None:
-        """Save a training history record."""
+    def create_user(
+        self,
+        username: str,
+        password_hash: str,
+        role: str = "viewer",
+        display_name: str | None = None,
+    ) -> User:
+        """Create a new user record."""
         with self.get_session() as session:
-            record = TrainingRecord(**kwargs)
-            session.add(record)
+            user = User(
+                username=username,
+                password_hash=password_hash,
+                role=role,
+                display_name=display_name,
+            )
+            session.add(user)
             session.commit()
-            logger.debug("database.training_record_saved", training_id=kwargs.get("training_id"))
+            session.refresh(user)
+            logger.info("database.user_created", username=username, role=role)
+            return user
 
-    def get_training_history(
-        self, camera_id: str | None = None, limit: int = 20
-    ) -> list[dict]:
-        """Get training history, optionally filtered by camera."""
+    def get_user(self, username: str) -> User | None:
+        """Get a user by username."""
         with self.get_session() as session:
-            stmt = select(TrainingRecord).order_by(TrainingRecord.started_at.desc())
-            if camera_id:
-                stmt = stmt.where(TrainingRecord.camera_id == camera_id)
-            stmt = stmt.limit(limit)
-            records = list(session.scalars(stmt).all())
-            return [r.to_dict() for r in records]
+            return session.scalar(select(User).where(User.username == username))
 
-    def get_training_record(self, training_id: str) -> dict | None:
-        """Get a single training record by ID."""
+    def get_all_users(self) -> list[User]:
+        """Return all users ordered by username."""
         with self.get_session() as session:
-            record = session.scalar(
-                select(TrainingRecord).where(TrainingRecord.training_id == training_id)
-            )
-            return record.to_dict() if record else None
+            return list(session.scalars(select(User).order_by(User.username)).all())
 
-    # ── Alert workflow (YOLO-005) ──
-
-    def update_alert_workflow(
-        self, alert_id: str, status: str,
-        assigned_to: str | None = None, notes: str | None = None,
-    ) -> bool:
-        """Update alert workflow status."""
-        try:
-            AlertWorkflowStatus(status)
-        except ValueError:
-            return False
-
+    def update_user(self, username: str, **kwargs) -> bool:
+        """Update user fields. Returns True if the user was found and updated."""
         with self.get_session() as session:
-            record = session.scalar(
-                select(AlertRecord).where(AlertRecord.alert_id == alert_id)
-            )
-            if record is None:
+            user = session.scalar(select(User).where(User.username == username))
+            if user is None:
                 return False
-
-            record.workflow_status = status
-            if assigned_to is not None:
-                record.assigned_to = assigned_to
-            if notes is not None:
-                record.notes = notes
-            if status == AlertWorkflowStatus.RESOLVED.value:
-                record.resolved_at = datetime.utcnow()
-            if status == AlertWorkflowStatus.ACKNOWLEDGED.value:
-                record.acknowledged = True
-            if status == AlertWorkflowStatus.FALSE_POSITIVE.value:
-                record.false_positive = True
-
+            for key, value in kwargs.items():
+                if hasattr(user, key):
+                    setattr(user, key, value)
             session.commit()
             return True
 
-    def get_alert_workflow_stats(self) -> dict[str, int]:
-        """Get counts per workflow status for dashboard display."""
+    def delete_user(self, username: str) -> bool:
+        """Delete a user. Returns True if deleted."""
         with self.get_session() as session:
-            alerts = list(session.scalars(select(AlertRecord)).all())
-            stats: dict[str, int] = {ws.value: 0 for ws in AlertWorkflowStatus}
-            for alert in alerts:
-                status = alert.workflow_status or "new"
-                stats[status] = stats.get(status, 0) + 1
-            return stats
+            user = session.scalar(select(User).where(User.username == username))
+            if user is None:
+                return False
+            session.delete(user)
+            session.commit()
+            logger.info("database.user_deleted", username=username)
+            return True
+
+    def user_count(self) -> int:
+        """Return total number of users."""
+        with self.get_session() as session:
+            return len(list(session.scalars(select(User)).all()))
 
     def close(self) -> None:
         """Close the database engine."""

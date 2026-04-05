@@ -204,6 +204,16 @@ async def update_detection_params(request: Request):
         updated += 1
 
     logger.info("config.detection_params_updated", pipelines=updated)
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="update_config",
+            target_type="detection_params",
+            detail=f"更新检测参数，影响 {updated} 条流水线",
+            ip_address=client_ip,
+        )
     return JSONResponse(
         {"status": "ok", "pipelines_updated": updated},
         headers={"HX-Trigger": '{"showToast": {"message": "检测参数已更新", "type": "success"}}'},
@@ -597,6 +607,16 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
         return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
 
     pipeline.clear_anomaly_lock()
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="clear_lock",
+            target_type="camera",
+            target_id=camera_id,
+            ip_address=client_ip,
+        )
     return HTMLResponse(
         '<span style="color:#4caf50;">锁定已解除</span>',
         headers={"HX-Trigger": '{"showToast": {"message": "异常锁定已解除", "type": "success"}}'},
