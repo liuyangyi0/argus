@@ -16,11 +16,15 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from argus.dashboard.routes.alerts import router as alerts_router
+from argus.dashboard.routes.audit import router as audit_router
+from argus.dashboard.routes.backup import router as backup_router
 from argus.dashboard.routes.cameras import router as cameras_router
 from argus.dashboard.routes.config import router as config_router
 from argus.dashboard.routes.detection import router as detection_router
 from argus.dashboard.routes.system import router as system_router
 from argus.dashboard.routes.tasks import router as tasks_router
+from argus.dashboard.routes.reports import router as reports_router
+from argus.dashboard.routes.users import router as users_router
 from argus.dashboard.routes.zones import router as zones_router
 
 if TYPE_CHECKING:
@@ -64,19 +68,36 @@ def create_app(
     app.state.config = config
     app.state.config_path = config_path
     app.state.task_manager = task_manager
+    app.state.audit_logger = None  # Will be set from __main__
+    app.state.backup_manager = None  # Will be set from __main__
+
+    # Generate a session secret for cookie signing
+    import secrets as _secrets
+    session_secret = _secrets.token_hex(32)
+    app.state.session_secret = session_secret
+    app.state.auth_enabled = getattr(getattr(config, "auth", None), "enabled", False)
 
     # Security middleware (order matters: outermost first)
     from argus.dashboard.auth import (
         AuthMiddleware,
         RateLimitMiddleware,
         SecurityHeadersMiddleware,
+        auth_router,
     )
 
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RateLimitMiddleware, max_requests_per_minute=60)
 
     auth_config = getattr(config, "auth", None) or AuthConfig()
-    app.add_middleware(AuthMiddleware, config=auth_config)
+    app.add_middleware(
+        AuthMiddleware,
+        config=auth_config,
+        session_secret=session_secret,
+        database=database,
+    )
+
+    # Login/logout routes
+    app.include_router(auth_router)
 
     # Mount static files
     static_dir = Path(__file__).parent / "static"
@@ -91,6 +112,10 @@ def create_app(
     app.include_router(detection_router, prefix="/api/detection", tags=["detection"])
     app.include_router(system_router, prefix="/api/system", tags=["system"])
     app.include_router(tasks_router, prefix="/api/tasks", tags=["tasks"])
+    app.include_router(audit_router, prefix="/api/audit", tags=["audit"])
+    app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
+    app.include_router(users_router, prefix="/api/users", tags=["users"])
+    app.include_router(reports_router, prefix="/api/reports", tags=["reports"])
 
     # Try to register baseline router (may not exist yet)
     try:
@@ -132,7 +157,38 @@ def create_app(
     async def system_page(request: Request):
         return _render_page(request, "system")
 
+    @app.get("/backup", response_class=HTMLResponse)
+    async def backup_page_route(request: Request):
+        return _render_page(request, "backup")
+
+    @app.get("/audit", response_class=HTMLResponse)
+    async def audit_page(request: Request):
+        return _render_page(request, "audit")
+
+    @app.get("/reports", response_class=HTMLResponse)
+    async def reports_page_route(request: Request):
+        return _render_page(request, "reports")
+
+    @app.get("/users", response_class=HTMLResponse)
+    async def users_page_route(request: Request):
+        return _render_page(request, "users")
+
     return app
+
+
+def _render_user_info(request: Request) -> str:
+    """Render current user info and logout link for the nav bar."""
+    user = getattr(request.state, "user", None)
+    if not user:
+        return ""
+    role_labels = {"admin": "管理员", "operator": "操作员", "viewer": "观察者"}
+    role = role_labels.get(user.get("role", ""), user.get("role", ""))
+    username = user.get("username", "")
+    return (
+        f'<span style="color:#8890a0;font-size:12px;">'
+        f'{username} ({role})</span>'
+        f'<a href="/logout" style="color:#8890a0;font-size:12px;margin-left:8px;text-decoration:none;">退出</a>'
+    )
 
 
 def _render_page(request: Request, active_page: str) -> HTMLResponse:
@@ -145,6 +201,10 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
         ("alerts", "/alerts", "告警中心"),
         ("detection", "/detection", "检测调试"),
         ("config", "/config", "系统设置"),
+        ("backup", "/backup", "数据备份"),
+        ("audit", "/audit", "审计日志"),
+        ("reports", "/reports", "报表统计"),
+        ("users", "/users", "用户管理"),
     ]
 
     nav_html = ""
@@ -162,6 +222,10 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
         "detection": "/api/detection",
         "config": "/api/config",
         "system": "/api/system",
+        "backup": "/api/backup",
+        "audit": "/api/audit",
+        "reports": "/api/reports",
+        "users": "/api/users",
     }
     content_url = content_url_map.get(active_page, f"/api/{active_page}")
 
@@ -194,6 +258,7 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
         {nav_html}
         <div class="nav-right">
             {task_indicator}
+            {_render_user_info(request)}
         </div>
     </nav>
     <div class="container">
@@ -213,6 +278,7 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
     <div id="toast-container" class="toast-container"></div>
     <script src="/static/js/toast.js"></script>
     <script src="/static/js/zone_editor.js"></script>
-    <script src="/static/js/alert_audio.js"></script>
+    <script src="/static/js/notifications.js"></script>
+    <script src="/static/js/keyboard.js"></script>
 </body>
 </html>""")

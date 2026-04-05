@@ -625,6 +625,17 @@ async def deploy_model(request: Request):
     success = pipeline.reload_anomaly_model(str(resolved))
 
     if success:
+        audit = getattr(request.app.state, "audit_logger", None)
+        client_ip = request.client.host if request.client else ""
+        if audit:
+            audit.log(
+                user="operator",
+                action="deploy_model",
+                target_type="camera",
+                target_id=camera_id,
+                detail=model_path,
+                ip_address=client_ip,
+            )
         return JSONResponse(
             {"status": "ok"},
             headers={"HX-Trigger": '{"showToast": {"message": "模型已部署", "type": "success"}}'},
