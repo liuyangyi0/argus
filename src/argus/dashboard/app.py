@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from argus.dashboard.routes.alerts import router as alerts_router
 from argus.dashboard.routes.cameras import router as cameras_router
 from argus.dashboard.routes.config import router as config_router
+from argus.dashboard.routes.detection import router as detection_router
 from argus.dashboard.routes.system import router as system_router
 from argus.dashboard.routes.tasks import router as tasks_router
 from argus.dashboard.routes.zones import router as zones_router
@@ -87,6 +88,7 @@ def create_app(
     app.include_router(alerts_router, prefix="/api/alerts", tags=["alerts"])
     app.include_router(zones_router, prefix="/api/zones", tags=["zones"])
     app.include_router(config_router, prefix="/api/config", tags=["config"])
+    app.include_router(detection_router, prefix="/api/detection", tags=["detection"])
     app.include_router(system_router, prefix="/api/system", tags=["system"])
     app.include_router(tasks_router, prefix="/api/tasks", tags=["tasks"])
 
@@ -118,6 +120,10 @@ def create_app(
     async def zones_page(request: Request):
         return _render_page(request, "zones")
 
+    @app.get("/detection", response_class=HTMLResponse)
+    async def detection_page(request: Request):
+        return _render_page(request, "detection")
+
     @app.get("/config", response_class=HTMLResponse)
     async def config_page(request: Request):
         return _render_page(request, "config")
@@ -137,6 +143,7 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
         ("baseline", "/baseline", "基线与模型"),
         ("zones", "/zones", "检测区域"),
         ("alerts", "/alerts", "告警中心"),
+        ("detection", "/detection", "检测调试"),
         ("config", "/config", "系统设置"),
     ]
 
@@ -152,6 +159,7 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
         "baseline": "/api/baseline",
         "zones": "/api/zones",
         "alerts": "/api/alerts",
+        "detection": "/api/detection",
         "config": "/api/config",
         "system": "/api/system",
     }
@@ -205,5 +213,6 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
     <div id="toast-container" class="toast-container"></div>
     <script src="/static/js/toast.js"></script>
     <script src="/static/js/zone_editor.js"></script>
+    <script src="/static/js/alert_audio.js"></script>
 </body>
 </html>""")

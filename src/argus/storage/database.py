@@ -9,7 +9,7 @@ import structlog
 from sqlalchemy import create_engine, func as sa_func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from argus.storage.models import AlertRecord, Base, BaselineRecord, TrainingRecord
+from argus.storage.models import AlertRecord, AlertWorkflowStatus, Base, BaselineRecord, TrainingRecord
 
 logger = structlog.get_logger()
 
@@ -207,53 +207,79 @@ class Database:
             )
             return len(old_alerts), image_paths
 
-    # ── Training records ──
+    # ── Training history (TRN-007) ──
 
-    def save_training_record(self, record: TrainingRecord) -> TrainingRecord:
-        """Save a training record to the database."""
+    def save_training_record(self, **kwargs) -> None:
+        """Save a training history record."""
         with self.get_session() as session:
+            record = TrainingRecord(**kwargs)
             session.add(record)
             session.commit()
-            session.refresh(record)
-            logger.debug("database.training_record_saved", camera_id=record.camera_id)
-            return record
+            logger.debug("database.training_record_saved", training_id=kwargs.get("training_id"))
 
     def get_training_history(
-        self,
-        camera_id: str | None = None,
-        zone_id: str | None = None,
-        limit: int = 20,
-    ) -> list[TrainingRecord]:
-        """Query training records with optional filters."""
+        self, camera_id: str | None = None, limit: int = 20
+    ) -> list[dict]:
+        """Get training history, optionally filtered by camera."""
         with self.get_session() as session:
-            stmt = select(TrainingRecord).order_by(TrainingRecord.trained_at.desc())
+            stmt = select(TrainingRecord).order_by(TrainingRecord.started_at.desc())
             if camera_id:
                 stmt = stmt.where(TrainingRecord.camera_id == camera_id)
-            if zone_id:
-                stmt = stmt.where(TrainingRecord.zone_id == zone_id)
             stmt = stmt.limit(limit)
-            return list(session.scalars(stmt).all())
+            records = list(session.scalars(stmt).all())
+            return [r.to_dict() for r in records]
 
-    def get_latest_training(
-        self, camera_id: str, zone_id: str = "default"
-    ) -> TrainingRecord | None:
-        """Get the most recent successful training record for a camera/zone."""
-        with self.get_session() as session:
-            return session.scalar(
-                select(TrainingRecord)
-                .where(TrainingRecord.camera_id == camera_id)
-                .where(TrainingRecord.zone_id == zone_id)
-                .where(TrainingRecord.status == "complete")  # TrainingStatus.COMPLETE.value
-                .order_by(TrainingRecord.trained_at.desc())
-                .limit(1)
-            )
-
-    def get_training_record(self, record_id: int) -> TrainingRecord | None:
+    def get_training_record(self, training_id: str) -> dict | None:
         """Get a single training record by ID."""
         with self.get_session() as session:
-            return session.scalar(
-                select(TrainingRecord).where(TrainingRecord.id == record_id)
+            record = session.scalar(
+                select(TrainingRecord).where(TrainingRecord.training_id == training_id)
             )
+            return record.to_dict() if record else None
+
+    # ── Alert workflow (YOLO-005) ──
+
+    def update_alert_workflow(
+        self, alert_id: str, status: str,
+        assigned_to: str | None = None, notes: str | None = None,
+    ) -> bool:
+        """Update alert workflow status."""
+        try:
+            AlertWorkflowStatus(status)
+        except ValueError:
+            return False
+
+        with self.get_session() as session:
+            record = session.scalar(
+                select(AlertRecord).where(AlertRecord.alert_id == alert_id)
+            )
+            if record is None:
+                return False
+
+            record.workflow_status = status
+            if assigned_to is not None:
+                record.assigned_to = assigned_to
+            if notes is not None:
+                record.notes = notes
+            if status == AlertWorkflowStatus.RESOLVED.value:
+                record.resolved_at = datetime.utcnow()
+            if status == AlertWorkflowStatus.ACKNOWLEDGED.value:
+                record.acknowledged = True
+            if status == AlertWorkflowStatus.FALSE_POSITIVE.value:
+                record.false_positive = True
+
+            session.commit()
+            return True
+
+    def get_alert_workflow_stats(self) -> dict[str, int]:
+        """Get counts per workflow status for dashboard display."""
+        with self.get_session() as session:
+            alerts = list(session.scalars(select(AlertRecord)).all())
+            stats: dict[str, int] = {ws.value: 0 for ws in AlertWorkflowStatus}
+            for alert in alerts:
+                status = alert.workflow_status or "new"
+                stats[status] = stats.get(status, 0) + 1
+            return stats
 
     def close(self) -> None:
         """Close the database engine."""

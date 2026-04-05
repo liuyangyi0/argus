@@ -22,11 +22,35 @@ from argus.anomaly.baseline import BaselineManager
 
 logger = structlog.get_logger()
 
-MIN_BASELINE_IMAGES = 30
-
-_EMPTY_VAL_STATS: dict = {
-    "scores": [], "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0,
-    "p5": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "p95": 0.0,
+MODEL_INFO = {
+    "patchcore": {
+        "name": "PatchCore",
+        "description": "高精度异常检测，适合静态场景",
+        "speed": "中等",
+        "epochs": 1,
+        "memory": "高",
+    },
+    "efficient_ad": {
+        "name": "EfficientAD",
+        "description": "高效异常检测，适合边缘部署",
+        "speed": "快",
+        "epochs": 70,
+        "memory": "低",
+    },
+    "fastflow": {
+        "name": "FastFlow",
+        "description": "基于正则化流的实时异常检测",
+        "speed": "很快",
+        "epochs": 70,
+        "memory": "中等",
+    },
+    "padim": {
+        "name": "PaDiM",
+        "description": "轻量级异常检测，适合嵌入式设备",
+        "speed": "很快",
+        "epochs": 1,
+        "memory": "低",
+    },
 }
 
 
@@ -674,7 +698,6 @@ class ModelTrainer:
         """
         from anomalib.data import Folder
         from anomalib.engine import Engine
-        from anomalib.models import EfficientAd, Patchcore
 
         datamodule = Folder(
             name="baseline",
@@ -687,15 +710,33 @@ class ModelTrainer:
         )
 
         if model_type == "efficient_ad":
+            from anomalib.models import EfficientAd
             model = EfficientAd()
-        else:
+        elif model_type == "fastflow":
+            from anomalib.models import Fastflow
+            model = Fastflow(
+                backbone="resnet18",  # Lightweight for real-time
+                flow_steps=8,
+            )
+        elif model_type == "padim":
+            from anomalib.models import Padim
+            model = Padim(
+                backbone="resnet18",
+                layers=["layer1", "layer2", "layer3"],
+            )
+        else:  # patchcore (default)
+            from anomalib.models import Patchcore
             model = Patchcore(
                 backbone="wide_resnet50_2",
                 layers=["layer2", "layer3"],
                 coreset_sampling_ratio=0.1,
             )
 
-        max_epochs = 70 if model_type == "efficient_ad" else 1
+        # FastFlow and EfficientAD need multiple epochs; PatchCore and Padim need 1
+        if model_type in ("efficient_ad", "fastflow"):
+            max_epochs = 70
+        else:
+            max_epochs = 1  # PatchCore and Padim only need feature extraction
 
         engine = Engine(
             default_root_dir=str(output_dir),
@@ -713,18 +754,13 @@ class ModelTrainer:
         export_format: str,
         export_path: str,
     ) -> None:
-        """Export trained model to an optimized inference format."""
-        from anomalib.deploy import ExportType
+        """Export trained model to an optimized inference format.
 
-        export_type_map = {
-            "openvino": ExportType.OPENVINO,
-            "onnx": ExportType.ONNX,
-        }
-        export_type = export_type_map.get(export_format, ExportType.OPENVINO)
-
+        CRIT-02/HIGH-12: Use correct Anomalib 2.x export API (export_mode parameter).
+        """
+        # Anomalib 2.x uses export_mode (str), not export_type (enum)
         engine.export(
             model=model,
-            export_type=export_type,
-            export_root=export_path,
+            export_mode=export_format,  # "openvino" or "onnx"
         )
         logger.info("training.exported", format=export_format, path=export_path)
