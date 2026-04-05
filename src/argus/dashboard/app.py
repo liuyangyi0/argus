@@ -159,41 +159,48 @@ def create_app(
     async def alerts_page(request: Request):
         return _render_page(request, "alerts")
 
-    @app.get("/baseline", response_class=HTMLResponse)
-    async def baseline_page(request: Request):
-        return _render_page(request, "baseline")
-
-    @app.get("/zones", response_class=HTMLResponse)
-    async def zones_page(request: Request):
-        return _render_page(request, "zones")
-
-    @app.get("/detection", response_class=HTMLResponse)
-    async def detection_page(request: Request):
-        return _render_page(request, "detection")
-
-    @app.get("/config", response_class=HTMLResponse)
-    async def config_page(request: Request):
-        return _render_page(request, "config")
+    @app.get("/models", response_class=HTMLResponse)
+    async def models_page(request: Request):
+        return _render_page(request, "models")
 
     @app.get("/system", response_class=HTMLResponse)
     async def system_page(request: Request):
         return _render_page(request, "system")
 
-    @app.get("/backup", response_class=HTMLResponse)
-    async def backup_page_route(request: Request):
-        return _render_page(request, "backup")
+    # Legacy routes — redirect to new merged locations
+    from fastapi.responses import RedirectResponse
 
-    @app.get("/audit", response_class=HTMLResponse)
-    async def audit_page(request: Request):
-        return _render_page(request, "audit")
+    @app.get("/baseline", response_class=RedirectResponse)
+    async def baseline_redirect():
+        return RedirectResponse("/models", status_code=301)
 
-    @app.get("/reports", response_class=HTMLResponse)
-    async def reports_page_route(request: Request):
-        return _render_page(request, "reports")
+    @app.get("/zones", response_class=RedirectResponse)
+    async def zones_redirect():
+        return RedirectResponse("/cameras", status_code=301)
 
-    @app.get("/users", response_class=HTMLResponse)
-    async def users_page_route(request: Request):
-        return _render_page(request, "users")
+    @app.get("/detection", response_class=RedirectResponse)
+    async def detection_redirect():
+        return RedirectResponse("/cameras", status_code=301)
+
+    @app.get("/config", response_class=RedirectResponse)
+    async def config_redirect():
+        return RedirectResponse("/system", status_code=301)
+
+    @app.get("/backup", response_class=RedirectResponse)
+    async def backup_redirect():
+        return RedirectResponse("/system", status_code=301)
+
+    @app.get("/audit", response_class=RedirectResponse)
+    async def audit_redirect():
+        return RedirectResponse("/system", status_code=301)
+
+    @app.get("/reports", response_class=RedirectResponse)
+    async def reports_redirect():
+        return RedirectResponse("/system", status_code=301)
+
+    @app.get("/users", response_class=RedirectResponse)
+    async def users_redirect():
+        return RedirectResponse("/system", status_code=301)
 
     return app
 
@@ -214,36 +221,45 @@ def _render_user_info(request: Request) -> str:
 
 
 def _render_page(request: Request, active_page: str) -> HTMLResponse:
-    """Render the main HTML shell with the active page content."""
+    """Render the main HTML shell with sidebar layout and 5-page navigation."""
+
+    # Lucide icon SVGs (inline, stroke-based, 20x20)
+    _ICONS = {
+        "overview": '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
+        "cameras": '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+        "alerts": '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
+        "models": '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+        "system": '<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>',
+    }
+
+    # 5 top-level nav items (sidebar)
     nav_items = [
         ("overview", "/", "总览"),
         ("cameras", "/cameras", "摄像头"),
-        ("baseline", "/baseline", "基线与模型"),
-        ("zones", "/zones", "检测区域"),
-        ("alerts", "/alerts", "告警中心"),
-        ("detection", "/detection", "检测调试"),
-        ("config", "/config", "系统设置"),
-        ("backup", "/backup", "数据备份"),
-        ("audit", "/audit", "审计日志"),
-        ("reports", "/reports", "报表统计"),
-        ("users", "/users", "用户管理"),
+        ("alerts", "/alerts", "告警"),
+        ("models", "/models", "模型"),
+        ("system", "/system", "系统"),
     ]
 
     nav_html = ""
     for page_id, href, label in nav_items:
         active_cls = ' class="active"' if page_id == active_page else ""
-        nav_html += f'<a href="{href}"{active_cls}>{label}</a>\n'
+        icon_path = _ICONS.get(page_id, "")
+        icon_svg = f'<svg viewBox="0 0 24 24">{icon_path}</svg>' if icon_path else ""
+        nav_html += f'<a href="{href}"{active_cls}>{icon_svg}{label}</a>\n'
 
-    # Map page to initial content URL
+    # Map active page to content URL
     content_url_map = {
         "overview": "/api/system/overview",
         "cameras": "/api/cameras",
+        "alerts": "/api/alerts",
+        "models": "/api/baseline",
+        "system": "/api/system",
+        # Legacy pages redirect to merged locations
         "baseline": "/api/baseline",
         "zones": "/api/zones",
-        "alerts": "/api/alerts",
         "detection": "/api/detection",
         "config": "/api/config",
-        "system": "/api/system",
         "backup": "/api/backup",
         "audit": "/api/audit",
         "reports": "/api/reports",
@@ -251,7 +267,7 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
     }
     content_url = content_url_map.get(active_page, f"/api/{active_page}")
 
-    # Task indicator: show active task count in nav
+    # Task indicator in sidebar footer
     task_manager = getattr(request.app.state, "task_manager", None)
     task_count = 0
     if task_manager:
@@ -260,10 +276,10 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
     task_indicator = ""
     if task_count > 0:
         task_indicator = (
-            f'<span style="background:#e65100;color:#fff;padding:2px 8px;'
-            f'border-radius:10px;font-size:11px;font-weight:600;">'
-            f'{task_count} 个任务运行中</span>'
+            f'<div class="task-indicator">{task_count} 个任务运行中</div>'
         )
+
+    user_info = _render_user_info(request)
 
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -271,30 +287,40 @@ def _render_page(request: Request, active_page: str) -> HTMLResponse:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Argus - 核电站异物检测系统</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/tokens.css">
     <link rel="stylesheet" href="/static/css/argus.css">
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
 </head>
 <body>
-    <nav>
-        <span class="logo">ARGUS</span>
-        {nav_html}
-        <div class="nav-right">
-            {task_indicator}
-            {_render_user_info(request)}
-        </div>
-    </nav>
-    <div class="container">
-        <div id="content"
-             hx-get="{content_url}"
-             hx-trigger="load"
-             hx-swap="innerHTML">
-            <div class="empty-state"><div class="spinner"></div><div class="message mt-8">加载中...</div></div>
+    <div class="app-layout">
+        <aside class="sidebar">
+            <div class="sidebar-logo">ARGUS</div>
+            <nav class="sidebar-nav">
+                {nav_html}
+            </nav>
+            <div class="sidebar-footer">
+                {task_indicator}
+                {user_info}
+                <div style="margin-top:var(--space-2);">v0.2.0</div>
+            </div>
+        </aside>
+        <div class="main-content">
+            <div class="container">
+                <div id="content"
+                     hx-get="{content_url}"
+                     hx-trigger="load"
+                     hx-swap="innerHTML">
+                    <div class="empty-state"><div class="spinner"></div><div class="message mt-8">加载中...</div></div>
+                </div>
+            </div>
         </div>
     </div>
     <div id="alert-modal" class="modal-overlay"
          onclick="if(event.target===this)this.classList.remove('active')">
         <div id="alert-modal-content" class="modal-content">
-            <p style="color:#8890a0;">加载中...</p>
+            <p style="color:var(--text-secondary);">加载中...</p>
         </div>
     </div>
     <div id="toast-container" class="toast-container"></div>

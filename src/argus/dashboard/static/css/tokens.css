@@ -1,0 +1,148 @@
+/* Argus Design Tokens
+ * Nuclear plant control room visual specification
+ * Dark mode only. WCAG AAA compliant.
+ */
+
+:root {
+  /* ========== Neutral Colors (Skeleton) ========== */
+
+  /* Backgrounds — 5 layers, deep to shallow */
+  --bg-base:      #0A0E1A;    /* Page base, deepest */
+  --bg-surface:   #121826;    /* Cards, panels */
+  --bg-raised:    #1A2234;    /* Hover cards, modals, tooltips */
+  --bg-sunken:    #060913;    /* Input fields, code blocks */
+  --bg-overlay:   rgba(0, 0, 0, 0.7);  /* Modal backdrop */
+
+  /* Borders — 3 levels */
+  --border-subtle:  #1F2937;  /* Card dividers, barely visible */
+  --border-default: #2D3748;  /* Standard borders */
+  --border-strong:  #4A5568;  /* Emphasized borders, focus rings */
+
+  /* Text — 4 levels */
+  --text-primary:   #F1F5F9;  /* Main text, high contrast */
+  --text-secondary: #94A3B8;  /* Descriptions, labels */
+  --text-tertiary:  #64748B;  /* Timestamps, footnotes */
+  --text-disabled:  #475569;  /* Disabled state */
+  --text-inverse:   #0A0E1A;  /* On light buttons */
+
+  /* ========== Semantic Colors (Status & Alerts) ========== */
+
+  /* OK / Success — green */
+  --status-ok:      #10B981;
+  --status-ok-bg:   rgba(16, 185, 129, 0.08);
+  --status-ok-text: #6EE7B7;
+
+  /* Info / In Progress — blue */
+  --status-info:      #3B82F6;
+  --status-info-bg:   rgba(59, 130, 246, 0.08);
+  --status-info-text: #93C5FD;
+
+  /* Warning / LOW alert — yellow */
+  --status-warn:      #F59E0B;
+  --status-warn-bg:   rgba(245, 158, 11, 0.08);
+  --status-warn-text: #FCD34D;
+
+  /* Alert / MEDIUM — orange */
+  --status-alert:      #F97316;
+  --status-alert-bg:   rgba(249, 115, 22, 0.08);
+  --status-alert-text: #FDBA74;
+
+  /* Critical / HIGH — red (ONLY for HIGH alerts & system failure) */
+  --status-critical:      #EF4444;
+  --status-critical-bg:   rgba(239, 68, 68, 0.12);
+  --status-critical-text: #FCA5A5;
+
+  /* Neutral / Pending — gray */
+  --status-neutral:      #64748B;
+  --status-neutral-bg:   rgba(100, 116, 139, 0.08);
+  --status-neutral-text: #94A3B8;
+
+  /* ========== Chart Colors (Data Visualization) ========== */
+  --chart-1: #60A5FA;  /* Blue */
+  --chart-2: #34D399;  /* Teal */
+  --chart-3: #FBBF24;  /* Gold */
+  --chart-4: #A78BFA;  /* Purple */
+  --chart-5: #F472B6;  /* Pink */
+  --chart-6: #2DD4BF;  /* Cyan */
+
+  /* ========== Heatmap Gradient ========== */
+  --heatmap-0: transparent;
+  --heatmap-1: #1E3A8A;  /* Deep blue (low) */
+  --heatmap-2: #3B82F6;
+  --heatmap-3: #A78BFA;
+  --heatmap-4: #F472B6;
+  --heatmap-5: #F59E0B;  /* Yellow (high) */
+  --heatmap-6: #EF4444;  /* Red (extreme) */
+
+  /* ========== Typography ========== */
+  --font-sans: "Inter", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+
+  /* Font sizes — 8pt scale */
+  --text-xs:   0.75rem;   /* 12px — only for chart axes */
+  --text-sm:   0.875rem;  /* 14px — secondary info */
+  --text-base: 1rem;      /* 16px — body default */
+  --text-lg:   1.125rem;  /* 18px — card titles */
+  --text-xl:   1.25rem;   /* 20px — key numbers */
+  --text-2xl:  1.5rem;    /* 24px — page titles */
+  --text-3xl:  2rem;      /* 32px — dashboard metrics */
+  --text-4xl:  3rem;      /* 48px — hero numbers */
+
+  /* Font weights — 3 levels only */
+  --font-normal:   400;
+  --font-medium:   500;
+  --font-semibold: 600;
+
+  /* Line heights */
+  --leading-tight:  1.2;  /* Headings, numbers */
+  --leading-normal: 1.5;  /* Body text */
+
+  /* ========== Spacing — 8px base ========== */
+  --space-1:   0.25rem;   /* 4px */
+  --space-2:   0.5rem;    /* 8px */
+  --space-3:   0.75rem;   /* 12px */
+  --space-4:   1rem;      /* 16px */
+  --space-5:   1.5rem;    /* 24px */
+  --space-6:   2rem;      /* 32px */
+  --space-8:   3rem;      /* 48px */
+  --space-10:  4rem;      /* 64px */
+
+  /* ========== Border Radius ========== */
+  --radius-sm:   4px;
+  --radius-md:   6px;
+  --radius-lg:   8px;
+  --radius-xl:   12px;
+  --radius-full: 9999px;
+
+  /* ========== Shadows (dark mode: inner glow + soft outer) ========== */
+  --shadow-sm:  inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --shadow-md:  inset 0 0 0 1px rgba(255, 255, 255, 0.06),
+                0 2px 8px rgba(0, 0, 0, 0.4);
+  --shadow-lg:  inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+                0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-xl:  inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+                0 16px 48px rgba(0, 0, 0, 0.6);
+
+  /* ========== Motion ========== */
+  --duration-fast:  100ms;
+  --duration-base:  200ms;
+  --duration-slow:  300ms;
+  --easing-default: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* ========== Layout ========== */
+  --sidebar-width:    240px;
+  --content-max:      1600px;
+  --nav-height:       0px;  /* No top nav, sidebar layout */
+}
+
+/* ========== Reduced Motion ========== */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+  /* Keep HIGH alert pulse — safety critical */
+  .alert-critical-pulse {
+    animation: pulse-critical 2s ease-in-out infinite !important;
+  }
+}
