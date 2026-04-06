@@ -9,6 +9,16 @@ from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
+class ModelStage(str, Enum):
+    """Lifecycle stage for model release pipeline."""
+
+    CANDIDATE = "candidate"
+    SHADOW = "shadow"
+    CANARY = "canary"
+    PRODUCTION = "production"
+    RETIRED = "retired"
+
+
 class AlertWorkflowStatus(str, Enum):
     """Workflow status for alert lifecycle management."""
 
@@ -264,6 +274,16 @@ class ModelRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Release pipeline fields
+    stage: Mapped[str] = mapped_column(
+        String(20), default="candidate", server_default="candidate", nullable=False,
+    )
+    component_type: Mapped[str] = mapped_column(
+        String(20), default="full", server_default="full", nullable=False,
+    )
+    model_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    canary_camera_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -278,6 +298,10 @@ class ModelRecord(Base):
             "backbone_version_id": self.backbone_version_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "is_active": self.is_active,
+            "stage": self.stage,
+            "component_type": self.component_type,
+            "model_path": self.model_path,
+            "canary_camera_id": self.canary_camera_id,
         }
 
 
@@ -436,3 +460,57 @@ class User(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ModelVersionEvent(Base):
+    """Structured version transition event for audit trail."""
+
+    __tablename__ = "model_version_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, index=True,
+    )
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    from_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    to_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    from_stage: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    to_stage: Mapped[str] = mapped_column(String(20), nullable=False)
+    triggered_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    warmup_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sha256_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "camera_id": self.camera_id,
+            "from_version": self.from_version,
+            "to_version": self.to_version,
+            "from_stage": self.from_stage,
+            "to_stage": self.to_stage,
+            "triggered_by": self.triggered_by,
+            "reason": self.reason,
+            "warmup_latency_ms": self.warmup_latency_ms,
+            "sha256_verified": self.sha256_verified,
+        }
+
+
+class ShadowInferenceLog(Base):
+    """Shadow model parallel inference results for comparison."""
+
+    __tablename__ = "shadow_inference_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    shadow_version_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    production_version_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    shadow_score: Mapped[float] = mapped_column(Float, nullable=False)
+    production_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    shadow_would_alert: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    production_alerted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)

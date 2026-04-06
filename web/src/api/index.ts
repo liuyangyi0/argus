@@ -85,6 +85,19 @@ export const activateModel = (versionId: string) =>
 export const rollbackModel = (versionId: string) =>
   api.post(`/models/${versionId}/rollback`)
 
+// ── Release Pipeline ──
+export const promoteModel = (versionId: string, data: { target_stage: string; triggered_by: string; reason?: string; canary_camera_id?: string }) =>
+  api.post(`/models/${versionId}/promote`, data)
+export const retireModel = (versionId: string, data?: { triggered_by?: string; reason?: string }) =>
+  api.post(`/models/${versionId}/retire`, data || {})
+export const getStageHistory = (versionId: string) =>
+  api.get(`/models/${versionId}/stage-history`)
+export const getVersionEvents = (params?: { camera_id?: string; limit?: number }) =>
+  api.get('/models/events/list', { params })
+export const getShadowReport = (versionId: string, params?: { camera_id?: string; days?: number }) =>
+  api.get(`/models/${versionId}/shadow-report`, { params })
+export const getBackboneStatus = () => api.get('/models/backbone/status')
+
 // ── Batch Inference ──
 export const batchInference = (cameraId: string, imagePaths: string[]) =>
   api.post('/models/batch-inference', { camera_id: cameraId, image_paths: imagePaths })

@@ -216,6 +216,32 @@ class AnomalyConfig(BaseModel):
         description="Sigmoid midpoint for SSIM score normalization",
     )
 
+    # Release pipeline parameters
+    shadow_sample_rate: int = Field(
+        default=5, ge=1, le=100,
+        description="Run shadow inference on every Nth frame (1 = every frame)",
+    )
+    warmup_frames: int = Field(
+        default=10, ge=1, le=50,
+        description="Number of baseline frames to run during model warmup verification",
+    )
+    warmup_max_latency_ms: float = Field(
+        default=500.0, ge=50.0, le=5000.0,
+        description="Maximum average inference latency (ms) allowed during warmup",
+    )
+    verify_model_signature: bool = Field(
+        default=False,
+        description="Require cryptographic signature verification on model files",
+    )
+    min_shadow_days: int = Field(
+        default=3, ge=0, le=90,
+        description="Minimum days in shadow stage before promotion to canary",
+    )
+    min_canary_days: int = Field(
+        default=7, ge=0, le=90,
+        description="Minimum days in canary stage before promotion to production",
+    )
+
 
 class ClassifierConfig(BaseModel):
     """Open vocabulary detection classifier (D1)."""

@@ -155,6 +155,70 @@ class CameraManager:
             )
             return self._shared_anomaly_detector
 
+    def _create_shadow_runner(self, cam_config) -> object | None:
+        """Create a ShadowRunner if a shadow-stage model exists for this camera."""
+        try:
+            db = getattr(self, "_db", None)
+            if db is None:
+                return None
+
+            from argus.storage.model_registry import ModelRegistry
+            from argus.storage.models import ModelStage
+
+            registry = ModelRegistry(session_factory=db.get_session)
+            shadow_models = registry.get_by_stage(
+                cam_config.camera_id, ModelStage.SHADOW.value,
+            )
+            if not shadow_models:
+                return None
+
+            shadow_record = shadow_models[0]  # Most recent shadow model
+            if not shadow_record.model_path:
+                return None
+
+            from pathlib import Path
+
+            from argus.anomaly.shadow_runner import ShadowRunner
+
+            # Get current production model version
+            active = registry.get_active(cam_config.camera_id)
+            prod_version = active.model_version_id if active else None
+
+            sample_rate = getattr(cam_config.anomaly, "shadow_sample_rate", 5)
+
+            shadow_model_path = Path(shadow_record.model_path)
+            if not shadow_model_path.exists():
+                logger.warning(
+                    "manager.shadow_model_missing",
+                    camera_id=cam_config.camera_id,
+                    model_path=str(shadow_model_path),
+                    shadow_version=shadow_record.model_version_id,
+                )
+                return None
+
+            runner = ShadowRunner(
+                shadow_model_path=shadow_model_path,
+                shadow_version_id=shadow_record.model_version_id,
+                production_version_id=prod_version,
+                camera_id=cam_config.camera_id,
+                session_factory=db.get_session,
+                sample_rate=sample_rate,
+                threshold=cam_config.anomaly.threshold,
+            )
+            logger.info(
+                "manager.shadow_runner_created",
+                camera_id=cam_config.camera_id,
+                shadow_version=shadow_record.model_version_id,
+            )
+            return runner
+        except Exception as e:
+            logger.warning(
+                "manager.shadow_runner_failed",
+                camera_id=cam_config.camera_id,
+                error=str(e),
+            )
+            return None
+
     def start_all(self) -> list[str]:
         """Start all camera pipelines. Returns list of successfully started camera IDs."""
         self._stop_event.clear()
@@ -426,6 +490,9 @@ class CameraManager:
         ):
             shared_detector = self._get_shared_detector(anomaly_cfg)
 
+        # Shadow runner: check for shadow-stage model to evaluate
+        shadow_runner = self._create_shadow_runner(cam_config)
+
         pipeline = DetectionPipeline(
             camera_config=cam_config,
             alert_config=self._alert_config,
@@ -435,6 +502,7 @@ class CameraManager:
             segmenter_config=self._segmenter_config,
             classifier_config=self._classifier_config,
             shared_anomaly_detector=shared_detector,
+            shadow_runner=shadow_runner,
         )
 
         if not pipeline.initialize():

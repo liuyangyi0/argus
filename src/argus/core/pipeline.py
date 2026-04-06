@@ -97,11 +97,13 @@ class DetectionPipeline:
         segmenter_config: SegmenterConfig | None = None,
         model_version_id: str | None = None,
         shared_anomaly_detector: object | None = None,
+        shadow_runner: object | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
         self._on_drift = on_drift
         self._model_version_id = model_version_id
+        self._shadow_runner = shadow_runner
         self.stats = PipelineStats()
         self._classifier_config = classifier_config
         self._segmenter_config = segmenter_config
@@ -801,6 +803,21 @@ class DetectionPipeline:
 
         self._update_latency(start)
 
+        # Shadow runner: parallel scoring for release pipeline evaluation
+        if self._shadow_runner is not None:
+            try:
+                self._shadow_runner.run_shadow(
+                    frame=frame_data.frame,
+                    production_score=anomaly_result.anomaly_score,
+                    production_alerted=alert is not None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "pipeline.shadow_runner_failed",
+                    camera_id=self.camera_config.camera_id,
+                    error=str(e),
+                )
+
         if alert is not None:
             alert.model_version_id = self._model_version_id
             self.stats.alerts_emitted += 1
@@ -912,6 +929,15 @@ class DetectionPipeline:
     def shutdown(self) -> None:
         """Clean up all pipeline resources."""
         self._camera.stop()
+        if self._shadow_runner is not None:
+            try:
+                self._shadow_runner.flush()
+            except Exception as e:
+                logger.warning(
+                    "pipeline.shadow_flush_failed",
+                    camera_id=self.camera_config.camera_id,
+                    error=str(e),
+                )
         logger.info(
             "pipeline.shutdown",
             camera_id=self.camera_config.camera_id,
