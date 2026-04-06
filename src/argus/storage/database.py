@@ -16,6 +16,9 @@ from argus.storage.models import (
     Base,
     BaselineRecord,
     BaselineVersionRecord,
+    FeedbackRecord,
+    FeedbackStatus,
+    InferenceRecord,
     TrainingJobRecord,
     TrainingRecord,
     User,
@@ -434,6 +437,191 @@ class Database:
             record.is_active = True
             session.commit()
             return True
+
+    # ── Inference records ──
+
+    def save_inference_batch(self, records: list[InferenceRecord]) -> int:
+        """Bulk-insert inference records. Returns count inserted."""
+        if not records:
+            return 0
+        with self.get_session() as session:
+            session.add_all(records)
+            session.commit()
+        return len(records)
+
+    def get_inference_stats(
+        self,
+        camera_id: str,
+        model_version_id: str | None = None,
+    ) -> dict:
+        """Return score distribution stats for a camera/model."""
+        with self.get_session() as session:
+            stmt = select(
+                sa_func.count(),
+                sa_func.avg(InferenceRecord.anomaly_score),
+                sa_func.max(InferenceRecord.anomaly_score),
+                sa_func.avg(InferenceRecord.inference_latency_ms),
+            ).where(InferenceRecord.camera_id == camera_id)
+            if model_version_id:
+                stmt = stmt.where(InferenceRecord.model_version_id == model_version_id)
+            row = session.execute(stmt).one()
+            return {
+                "total_frames": row[0] or 0,
+                "avg_score": round(row[1], 4) if row[1] else 0.0,
+                "max_score": round(row[2], 4) if row[2] else 0.0,
+                "avg_latency_ms": round(row[3], 2) if row[3] else 0.0,
+            }
+
+    def delete_old_inference_records(self, days: int = 30) -> int:
+        """Delete inference records older than N days. Returns count deleted."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        with self.get_session() as session:
+            # InferenceRecord.timestamp is a float (epoch seconds)
+            cutoff_ts = cutoff.timestamp()
+            count = (
+                session.query(InferenceRecord)
+                .filter(InferenceRecord.timestamp < cutoff_ts)
+                .delete()
+            )
+            session.commit()
+        if count:
+            logger.info("database.inference_cleaned", deleted=count, cutoff_days=days)
+        return count
+
+    # ── Feedback entries ──
+
+    def save_feedback(self, record: FeedbackRecord) -> FeedbackRecord:
+        """Save a feedback entry to the database."""
+        with self.get_session() as session:
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            logger.debug(
+                "database.feedback_saved",
+                feedback_id=record.feedback_id,
+                feedback_type=record.feedback_type,
+            )
+            return record
+
+    def get_feedback(self, feedback_id: str) -> FeedbackRecord | None:
+        """Get a single feedback entry by feedback_id."""
+        with self.get_session() as session:
+            return session.scalar(
+                select(FeedbackRecord).where(FeedbackRecord.feedback_id == feedback_id)
+            )
+
+    def get_pending_feedback(
+        self,
+        camera_id: str | None = None,
+        feedback_type: str | None = None,
+        limit: int = 500,
+    ) -> list[FeedbackRecord]:
+        """Get feedback entries with status='pending', optionally filtered."""
+        with self.get_session() as session:
+            stmt = (
+                select(FeedbackRecord)
+                .where(FeedbackRecord.status == FeedbackStatus.PENDING)
+                .order_by(FeedbackRecord.created_at.asc())
+            )
+            if camera_id:
+                stmt = stmt.where(FeedbackRecord.camera_id == camera_id)
+            if feedback_type:
+                stmt = stmt.where(FeedbackRecord.feedback_type == feedback_type)
+            stmt = stmt.limit(limit)
+            return list(session.scalars(stmt).all())
+
+    def mark_feedback_processed(
+        self,
+        feedback_ids: list[str],
+        trained_into: str,
+    ) -> int:
+        """Bulk-mark feedback entries as processed with the model version they fed into.
+
+        Returns the number of records updated.
+        """
+        if not feedback_ids:
+            return 0
+        now = datetime.now(timezone.utc)
+        updated = 0
+        with self.get_session() as session:
+            for fid in feedback_ids:
+                record = session.scalar(
+                    select(FeedbackRecord).where(FeedbackRecord.feedback_id == fid)
+                )
+                if record and record.status == FeedbackStatus.PENDING:
+                    record.status = FeedbackStatus.PROCESSED
+                    record.trained_into = trained_into
+                    record.processed_at = now
+                    updated += 1
+            session.commit()
+        logger.info(
+            "database.feedback_batch_processed",
+            count=updated,
+            trained_into=trained_into,
+        )
+        return updated
+
+    def skip_feedback(self, feedback_ids: list[str], reason: str | None = None) -> int:
+        """Mark feedback entries as skipped (will not be used for training).
+
+        Returns the number of records updated.
+        """
+        if not feedback_ids:
+            return 0
+        updated = 0
+        with self.get_session() as session:
+            for fid in feedback_ids:
+                record = session.scalar(
+                    select(FeedbackRecord).where(FeedbackRecord.feedback_id == fid)
+                )
+                if record and record.status == FeedbackStatus.PENDING:
+                    record.status = FeedbackStatus.SKIPPED
+                    if reason:
+                        record.notes = (record.notes or "") + f" [skip: {reason}]"
+                    updated += 1
+            session.commit()
+        return updated
+
+    def get_feedback_summary(self, camera_id: str | None = None) -> dict:
+        """Return feedback counts grouped by type and status."""
+        with self.get_session() as session:
+            stmt = select(
+                FeedbackRecord.feedback_type,
+                FeedbackRecord.status,
+                sa_func.count(),
+            ).group_by(FeedbackRecord.feedback_type, FeedbackRecord.status)
+            if camera_id:
+                stmt = stmt.where(FeedbackRecord.camera_id == camera_id)
+            rows = session.execute(stmt).all()
+
+        summary: dict = {"total": 0, "by_type": {}, "by_status": {}}
+        for fb_type, status, count in rows:
+            summary["total"] += count
+            summary["by_type"].setdefault(fb_type, 0)
+            summary["by_type"][fb_type] += count
+            summary["by_status"].setdefault(status, 0)
+            summary["by_status"][status] += count
+        return summary
+
+    def list_feedback(
+        self,
+        camera_id: str | None = None,
+        feedback_type: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[FeedbackRecord]:
+        """List feedback entries with optional filters."""
+        with self.get_session() as session:
+            stmt = select(FeedbackRecord).order_by(FeedbackRecord.created_at.desc())
+            if camera_id:
+                stmt = stmt.where(FeedbackRecord.camera_id == camera_id)
+            if feedback_type:
+                stmt = stmt.where(FeedbackRecord.feedback_type == feedback_type)
+            if status:
+                stmt = stmt.where(FeedbackRecord.status == status)
+            stmt = stmt.offset(offset).limit(limit)
+            return list(session.scalars(stmt).all())
 
     # ── User management ──
 

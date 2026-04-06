@@ -107,12 +107,14 @@ class DetectionPipeline:
         model_version_id: str | None = None,
         shared_anomaly_detector: object | None = None,
         shadow_runner: object | None = None,
+        feedback_manager: object | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
         self._on_drift = on_drift
         self._model_version_id = model_version_id
         self._shadow_runner = shadow_runner
+        self._feedback_manager = feedback_manager
         self.stats = PipelineStats()
         self._classifier_config = classifier_config
         self._segmenter_config = segmenter_config
@@ -1283,6 +1285,27 @@ class DetectionPipeline:
                         "current_mean": round(status.current_mean, 4),
                         "samples_collected": status.samples_collected,
                     })
+                # Passive feedback: submit drift event to feedback queue
+                if self._feedback_manager is not None:
+                    try:
+                        self._feedback_manager.submit_passive_feedback(
+                            camera_id=camera_id,
+                            zone_id="all",
+                            source="drift",
+                            notes=(
+                                f"KS={status.ks_statistic:.4f} "
+                                f"p={status.p_value:.6f} "
+                                f"ref_mean={status.reference_mean:.4f} "
+                                f"cur_mean={status.current_mean:.4f}"
+                            ),
+                            model_version_id=self._model_version_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "feedback.drift_submit_failed",
+                            camera_id=camera_id,
+                            exc_info=True,
+                        )
 
     def get_drift_status(self) -> DriftStatus | None:
         """Get current drift detection status, or None if disabled."""

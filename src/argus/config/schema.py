@@ -612,6 +612,31 @@ class RetrainingConfig(BaseModel):
         return v
 
 
+class FeedbackConfig(BaseModel):
+    """Feedback loop configuration (Section 6)."""
+
+    auto_baseline_on_fp: bool = Field(
+        default=True,
+        description="Automatically add FP snapshots to baseline directory",
+    )
+    auto_validation_on_confirmed: bool = Field(
+        default=True,
+        description="Automatically add confirmed anomaly frames to validation set",
+    )
+    uncertain_escalation_role: str = Field(
+        default="supervisor",
+        description="Role to notify when operator selects 'uncertain'",
+    )
+    passive_feedback_enabled: bool = Field(
+        default=True,
+        description="Generate feedback entries from drift/health events",
+    )
+    validation_dir: Path = Field(
+        default=Path("data/validation"),
+        description="Directory for confirmed anomaly frames used in recall testing",
+    )
+
+
 class CrossCameraConfig(BaseModel):
     """Cross-camera anomaly correlation."""
 
@@ -690,6 +715,7 @@ class ArgusConfig(BaseModel):
     segmenter: SegmenterConfig = Field(default_factory=SegmenterConfig)
     cross_camera: CrossCameraConfig = Field(default_factory=CrossCameraConfig)
     retraining: RetrainingConfig = Field(default_factory=RetrainingConfig)
+    feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
     baseline_capture: BaselineCaptureConfig = Field(default_factory=BaselineCaptureConfig)
     camera_groups: list[CameraGroupConfig] = Field(
         default_factory=list,

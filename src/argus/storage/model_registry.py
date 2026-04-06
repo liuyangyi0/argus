@@ -104,6 +104,122 @@ class ModelRegistry:
                 .first()
             )
 
+    # Valid stage transitions (nuclear safety: no skipping stages)
+    _VALID_TRANSITIONS: dict[str, set[str]] = {
+        ModelStage.CANDIDATE.value: {ModelStage.SHADOW.value, ModelStage.RETIRED.value},
+        ModelStage.SHADOW.value: {ModelStage.CANARY.value, ModelStage.RETIRED.value},
+        ModelStage.CANARY.value: {
+            ModelStage.PRODUCTION.value,
+            ModelStage.SHADOW.value,
+            ModelStage.RETIRED.value,
+        },
+        ModelStage.PRODUCTION.value: {ModelStage.RETIRED.value},
+        ModelStage.RETIRED.value: set(),  # terminal state
+    }
+
+    def promote(
+        self,
+        model_version_id: str,
+        target_stage: str,
+        triggered_by: str,
+        reason: str | None = None,
+    ) -> ModelRecord:
+        """Promote a model to the next stage in the release pipeline.
+
+        Validates that the transition is allowed by the state machine.
+        If target is 'production', retires the current production model
+        and sets is_active=True.  Every promotion generates a
+        ModelVersionEvent for audit.
+
+        Args:
+            model_version_id: Model to promote.
+            target_stage: Target stage (must be a valid ModelStage value).
+            triggered_by: Who initiated the promotion (required, non-empty).
+            reason: Optional reason for the transition.
+
+        Returns:
+            The updated ModelRecord.
+
+        Raises:
+            ValueError: If the model is not found, transition is invalid,
+                        or triggered_by is empty.
+        """
+        if not triggered_by:
+            raise ValueError("triggered_by is required for audit compliance")
+
+        valid_stages = {s.value for s in ModelStage}
+        if target_stage not in valid_stages:
+            raise ValueError(f"Invalid target stage: {target_stage}")
+
+        with self._session_factory() as session:
+            record = (
+                session.query(ModelRecord)
+                .filter_by(model_version_id=model_version_id)
+                .first()
+            )
+            if record is None:
+                raise ValueError(f"Model version not found: {model_version_id}")
+
+            current_stage = record.stage
+            allowed = self._VALID_TRANSITIONS.get(current_stage, set())
+            if target_stage not in allowed:
+                raise ValueError(
+                    f"Invalid transition: {current_stage} → {target_stage}. "
+                    f"Allowed targets: {sorted(allowed) or 'none (terminal state)'}"
+                )
+
+            from_version = record.model_version_id
+            from_stage = current_stage
+
+            # If promoting to production, retire current production model
+            if target_stage == ModelStage.PRODUCTION.value:
+                current_prod = (
+                    session.query(ModelRecord)
+                    .filter_by(camera_id=record.camera_id, is_active=True)
+                    .first()
+                )
+                if current_prod and current_prod.model_version_id != model_version_id:
+                    current_prod.is_active = False
+                    current_prod.stage = ModelStage.RETIRED.value
+                    # Record retirement event
+                    session.add(ModelVersionEvent(
+                        camera_id=record.camera_id,
+                        from_version=current_prod.model_version_id,
+                        to_version=current_prod.model_version_id,
+                        from_stage=ModelStage.PRODUCTION.value,
+                        to_stage=ModelStage.RETIRED.value,
+                        triggered_by=triggered_by,
+                        reason=f"Replaced by {model_version_id}",
+                    ))
+                record.is_active = True
+            elif current_stage == ModelStage.PRODUCTION.value:
+                # Leaving production
+                record.is_active = False
+
+            record.stage = target_stage
+
+            # Record promotion event
+            session.add(ModelVersionEvent(
+                camera_id=record.camera_id,
+                from_version=from_version,
+                to_version=model_version_id,
+                from_stage=from_stage,
+                to_stage=target_stage,
+                triggered_by=triggered_by,
+                reason=reason,
+            ))
+            session.commit()
+            session.refresh(record)
+
+        logger.info(
+            "model_registry.promoted",
+            model_version_id=model_version_id,
+            from_stage=from_stage,
+            to_stage=target_stage,
+            triggered_by=triggered_by,
+        )
+        return record
+
     def activate(self, model_version_id: str, triggered_by: str = "system") -> None:
         """Set a model as active (deactivates others for same camera).
 

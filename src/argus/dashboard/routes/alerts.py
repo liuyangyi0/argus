@@ -91,6 +91,7 @@ _WF_LABELS = {
     "resolved": ("已解决", "var(--status-ok)"),
     "closed": ("已关闭", "var(--text-tertiary)"),
     "false_positive": ("误报", "var(--status-alert)"),
+    "uncertain": ("不确定", "var(--status-warn)"),
 }
 
 _FEEDBACK_CATEGORIES = [
@@ -481,7 +482,10 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     elif category:
         notes = f"[{category}]"
 
-    valid_statuses = {"acknowledged", "investigating", "resolved", "closed", "false_positive"}
+    valid_statuses = {
+        "acknowledged", "investigating", "resolved", "closed",
+        "false_positive", "uncertain",
+    }
     if new_status not in valid_statuses:
         return JSONResponse({"error": f"无效状态: {new_status}"}, status_code=400)
 
@@ -490,6 +494,9 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     )
     if not success:
         return JSONResponse({"error": "告警不存在"}, status_code=404)
+
+    # Submit to feedback queue if applicable
+    _submit_workflow_feedback(request, alert_id, new_status, category, notes)
 
     # Re-render the detail view
     return await alert_detail(request, alert_id)
@@ -617,11 +624,11 @@ async def acknowledge_alert(request: Request, alert_id: str):
 
 @router.post("/{alert_id}/false-positive", response_class=HTMLResponse)
 async def mark_false_positive(request: Request, alert_id: str):
-    """Mark an alert as a false positive and add its snapshot to baseline.
+    """Mark an alert as a false positive and submit to feedback queue.
 
-    False positive feedback loop (A4-3): when a normal scene triggers a false
-    alarm, saving its snapshot as a baseline image teaches the model to treat
-    similar scenes as normal, reducing future false positives.
+    False positive feedback loop (A4-3 / Section 6): when a normal scene
+    triggers a false alarm, the feedback is queued for retraining and the
+    snapshot is copied to the baseline directory via FeedbackManager.
     """
     db = request.app.state.db
     if db and db.mark_false_positive(alert_id):
@@ -636,11 +643,71 @@ async def mark_false_positive(request: Request, alert_id: str):
                 ip_address=client_ip,
             )
 
-        # FP feedback loop: save snapshot as new baseline image
-        _add_fp_snapshot_to_baseline(request, alert_id)
+        # Submit to feedback queue (handles baseline copy + queue entry)
+        _submit_workflow_feedback(request, alert_id, "false_positive")
 
         return HTMLResponse('<span style="color:#ff9800;font-size:12px;">已标记误报</span>')
     return HTMLResponse('<span style="color:#f44336;font-size:12px;">操作失败</span>')
+
+
+def _submit_workflow_feedback(
+    request: Request,
+    alert_id: str,
+    workflow_status: str,
+    category: str | None = None,
+    notes: str | None = None,
+) -> None:
+    """Submit feedback to the queue when an alert workflow transition happens.
+
+    Maps workflow statuses to feedback types:
+    - acknowledged → confirmed
+    - false_positive → false_positive
+    - uncertain → uncertain
+    Other statuses (investigating, resolved, closed) don't generate feedback.
+    """
+    _STATUS_TO_FEEDBACK = {
+        "acknowledged": "confirmed",
+        "false_positive": "false_positive",
+        "uncertain": "uncertain",
+    }
+    feedback_type = _STATUS_TO_FEEDBACK.get(workflow_status)
+    if feedback_type is None:
+        return
+
+    feedback_mgr = getattr(request.app.state, "feedback_manager", None)
+    if feedback_mgr is None:
+        # Fallback to legacy _add_fp_snapshot_to_baseline for FP
+        if workflow_status == "false_positive":
+            _add_fp_snapshot_to_baseline(request, alert_id)
+        return
+
+    db = request.app.state.db
+    if not db:
+        return
+    alert = db.get_alert(alert_id)
+    if alert is None:
+        return
+
+    try:
+        feedback_mgr.submit_feedback(
+            alert_id=alert_id,
+            feedback_type=feedback_type,
+            camera_id=alert.camera_id,
+            zone_id=getattr(alert, "zone_id", "default") or "default",
+            category=category,
+            notes=notes,
+            submitted_by="operator",
+            anomaly_score=alert.anomaly_score,
+            snapshot_path=alert.snapshot_path,
+        )
+    except Exception:
+        import structlog
+        structlog.get_logger().warning(
+            "feedback.submit_failed",
+            alert_id=alert_id,
+            feedback_type=feedback_type,
+            exc_info=True,
+        )
 
 
 def _add_fp_snapshot_to_baseline(request: Request, alert_id: str) -> None:

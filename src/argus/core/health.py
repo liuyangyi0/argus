@@ -55,13 +55,19 @@ class HealthMonitor:
     a unified view for the dashboard.
     """
 
-    def __init__(self, on_change: Callable[[str, dict], None] | None = None):
+    def __init__(
+        self,
+        on_change: Callable[[str, dict], None] | None = None,
+        feedback_manager: object | None = None,
+    ):
         self._start_time = time.monotonic()
         self._camera_health: dict[str, CameraHealth] = {}
         self._total_alerts = 0
         self._on_change = on_change
+        self._feedback_manager = feedback_manager
         self._last_status: str = ""
         self._last_connected_count: int = -1
+        self._degradation_feedback_sent: set[str] = set()  # cameras already reported
 
     def update_camera(
         self,
@@ -73,6 +79,9 @@ class HealthMonitor:
         error: str | None = None,
     ) -> None:
         """Update health data for a camera."""
+        prev = self._camera_health.get(camera_id)
+        was_connected = prev.connected if prev else True
+
         self._camera_health[camera_id] = CameraHealth(
             camera_id=camera_id,
             connected=connected,
@@ -83,6 +92,23 @@ class HealthMonitor:
             error=error,
         )
         self._notify_change()
+
+        # Passive feedback: camera disconnection or error
+        if self._feedback_manager and not connected and was_connected:
+            if camera_id not in self._degradation_feedback_sent:
+                self._degradation_feedback_sent.add(camera_id)
+                try:
+                    self._feedback_manager.submit_passive_feedback(
+                        camera_id=camera_id,
+                        zone_id="all",
+                        source="health",
+                        notes=f"Camera disconnected. error={error or 'none'}",
+                    )
+                except Exception:
+                    logger.debug("health.feedback_failed", camera_id=camera_id)
+        elif connected and camera_id in self._degradation_feedback_sent:
+            # Camera recovered — allow future feedback
+            self._degradation_feedback_sent.discard(camera_id)
 
     def record_alert(self) -> None:
         """Increment the total alert counter."""
