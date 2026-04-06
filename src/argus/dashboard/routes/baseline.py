@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from argus.capture.baseline_job import run_baseline_capture_job, BaselineCaptureJobConfig
+from argus.config.schema import BaselineCaptureConfig
 from argus.dashboard.components import (
     confirm_button,
     empty_state,
@@ -301,12 +304,18 @@ async def baseline_list_json(request: Request):
                     meta = _json.loads(meta_path.read_text())
                 except (ValueError, OSError):
                     pass
+            lifecycle = _get_lifecycle(request)
+            version_state = None
+            if lifecycle:
+                ver_rec = lifecycle.get_version(camera_id, "default", ver_dir.name)
+                version_state = ver_rec.state if ver_rec else None
             baselines.append({
                 "camera_id": camera_id,
                 "version": ver_dir.name,
                 "image_count": len(images),
                 "session_label": meta.get("session_label", ""),
                 "status": "ready",
+                "state": version_state,
             })
 
     return JSONResponse({"baselines": baselines})
@@ -607,6 +616,7 @@ async def start_training(request: Request):
     model_type = form.get("model_type", "patchcore")
     export_format = form.get("export_format", "openvino")
     quantization = form.get("quantization", "fp16")
+    resume_from = form.get("resume_from", "") or None
 
     if not camera_id:
         return JSONResponse({"error": "请选择摄像头"}, status_code=400)
@@ -639,6 +649,7 @@ async def start_training(request: Request):
             quantization=quantization,
             database_url=database_url,
             anomaly_config=anomaly_config,
+            resume_from=resume_from,
         )
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -753,6 +764,118 @@ async def deploy_model(request: Request):
             headers={"HX-Trigger": '{"showToast": {"message": "模型已部署", "type": "success"}}'},
         )
     return JSONResponse({"error": "模型部署失败"}, status_code=500)
+
+
+# ── Advanced Baseline Capture Job Endpoints ──
+
+
+@router.post("/api/baseline/job")
+async def start_capture_job(request: Request):
+    """Start an advanced baseline capture job with strategy selection."""
+    form = await request.form()
+    camera_id = form.get("camera_id", "")
+    target_frames = int(form.get("target_frames", 1000))
+    duration_hours = float(form.get("duration_hours", 24.0))
+    sampling_strategy = form.get("sampling_strategy", "active")
+    diversity_threshold = float(form.get("diversity_threshold", 0.3))
+    frames_per_period = int(form.get("frames_per_period", 50))
+
+    if not camera_id:
+        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+
+    app = request.app
+    camera_manager = app.state.camera_manager
+    task_manager = app.state.task_manager
+    config = app.state.config
+
+    job_config = BaselineCaptureJobConfig(
+        camera_id=camera_id,
+        target_frames=target_frames,
+        duration_hours=duration_hours,
+        sampling_strategy=sampling_strategy,
+        storage_path=str(config.storage.baselines_dir),
+        quality_config=config.capture_quality,
+        pause_on_anomaly_lock=config.baseline_capture.pause_on_anomaly_lock,
+        diversity_threshold=diversity_threshold,
+        dino_backbone=config.baseline_capture.dino_backbone,
+        dino_image_size=config.baseline_capture.dino_image_size,
+        schedule_periods=dict(config.baseline_capture.schedule_periods),
+        frames_per_period=frames_per_period,
+        post_capture_review=config.baseline_capture.post_capture_review,
+        review_flag_percentile=config.baseline_capture.review_flag_percentile,
+        models_dir=str(config.storage.models_dir),
+        exports_dir=str(config.models.anomalib_export_dir),
+    )
+
+    pause_ev = threading.Event()
+    pause_ev.set()  # not paused
+    abort_ev = threading.Event()
+
+    try:
+        task_id = task_manager.submit(
+            "baseline_capture_job",
+            run_baseline_capture_job,
+            camera_id=camera_id,
+            job_config=job_config,
+            camera_manager=camera_manager,
+            pause_event=pause_ev,
+            abort_event=abort_ev,
+        )
+        # Sync events so TaskManager.pause_task/abort_task work
+        task_info = task_manager.get_task(task_id)
+        if task_info:
+            task_info.pause_event = pause_ev
+            task_info.abort_event = abort_ev
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+
+    return JSONResponse({"task_id": task_id, "status": "submitted"})
+
+
+@router.post("/api/baseline/job/{task_id}/pause")
+async def pause_capture_job(task_id: str, request: Request):
+    """Pause a running baseline capture job."""
+    task_manager = request.app.state.task_manager
+    if task_manager.pause_task(task_id):
+        return JSONResponse({"task_id": task_id, "status": "paused"})
+    return JSONResponse({"error": "Task not found or not running"}, status_code=404)
+
+
+@router.post("/api/baseline/job/{task_id}/resume")
+async def resume_capture_job(task_id: str, request: Request):
+    """Resume a paused baseline capture job."""
+    task_manager = request.app.state.task_manager
+    if task_manager.resume_task(task_id):
+        return JSONResponse({"task_id": task_id, "status": "resumed"})
+    return JSONResponse({"error": "Task not found or not paused"}, status_code=404)
+
+
+@router.post("/api/baseline/job/{task_id}/abort")
+async def abort_capture_job(task_id: str, request: Request):
+    """Abort a running or paused baseline capture job."""
+    task_manager = request.app.state.task_manager
+    if task_manager.abort_task(task_id):
+        return JSONResponse({"task_id": task_id, "status": "aborting"})
+    return JSONResponse({"error": "Task not found or not active"}, status_code=404)
+
+
+@router.get("/api/baseline/job/{task_id}")
+async def get_capture_job_status(task_id: str, request: Request):
+    """Get the status of a baseline capture job."""
+    task_manager = request.app.state.task_manager
+    task = task_manager.get_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    return JSONResponse({
+        "task_id": task.task_id,
+        "task_type": task.task_type,
+        "camera_id": task.camera_id,
+        "status": task.status.value,
+        "progress": task.progress,
+        "message": task.message,
+        "error": task.error,
+        "result": task.result if task.status.value in ("complete", "aborted", "failed") else None,
+    })
 
 
 # ── Helpers ──
@@ -1173,7 +1296,8 @@ def _capture_baseline_task(
 
 def _train_model_task(
     progress_callback, *, baselines_dir, models_dir, camera_id, model_type,
-    export_format, quantization="fp16", database_url=None, anomaly_config=None
+    export_format, quantization="fp16", database_url=None, anomaly_config=None,
+    resume_from=None,
 ):
     """Train an anomaly detection model with full validation pipeline.
 
@@ -1206,6 +1330,7 @@ def _train_model_task(
         quantization=quantization,
         progress_callback=progress_callback,
         anomaly_config=anomaly_config,
+        resume_from=resume_from,
     )
 
     if result.status == TrainingStatus.FAILED:
@@ -1428,3 +1553,232 @@ async def optimize_baseline_json(request: Request):
         "moved": moved,
         "backup_dir": str(backup_dir),
     })
+
+
+# ── Camera Group Endpoints ──
+
+
+@router.get("/groups/json")
+async def camera_groups_json(request: Request):
+    """JSON API: list configured camera groups with baseline status."""
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"groups": []})
+
+    groups = []
+    baseline_mgr = _get_baseline_manager(request)
+    for grp in getattr(config, "camera_groups", []):
+        image_count = 0
+        current_version = None
+        if baseline_mgr:
+            group_dir = baseline_mgr.get_group_baseline_dir(grp.group_id, grp.zone_id)
+            if group_dir.is_dir():
+                image_count = (
+                    len(list(group_dir.glob("*.png")))
+                    + len(list(group_dir.glob("*.jpg")))
+                )
+                current_version = group_dir.name
+        groups.append({
+            "group_id": grp.group_id,
+            "name": grp.name,
+            "camera_ids": grp.camera_ids,
+            "zone_id": grp.zone_id,
+            "image_count": image_count,
+            "current_version": current_version,
+        })
+    return JSONResponse({"groups": groups})
+
+
+@router.post("/groups/merge")
+async def merge_group_baseline(request: Request):
+    """Merge baselines from member cameras into a group baseline version."""
+    data = await request.json()
+    group_id = data.get("group_id", "")
+    zone_id = data.get("zone_id", "default")
+    target_count = data.get("target_count")
+
+    if not group_id:
+        return JSONResponse({"error": "group_id is required"}, status_code=400)
+
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    group_cfg = next(
+        (g for g in getattr(config, "camera_groups", []) if g.group_id == group_id),
+        None,
+    )
+    if group_cfg is None:
+        return JSONResponse({"error": f"Group {group_id} not found"}, status_code=404)
+
+    baseline_mgr = _get_baseline_manager(request)
+    if baseline_mgr is None:
+        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+
+    version_dir = baseline_mgr.merge_camera_baselines(
+        group_id=group_id,
+        camera_ids=group_cfg.camera_ids,
+        zone_id=zone_id,
+        target_count=int(target_count) if target_count else None,
+    )
+
+    image_count = (
+        len(list(version_dir.glob("*.png")))
+        + len(list(version_dir.glob("*.jpg")))
+    )
+
+    return JSONResponse({
+        "status": "ok",
+        "group_id": group_id,
+        "version": version_dir.name,
+        "image_count": image_count,
+    })
+
+
+# ── False Positive Merge Endpoint ──
+
+
+@router.post("/merge-fp")
+async def merge_false_positives(request: Request):
+    """Merge false positive candidate pool into a new baseline version (Draft state)."""
+    data = await request.json()
+    camera_id = data.get("camera_id", "")
+    zone_id = data.get("zone_id", "default")
+    max_fp_images = data.get("max_fp_images")
+
+    if not camera_id:
+        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+
+    feedback_mgr = getattr(request.app.state, "feedback_manager", None)
+    if feedback_mgr is None:
+        return JSONResponse({"error": "反馈���理器未初始化"}, status_code=503)
+
+    baseline_mgr = _get_baseline_manager(request)
+    if baseline_mgr is None:
+        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+
+    result = feedback_mgr.merge_fp_into_baseline(
+        camera_id=camera_id,
+        zone_id=zone_id,
+        baseline_manager=baseline_mgr,
+        max_fp_images=int(max_fp_images) if max_fp_images else None,
+    )
+
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+
+    return JSONResponse({"status": "ok", **result})
+
+
+# ── Baseline Lifecycle Endpoints ──
+
+
+def _get_lifecycle(request: Request):
+    """Get BaselineLifecycle from app state."""
+    return getattr(request.app.state, "baseline_lifecycle", None)
+
+
+@router.get("/versions/json")
+async def baseline_versions_json(request: Request):
+    """JSON API: list baseline versions with lifecycle state."""
+    camera_id = request.query_params.get("camera_id", "")
+    zone_id = request.query_params.get("zone_id", "default")
+    if not camera_id:
+        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+
+    lifecycle = _get_lifecycle(request)
+    if lifecycle is None:
+        return JSONResponse({"error": "生命周期管理器未初始化"}, status_code=503)
+
+    versions = lifecycle.get_versions(camera_id, zone_id)
+    return JSONResponse({"versions": [v.to_dict() for v in versions]})
+
+
+@router.post("/verify")
+async def verify_baseline(request: Request):
+    """Verify a baseline version (Draft -> Verified)."""
+    data = await request.json()
+    camera_id = data.get("camera_id", "")
+    zone_id = data.get("zone_id", "default")
+    version = data.get("version", "")
+    verified_by = data.get("verified_by", "")
+    verified_by_secondary = data.get("verified_by_secondary")
+
+    if not camera_id or not version or not verified_by:
+        return JSONResponse(
+            {"error": "camera_id, version, verified_by are required"}, status_code=400
+        )
+
+    lifecycle = _get_lifecycle(request)
+    if lifecycle is None:
+        return JSONResponse({"error": "生命周期管理器未初始化"}, status_code=503)
+
+    try:
+        client_ip = request.client.host if request.client else ""
+        record = lifecycle.verify(
+            camera_id, zone_id, version,
+            verified_by=verified_by,
+            verified_by_secondary=verified_by_secondary,
+            ip_address=client_ip,
+        )
+        return JSONResponse({"status": "ok", "version": record.to_dict()})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@router.post("/activate-baseline")
+async def activate_baseline(request: Request):
+    """Activate a baseline version (Verified -> Active). Auto-retires previous."""
+    data = await request.json()
+    camera_id = data.get("camera_id", "")
+    zone_id = data.get("zone_id", "default")
+    version = data.get("version", "")
+    user = data.get("user", "operator")
+
+    if not camera_id or not version:
+        return JSONResponse(
+            {"error": "camera_id and version are required"}, status_code=400
+        )
+
+    lifecycle = _get_lifecycle(request)
+    if lifecycle is None:
+        return JSONResponse({"error": "生命周期管理器未初始化"}, status_code=503)
+
+    try:
+        client_ip = request.client.host if request.client else ""
+        record = lifecycle.activate(
+            camera_id, zone_id, version, user=user, ip_address=client_ip,
+        )
+        return JSONResponse({"status": "ok", "version": record.to_dict()})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@router.post("/retire")
+async def retire_baseline(request: Request):
+    """Retire a baseline version (Active -> Retired)."""
+    data = await request.json()
+    camera_id = data.get("camera_id", "")
+    zone_id = data.get("zone_id", "default")
+    version = data.get("version", "")
+    user = data.get("user", "operator")
+    reason = data.get("reason", "")
+
+    if not camera_id or not version:
+        return JSONResponse(
+            {"error": "camera_id and version are required"}, status_code=400
+        )
+
+    lifecycle = _get_lifecycle(request)
+    if lifecycle is None:
+        return JSONResponse({"error": "生命周期管理器未初始化"}, status_code=503)
+
+    try:
+        client_ip = request.client.host if request.client else ""
+        record = lifecycle.retire(
+            camera_id, zone_id, version,
+            user=user, reason=reason, ip_address=client_ip,
+        )
+        return JSONResponse({"status": "ok", "version": record.to_dict()})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)

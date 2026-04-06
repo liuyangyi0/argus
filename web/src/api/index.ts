@@ -42,6 +42,32 @@ export const optimizeBaseline = (data: { camera_id: string; zone_id?: string; ta
 export const previewOptimize = (params: { camera_id: string; zone_id?: string; target_ratio?: number }) =>
   api.get('/baseline/optimize/preview', { params })
 
+// ── Advanced Baseline Capture Job ──
+export const startCaptureJob = (data: FormData) => api.post('/baseline/job', data)
+export const pauseCaptureJob = (taskId: string) => api.post(`/baseline/job/${taskId}/pause`)
+export const resumeCaptureJob = (taskId: string) => api.post(`/baseline/job/${taskId}/resume`)
+export const abortCaptureJob = (taskId: string) => api.post(`/baseline/job/${taskId}/abort`)
+export const getCaptureJobStatus = (taskId: string) => api.get(`/baseline/job/${taskId}`)
+
+// ── False Positive Merge ──
+export const mergeFalsePositives = (data: { camera_id: string; zone_id?: string; max_fp_images?: number }) =>
+  api.post('/baseline/merge-fp', data)
+
+// ── Camera Groups ──
+export const getCameraGroups = () => api.get('/baseline/groups/json')
+export const mergeGroupBaseline = (data: { group_id: string; zone_id?: string; target_count?: number }) =>
+  api.post('/baseline/groups/merge', data)
+
+// ── Baseline Lifecycle ──
+export const getBaselineVersions = (params: { camera_id: string; zone_id?: string }) =>
+  api.get('/baseline/versions/json', { params })
+export const verifyBaseline = (data: { camera_id: string; zone_id?: string; version: string; verified_by: string; verified_by_secondary?: string }) =>
+  api.post('/baseline/verify', data)
+export const activateBaseline = (data: { camera_id: string; zone_id?: string; version: string; user?: string }) =>
+  api.post('/baseline/activate-baseline', data)
+export const retireBaseline = (data: { camera_id: string; zone_id?: string; version: string; user?: string; reason?: string }) =>
+  api.post('/baseline/retire', data)
+
 // ── Training ──
 export const startTraining = (data: FormData) => api.post('/baseline/train', data)
 export const getTrainingHistory = (params?: Record<string, any>) =>
@@ -58,6 +84,10 @@ export const activateModel = (versionId: string) =>
   api.post(`/models/${versionId}/activate`)
 export const rollbackModel = (versionId: string) =>
   api.post(`/models/${versionId}/rollback`)
+
+// ── Batch Inference ──
+export const batchInference = (cameraId: string, imagePaths: string[]) =>
+  api.post('/models/batch-inference', { camera_id: cameraId, image_paths: imagePaths })
 
 // ── Tasks ──
 export const getTasks = () => api.get('/tasks/json')

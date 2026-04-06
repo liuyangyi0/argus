@@ -9,7 +9,15 @@ import structlog
 from sqlalchemy import create_engine, func as sa_func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from argus.storage.models import AlertRecord, AlertWorkflowStatus, Base, BaselineRecord, TrainingRecord, User
+from argus.storage.models import (
+    AlertRecord,
+    AlertWorkflowStatus,
+    Base,
+    BaselineRecord,
+    BaselineVersionRecord,
+    TrainingRecord,
+    User,
+)
 
 logger = structlog.get_logger()
 
@@ -56,6 +64,7 @@ class Database:
             ("alerts", "workflow_status", "VARCHAR(20) DEFAULT 'new'"),
             ("alerts", "assigned_to", "VARCHAR(100)"),
             ("alerts", "resolved_at", "DATETIME"),
+            ("training_records", "group_id", "VARCHAR(100)"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:

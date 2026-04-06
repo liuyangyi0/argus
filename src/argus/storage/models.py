@@ -20,6 +20,15 @@ class AlertWorkflowStatus(str, Enum):
     FALSE_POSITIVE = "false_positive"
 
 
+class BaselineState(str, Enum):
+    """Lifecycle state for baseline versions (nuclear audit requirement)."""
+
+    DRAFT = "draft"
+    VERIFIED = "verified"
+    ACTIVE = "active"
+    RETIRED = "retired"
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -88,6 +97,58 @@ class BaselineRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
+
+
+class BaselineVersionRecord(Base):
+    """Tracks lifecycle state of baseline versions (nuclear audit compliance).
+
+    Each row represents one baseline version (e.g. v001) for a camera/zone.
+    State transitions: Draft -> Verified -> Active -> Retired (strict, unidirectional).
+    """
+
+    __tablename__ = "baseline_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    zone_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    version: Mapped[str] = mapped_column(String(20), nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    image_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Verification (requires at least one approver)
+    verified_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    verified_by_secondary: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # Activation / retirement
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    retirement_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Camera group support (Phase 2)
+    group_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "camera_id": self.camera_id,
+            "zone_id": self.zone_id,
+            "version": self.version,
+            "state": self.state,
+            "image_count": self.image_count,
+            "verified_by": self.verified_by,
+            "verified_at": self.verified_at.isoformat() if self.verified_at else None,
+            "verified_by_secondary": self.verified_by_secondary,
+            "activated_at": self.activated_at.isoformat() if self.activated_at else None,
+            "retired_at": self.retired_at.isoformat() if self.retired_at else None,
+            "retirement_reason": self.retirement_reason,
+            "group_id": self.group_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
 
 
 class TrainingRecord(Base):
