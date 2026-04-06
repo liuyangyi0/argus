@@ -10,6 +10,7 @@ optional dependency.
 
 from __future__ import annotations
 
+import concurrent.futures
 from dataclasses import dataclass, field
 
 import cv2
@@ -118,12 +119,15 @@ class InstanceSegmenter:
         self,
         model_size: str = "small",
         min_mask_area_px: int = 100,
+        timeout_seconds: float = 10.0,
     ):
         self._model_size = model_size
         self._min_mask_area_px = min_mask_area_px
+        self._timeout_seconds = timeout_seconds
         self._predictor = None
         self._loaded = False
         self._sam2_available = False
+        self._executor = None  # lazy init for SAM2 timeout
 
     def load(self) -> None:
         """Load SAM 2 model (lazy initialisation)."""
@@ -188,7 +192,7 @@ class InstanceSegmenter:
 
         try:
             if self._sam2_available and self._predictor is not None:
-                return self._segment_sam2(frame, prompt_points)
+                return self._segment_sam2_with_timeout(frame, prompt_points)
             return self._segment_contour_fallback(frame, prompt_points)
         except Exception as exc:
             logger.warning(
@@ -198,6 +202,34 @@ class InstanceSegmenter:
                 msg="Segmentation failed — returning empty result",
             )
             return SegmentationResult()
+
+    def _segment_sam2_with_timeout(
+        self,
+        frame: np.ndarray,
+        prompt_points: list[tuple[int, int]],
+    ) -> SegmentationResult:
+        """Run SAM2 segmentation with timeout protection."""
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sam2"
+            )
+
+        future = self._executor.submit(self._segment_sam2, frame, prompt_points)
+        try:
+            return future.result(timeout=self._timeout_seconds)
+        except (concurrent.futures.TimeoutError, TimeoutError):
+            logger.warning(
+                "segmenter.timeout",
+                timeout_seconds=self._timeout_seconds,
+                msg="SAM2 inference timed out — returning empty result",
+            )
+            return SegmentationResult()
+
+    def shutdown(self) -> None:
+        """Clean up the thread pool executor."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
 
     # ------------------------------------------------------------------
     # SAM 2 path

@@ -24,6 +24,7 @@ from argus.dashboard.tasks import TaskManager
 from argus.storage.audit import AuditLogger
 from argus.storage.backup import BackupManager
 from argus.storage.database import Database
+from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
 
@@ -173,6 +174,13 @@ def main():
         dispatcher.dispatch(alert)
         health.record_alert()
 
+    # 5.2: InferenceRecord persistence for audit trail
+    audit_log = AuditLogger(database=db)
+    record_store = InferenceRecordStore(
+        base_dir=config.storage.inference_records_dir,
+    )
+    record_store.start()
+
     # Start camera manager with all cameras
     manager = CameraManager(
         cameras=cameras,
@@ -181,6 +189,9 @@ def main():
         cross_camera_config=config.cross_camera,
         segmenter_config=config.segmenter,
         classifier_config=config.classifier,
+        health_monitor=health,
+        audit_logger=audit_log,
+        record_store=record_store,
     )
 
     # Graceful shutdown
@@ -312,6 +323,7 @@ def main():
     finally:
         scheduler.stop()
         manager.stop_all()
+        record_store.stop()
         dispatcher.close()
         db.close()
 

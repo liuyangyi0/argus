@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import structlog
@@ -19,6 +19,12 @@ from argus.alerts.grader import Alert, AlertSeverity
 from argus.config.schema import AlertConfig, AnomalyConfig, CameraConfig, ClassifierConfig, CrossCameraConfig, SegmenterConfig
 from argus.core.correlation import CameraOverlapPair, CrossCameraCorrelator
 from argus.core.pipeline import DetectionPipeline, PipelineMode, PipelineStats
+from argus.core.runner import CameraInferenceRunner, RunnerSnapshot
+
+if TYPE_CHECKING:
+    from argus.core.health import HealthMonitor
+    from argus.storage.audit import AuditLogger
+    from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
 
@@ -57,6 +63,9 @@ class CameraManager:
         cross_camera_config: CrossCameraConfig | None = None,
         segmenter_config: SegmenterConfig | None = None,
         classifier_config: ClassifierConfig | None = None,
+        health_monitor: HealthMonitor | None = None,
+        audit_logger: AuditLogger | None = None,
+        record_store: InferenceRecordStore | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
@@ -64,7 +73,11 @@ class CameraManager:
         self._on_status_change = on_status_change
         self._segmenter_config = segmenter_config
         self._classifier_config = classifier_config
-        self._pipelines: dict[str, DetectionPipeline] = {}
+        self._health_monitor = health_monitor
+        self._audit_logger = audit_logger
+        self._record_store = record_store
+        self._runners: dict[str, CameraInferenceRunner] = {}
+        self._pipelines: dict[str, DetectionPipeline] = {}  # backward compat
         self._threads: dict[str, threading.Thread] = {}
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -103,6 +116,10 @@ class CameraManager:
                 pairs=len(pairs),
                 threshold=cross_camera_config.corroboration_threshold,
             )
+
+        # 5.3: Process-level watchdog
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
 
         # DET-012: Pre-load shared YOLO model for all pipelines
         self._shared_yolo = None
@@ -228,6 +245,9 @@ class CameraManager:
             if self._start_camera(cam_config):
                 started.append(cam_config.camera_id)
 
+        # 5.3: Start process-level watchdog thread
+        self._start_watchdog()
+
         logger.info(
             "manager.started",
             total=len(self._cameras),
@@ -239,6 +259,7 @@ class CameraManager:
     def stop_all(self) -> None:
         """Stop all camera pipelines and wait for threads to finish."""
         logger.info("manager.stopping", cameras=len(self._threads))
+        self._stop_watchdog()
         self._stop_event.set()
 
         for camera_id, pipeline in list(self._pipelines.items()):
@@ -250,6 +271,7 @@ class CameraManager:
                 logger.warning("manager.thread_timeout", camera_id=camera_id)
 
         self._pipelines.clear()
+        self._runners.clear()
         self._threads.clear()
         logger.info("manager.stopped")
 
@@ -265,6 +287,7 @@ class CameraManager:
         """Stop a single camera by ID."""
         with self._lock:
             pipeline = self._pipelines.pop(camera_id, None)
+            self._runners.pop(camera_id, None)
             thread = self._threads.pop(camera_id, None)
 
         if pipeline:
@@ -429,6 +452,21 @@ class CameraManager:
         except Exception as e:
             logger.debug("manager.notify_failed", error=str(e))
 
+    @staticmethod
+    def _model_version_id(cam_config: CameraConfig) -> str:
+        """Derive a version tag for the camera's model."""
+        model_path = DetectionPipeline._find_model(cam_config.camera_id)
+        if model_path:
+            return f"{cam_config.anomaly.model_type}:{model_path.parent.name}"
+        return f"{cam_config.anomaly.model_type}:ssim_fallback"
+
+    def get_runner_snapshot(self, camera_id: str) -> RunnerSnapshot | None:
+        """Get point-in-time snapshot of a camera's inference runner state."""
+        runner = self._runners.get(camera_id)
+        if runner is None:
+            return None
+        return runner.get_snapshot()
+
     @property
     def alert_count(self) -> int:
         return self._alert_count
@@ -505,27 +543,42 @@ class CameraManager:
             shadow_runner=shadow_runner,
         )
 
-        if not pipeline.initialize():
+        # 5.1: Wrap pipeline in CameraInferenceRunner
+        deg_config = cam_config.degradation
+        runner = CameraInferenceRunner(
+            pipeline=pipeline,
+            health_monitor=self._health_monitor,
+            version_tag=self._model_version_id(cam_config),
+            audit_logger=self._audit_logger,
+            max_consecutive_failures=deg_config.max_consecutive_failures,
+            refuse_start_on_backbone_failure=deg_config.refuse_start_on_backbone_failure,
+        )
+        if self._record_store is not None:
+            runner.set_record_store(self._record_store)
+
+        if not runner.initialize():
             logger.error("manager.init_failed", camera_id=camera_id)
             return False
 
         thread = threading.Thread(
             target=self._camera_loop,
-            args=(camera_id, pipeline),
+            args=(camera_id, runner),
             name=f"argus-{camera_id}",
             daemon=True,
         )
 
         with self._lock:
-            self._pipelines[camera_id] = pipeline
+            self._runners[camera_id] = runner
+            self._pipelines[camera_id] = pipeline  # backward compat
             self._threads[camera_id] = thread
 
         thread.start()
         logger.info("manager.camera_started", camera_id=camera_id, source=cam_config.source)
         return True
 
-    def _camera_loop(self, camera_id: str, pipeline: DetectionPipeline) -> None:
+    def _camera_loop(self, camera_id: str, runner: CameraInferenceRunner) -> None:
         """Main loop for a single camera thread with frame-rate watchdog."""
+        pipeline = runner.pipeline
         logger.info("camera_loop.started", camera_id=camera_id)
         last_frame_time = time.monotonic()
         # MED-03: Configurable watchdog timeout from camera config
@@ -571,7 +624,7 @@ class CameraManager:
                         self._pending_frames[camera_id] = self._pending_frames.get(camera_id, 0) + 1
 
                     try:
-                        alert = pipeline.run_once()
+                        alert = runner.run_once()
                     finally:
                         with self._bp_lock:
                             self._pending_frames[camera_id] = max(0, self._pending_frames.get(camera_id, 0) - 1)
@@ -646,3 +699,79 @@ class CameraManager:
             return severity
         new_idx = max(0, idx - levels)
         return cls._SEVERITY_ORDER[new_idx]
+
+    # --- 5.3: Process-level watchdog ---
+
+    def _start_watchdog(self) -> None:
+        """Start the process-level watchdog thread."""
+        if self._watchdog_thread is not None:
+            return
+        self._watchdog_stop.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="argus-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _stop_watchdog(self) -> None:
+        """Stop the process-level watchdog thread."""
+        self._watchdog_stop.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=5.0)
+            self._watchdog_thread = None
+
+    def _watchdog_loop(self) -> None:
+        """Periodically check thread liveness and restart dead camera threads."""
+        # Get check interval from first camera config or use default
+        interval = 15.0
+        if self._cameras:
+            interval = self._cameras[0].degradation.watchdog_check_interval_seconds
+
+        while not self._watchdog_stop.wait(interval):
+            if self._stop_event.is_set():
+                break
+
+            with self._lock:
+                dead_cameras = [
+                    cam_id for cam_id, thread in self._threads.items()
+                    if not thread.is_alive()
+                ]
+
+            for camera_id in dead_cameras:
+                logger.warning(
+                    "watchdog.thread_dead",
+                    camera_id=camera_id,
+                    msg="Camera thread died, attempting restart",
+                )
+                # Clean up dead thread
+                with self._lock:
+                    self._threads.pop(camera_id, None)
+                    self._pipelines.pop(camera_id, None)
+                    self._runners.pop(camera_id, None)
+
+                # Attempt restart
+                cam_config = next(
+                    (c for c in self._cameras if c.camera_id == camera_id), None
+                )
+                if cam_config:
+                    try:
+                        self._start_camera(cam_config)
+                        logger.info("watchdog.restarted", camera_id=camera_id)
+                    except Exception as e:
+                        logger.error(
+                            "watchdog.restart_failed",
+                            camera_id=camera_id,
+                            error=str(e),
+                        )
+
+            # Write heartbeat file for external process monitors
+            try:
+                from pathlib import Path
+                heartbeat_path = Path("data/.watchdog")
+                heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = heartbeat_path.with_suffix(".tmp")
+                tmp.write_text(str(time.time()))
+                tmp.replace(heartbeat_path)
+            except Exception:
+                pass  # non-critical

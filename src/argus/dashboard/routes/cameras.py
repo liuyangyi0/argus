@@ -500,6 +500,37 @@ async def cameras_json(request: Request):
     ]
 
 
+@router.get("/{camera_id}/runner")
+async def camera_runner_snapshot(request: Request, camera_id: str):
+    """Get the inference runner state snapshot for a camera (5.1)."""
+    camera_manager = request.app.state.camera_manager
+    if not camera_manager:
+        return JSONResponse({"error": "Camera manager not running"}, status_code=503)
+
+    snapshot = camera_manager.get_runner_snapshot(camera_id)
+    if snapshot is None:
+        return JSONResponse({"error": f"Camera {camera_id} not found"}, status_code=404)
+
+    return JSONResponse({
+        "camera_id": snapshot.camera_id,
+        "model_ref": snapshot.model_ref,
+        "health_status": snapshot.health_status,
+        "cusum_state": snapshot.cusum_state,
+        "lock_state": snapshot.lock_state.value,
+        "last_heartbeat": snapshot.last_heartbeat,
+        "version_tag": snapshot.version_tag,
+        "degradation_state": snapshot.degradation_state.value,
+        "consecutive_failures": snapshot.consecutive_failures,
+        "stats": {
+            "frames_captured": snapshot.stats.frames_captured,
+            "frames_analyzed": snapshot.stats.frames_analyzed,
+            "anomalies_detected": snapshot.stats.anomalies_detected,
+            "alerts_emitted": snapshot.stats.alerts_emitted,
+            "avg_latency_ms": round(snapshot.stats.avg_latency_ms, 1),
+        },
+    })
+
+
 @router.get("/{camera_id}/snapshot")
 async def camera_snapshot(request: Request, camera_id: str):
     """Get the latest frame from a camera as a JPEG image."""

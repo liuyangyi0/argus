@@ -286,6 +286,27 @@ class SegmenterConfig(BaseModel):
         default=100, ge=10, le=100000,
         description="Minimum mask area in pixels — smaller objects are discarded",
     )
+    timeout_seconds: float = Field(
+        default=10.0, ge=1.0, le=60.0,
+        description="Maximum seconds to wait for SAM2 inference before timeout",
+    )
+
+
+class DegradationConfig(BaseModel):
+    """Degradation and resilience configuration for inference runners."""
+
+    max_consecutive_failures: int = Field(
+        default=5, ge=1, le=50,
+        description="Consecutive detection failures before attempting model restart",
+    )
+    refuse_start_on_backbone_failure: bool = Field(
+        default=False,
+        description="Refuse to start camera if backbone model fails to load (True=strict, False=SSIM fallback)",
+    )
+    watchdog_check_interval_seconds: float = Field(
+        default=15.0, ge=5.0, le=120.0,
+        description="Interval for process-level watchdog to check thread liveness",
+    )
 
 
 class DriftConfig(BaseModel):
@@ -336,6 +357,7 @@ class CameraConfig(BaseModel):
     simplex: SimplexConfig = Field(default_factory=SimplexConfig)
     health: CameraHealthConfig = Field(default_factory=CameraHealthConfig)
     drift: DriftConfig = Field(default_factory=DriftConfig)
+    degradation: DegradationConfig = Field(default_factory=DegradationConfig)
 
 
 class CameraGroupConfig(BaseModel):
@@ -504,6 +526,7 @@ class StorageConfig(BaseModel):
     foe_objects_dir: Path = Path("data/foe_objects")
     model_packages_dir: Path = Path("data/model_packages")
     alerts_dir: Path = Path("data/alerts")
+    inference_records_dir: Path = Path("data/inference_records")
     alert_retention_days: int = Field(
         default=90, ge=7, le=3650,
         description="Days to retain alert records and images (7-3650)",
