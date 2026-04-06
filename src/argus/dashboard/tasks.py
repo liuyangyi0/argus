@@ -24,6 +24,18 @@ class TaskStatus(str, Enum):
     RUNNING = "running"
     COMPLETE = "complete"
     FAILED = "failed"
+    PAUSED = "paused"
+    ABORTED = "aborted"
+
+
+def _set_event() -> threading.Event:
+    e = threading.Event()
+    e.set()  # not paused by default
+    return e
+
+
+class TaskAbortedError(Exception):
+    """Raised when a task detects the abort event."""
 
 
 @dataclass
@@ -40,6 +52,8 @@ class TaskInfo:
     created_at: float = field(default_factory=time.monotonic)
     completed_at: float | None = None
     result: Any = None
+    pause_event: threading.Event = field(default_factory=lambda: _set_event())
+    abort_event: threading.Event = field(default_factory=threading.Event)
 
 
 class TaskManager:
@@ -81,7 +95,7 @@ class TaskManager:
             if (
                 t.task_type == task_type
                 and t.camera_id == camera_id
-                and t.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+                and t.status in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.PAUSED)
             ):
                 raise RuntimeError(f"摄像头 {camera_id} 已有相同类型的任务在运行")
 
@@ -101,7 +115,7 @@ class TaskManager:
             with self._lock:
                 info.status = TaskStatus.RUNNING
                 info.message = "正在启动..."
-
+            self._notify_task_change(info)
             try:
                 result = func(_progress_callback, **kwargs)
                 with self._lock:
@@ -112,6 +126,13 @@ class TaskManager:
                     info.completed_at = time.monotonic()
                 self._notify_task_change(info)
                 logger.info("task.complete", task_id=task_id, task_type=task_type)
+            except TaskAbortedError:
+                with self._lock:
+                    info.status = TaskStatus.ABORTED
+                    info.message = "已中止"
+                    info.completed_at = time.monotonic()
+                self._notify_task_change(info)
+                logger.info("task.aborted", task_id=task_id, task_type=task_type)
             except Exception as e:
                 with self._lock:
                     info.status = TaskStatus.FAILED
@@ -135,7 +156,7 @@ class TaskManager:
         if not self._on_change:
             return
         last_progress = getattr(info, "_last_notified_progress", -10)
-        is_terminal = info.status in (TaskStatus.COMPLETE, TaskStatus.FAILED)
+        is_terminal = info.status in (TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.ABORTED)
         if not is_terminal and abs(info.progress - last_progress) < 5:
             return
         info._last_notified_progress = info.progress
@@ -152,6 +173,42 @@ class TaskManager:
         except Exception as e:
             logger.debug("task.notify_failed", error=str(e))
 
+    def pause_task(self, task_id: str) -> bool:
+        """Pause a running task. The task must check pause_event in its loop."""
+        task = self._tasks.get(task_id)
+        if task and task.status == TaskStatus.RUNNING:
+            task.pause_event.clear()
+            with self._lock:
+                task.status = TaskStatus.PAUSED
+                task.message = "已暂停"
+            self._notify_task_change(task)
+            logger.info("task.paused", task_id=task_id)
+            return True
+        return False
+
+    def resume_task(self, task_id: str) -> bool:
+        """Resume a paused task."""
+        task = self._tasks.get(task_id)
+        if task and task.status == TaskStatus.PAUSED:
+            with self._lock:
+                task.status = TaskStatus.RUNNING
+                task.message = "已恢复"
+            task.pause_event.set()
+            self._notify_task_change(task)
+            logger.info("task.resumed", task_id=task_id)
+            return True
+        return False
+
+    def abort_task(self, task_id: str) -> bool:
+        """Signal a running or paused task to abort."""
+        task = self._tasks.get(task_id)
+        if task and task.status in (TaskStatus.RUNNING, TaskStatus.PAUSED):
+            task.abort_event.set()
+            task.pause_event.set()  # unblock if paused so it can detect abort
+            logger.info("task.abort_requested", task_id=task_id)
+            return True
+        return False
+
     def get_task(self, task_id: str) -> TaskInfo | None:
         """Get task info by ID."""
         return self._tasks.get(task_id)
@@ -165,14 +222,14 @@ class TaskManager:
         now = time.monotonic()
         return [
             t for t in self._tasks.values()
-            if t.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+            if t.status in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.PAUSED)
             or (t.completed_at and now - t.completed_at < 300)  # show completed for 5 min
         ]
 
     def dismiss(self, task_id: str) -> bool:
         """Remove a completed/failed task from the list."""
         task = self._tasks.get(task_id)
-        if task and task.status in (TaskStatus.COMPLETE, TaskStatus.FAILED):
+        if task and task.status in (TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.ABORTED):
             del self._tasks[task_id]
             return True
         return False
