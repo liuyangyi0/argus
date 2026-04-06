@@ -18,7 +18,7 @@ from argus.capture.manager import CameraManager
 from argus.config.loader import load_config
 from argus.config.schema import AlertSeverity
 from argus.core.health import HealthMonitor
-from argus.core.scheduler import TaskScheduler, create_maintenance_tasks
+from argus.core.scheduler import TaskScheduler, create_maintenance_tasks, create_retraining_task
 from argus.dashboard.app import create_app
 from argus.dashboard.tasks import TaskManager
 from argus.storage.audit import AuditLogger
@@ -241,6 +241,27 @@ def main():
         health_monitor=health,
         alerts_dir=config.storage.alerts_dir,
     )
+
+    # Scheduled retraining (C4 + A4: active learning loop)
+    if config.retraining.enabled:
+        from argus.anomaly.trainer import ModelTrainer
+        from argus.storage.model_registry import ModelRegistry
+        from argus.anomaly.baseline import BaselineManager
+
+        baseline_mgr = BaselineManager(baselines_dir=config.storage.baselines_dir)
+        model_trainer = ModelTrainer(
+            baseline_manager=baseline_mgr,
+            exports_dir=config.storage.exports_dir,
+        )
+        model_reg = ModelRegistry(session_factory=db.get_session)
+        create_retraining_task(
+            scheduler=scheduler,
+            config=config,
+            camera_configs=cameras,
+            trainer=model_trainer,
+            model_registry=model_reg,
+            baseline_manager=baseline_mgr,
+        )
 
     # Scheduled automatic backup every 6 hours
     if not args.no_dashboard:
