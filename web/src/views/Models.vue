@@ -3,14 +3,15 @@ import { ref, computed, onMounted } from 'vue'
 import {
   Tabs, Table, Card, Button, Select, Form, InputNumber, Space,
   Typography, Progress, Tag, Modal, message, Descriptions, Tooltip,
-  Radio, Collapse, Slider,
+  Radio, Collapse, Slider, Drawer, Input, Divider,
 } from 'ant-design-vue'
 import {
   PlayCircleOutlined, RocketOutlined, ReloadOutlined,
   CheckCircleOutlined, CloseCircleOutlined, LoadingOutlined,
   HistoryOutlined, ExperimentOutlined, SwapOutlined,
   RollbackOutlined, CheckOutlined, PauseCircleOutlined,
-  StopOutlined, CaretRightOutlined,
+  StopOutlined, CaretRightOutlined, SafetyCertificateOutlined,
+  TeamOutlined, MergeCellsOutlined,
 } from '@ant-design/icons-vue'
 import {
   getCameras, getBaselines, startCapture, startTraining,
@@ -18,6 +19,8 @@ import {
   optimizeBaseline, previewOptimize, getModelRegistry, activateModel,
   rollbackModel, compareModels, batchInference,
   startCaptureJob, pauseCaptureJob, resumeCaptureJob, abortCaptureJob,
+  getBaselineVersions, verifyBaseline, activateBaseline, retireBaseline,
+  getCameraGroups, mergeGroupBaseline, mergeFalsePositives,
 } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
@@ -72,6 +75,22 @@ const compareForm = ref({ old_record_id: undefined as number | undefined, new_re
 const compareResult = ref<any>(null)
 const comparing = ref(false)
 
+// ── Baseline Lifecycle ──
+const versionDrawerVisible = ref(false)
+const versionDrawerCamera = ref('')
+const baselineVersions = ref<any[]>([])
+const versionsLoading = ref(false)
+const verifyingVersion = ref<string | null>(null)
+const activatingVersion = ref<string | null>(null)
+
+// ── Camera Groups ──
+const cameraGroups = ref<any[]>([])
+const groupsLoading = ref(false)
+const mergingGroup = ref<string | null>(null)
+
+// ── FP Merge ──
+const mergingFP = ref<string | null>(null)
+
 // ── WebSocket for tasks ──
 useWebSocket({
   topics: ['tasks'],
@@ -125,6 +144,13 @@ const RECOMMENDATION_COLORS: Record<string, string> = {
 }
 const RECOMMENDATION_TEXT: Record<string, string> = {
   deploy: '推荐部署新模型', keep_old: '保留旧模型', review: '需要人工审核',
+}
+
+const BASELINE_STATE_MAP: Record<string, { text: string; color: string }> = {
+  draft: { text: '草稿', color: 'default' },
+  verified: { text: '已审核', color: 'blue' },
+  active: { text: '生产中', color: 'green' },
+  retired: { text: '已退役', color: '' },
 }
 
 // ── Data loading ──
@@ -199,7 +225,157 @@ async function loadRegistry() {
   }
 }
 
+async function loadBaselineVersions(cameraId: string) {
+  versionsLoading.value = true
+  try {
+    const res = await getBaselineVersions({ camera_id: cameraId })
+    baselineVersions.value = res.data.versions || []
+  } catch (e) {
+    console.error('Failed to load baseline versions', e)
+    baselineVersions.value = []
+  } finally {
+    versionsLoading.value = false
+  }
+}
+
+async function loadCameraGroups() {
+  groupsLoading.value = true
+  try {
+    const res = await getCameraGroups()
+    cameraGroups.value = res.data.groups || []
+  } catch (e) {
+    console.error('Failed to load camera groups', e)
+  } finally {
+    groupsLoading.value = false
+  }
+}
+
 // ── Actions ──
+
+function openVersionDrawer(cameraId: string) {
+  versionDrawerCamera.value = cameraId
+  versionDrawerVisible.value = true
+  loadBaselineVersions(cameraId)
+}
+
+function handleVerify(record: any) {
+  let verifiedBy = ''
+  Modal.confirm({
+    title: '审核基线版本',
+    content: `确认审核通过 ${record.version}？请输入审核人姓名。`,
+    okText: '确认审核',
+    cancelText: '取消',
+    async onOk() {
+      verifiedBy = verifiedBy || 'operator'
+      verifyingVersion.value = record.version
+      try {
+        await verifyBaseline({
+          camera_id: record.camera_id,
+          version: record.version,
+          verified_by: verifiedBy,
+        })
+        message.success(`${record.version} 已审核通过`)
+        loadBaselineVersions(versionDrawerCamera.value)
+        loadBaselines()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '审核失败')
+      } finally {
+        verifyingVersion.value = null
+      }
+    },
+  })
+}
+
+function handleActivateBaseline(record: any) {
+  Modal.confirm({
+    title: '激活基线版本',
+    content: `确定将 ${record.version} 设为生产基线？当前 Active 版本将自动退役。`,
+    okText: '确认激活',
+    cancelText: '取消',
+    async onOk() {
+      activatingVersion.value = record.version
+      try {
+        await activateBaseline({
+          camera_id: record.camera_id,
+          version: record.version,
+        })
+        message.success(`${record.version} 已激活`)
+        loadBaselineVersions(versionDrawerCamera.value)
+        loadBaselines()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '激活失败')
+      } finally {
+        activatingVersion.value = null
+      }
+    },
+  })
+}
+
+function handleRetireBaseline(record: any) {
+  Modal.confirm({
+    title: '退役基线版本',
+    content: `确定退役 ${record.version}？退役后将保留数据但不再用于训练。`,
+    okText: '确认退役',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        await retireBaseline({
+          camera_id: record.camera_id,
+          version: record.version,
+          reason: '手动退役',
+        })
+        message.success(`${record.version} 已退役`)
+        loadBaselineVersions(versionDrawerCamera.value)
+        loadBaselines()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '退役失败')
+      }
+    },
+  })
+}
+
+function handleMergeGroup(groupId: string) {
+  Modal.confirm({
+    title: '合并摄像头组基线',
+    content: `将组 ${groupId} 内所有成员摄像头的基线合并为一个组版本（Draft 状态）。`,
+    okText: '执行合并',
+    cancelText: '取消',
+    async onOk() {
+      mergingGroup.value = groupId
+      try {
+        const res = await mergeGroupBaseline({ group_id: groupId })
+        message.success(`组基线合并完成: ${res.data.version}, ${res.data.image_count} 张图片`)
+        loadCameraGroups()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '合并失败')
+      } finally {
+        mergingGroup.value = null
+      }
+    },
+  })
+}
+
+function handleMergeFP(cameraId: string) {
+  Modal.confirm({
+    title: '合并误报到基线',
+    content: `将 ${cameraId} 的误报候选池帧合并到新基线版本（Draft 状态，需审核后才能训练）。`,
+    okText: '执行合并',
+    cancelText: '取消',
+    async onOk() {
+      mergingFP.value = cameraId
+      try {
+        const res = await mergeFalsePositives({ camera_id: cameraId })
+        message.success(`误报合并完成: ${res.data.version}, 新增 ${res.data.fp_included} 张误报帧`)
+        loadBaselines()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '合并失败')
+      } finally {
+        mergingFP.value = null
+      }
+    },
+  })
+}
 
 async function handleCapture() {
   if (!captureForm.value.camera_id) {
@@ -472,7 +648,25 @@ const baselineColumns = [
   { title: '版本', dataIndex: 'version', key: 'version' },
   { title: '图片数量', dataIndex: 'image_count', key: 'image_count' },
   { title: '采集场景', dataIndex: 'session_label', key: 'session_label' },
-  { title: '状态', dataIndex: 'status', key: 'status' },
+  { title: '生命周期', key: 'state', width: 100 },
+  { title: '操作', key: 'action', width: 280 },
+]
+
+const versionColumns = [
+  { title: '版本', dataIndex: 'version', key: 'version', width: 80 },
+  { title: '状态', key: 'state', width: 90 },
+  { title: '图片', dataIndex: 'image_count', key: 'image_count', width: 70 },
+  { title: '审核人', dataIndex: 'verified_by', key: 'verified_by', width: 100 },
+  { title: '审核时间', dataIndex: 'verified_at', key: 'verified_at', width: 140 },
+  { title: '操作', key: 'action', width: 120 },
+]
+
+const groupColumns = [
+  { title: '组 ID', dataIndex: 'group_id', key: 'group_id' },
+  { title: '名称', dataIndex: 'name', key: 'name' },
+  { title: '成员摄像头', key: 'camera_ids' },
+  { title: '图片数', dataIndex: 'image_count', key: 'image_count', width: 80 },
+  { title: '当前版本', dataIndex: 'current_version', key: 'current_version', width: 100 },
   { title: '操作', key: 'action', width: 120 },
 ]
 
@@ -544,6 +738,7 @@ onMounted(async () => {
   await loadCameras()
   loadBaselines()
   loadTasks()
+  loadCameraGroups()
 })
 </script>
 
@@ -663,20 +858,42 @@ onMounted(async () => {
                 <Tag v-if="record.session_label">{{ record.session_label }}</Tag>
                 <span v-else style="color: #666">-</span>
               </template>
-              <template v-if="column.key === 'status'">
-                <Tag color="green">就绪</Tag>
+              <template v-if="column.key === 'state'">
+                <Tag
+                  v-if="record.state"
+                  :color="(BASELINE_STATE_MAP[record.state] || {}).color || 'default'"
+                >
+                  {{ (BASELINE_STATE_MAP[record.state] || {}).text || record.state }}
+                </Tag>
+                <Tag v-else color="green">就绪</Tag>
               </template>
               <template v-if="column.key === 'action'">
-                <Tooltip title="多样性优选：预览后确认保留最具代表性的子集">
-                  <Button
-                    size="small"
-                    :loading="optimizingBaseline === `${record.camera_id}-${record.version}`"
-                    :disabled="record.image_count < 30"
-                    @click="handleOptimize(record)"
-                  >
-                    优化
+                <Space>
+                  <Tooltip title="多样性优选">
+                    <Button
+                      size="small"
+                      :loading="optimizingBaseline === `${record.camera_id}-${record.version}`"
+                      :disabled="record.image_count < 30"
+                      @click="handleOptimize(record)"
+                    >
+                      优化
+                    </Button>
+                  </Tooltip>
+                  <Button size="small" @click="openVersionDrawer(record.camera_id)">
+                    <SafetyCertificateOutlined />
+                    版本管理
                   </Button>
-                </Tooltip>
+                  <Tooltip title="将误报候选帧合并到新基线版本">
+                    <Button
+                      size="small"
+                      :loading="mergingFP === record.camera_id"
+                      @click="handleMergeFP(record.camera_id)"
+                    >
+                      <MergeCellsOutlined />
+                      合并误报
+                    </Button>
+                  </Tooltip>
+                </Space>
               </template>
             </template>
           </Table>
@@ -684,6 +901,104 @@ onMounted(async () => {
             暂无基线数据，请先采集基线图片
           </div>
         </Card>
+
+        <!-- Camera Groups Panel -->
+        <Card v-if="cameraGroups.length > 0" size="small" style="margin-top: 16px">
+          <template #title>
+            <Space>
+              <TeamOutlined />
+              <span>摄像头组共享基线</span>
+            </Space>
+          </template>
+          <Table
+            :columns="groupColumns"
+            :data-source="cameraGroups"
+            :loading="groupsLoading"
+            :pagination="false"
+            row-key="group_id"
+            size="small"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'camera_ids'">
+                <Tag v-for="cam in record.camera_ids" :key="cam" style="margin: 2px">{{ cam }}</Tag>
+              </template>
+              <template v-if="column.key === 'action'">
+                <Button
+                  size="small"
+                  type="primary"
+                  :loading="mergingGroup === record.group_id"
+                  @click="handleMergeGroup(record.group_id)"
+                >
+                  <MergeCellsOutlined />
+                  合并基线
+                </Button>
+              </template>
+            </template>
+          </Table>
+        </Card>
+
+        <!-- Version Management Drawer -->
+        <Drawer
+          v-model:open="versionDrawerVisible"
+          :title="`基线版本管理 — ${versionDrawerCamera}`"
+          width="680"
+          placement="right"
+        >
+          <Table
+            :columns="versionColumns"
+            :data-source="baselineVersions"
+            :loading="versionsLoading"
+            :pagination="false"
+            row-key="version"
+            size="small"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'state'">
+                <Tag :color="(BASELINE_STATE_MAP[record.state] || {}).color || 'default'">
+                  {{ (BASELINE_STATE_MAP[record.state] || {}).text || record.state }}
+                </Tag>
+              </template>
+              <template v-if="column.key === 'verified_at'">
+                <span v-if="record.verified_at">{{ record.verified_at.replace('T', ' ').slice(0, 19) }}</span>
+                <span v-else style="color: #999">-</span>
+              </template>
+              <template v-if="column.key === 'action'">
+                <Button
+                  v-if="record.state === 'draft'"
+                  size="small"
+                  type="primary"
+                  :loading="verifyingVersion === record.version"
+                  @click="handleVerify(record)"
+                >
+                  审核
+                </Button>
+                <Button
+                  v-if="record.state === 'verified'"
+                  size="small"
+                  type="primary"
+                  :loading="activatingVersion === record.version"
+                  @click="handleActivateBaseline(record)"
+                >
+                  激活
+                </Button>
+                <Button
+                  v-if="record.state === 'active'"
+                  size="small"
+                  danger
+                  @click="handleRetireBaseline(record)"
+                >
+                  退役
+                </Button>
+                <span v-if="record.state === 'retired'" style="color: #999">已退役</span>
+              </template>
+            </template>
+          </Table>
+          <Divider />
+          <div style="color: #8890a0; font-size: 12px">
+            <p><strong>状态流转:</strong> 草稿 → 已审核 → 生产中 → 已退役（严格单向，不可逆转）</p>
+            <p><strong>训练要求:</strong> 仅「已审核」或「生产中」的基线可用于模型训练</p>
+          </div>
+        </Drawer>
 
         <!-- Capture modal -->
         <Modal
