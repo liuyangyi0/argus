@@ -38,6 +38,12 @@ const router = createRouter({
       meta: { title: '模型' },
     },
     {
+      path: '/training',
+      name: 'training',
+      component: () => import('../views/TrainingJobs.vue'),
+      meta: { title: '训练任务' },
+    },
+    {
       path: '/system',
       name: 'system',
       component: () => import('../views/System.vue'),

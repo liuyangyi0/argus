@@ -115,6 +115,9 @@ def create_app(
     from argus.dashboard.routes.models import router as models_router
     app.include_router(models_router, prefix="/api/models", tags=["models"])
 
+    from argus.dashboard.routes.training_jobs import router as training_jobs_router
+    app.include_router(training_jobs_router, prefix="/api/training-jobs", tags=["training-jobs"])
+
     try:
         from argus.dashboard.routes.baseline import router as baseline_router
         app.include_router(baseline_router, prefix="/api/baseline", tags=["baseline"])
