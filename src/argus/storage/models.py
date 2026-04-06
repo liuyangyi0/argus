@@ -28,6 +28,31 @@ class AlertWorkflowStatus(str, Enum):
     RESOLVED = "resolved"
     CLOSED = "closed"
     FALSE_POSITIVE = "false_positive"
+    UNCERTAIN = "uncertain"
+
+
+class FeedbackType(str, Enum):
+    """Operator feedback classification for alerts."""
+
+    CONFIRMED = "confirmed"
+    FALSE_POSITIVE = "false_positive"
+    UNCERTAIN = "uncertain"
+
+
+class FeedbackStatus(str, Enum):
+    """Processing status for feedback entries in the retraining queue."""
+
+    PENDING = "pending"
+    PROCESSED = "processed"
+    SKIPPED = "skipped"
+
+
+class FeedbackSource(str, Enum):
+    """Origin of a feedback entry."""
+
+    MANUAL = "manual"
+    DRIFT = "drift"
+    HEALTH = "health"
 
 
 class BaselineState(str, Enum):
@@ -254,6 +279,121 @@ class AuditLog(Base):
     target_id: Mapped[str] = mapped_column(String(200), nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
+
+class FeedbackRecord(Base):
+    """Operator/system feedback entry for the retraining queue (Section 6).
+
+    Each feedback entry tracks an operator's assessment of an alert
+    (confirmed / false_positive / uncertain) or a system-generated
+    passive feedback event (drift / health).  Entries live in a
+    pending → processed/skipped lifecycle so that engineers can select
+    batches for retraining and audit which feedback was incorporated
+    into which model version.
+    """
+
+    __tablename__ = "feedback_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feedback_id: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True,
+    )
+    alert_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+        comment="Nullable — passive feedback from drift/health has no alert",
+    )
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    zone_id: Mapped[str] = mapped_column(String(50), nullable=False, default="default")
+
+    # Classification
+    feedback_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, index=True,
+        comment="confirmed / false_positive / uncertain",
+    )
+    category: Mapped[str | None] = mapped_column(
+        String(50), nullable=True,
+        comment="FP sub-category (lens_glare, insect, shadow, etc.)",
+    )
+
+    # Context at feedback time
+    model_version_at_time: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    anomaly_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    snapshot_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Operator info
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitted_by: Mapped[str] = mapped_column(
+        String(100), nullable=False, default="operator",
+    )
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="manual",
+        comment="manual / drift / health",
+    )
+
+    # Queue lifecycle
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending",
+        index=True,
+    )
+    trained_into: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+        comment="model_version_id of the training run that consumed this feedback",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "feedback_id": self.feedback_id,
+            "alert_id": self.alert_id,
+            "camera_id": self.camera_id,
+            "zone_id": self.zone_id,
+            "feedback_type": self.feedback_type,
+            "category": self.category,
+            "model_version_at_time": self.model_version_at_time,
+            "anomaly_score": self.anomaly_score,
+            "snapshot_path": self.snapshot_path,
+            "notes": self.notes,
+            "submitted_by": self.submitted_by,
+            "source": self.source,
+            "status": self.status,
+            "trained_into": self.trained_into,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "processed_at": self.processed_at.isoformat() if self.processed_at else None,
+        }
+
+
+class InferenceRecord(Base):
+    """Per-frame inference result for audit trail and model comparison (Section 7).
+
+    High-volume table — use InferenceBuffer for batched writes.
+    Indexed on (camera_id, timestamp) and (model_version_id) for
+    efficient range queries and A/B comparison.
+    """
+
+    __tablename__ = "inference_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    zone_id: Mapped[str] = mapped_column(String(50), nullable=False, default="default")
+    frame_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    timestamp: Mapped[float] = mapped_column(Float, nullable=False)
+    model_version_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True,
+    )
+    anomaly_score: Mapped[float] = mapped_column(Float, nullable=False)
+    inference_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    was_alert: Mapped[bool] = mapped_column(Boolean, default=False)
+    alert_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deployment_stage: Mapped[str | None] = mapped_column(
+        String(20), nullable=True,
+        comment="production / shadow — for A/B comparison",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
 
 
 class ModelRecord(Base):

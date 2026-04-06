@@ -76,6 +76,23 @@ def create_app(
     app.state.task_manager = task_manager
     app.state.ws_manager = ws_manager
 
+    # Feedback manager for the feedback queue (Section 6)
+    if database:
+        from argus.alerts.feedback import FeedbackManager
+        from argus.config.schema import FeedbackConfig
+
+        feedback_cfg = getattr(config, "feedback", None) or FeedbackConfig()
+        baselines_dir = getattr(config, "storage", None)
+        baselines_path = baselines_dir.baselines_dir if baselines_dir else "data/baselines"
+        app.state.feedback_manager = FeedbackManager(
+            database=database,
+            baselines_dir=str(baselines_path),
+            alerts_dir=str(app.state.alerts_dir),
+            config=feedback_cfg,
+        )
+    else:
+        app.state.feedback_manager = None
+
     # ── Security middleware ──
     from argus.dashboard.auth import (
         AuthMiddleware,

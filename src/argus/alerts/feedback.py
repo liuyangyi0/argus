@@ -1,36 +1,44 @@
-"""False positive feedback loop.
+"""Feedback loop manager for alert review and model retraining (Section 6).
 
-Exports false positive data for model retraining and tracks
-feedback statistics to measure system improvement over time.
+Handles both active (operator) and passive (drift/health) feedback.
+Feedback entries enter a pending queue and are consumed by retraining runs.
+
+Workflow:
+1. Operator/system submits feedback → FeedbackRecord(status=pending) created
+2. Side-effects: FP frames → baseline dir; confirmed frames → validation dir
+3. Engineer triggers retraining → selects pending batch → mark_batch_processed
+4. TrainingRecord records which feedback_ids were incorporated
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import structlog
 
+from argus.config.schema import FeedbackConfig
 from argus.storage.database import Database
-from argus.storage.models import BaselineState
+from argus.storage.models import (
+    BaselineState,
+    FeedbackRecord,
+    FeedbackSource,
+    FeedbackStatus,
+    FeedbackType,
+)
 
 logger = structlog.get_logger()
 
 
 class FeedbackManager:
-    """Manages the false positive feedback loop for model improvement.
+    """Manages the feedback loop for alert review and model retraining.
 
-    When operators mark alerts as false positives, those frames can be
-    added to the normal training set so the model learns to ignore
-    similar patterns in the future.
-
-    Workflow:
-    1. Operator marks alert as FP via dashboard
-    2. FeedbackManager extracts the snapshot from the alert
-    3. Snapshot is copied to the camera's baseline directory
-    4. Next retraining cycle incorporates the FP frames
+    Replaces the old FP-only export with a full queue model supporting
+    three feedback types (confirmed, false_positive, uncertain) and
+    passive feedback from drift/health monitoring.
     """
 
     def __init__(
@@ -38,10 +46,187 @@ class FeedbackManager:
         database: Database,
         baselines_dir: str | Path = "data/baselines",
         alerts_dir: str | Path = "data/alerts",
+        config: FeedbackConfig | None = None,
     ):
         self._db = database
         self._baselines_dir = Path(baselines_dir)
         self._alerts_dir = Path(alerts_dir)
+        self._config = config or FeedbackConfig()
+
+    # ── Core feedback submission ──
+
+    def submit_feedback(
+        self,
+        alert_id: str,
+        feedback_type: str,
+        camera_id: str,
+        zone_id: str = "default",
+        category: str | None = None,
+        notes: str | None = None,
+        submitted_by: str = "operator",
+        model_version_id: str | None = None,
+        anomaly_score: float | None = None,
+        snapshot_path: str | None = None,
+    ) -> FeedbackRecord:
+        """Submit operator feedback for an alert.
+
+        Creates a FeedbackRecord in the pending queue and triggers
+        side-effects based on feedback type:
+        - false_positive + auto_baseline_on_fp → copy snapshot to baselines
+        - confirmed + auto_validation_on_confirmed → copy to validation set
+        - uncertain → log + no copy (awaits supervisor review)
+
+        Returns the created FeedbackRecord.
+        """
+        record = FeedbackRecord(
+            feedback_id=str(uuid.uuid4()),
+            alert_id=alert_id,
+            camera_id=camera_id,
+            zone_id=zone_id,
+            feedback_type=feedback_type,
+            category=category,
+            model_version_at_time=model_version_id,
+            anomaly_score=anomaly_score,
+            snapshot_path=snapshot_path,
+            notes=notes,
+            submitted_by=submitted_by,
+            source=FeedbackSource.MANUAL,
+            status=FeedbackStatus.PENDING,
+        )
+        saved = self._db.save_feedback(record)
+
+        # Side-effects
+        if feedback_type == FeedbackType.FALSE_POSITIVE and self._config.auto_baseline_on_fp:
+            self._copy_to_baseline(saved)
+        elif feedback_type == FeedbackType.CONFIRMED and self._config.auto_validation_on_confirmed:
+            self._copy_to_validation(saved)
+        elif feedback_type == FeedbackType.UNCERTAIN:
+            logger.info(
+                "feedback.uncertain_submitted",
+                alert_id=alert_id,
+                camera_id=camera_id,
+                submitted_by=submitted_by,
+                escalation_role=self._config.uncertain_escalation_role,
+            )
+
+        logger.info(
+            "feedback.submitted",
+            feedback_id=saved.feedback_id,
+            feedback_type=feedback_type,
+            alert_id=alert_id,
+            camera_id=camera_id,
+        )
+        return saved
+
+    def submit_passive_feedback(
+        self,
+        camera_id: str,
+        zone_id: str = "all",
+        source: str = FeedbackSource.DRIFT,
+        notes: str | None = None,
+        model_version_id: str | None = None,
+    ) -> FeedbackRecord:
+        """Submit system-generated feedback from drift/health monitoring.
+
+        Passive feedback has no associated alert_id and is auto-generated
+        by the pipeline when score distribution drift or camera health
+        anomalies are detected.
+        """
+        record = FeedbackRecord(
+            feedback_id=str(uuid.uuid4()),
+            alert_id=None,
+            camera_id=camera_id,
+            zone_id=zone_id,
+            feedback_type=FeedbackType.CONFIRMED,  # System confirms anomaly
+            category=None,
+            model_version_at_time=model_version_id,
+            notes=notes,
+            submitted_by="system",
+            source=source,
+            status=FeedbackStatus.PENDING,
+        )
+        saved = self._db.save_feedback(record)
+        logger.info(
+            "feedback.passive_submitted",
+            feedback_id=saved.feedback_id,
+            source=source,
+            camera_id=camera_id,
+        )
+        return saved
+
+    # ── Queue operations ──
+
+    def get_pending_for_training(
+        self,
+        camera_id: str | None = None,
+        feedback_type: str | None = None,
+    ) -> list[FeedbackRecord]:
+        """Get pending feedback entries ready for the next training batch."""
+        return self._db.get_pending_feedback(
+            camera_id=camera_id, feedback_type=feedback_type,
+        )
+
+    def mark_batch_processed(
+        self,
+        feedback_ids: list[str],
+        model_version_id: str,
+    ) -> int:
+        """Mark a batch of feedback entries as consumed by a training run.
+
+        Returns the number of records updated.
+        """
+        return self._db.mark_feedback_processed(feedback_ids, model_version_id)
+
+    # ── Confirmed frames collection ──
+
+    def collect_confirmed_for_validation(
+        self,
+        camera_id: str,
+        validation_dir: str | Path | None = None,
+    ) -> int:
+        """Copy confirmed anomaly snapshots to validation directory.
+
+        These are real anomaly frames used for recall testing — more
+        valuable than synthetic data for measuring detection quality.
+
+        Returns the number of images copied.
+        """
+        out_dir = Path(validation_dir or self._config.validation_dir) / camera_id / "confirmed"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        pending = self._db.get_pending_feedback(
+            camera_id=camera_id, feedback_type=FeedbackType.CONFIRMED,
+        )
+        copied = 0
+        for fb in pending:
+            if fb.snapshot_path and Path(fb.snapshot_path).exists():
+                dst = out_dir / f"confirmed_{fb.feedback_id[:16]}.jpg"
+                if not dst.exists():
+                    shutil.copy2(fb.snapshot_path, dst)
+                    # Write metadata sidecar
+                    meta = {
+                        "feedback_id": fb.feedback_id,
+                        "alert_id": fb.alert_id,
+                        "anomaly_score": fb.anomaly_score,
+                        "camera_id": fb.camera_id,
+                        "zone_id": fb.zone_id,
+                        "model_version": fb.model_version_at_time,
+                        "submitted_by": fb.submitted_by,
+                    }
+                    meta_path = dst.with_suffix(".meta.json")
+                    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+                    copied += 1
+
+        if copied:
+            logger.info(
+                "feedback.confirmed_collected",
+                camera_id=camera_id,
+                collected=copied,
+                output_dir=str(out_dir),
+            )
+        return copied
+
+    # ── Legacy compatibility ──
 
     def export_false_positives(
         self,
@@ -158,7 +343,7 @@ class FeedbackManager:
             fp_included += 1
             idx += 1
 
-        # Deduplicate: keep at most the original baseline count + 20% headroom for FP additions
+        # Deduplicate: keep at most the original baseline count + 20% headroom
         total_before = idx
         total_after = total_before
         if len(current_images) > 0 and total_before > len(current_images):
@@ -206,7 +391,10 @@ class FeedbackManager:
         }
 
     def get_feedback_stats(self, camera_id: str | None = None) -> dict:
-        """Get feedback statistics for monitoring."""
+        """Get feedback statistics for monitoring.
+
+        Returns both legacy alert-based stats and new queue-based summary.
+        """
         alerts = self._db.get_alerts(camera_id=camera_id, limit=1000)
 
         total = len(alerts)
@@ -214,10 +402,84 @@ class FeedbackManager:
         false_positives = sum(1 for a in alerts if a.false_positive)
         fp_rate = false_positives / total if total > 0 else 0
 
+        # New queue-based summary
+        queue_summary = self._db.get_feedback_summary(camera_id=camera_id)
+
         return {
             "total_alerts": total,
             "acknowledged": acknowledged,
             "false_positives": false_positives,
             "false_positive_rate": round(fp_rate, 4),
             "unreviewed": total - acknowledged - false_positives,
+            "feedback_queue": queue_summary,
         }
+
+    # ── Internal helpers ──
+
+    def _copy_to_baseline(self, record: FeedbackRecord) -> None:
+        """Copy FP snapshot to camera's baseline false_positives directory."""
+        if not record.snapshot_path:
+            return
+        src = Path(record.snapshot_path)
+        if not src.exists():
+            logger.warning(
+                "feedback.snapshot_not_found",
+                feedback_id=record.feedback_id,
+                path=str(src),
+            )
+            return
+
+        fp_dir = self._baselines_dir / record.camera_id / record.zone_id / "false_positives"
+        fp_dir.mkdir(parents=True, exist_ok=True)
+
+        dst = fp_dir / f"fp_{record.feedback_id[:16]}{src.suffix}"
+        if not dst.exists():
+            shutil.copy2(src, dst)
+            # Write metadata sidecar
+            meta = {
+                "feedback_id": record.feedback_id,
+                "alert_id": record.alert_id,
+                "category": record.category,
+                "anomaly_score": record.anomaly_score,
+                "camera_id": record.camera_id,
+                "zone_id": record.zone_id,
+                "model_version": record.model_version_at_time,
+                "submitted_by": record.submitted_by,
+            }
+            meta_path = dst.with_suffix(".meta.json")
+            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+            logger.debug(
+                "feedback.fp_to_baseline",
+                feedback_id=record.feedback_id,
+                dst=str(dst),
+            )
+
+    def _copy_to_validation(self, record: FeedbackRecord) -> None:
+        """Copy confirmed anomaly snapshot to validation directory."""
+        if not record.snapshot_path:
+            return
+        src = Path(record.snapshot_path)
+        if not src.exists():
+            return
+
+        val_dir = self._config.validation_dir / record.camera_id / "confirmed"
+        val_dir.mkdir(parents=True, exist_ok=True)
+
+        dst = val_dir / f"confirmed_{record.feedback_id[:16]}{src.suffix}"
+        if not dst.exists():
+            shutil.copy2(src, dst)
+            meta = {
+                "feedback_id": record.feedback_id,
+                "alert_id": record.alert_id,
+                "anomaly_score": record.anomaly_score,
+                "camera_id": record.camera_id,
+                "zone_id": record.zone_id,
+                "model_version": record.model_version_at_time,
+            }
+            meta_path = dst.with_suffix(".meta.json")
+            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+            logger.debug(
+                "feedback.confirmed_to_validation",
+                feedback_id=record.feedback_id,
+                dst=str(dst),
+            )

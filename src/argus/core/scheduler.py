@@ -277,6 +277,7 @@ def create_retraining_task(
     trainer,
     model_registry,
     baseline_manager,
+    feedback_manager=None,
 ) -> None:
     """Register a scheduled retraining task that closes the active learning loop.
 
@@ -348,6 +349,29 @@ def create_retraining_task(
                     grade=grade,
                     status=getattr(result, "status", None),
                 )
+
+                # Mark pending feedback as processed for this camera
+                if feedback_manager is not None:
+                    try:
+                        pending = feedback_manager.get_pending_for_training(
+                            camera_id=camera_id,
+                        )
+                        if pending:
+                            model_vid = getattr(result, "model_version_id", None) or "unknown"
+                            ids = [fb.feedback_id for fb in pending]
+                            count = feedback_manager.mark_batch_processed(ids, model_vid)
+                            logger.info(
+                                "retraining.feedback_processed",
+                                camera_id=camera_id,
+                                feedback_count=count,
+                                model_version_id=model_vid,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "retraining.feedback_processing_failed",
+                            camera_id=camera_id,
+                            error=str(e),
+                        )
 
                 # Auto-deploy if grade meets threshold
                 if (
