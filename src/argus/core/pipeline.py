@@ -66,6 +66,7 @@ class PipelineStats:
     frames_skipped_person: int = 0
     frames_analyzed: int = 0
     frames_heartbeat: int = 0
+    frames_dropped_backpressure: int = 0
     anomalies_detected: int = 0
     alerts_emitted: int = 0
     avg_latency_ms: float = 0.0
