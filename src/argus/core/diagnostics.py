@@ -37,6 +37,7 @@ class FrameDiagnostics:
     is_anomalous: bool = False
     alert_emitted: bool = False
     pipeline_mode: str = "active"
+    frame_id: str = ""  # uuid hex, populated by pipeline for audit linkage
 
 
 @dataclass

@@ -64,6 +64,21 @@ class DetectionType(str, Enum):
     HYBRID = "hybrid"  # Both YOLO and Anomalib agree
 
 
+@dataclass(frozen=True)
+class CusumSnapshot:
+    """Read-only snapshot of CUSUM evidence state for a zone.
+
+    Exposed via AlertGrader.get_cusum_state() so that CameraInferenceRunner
+    can include per-zone evidence in RunnerSnapshot without breaking
+    AlertGrader encapsulation.
+    """
+
+    evidence: float
+    first_seen: float
+    last_seen: float
+    max_score: float
+
+
 @dataclass
 class _AnomalyTracker:
     """Tracks anomaly evidence for a specific zone using exponential accumulation."""
@@ -270,6 +285,41 @@ class AlertGrader:
         else:
             self._trackers.clear()
             self._last_alerts.clear()
+
+    @staticmethod
+    def _tracker_to_snapshot(tracker: _AnomalyTracker) -> CusumSnapshot | None:
+        """Convert an active tracker to a frozen snapshot, or None if inactive."""
+        if tracker.evidence == 0.0 and tracker.last_seen == 0.0:
+            return None
+        return CusumSnapshot(
+            evidence=tracker.evidence,
+            first_seen=tracker.first_seen,
+            last_seen=tracker.last_seen,
+            max_score=tracker.max_score,
+        )
+
+    def get_cusum_state(self, zone_key: str) -> CusumSnapshot | None:
+        """Return a frozen snapshot of the CUSUM evidence for a zone.
+
+        Args:
+            zone_key: Zone key in the format "camera_id:zone_id".
+
+        Returns:
+            CusumSnapshot if the zone has an active tracker, None otherwise.
+        """
+        tracker = self._trackers.get(zone_key)
+        if tracker is None:
+            return None
+        return self._tracker_to_snapshot(tracker)
+
+    def get_all_cusum_states(self) -> dict[str, CusumSnapshot]:
+        """Return snapshots for all active zone trackers."""
+        result = {}
+        for zone_key, tracker in self._trackers.items():
+            snap = self._tracker_to_snapshot(tracker)
+            if snap is not None:
+                result[zone_key] = snap
+        return result
 
     def prune_stale_trackers(self, max_age_seconds: float = 3600.0) -> int:
         """Remove zone trackers that haven't been updated in max_age_seconds.

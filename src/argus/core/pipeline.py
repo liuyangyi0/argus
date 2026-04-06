@@ -24,7 +24,9 @@ from typing import Callable
 import numpy as np
 import structlog
 
-from argus.alerts.grader import Alert, AlertGrader, DetectionType
+import uuid
+
+from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
 from argus.anomaly.detector import AnomalibDetector, AnomalyResult, DetectorStatus
 from argus.anomaly.drift import DriftDetector, DriftStatus
 from argus.core.diagnostics import (
@@ -32,6 +34,13 @@ from argus.core.diagnostics import (
     FrameDiagnostics,
     FrameScoreRecord,
     StageResult,
+)
+from argus.core.degradation import LockState
+from argus.core.inference_record import (
+    ConformalLevel,
+    FinalDecision,
+    InferenceRecord,
+    PrefilterDecision,
 )
 from argus.capture.camera import CameraCapture, FrameData
 from argus.config.schema import AlertConfig, CameraConfig, ClassifierConfig, SegmenterConfig, ZonePriority
@@ -245,6 +254,10 @@ class DetectionPipeline:
         self._learning_duration: float = 0.0
         self._auto_learning_complete = False
 
+        # 5.1/5.2: Per-frame inference tracking for CameraInferenceRunner
+        self._last_inference_record: InferenceRecord | None = None
+        self._last_detection_failed: bool = False
+
         # Drift monitoring: KS test on anomaly score distribution
         drift_cfg = camera_config.drift
         if drift_cfg.enabled:
@@ -298,6 +311,7 @@ class DetectionPipeline:
                 self._segmenter = InstanceSegmenter(
                     model_size=segmenter_config.model_size,
                     min_mask_area_px=segmenter_config.min_mask_area_px,
+                    timeout_seconds=segmenter_config.timeout_seconds,
                 )
                 self._segmenter_max_points = segmenter_config.max_points
                 self._segmenter_min_score = segmenter_config.min_anomaly_score
@@ -826,6 +840,73 @@ class DetectionPipeline:
 
         diag.alert_emitted = alert is not None
         diag.total_duration_ms = (time.monotonic() - start) * 1000
+        self._last_detection_failed = anomaly_result.detection_failed
+
+        # 5.2: Build InferenceRecord only for non-NORMAL frames (avoid
+        # uuid4/time_ns/dict-comprehension overhead on every frame)
+        if alert is not None:
+            final_decision = FinalDecision.ALERT
+        elif current_mode == PipelineMode.LEARNING and anomaly_result.is_anomalous:
+            final_decision = FinalDecision.SUPPRESSED
+        elif anomaly_result.is_anomalous:
+            final_decision = FinalDecision.INFO
+        else:
+            final_decision = FinalDecision.NORMAL
+
+        if final_decision != FinalDecision.NORMAL:
+            frame_id = uuid.uuid4().hex
+            diag.frame_id = frame_id
+
+            if skip_prefilter:
+                prefilter_decision = (
+                    PrefilterDecision.SKIPPED_HEARTBEAT if is_heartbeat
+                    else PrefilterDecision.SKIPPED_LOCK
+                )
+            else:
+                prefilter_decision = PrefilterDecision.PASSED
+
+            if self._anomaly_detector._calibration_scores is not None:
+                cal_level = ConformalLevel.INFO
+                thresholds = self._alert_grader._config.severity_thresholds
+                if anomaly_result.anomaly_score >= thresholds.high:
+                    cal_level = ConformalLevel.HIGH
+                elif anomaly_result.anomaly_score >= thresholds.medium:
+                    cal_level = ConformalLevel.MEDIUM
+                elif anomaly_result.anomaly_score >= thresholds.low:
+                    cal_level = ConformalLevel.LOW
+            else:
+                cal_level = ConformalLevel.NONE
+
+            cusum_evidence = {}
+            try:
+                best_zone = (
+                    self.camera_config.zones[0].zone_id
+                    if self.camera_config.zones
+                    else "default"
+                )
+                zone_key = f"{frame_data.camera_id}:{best_zone}"
+                snap = self._alert_grader.get_cusum_state(zone_key)
+                if snap is not None:
+                    cusum_evidence[zone_key] = snap.evidence
+            except Exception:
+                pass
+
+            self._last_inference_record = InferenceRecord(
+                frame_id=frame_id,
+                camera_id=frame_data.camera_id,
+                timestamp_ns=time.time_ns(),
+                model_version=self._model_version_id or "",
+                prefilter_result=prefilter_decision,
+                anomaly_score=anomaly_result.anomaly_score,
+                cusum_evidence=cusum_evidence,
+                conformal_level=cal_level,
+                safety_channel_result=simplex_detected if self._simplex is not None else None,
+                final_decision=final_decision,
+                stage_durations_ms={s.stage_name: s.duration_ms for s in diag.stages},
+            )
+        else:
+            self._last_inference_record = None
+
         self._diagnostics.append(diag)
         self._diagnostics.append_score(FrameScoreRecord(
             frame_number=frame_data.frame_number,
@@ -868,6 +949,35 @@ class DetectionPipeline:
         # HIGH-01: Reset MOG2 background model after lock release
         self._prefilter.reset()
         logger.info("pipeline.lock_cleared", camera_id=self.camera_config.camera_id)
+
+    @property
+    def lock_state(self) -> LockState:
+        """Current anomaly region lock state as LockState enum."""
+        with self._lock_state_lock:
+            if self._locked:
+                if self._lock_last_below_time is not None:
+                    return LockState.CLEARING
+                return LockState.LOCKED
+            return LockState.UNLOCKED
+
+    @property
+    def last_heartbeat_time(self) -> float:
+        """Timestamp of the last heartbeat bypass."""
+        return self._last_heartbeat_time
+
+    @property
+    def last_inference_record(self) -> InferenceRecord | None:
+        """Last InferenceRecord built during process_frame (None for NORMAL frames)."""
+        return self._last_inference_record
+
+    @property
+    def last_detection_failed(self) -> bool:
+        """Whether the last anomaly detection call failed."""
+        return self._last_detection_failed
+
+    def get_cusum_states(self) -> dict[str, CusumSnapshot]:
+        """Return CUSUM evidence snapshots for all active zones."""
+        return self._alert_grader.get_all_cusum_states()
 
     @property
     def mode(self) -> PipelineMode:
