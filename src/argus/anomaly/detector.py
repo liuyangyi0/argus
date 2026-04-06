@@ -478,6 +478,112 @@ class AnomalibDetector:
             logger.error("anomaly.hot_reload_failed", error=str(e), msg="Keeping old model")
             return False
 
+    def hot_reload_with_warmup(
+        self,
+        new_model_path: Path,
+        expected_hash: str | None = None,
+        warmup_frames: list[np.ndarray] | None = None,
+        warmup_count: int = 10,
+        max_latency_ms: float = 500.0,
+        baseline_dir: Path | None = None,
+        callback: "threading.Event | None" = None,
+    ) -> dict:
+        """Hot-reload with SHA256 verification, warmup, and latency check.
+
+        Runs in the calling thread (caller should spawn a thread if async needed).
+        Returns a dict with status and details.
+        """
+        import time
+
+        from argus.storage.model_registry import ModelRegistry
+
+        result = {
+            "success": False,
+            "sha256_verified": False,
+            "warmup_latency_ms": None,
+            "error": None,
+        }
+
+        logger.info("anomaly.warmup_reload_start", path=str(new_model_path))
+
+        try:
+            if expected_hash:
+                actual_hash = ModelRegistry._compute_dir_hash(new_model_path)
+                if actual_hash != expected_hash:
+                    result["error"] = (
+                        f"SHA256 mismatch: expected {expected_hash}, got {actual_hash}"
+                    )
+                    logger.error("anomaly.warmup_sha256_mismatch", **result)
+                    if callback:
+                        callback.set()
+                    return result
+                result["sha256_verified"] = True
+
+            # Step 2: Load new model
+            try:
+                from anomalib.deploy import OpenVINOInferencer
+                new_engine = OpenVINOInferencer(path=new_model_path)
+            except Exception:
+                from anomalib.deploy import TorchInferencer
+                new_engine = TorchInferencer(path=new_model_path)
+
+            # Warmup with baseline frames
+            if warmup_frames is None and baseline_dir and baseline_dir.is_dir():
+                warmup_frames = []
+                for img_path in sorted(baseline_dir.iterdir())[:warmup_count]:
+                    if img_path.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp"):
+                        frame = cv2.imread(str(img_path))
+                        if frame is not None:
+                            warmup_frames.append(frame)
+
+            if warmup_frames:
+                latencies = []
+                for frame in warmup_frames[:warmup_count]:
+                    t0 = time.perf_counter()
+                    new_engine.predict(frame)
+                    t1 = time.perf_counter()
+                    latencies.append((t1 - t0) * 1000)
+
+                avg_latency = sum(latencies) / len(latencies) if latencies else 0
+                result["warmup_latency_ms"] = round(avg_latency, 1)
+
+                if avg_latency > max_latency_ms:
+                    result["error"] = (
+                        f"Warmup latency {avg_latency:.1f}ms exceeds limit {max_latency_ms}ms"
+                    )
+                    logger.warning("anomaly.warmup_latency_exceeded", **result)
+                    if callback:
+                        callback.set()
+                    return result
+
+                logger.info(
+                    "anomaly.warmup_complete",
+                    avg_latency_ms=result["warmup_latency_ms"],
+                    frames=len(latencies),
+                )
+
+            # Step 4: Atomic swap
+            with self._reload_lock:
+                self._engine = new_engine
+                self._model_path = new_model_path
+                self._loaded = True
+
+            self._calibration_scores = None
+            self._calibration_n = 0
+            self._load_calibration()
+
+            result["success"] = True
+            logger.info("anomaly.warmup_reload_success", path=str(new_model_path))
+
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error("anomaly.warmup_reload_failed", error=str(e))
+
+        if callback:
+            callback.set()
+
+        return result
+
     @property
     def is_loaded(self) -> bool:
         return self._loaded

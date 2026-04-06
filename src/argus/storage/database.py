@@ -68,6 +68,11 @@ class Database:
             ("alerts", "resolved_at", "DATETIME"),
             ("training_records", "group_id", "VARCHAR(100)"),
             ("models", "backbone_version_id", "VARCHAR(128)"),
+            # Model release pipeline
+            ("models", "stage", "VARCHAR(20) DEFAULT 'production'"),
+            ("models", "component_type", "VARCHAR(20) DEFAULT 'full'"),
+            ("models", "model_path", "VARCHAR(500)"),
+            ("models", "canary_camera_id", "VARCHAR(50)"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:

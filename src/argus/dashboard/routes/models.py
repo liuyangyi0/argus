@@ -9,7 +9,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from argus.storage.model_registry import ModelRegistry
-from argus.storage.models import ModelRecord
+from argus.storage.models import ModelRecord, ModelStage
+from argus.storage.release_pipeline import (
+    ReleasePipeline,
+    StageTransitionError,
+)
 
 logger = structlog.get_logger()
 
@@ -27,6 +31,25 @@ def _get_registry(request: Request) -> ModelRegistry | None:
     if session_factory is None:
         return None
     return ModelRegistry(session_factory=session_factory)
+
+
+def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
+    """Get ReleasePipeline from app state, or None if unavailable."""
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return None
+    session_factory = getattr(db, "get_session", None)
+    if session_factory is None:
+        return None
+    # Get config for min_shadow_days / min_canary_days
+    config = getattr(request.app.state, "config", None)
+    kwargs = {}
+    if config:
+        anomaly_cfg = getattr(config, "anomaly", None)
+        if anomaly_cfg:
+            kwargs["min_shadow_days"] = getattr(anomaly_cfg, "min_shadow_days", 3)
+            kwargs["min_canary_days"] = getattr(anomaly_cfg, "min_canary_days", 7)
+    return ReleasePipeline(session_factory=session_factory, **kwargs)
 
 
 @router.get("/json")
@@ -180,3 +203,185 @@ async def batch_inference(request: Request):
         "total": len(image_paths),
         "scored": scored,
     })
+
+
+# ── Release pipeline endpoints ──
+
+
+@router.post("/{version_id}/promote")
+async def promote_model(request: Request, version_id: str):
+    """Promote a model to the next release stage.
+
+    Body: { target_stage, triggered_by, reason?, canary_camera_id? }
+    """
+    pipeline = _get_release_pipeline(request)
+    if pipeline is None:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    target_stage = body.get("target_stage")
+    triggered_by = body.get("triggered_by")
+    if not target_stage or not triggered_by:
+        return JSONResponse(
+            {"error": "target_stage and triggered_by are required"},
+            status_code=400,
+        )
+
+    try:
+        record = pipeline.transition(
+            model_version_id=version_id,
+            target_stage=target_stage,
+            triggered_by=triggered_by,
+            reason=body.get("reason"),
+            canary_camera_id=body.get("canary_camera_id"),
+        )
+        return JSONResponse({
+            "status": "ok",
+            "model": record.to_dict(),
+        })
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except StageTransitionError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+
+
+@router.post("/{version_id}/retire")
+async def retire_model(request: Request, version_id: str):
+    """Retire a model (any stage → retired)."""
+    pipeline = _get_release_pipeline(request)
+    if pipeline is None:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    triggered_by = body.get("triggered_by", "system")
+
+    try:
+        record = pipeline.transition(
+            model_version_id=version_id,
+            target_stage=ModelStage.RETIRED.value,
+            triggered_by=triggered_by,
+            reason=body.get("reason", "manual retirement"),
+        )
+        return JSONResponse({
+            "status": "ok",
+            "model": record.to_dict(),
+        })
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    except StageTransitionError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+
+
+@router.get("/{version_id}/stage-history")
+async def stage_history(request: Request, version_id: str):
+    """Get version event history for a specific model."""
+    registry = _get_registry(request)
+    if registry is None:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    events = registry.get_version_events(model_version_id=version_id)
+    return JSONResponse({
+        "events": [e.to_dict() for e in events],
+        "total": len(events),
+    })
+
+
+@router.get("/events/list")
+async def list_version_events(
+    request: Request,
+    camera_id: str | None = None,
+    limit: int = 50,
+):
+    """Query global version transition events."""
+    registry = _get_registry(request)
+    if registry is None:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    events = registry.get_version_events(camera_id=camera_id, limit=limit)
+    return JSONResponse({
+        "events": [e.to_dict() for e in events],
+        "total": len(events),
+    })
+
+
+@router.get("/{version_id}/shadow-report")
+async def shadow_report(
+    request: Request,
+    version_id: str,
+    camera_id: str | None = None,
+    days: int = 7,
+):
+    """Get shadow inference comparison report."""
+    pipeline = _get_release_pipeline(request)
+    if pipeline is None:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    stats = pipeline.get_shadow_stats(
+        shadow_version_id=version_id,
+        camera_id=camera_id,
+        days=days,
+    )
+    return JSONResponse(stats)
+
+
+# ── Backbone management endpoints ──
+
+
+@router.get("/backbone/status")
+async def backbone_status(request: Request):
+    """Get current backbone loading status."""
+    from argus.anomaly.backbone_manager import BackboneManager
+
+    manager = BackboneManager.get_instance()
+    return JSONResponse({
+        "version": manager.version,
+        "loaded": manager.is_loaded,
+    })
+
+
+@router.post("/backbone/upgrade")
+async def backbone_upgrade(request: Request):
+    """Upgrade the shared backbone.
+
+    Body: { backbone_path: str, version: str, triggered_by: str }
+    """
+    from pathlib import Path
+
+    from argus.anomaly.backbone_manager import BackboneManager
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    backbone_path = body.get("backbone_path")
+    version = body.get("version")
+    triggered_by = body.get("triggered_by", "system")
+
+    if not backbone_path or not version:
+        return JSONResponse(
+            {"error": "backbone_path and version are required"},
+            status_code=400,
+        )
+
+    manager = BackboneManager.get_instance()
+    success = manager.upgrade(Path(backbone_path), version)
+
+    if success:
+        return JSONResponse({
+            "status": "ok",
+            "version": version,
+        })
+    else:
+        return JSONResponse(
+            {"error": "Backbone upgrade failed"},
+            status_code=500,
+        )

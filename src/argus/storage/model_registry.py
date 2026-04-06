@@ -1,6 +1,7 @@
 """Model version registry for MLOps tracking (C4-1).
 
 Tracks trained model versions with hashes, parameters, and activation state.
+Supports the four-stage release pipeline: candidate → shadow → canary → production.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from pathlib import Path
 import structlog
 from sqlalchemy.orm import Session
 
-from argus.storage.models import ModelRecord
+from argus.storage.models import ModelRecord, ModelStage, ModelVersionEvent
 
 logger = structlog.get_logger()
 
@@ -33,8 +34,10 @@ class ModelRegistry:
         camera_id: str,
         model_type: str,
         training_params: dict | None = None,
+        component_type: str = "full",
+        backbone_ref: str | None = None,
     ) -> str:
-        """Register a new model version. Returns model_version_id."""
+        """Register a new model version as candidate. Returns model_version_id."""
         model_path = Path(model_path)
         baseline_dir = Path(baseline_dir)
 
@@ -54,6 +57,10 @@ class ModelRegistry:
             data_hash=data_hash,
             code_version=code_version,
             training_params=json.dumps(training_params) if training_params else None,
+            stage=ModelStage.CANDIDATE.value,
+            component_type=component_type,
+            model_path=str(model_path),
+            backbone_version_id=backbone_ref,
         )
 
         with self._session_factory() as session:
@@ -65,6 +72,7 @@ class ModelRegistry:
             model_version_id=model_version_id,
             camera_id=camera_id,
             model_type=model_type,
+            stage=ModelStage.CANDIDATE.value,
         )
         return model_version_id
 
@@ -77,8 +85,30 @@ class ModelRegistry:
                 .first()
             )
 
-    def activate(self, model_version_id: str) -> None:
-        """Set a model as active (deactivates others for same camera)."""
+    def get_by_stage(self, camera_id: str, stage: str) -> list[ModelRecord]:
+        """Get models for a camera at a specific stage."""
+        with self._session_factory() as session:
+            return list(
+                session.query(ModelRecord)
+                .filter_by(camera_id=camera_id, stage=stage)
+                .order_by(ModelRecord.created_at.desc())
+                .all()
+            )
+
+    def get_by_version_id(self, model_version_id: str) -> ModelRecord | None:
+        """Get a model by its version ID."""
+        with self._session_factory() as session:
+            return (
+                session.query(ModelRecord)
+                .filter_by(model_version_id=model_version_id)
+                .first()
+            )
+
+    def activate(self, model_version_id: str, triggered_by: str = "system") -> None:
+        """Set a model as active (deactivates others for same camera).
+
+        Also sets stage to production and records a version event.
+        """
         with self._session_factory() as session:
             record = (
                 session.query(ModelRecord)
@@ -88,12 +118,34 @@ class ModelRegistry:
             if record is None:
                 raise ValueError(f"Model version not found: {model_version_id}")
 
+            # Find current active model for version event
+            current = (
+                session.query(ModelRecord)
+                .filter_by(camera_id=record.camera_id, is_active=True)
+                .first()
+            )
+            from_version = current.model_version_id if current else None
+            from_stage = current.stage if current else None
+
             # Deactivate all other models for this camera
             session.query(ModelRecord).filter_by(
                 camera_id=record.camera_id, is_active=True
             ).update({"is_active": False})
 
             record.is_active = True
+            record.stage = ModelStage.PRODUCTION.value
+
+            # Record version event
+            event = ModelVersionEvent(
+                camera_id=record.camera_id,
+                from_version=from_version,
+                to_version=model_version_id,
+                from_stage=from_stage,
+                to_stage=ModelStage.PRODUCTION.value,
+                triggered_by=triggered_by,
+                reason="direct activation",
+            )
+            session.add(event)
             session.commit()
 
         logger.info("model_registry.activated", model_version_id=model_version_id)
@@ -106,7 +158,7 @@ class ModelRegistry:
                 query = query.filter_by(camera_id=camera_id)
             return list(query.all())
 
-    def rollback(self, camera_id: str) -> ModelRecord | None:
+    def rollback(self, camera_id: str, triggered_by: str = "system") -> ModelRecord | None:
         """Reactivate the previous model version for a camera.
 
         Deactivates the current active model and activates the most recent
@@ -139,12 +191,28 @@ class ModelRegistry:
                 logger.warning("model_registry.rollback_no_previous", camera_id=camera_id)
                 return None
 
+            from_version = current.model_version_id if current else None
+            from_stage = current.stage if current else None
+
             # Deactivate all models for this camera
             session.query(ModelRecord).filter_by(
                 camera_id=camera_id, is_active=True
             ).update({"is_active": False})
 
             previous.is_active = True
+            previous.stage = ModelStage.PRODUCTION.value
+
+            # Record version event
+            event = ModelVersionEvent(
+                camera_id=camera_id,
+                from_version=from_version,
+                to_version=previous.model_version_id,
+                from_stage=from_stage,
+                to_stage=ModelStage.PRODUCTION.value,
+                triggered_by=triggered_by,
+                reason="rollback",
+            )
+            session.add(event)
             session.commit()
 
             logger.info(
@@ -153,6 +221,26 @@ class ModelRegistry:
                 model_version_id=previous.model_version_id,
             )
             return previous
+
+    def get_version_events(
+        self,
+        camera_id: str | None = None,
+        model_version_id: str | None = None,
+        limit: int = 50,
+    ) -> list[ModelVersionEvent]:
+        """Query version transition events."""
+        with self._session_factory() as session:
+            query = session.query(ModelVersionEvent).order_by(
+                ModelVersionEvent.timestamp.desc()
+            )
+            if camera_id:
+                query = query.filter_by(camera_id=camera_id)
+            if model_version_id:
+                query = query.filter(
+                    (ModelVersionEvent.from_version == model_version_id)
+                    | (ModelVersionEvent.to_version == model_version_id)
+                )
+            return list(query.limit(limit).all())
 
     @staticmethod
     def _compute_dir_hash(path: Path) -> str:
