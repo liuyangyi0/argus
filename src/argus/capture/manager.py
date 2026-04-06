@@ -71,6 +71,13 @@ class CameraManager:
         self._alert_count = 0
         self._last_frame_counts: dict[str, int] = {}  # camera_id -> last known frame count
 
+        # Backpressure tracking
+        self._pending_frames: dict[str, int] = {}
+        self._frames_dropped: dict[str, int] = {}
+        self._max_pending: int = 30
+        self._bp_lock = threading.Lock()
+        self._last_bp_warn: dict[str, float] = {}  # rate-limit warnings
+
         # B1-5: Shared anomaly detector for dinomaly_multi_class mode
         self._shared_anomaly_detector = None
         self._shared_detector_lock = threading.Lock()
@@ -235,6 +242,14 @@ class CameraManager:
             return None
         return pipeline.get_raw_frame()
 
+    def is_anomaly_locked(self, camera_id: str) -> bool:
+        """Check if a camera's pipeline has an active anomaly lock."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return False
+        with pipeline._lock_state_lock:
+            return pipeline._locked
+
     def set_pipeline_mode(self, camera_id: str, mode: PipelineMode) -> bool:
         """Set pipeline operating mode for a camera (DET-006)."""
         pipeline = self._pipelines.get(camera_id)
@@ -311,6 +326,18 @@ class CameraManager:
             "current_mean": round(status.current_mean, 4),
             "samples_collected": status.samples_collected,
         }
+
+    def get_backpressure_stats(self) -> dict[str, dict]:
+        """Get per-camera backpressure statistics."""
+        with self._bp_lock:
+            return {
+                cam_id: {
+                    "pending": self._pending_frames.get(cam_id, 0),
+                    "dropped": self._frames_dropped.get(cam_id, 0),
+                    "backpressured": self._pending_frames.get(cam_id, 0) >= self._max_pending,
+                }
+                for cam_id in [c.camera_id for c in self._cameras]
+            }
 
     def _notify_camera_status(self, camera_id: str) -> None:
         """Notify WebSocket subscribers of camera status change."""
@@ -437,10 +464,49 @@ class CameraManager:
         cam_config = next((c for c in self._cameras if c.camera_id == camera_id), None)
         watchdog_timeout = cam_config.watchdog_timeout if cam_config else 30.0
 
+        # Initialize backpressure counters
+        with self._bp_lock:
+            self._pending_frames[camera_id] = 0
+            self._frames_dropped[camera_id] = 0
+
         try:
             while not self._stop_event.is_set():
                 try:
-                    alert = pipeline.run_once()
+                    # Backpressure check: skip non-heartbeat frames when overloaded
+                    with self._bp_lock:
+                        pending = self._pending_frames.get(camera_id, 0)
+                    is_heartbeat = (
+                        pipeline.stats.frames_captured > 0
+                        and cam_config is not None
+                        and getattr(cam_config.mog2, "heartbeat_frames", 0) > 0
+                        and pipeline.stats.frames_captured % cam_config.mog2.heartbeat_frames == 0
+                    )
+
+                    if pending >= self._max_pending and not is_heartbeat:
+                        with self._bp_lock:
+                            self._frames_dropped[camera_id] = self._frames_dropped.get(camera_id, 0) + 1
+                        pipeline.stats.frames_dropped_backpressure += 1
+                        now = time.monotonic()
+                        last_warn = self._last_bp_warn.get(camera_id, 0)
+                        if now - last_warn > 60.0:
+                            logger.warning(
+                                "backpressure.dropping_frame",
+                                camera_id=camera_id,
+                                pending=pending,
+                                total_dropped=self._frames_dropped.get(camera_id, 0),
+                            )
+                            self._last_bp_warn[camera_id] = now
+                        self._stop_event.wait(0.01)  # Brief yield
+                        continue
+
+                    with self._bp_lock:
+                        self._pending_frames[camera_id] = self._pending_frames.get(camera_id, 0) + 1
+
+                    try:
+                        alert = pipeline.run_once()
+                    finally:
+                        with self._bp_lock:
+                            self._pending_frames[camera_id] = max(0, self._pending_frames.get(camera_id, 0) - 1)
 
                     # C3: Feed anomaly map to cross-camera correlator
                     if self._correlator is not None:
