@@ -3,18 +3,21 @@ import { ref, computed, onMounted } from 'vue'
 import {
   Tabs, Table, Card, Button, Select, Form, InputNumber, Space,
   Typography, Progress, Tag, Modal, message, Descriptions, Tooltip,
+  Radio, Collapse, Slider,
 } from 'ant-design-vue'
 import {
   PlayCircleOutlined, RocketOutlined, ReloadOutlined,
   CheckCircleOutlined, CloseCircleOutlined, LoadingOutlined,
   HistoryOutlined, ExperimentOutlined, SwapOutlined,
-  RollbackOutlined, CheckOutlined,
+  RollbackOutlined, CheckOutlined, PauseCircleOutlined,
+  StopOutlined, CaretRightOutlined,
 } from '@ant-design/icons-vue'
 import {
   getCameras, getBaselines, startCapture, startTraining,
   getModels, deployModel, getTrainingHistory, getTasks, dismissTask,
   optimizeBaseline, previewOptimize, getModelRegistry, activateModel,
-  rollbackModel, compareModels,
+  rollbackModel, compareModels, batchInference,
+  startCaptureJob, pauseCaptureJob, resumeCaptureJob, abortCaptureJob,
 } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
@@ -28,6 +31,18 @@ const baselinesLoading = ref(false)
 const captureModalVisible = ref(false)
 const captureForm = ref({ camera_id: '', count: 100, interval: 2.0, session_label: 'daytime' })
 const captureSubmitting = ref(false)
+
+// ── Advanced capture job ──
+const advCaptureVisible = ref(false)
+const advCaptureForm = ref({
+  camera_id: '',
+  target_frames: 1000,
+  duration_hours: 24,
+  sampling_strategy: 'active',
+  diversity_threshold: 0.3,
+  frames_per_period: 50,
+})
+const advCaptureSubmitting = ref(false)
 
 // ── Baseline optimization ──
 const optimizingBaseline = ref<string | null>(null)
@@ -85,6 +100,21 @@ const SESSION_LABELS = [
   { value: 'maintenance', label: '检修期间' },
   { value: 'custom', label: '自定义' },
 ]
+
+const SAMPLING_STRATEGIES = [
+  { value: 'uniform', label: '均匀采样', desc: '按固定间隔抽帧，简单可靠' },
+  { value: 'active', label: '主动采样（推荐）', desc: 'DINOv2 特征去冗余，自动过滤相似帧' },
+  { value: 'scheduled', label: '定时采样', desc: '按昼夜时段自动采集，内含主动去冗余' },
+]
+
+const JOB_STATUS_MAP: Record<string, { text: string; color: string }> = {
+  pending: { text: '等待中', color: 'default' },
+  running: { text: '运行中', color: 'processing' },
+  paused: { text: '已暂停', color: 'warning' },
+  complete: { text: '已完成', color: 'success' },
+  failed: { text: '失败', color: 'error' },
+  aborted: { text: '已中止', color: 'default' },
+}
 
 const GRADE_COLORS: Record<string, string> = {
   A: 'green', B: 'blue', C: 'orange', F: 'red',
@@ -239,6 +269,72 @@ async function handleDismissTask(taskId: string) {
   }
 }
 
+// ── Advanced capture job actions ──
+
+async function handleAdvCapture() {
+  if (!advCaptureForm.value.camera_id) {
+    message.warning('请先选择摄像头')
+    return
+  }
+  advCaptureSubmitting.value = true
+  try {
+    const form = new FormData()
+    form.append('camera_id', advCaptureForm.value.camera_id)
+    form.append('target_frames', String(advCaptureForm.value.target_frames))
+    form.append('duration_hours', String(advCaptureForm.value.duration_hours))
+    form.append('sampling_strategy', advCaptureForm.value.sampling_strategy)
+    form.append('diversity_threshold', String(advCaptureForm.value.diversity_threshold))
+    form.append('frames_per_period', String(advCaptureForm.value.frames_per_period))
+    await startCaptureJob(form)
+    message.success('高级采集任务已启动')
+    advCaptureVisible.value = false
+    loadTasks()
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '启动高级采集失败')
+  } finally {
+    advCaptureSubmitting.value = false
+  }
+}
+
+async function handlePauseJob(taskId: string) {
+  try {
+    await pauseCaptureJob(taskId)
+    message.success('任务已暂停')
+    loadTasks()
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '暂停失败')
+  }
+}
+
+async function handleResumeJob(taskId: string) {
+  try {
+    await resumeCaptureJob(taskId)
+    message.success('任务已恢复')
+    loadTasks()
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '恢复失败')
+  }
+}
+
+function handleAbortJob(taskId: string) {
+  Modal.confirm({
+    title: '确认中止采集任务？',
+    content: '已采集的帧将被保留，但任务不可恢复。',
+    okText: '中止',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        await abortCaptureJob(taskId)
+        message.success('任务已中止')
+        loadTasks()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '中止失败')
+      }
+    },
+  })
+}
+
 async function handleOptimize(record: any) {
   optimizingBaseline.value = `${record.camera_id}-${record.version}`
   try {
@@ -360,7 +456,7 @@ function onTabChange(key: string | number) {
 // ── Computed: active tasks by type ──
 
 const captureTasks = computed(() =>
-  tasks.value.filter(t => t.task_type === 'baseline_capture')
+  tasks.value.filter(t => t.task_type === 'baseline_capture' || t.task_type === 'baseline_capture_job')
 )
 const trainingTasks = computed(() =>
   tasks.value.filter(t => t.task_type === 'model_training')
@@ -415,6 +511,35 @@ const historyColumns = [
 
 // ── Lifecycle ──
 
+// ── Batch Inference ──
+const batchCameraId = ref('')
+const batchImagePaths = ref('')
+const batchRunning = ref(false)
+const batchResults = ref<any[]>([])
+
+async function handleBatchInference() {
+  const paths = batchImagePaths.value.split('\n').map(p => p.trim()).filter(Boolean)
+  if (!batchCameraId.value) {
+    message.error('请选择摄像头')
+    return
+  }
+  if (paths.length === 0) {
+    message.error('请输入图片路径')
+    return
+  }
+  batchRunning.value = true
+  batchResults.value = []
+  try {
+    const res = await batchInference(batchCameraId.value, paths)
+    batchResults.value = res.data.results || []
+    message.success(`完成推理: ${res.data.scored}/${res.data.total} 张图片`)
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '批量推理失败')
+  } finally {
+    batchRunning.value = false
+  }
+}
+
 onMounted(async () => {
   await loadCameras()
   loadBaselines()
@@ -439,24 +564,59 @@ onMounted(async () => {
           >
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
               <Space>
-                <LoadingOutlined v-if="task.status === 'running'" spin style="color: #3b82f6" />
+                <PauseCircleOutlined v-if="task.status === 'paused'" style="color: #faad14" />
+                <LoadingOutlined v-else-if="task.status === 'running'" spin style="color: #3b82f6" />
                 <CheckCircleOutlined v-else-if="task.status === 'complete'" style="color: #52c41a" />
                 <CloseCircleOutlined v-else-if="task.status === 'failed'" style="color: #ff4d4f" />
-                <span style="font-weight: 500">基线采集</span>
+                <StopOutlined v-else-if="task.status === 'aborted'" style="color: #8890a0" />
+                <span style="font-weight: 500">
+                  {{ task.task_type === 'baseline_capture_job' ? '高级基线采集' : '基线采集' }}
+                </span>
                 <span v-if="task.camera_id" style="color: #8890a0">{{ task.camera_id }}</span>
-                <Tag :color="task.status === 'complete' ? 'green' : task.status === 'failed' ? 'red' : 'blue'">
-                  {{ task.status === 'running' ? '运行中' : task.status === 'complete' ? '已完成' : task.status === 'failed' ? '失败' : '等待中' }}
+                <Tag :color="(JOB_STATUS_MAP[task.status] || {}).color || 'default'">
+                  {{ (JOB_STATUS_MAP[task.status] || {}).text || task.status }}
                 </Tag>
               </Space>
-              <Button
-                v-if="task.status === 'complete' || task.status === 'failed'"
-                size="small"
-                @click="handleDismissTask(task.task_id)"
-              >关闭</Button>
+              <Space>
+                <!-- Pause/Resume/Abort for advanced capture jobs -->
+                <template v-if="task.task_type === 'baseline_capture_job'">
+                  <Button
+                    v-if="task.status === 'running'"
+                    size="small"
+                    @click="handlePauseJob(task.task_id)"
+                  >
+                    <template #icon><PauseCircleOutlined /></template>
+                    暂停
+                  </Button>
+                  <Button
+                    v-if="task.status === 'paused'"
+                    size="small"
+                    type="primary"
+                    @click="handleResumeJob(task.task_id)"
+                  >
+                    <template #icon><CaretRightOutlined /></template>
+                    恢复
+                  </Button>
+                  <Button
+                    v-if="task.status === 'running' || task.status === 'paused'"
+                    size="small"
+                    danger
+                    @click="handleAbortJob(task.task_id)"
+                  >
+                    <template #icon><StopOutlined /></template>
+                    中止
+                  </Button>
+                </template>
+                <Button
+                  v-if="task.status === 'complete' || task.status === 'failed' || task.status === 'aborted'"
+                  size="small"
+                  @click="handleDismissTask(task.task_id)"
+                >关闭</Button>
+              </Space>
             </div>
             <Progress
               :percent="task.progress"
-              :status="task.status === 'failed' ? 'exception' : task.status === 'complete' ? 'success' : 'active'"
+              :status="task.status === 'failed' ? 'exception' : task.status === 'complete' ? 'success' : task.status === 'paused' ? 'normal' : 'active'"
               size="small"
             />
             <div style="font-size: 12px; color: #8890a0; margin-top: 4px">{{ task.message }}</div>
@@ -475,7 +635,11 @@ onMounted(async () => {
                 </Button>
                 <Button type="primary" @click="captureModalVisible = true">
                   <template #icon><PlayCircleOutlined /></template>
-                  采集新基线
+                  快速采集
+                </Button>
+                <Button @click="advCaptureVisible = true">
+                  <template #icon><ExperimentOutlined /></template>
+                  高级采集
                 </Button>
               </Space>
             </div>
@@ -553,6 +717,86 @@ onMounted(async () => {
                 <InputNumber v-model:value="captureForm.interval" :min="0.5" :max="60" :step="0.5" />
               </Form.Item>
             </Space>
+          </Form>
+        </Modal>
+
+        <!-- Advanced capture modal -->
+        <Modal
+          v-model:open="advCaptureVisible"
+          title="高级基线采集"
+          @ok="handleAdvCapture"
+          :confirmLoading="advCaptureSubmitting"
+          okText="开始采集"
+          cancelText="取消"
+          width="560px"
+        >
+          <Form layout="vertical" style="margin-top: 16px">
+            <Form.Item label="选择摄像头">
+              <Select v-model:value="advCaptureForm.camera_id" style="width: 100%">
+                <Select.Option v-for="cam in cameras" :key="cam.camera_id" :value="cam.camera_id">
+                  {{ cam.camera_id }} — {{ cam.name }}
+                </Select.Option>
+              </Select>
+            </Form.Item>
+
+            <Form.Item label="采样策略">
+              <Radio.Group v-model:value="advCaptureForm.sampling_strategy" style="width: 100%">
+                <div v-for="s in SAMPLING_STRATEGIES" :key="s.value" style="margin-bottom: 8px">
+                  <Radio :value="s.value">
+                    <span style="font-weight: 500">{{ s.label }}</span>
+                    <div style="font-size: 12px; color: #8890a0; margin-left: 24px">{{ s.desc }}</div>
+                  </Radio>
+                </div>
+              </Radio.Group>
+            </Form.Item>
+
+            <Space :size="16">
+              <Form.Item label="目标帧数">
+                <InputNumber
+                  v-model:value="advCaptureForm.target_frames"
+                  :min="100" :max="10000" :step="100"
+                  style="width: 140px"
+                />
+              </Form.Item>
+              <Form.Item label="持续时长（小时）">
+                <InputNumber
+                  v-model:value="advCaptureForm.duration_hours"
+                  :min="1" :max="168" :step="1"
+                  style="width: 140px"
+                />
+              </Form.Item>
+            </Space>
+
+            <Collapse ghost>
+              <Collapse.Panel key="advanced" header="高级参数">
+                <Form.Item
+                  label="多样性阈值"
+                  v-if="advCaptureForm.sampling_strategy !== 'uniform'"
+                >
+                  <Slider
+                    v-model:value="advCaptureForm.diversity_threshold"
+                    :min="0.1" :max="0.9" :step="0.05"
+                    :marks="{ 0.1: '低', 0.3: '默认', 0.9: '高' }"
+                  />
+                  <div style="font-size: 12px; color: #8890a0">
+                    值越高，保留的帧越多样；值越低，接受更多相似帧
+                  </div>
+                </Form.Item>
+                <Form.Item
+                  label="每时段帧数"
+                  v-if="advCaptureForm.sampling_strategy === 'scheduled'"
+                >
+                  <InputNumber
+                    v-model:value="advCaptureForm.frames_per_period"
+                    :min="5" :max="200" :step="5"
+                    style="width: 140px"
+                  />
+                  <div style="font-size: 12px; color: #8890a0; margin-top: 4px">
+                    每个时段（清晨/正午/傍晚/深夜）采集的目标帧数
+                  </div>
+                </Form.Item>
+              </Collapse.Panel>
+            </Collapse>
           </Form>
         </Modal>
       </Tabs.TabPane>
@@ -966,6 +1210,64 @@ onMounted(async () => {
             />
           </div>
         </Modal>
+
+        <!-- Batch Inference -->
+        <Card style="margin-top: 16px">
+          <template #title>批量推理</template>
+          <p style="color: #999; margin-bottom: 16px">输入图片路径（每行一个），使用摄像头的活跃模型进行异常检测评分。</p>
+          <Form layout="vertical">
+            <Form.Item label="摄像头">
+              <Select
+                v-model:value="batchCameraId"
+                placeholder="选择摄像头"
+                style="width: 300px"
+                :options="cameras.map(c => ({ value: c.camera_id, label: `${c.camera_id} - ${c.name || ''}` }))"
+              />
+            </Form.Item>
+            <Form.Item label="图片路径（每行一个，最多100张）">
+              <textarea
+                v-model="batchImagePaths"
+                rows="5"
+                style="width: 100%; font-family: monospace; padding: 8px; border: 1px solid #d9d9d9; border-radius: 6px"
+                placeholder="/path/to/image1.jpg&#10;/path/to/image2.jpg"
+              />
+            </Form.Item>
+            <Form.Item>
+              <Button type="primary" :loading="batchRunning" @click="handleBatchInference">
+                <template #icon><ExperimentOutlined /></template>
+                开始推理
+              </Button>
+            </Form.Item>
+          </Form>
+          <Table
+            v-if="batchResults.length > 0"
+            :data-source="batchResults"
+            :columns="[
+              { title: '文件路径', dataIndex: 'path', key: 'path', ellipsis: true },
+              { title: '分数', dataIndex: 'score', key: 'score', width: 100 },
+              { title: '异常', dataIndex: 'is_anomalous', key: 'is_anomalous', width: 80 },
+              { title: '错误', dataIndex: 'error', key: 'error', width: 200 },
+            ]"
+            :pagination="{ pageSize: 20 }"
+            size="small"
+            row-key="path"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'is_anomalous'">
+                <Tag v-if="record.is_anomalous === true" color="red">异常</Tag>
+                <Tag v-else-if="record.is_anomalous === false" color="green">正常</Tag>
+                <span v-else>-</span>
+              </template>
+              <template v-if="column.key === 'score'">
+                <span v-if="record.score !== undefined">{{ record.score.toFixed(4) }}</span>
+                <span v-else>-</span>
+              </template>
+              <template v-if="column.key === 'error'">
+                <Tag v-if="record.error" color="red">{{ record.error }}</Tag>
+              </template>
+            </template>
+          </Table>
+        </Card>
       </Tabs.TabPane>
     </Tabs>
   </div>
