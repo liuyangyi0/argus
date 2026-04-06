@@ -19,6 +19,7 @@ import numpy as np
 import structlog
 
 from argus.anomaly.baseline import BaselineManager
+from argus.storage.models import BaselineState
 
 logger = structlog.get_logger()
 
@@ -241,6 +242,8 @@ class ModelTrainer:
         calibration_images: int = 100,
         progress_callback: callable | None = None,
         anomaly_config: object | None = None,
+        resume_from: str | None = None,
+        group_id: str | None = None,
     ) -> TrainingResult:
         """Train an anomaly detection model for a specific camera/zone.
 
@@ -256,7 +259,23 @@ class ModelTrainer:
             if progress_callback:
                 progress_callback(pct, msg)
 
-        baseline_dir = self._baseline_manager.get_baseline_dir(camera_id, zone_id)
+        if group_id:
+            baseline_dir = self._baseline_manager.get_group_baseline_dir(group_id, zone_id)
+        else:
+            baseline_dir = self._baseline_manager.get_baseline_dir(camera_id, zone_id)
+
+        # Lifecycle gate: only Verified or Active baselines can be used for training
+        lifecycle = getattr(self._baseline_manager, "_lifecycle", None)
+        if lifecycle and baseline_dir.exists():
+            version_name = baseline_dir.name
+            lifecycle_camera = f"group:{group_id}" if group_id else camera_id
+            ver_rec = lifecycle.get_version(lifecycle_camera, zone_id, version_name)
+            if ver_rec and ver_rec.state == BaselineState.DRAFT:
+                return self._fail(
+                    start,
+                    error=f"基���版本 {version_name} 处于 Draft 状态，未通过审核，不能用于训练",
+                )
+
         image_count = self._baseline_manager.count_images(camera_id, zone_id)
 
         # Dinomaly2 supports few-shot mode with fewer images
@@ -333,6 +352,7 @@ class ModelTrainer:
                 model_type=model_type,
                 image_size=image_size,
                 anomaly_config=anomaly_config,
+                resume_from=resume_from,
             )
         except ImportError:
             return self._fail(start, error="anomalib 未安装", **common_fail_kwargs)
@@ -867,6 +887,7 @@ class ModelTrainer:
         model_type: str,
         image_size: int,
         anomaly_config: object | None = None,
+        resume_from: str | None = None,
     ) -> tuple:
         """Execute Anomalib training. Raises ImportError if anomalib is not installed.
 
@@ -950,12 +971,41 @@ class ModelTrainer:
         else:
             max_epochs = 1  # PatchCore, Padim, and Dinomaly only need feature extraction
 
+        # Early stopping + checkpointing for multi-epoch models
+        callbacks = []
+        if max_epochs > 1:
+            try:
+                from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+
+                callbacks.append(EarlyStopping(
+                    monitor="image_AUROC",
+                    patience=10,
+                    mode="max",
+                    min_delta=0.001,
+                ))
+                callbacks.append(ModelCheckpoint(
+                    monitor="image_AUROC",
+                    mode="max",
+                    save_top_k=1,
+                    filename="best-{epoch}-{image_AUROC:.4f}",
+                ))
+                logger.info("trainer.callbacks_enabled", model_type=model_type, max_epochs=max_epochs)
+            except ImportError:
+                logger.warning("trainer.callbacks_unavailable", msg="EarlyStopping/ModelCheckpoint not available")
+
         engine = Engine(
             default_root_dir=str(output_dir),
             max_epochs=max_epochs,
+            callbacks=callbacks if callbacks else None,
         )
 
-        engine.fit(model=model, datamodule=datamodule)
+        # Checkpoint resumption
+        fit_kwargs = {"model": model, "datamodule": datamodule}
+        if resume_from and Path(resume_from).exists():
+            fit_kwargs["ckpt_path"] = resume_from
+            logger.info("trainer.resuming_from_checkpoint", path=resume_from)
+
+        engine.fit(**fit_kwargs)
 
         return engine, model
 

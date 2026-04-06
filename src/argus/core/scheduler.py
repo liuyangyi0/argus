@@ -174,6 +174,191 @@ def create_maintenance_tasks(
     scheduler.add_interval_task("check_disk_space", check_disk_space, minutes=5)
 
 
+_GRADE_RANK = {"A": 4, "B": 3, "C": 2, "F": 1}
+
+
+def create_retraining_task(
+    scheduler: TaskScheduler,
+    config,
+    camera_configs: list,
+    trainer,
+    model_registry,
+    baseline_manager,
+) -> None:
+    """Register a scheduled retraining task that closes the active learning loop.
+
+    For each camera, checks if enough new baseline images have been added
+    (e.g. from false-positive feedback) and triggers retraining if threshold met.
+    Optionally auto-deploys if quality grade is sufficient.
+    """
+    if not config.retraining.enabled:
+        return
+
+    retrain_cfg = config.retraining
+    min_grade_rank = _GRADE_RANK.get(retrain_cfg.auto_deploy_min_grade, 3)
+
+    def _retraining_check():
+        for cam in camera_configs:
+            camera_id = cam.camera_id
+            try:
+                current_count = baseline_manager.count_images(camera_id, "default")
+                if current_count < retrain_cfg.min_new_baselines:
+                    logger.debug(
+                        "retraining.skip_insufficient",
+                        camera_id=camera_id,
+                        images=current_count,
+                        required=retrain_cfg.min_new_baselines,
+                    )
+                    continue
+
+                # Check last training record to see if images have grown
+                models = model_registry.list_models(camera_id=camera_id)
+                last_image_count = 0
+                if models:
+                    # The latest model has metadata with image_count
+                    last = models[0]
+                    last_image_count = getattr(last, "image_count", 0) or 0
+
+                new_images = current_count - last_image_count
+                if new_images < retrain_cfg.min_new_baselines:
+                    logger.debug(
+                        "retraining.skip_no_new",
+                        camera_id=camera_id,
+                        new_images=new_images,
+                        required=retrain_cfg.min_new_baselines,
+                    )
+                    continue
+
+                logger.info(
+                    "retraining.triggered",
+                    camera_id=camera_id,
+                    new_images=new_images,
+                    total_images=current_count,
+                )
+
+                result = trainer.train(
+                    camera_id=camera_id,
+                    zone_id="default",
+                    model_type=cam.anomaly.model_type,
+                    image_size=cam.anomaly.image_size[0]
+                    if isinstance(cam.anomaly.image_size, (list, tuple))
+                    else cam.anomaly.image_size,
+                    export_format="openvino",
+                    quantization=cam.anomaly.quantization,
+                    anomaly_config=cam.anomaly,
+                )
+
+                grade = getattr(result, "quality_grade", "F") or "F"
+                logger.info(
+                    "retraining.complete",
+                    camera_id=camera_id,
+                    grade=grade,
+                    status=getattr(result, "status", None),
+                )
+
+                # Auto-deploy if grade meets threshold
+                if (
+                    retrain_cfg.auto_deploy
+                    and _GRADE_RANK.get(grade, 0) >= min_grade_rank
+                    and getattr(result, "status", None) is not None
+                    and result.status.value == "COMPLETE"
+                ):
+                    try:
+                        version_id = model_registry.register(
+                            camera_id=camera_id,
+                            model_type=cam.anomaly.model_type,
+                            model_path=str(getattr(result, "model_path", "")),
+                            image_count=current_count,
+                            quality_grade=grade,
+                        )
+                        model_registry.activate(version_id)
+                        logger.info(
+                            "retraining.auto_deployed",
+                            camera_id=camera_id,
+                            version_id=version_id,
+                            grade=grade,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "retraining.deploy_failed",
+                            camera_id=camera_id,
+                            error=str(e),
+                        )
+                elif retrain_cfg.auto_deploy:
+                    logger.info(
+                        "retraining.skip_deploy",
+                        camera_id=camera_id,
+                        grade=grade,
+                        min_grade=retrain_cfg.auto_deploy_min_grade,
+                    )
+
+            except Exception as e:
+                logger.error(
+                    "retraining.camera_failed",
+                    camera_id=camera_id,
+                    error=str(e),
+                )
+
+        # Camera group retraining
+        for group in getattr(config, "camera_groups", []):
+            try:
+                group_dir = baseline_manager.get_group_baseline_dir(
+                    group.group_id, group.zone_id
+                )
+                if not group_dir.is_dir():
+                    continue
+                group_images = (
+                    len(list(group_dir.glob("*.png")))
+                    + len(list(group_dir.glob("*.jpg")))
+                )
+                if group_images < retrain_cfg.min_new_baselines:
+                    continue
+
+                logger.info(
+                    "retraining.group_triggered",
+                    group_id=group.group_id,
+                    images=group_images,
+                )
+                # Use first member camera's anomaly config for model type
+                group_cam = next(
+                    (c for c in camera_configs if c.camera_id in group.camera_ids),
+                    None,
+                )
+                if group_cam is None:
+                    continue
+
+                trainer.train(
+                    camera_id=f"group:{group.group_id}",
+                    zone_id=group.zone_id,
+                    model_type=group_cam.anomaly.model_type,
+                    image_size=group_cam.anomaly.image_size[0]
+                    if isinstance(group_cam.anomaly.image_size, (list, tuple))
+                    else group_cam.anomaly.image_size,
+                    export_format="openvino",
+                    quantization=group_cam.anomaly.quantization,
+                    anomaly_config=group_cam.anomaly,
+                    group_id=group.group_id,
+                )
+            except Exception as e:
+                logger.error(
+                    "retraining.group_failed",
+                    group_id=group.group_id,
+                    error=str(e),
+                )
+
+    scheduler.add_interval_task(
+        "scheduled_retraining",
+        _retraining_check,
+        hours=retrain_cfg.interval_hours,
+    )
+    logger.info(
+        "scheduler.retraining_registered",
+        interval_hours=retrain_cfg.interval_hours,
+        auto_deploy=retrain_cfg.auto_deploy,
+        min_grade=retrain_cfg.auto_deploy_min_grade,
+    )
+
+
 def _cleanup_empty_dirs(base_dir: Path) -> None:
     """Remove empty subdirectories under base_dir."""
     if not base_dir.exists():

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ZonePriority(str, Enum):
@@ -311,6 +312,26 @@ class CameraConfig(BaseModel):
     drift: DriftConfig = Field(default_factory=DriftConfig)
 
 
+class CameraGroupConfig(BaseModel):
+    """A group of cameras sharing a combined baseline and model.
+
+    Camera groups allow multiple cameras with similar views (e.g. corridor cameras)
+    to share a single baseline set and trained model, reducing storage and update cost.
+    """
+
+    group_id: str = Field(description="Unique group identifier (e.g. CORRIDOR-A)")
+    name: str = Field(description="Human-readable group name")
+    camera_ids: list[str] = Field(min_length=1, description="Member camera IDs")
+    zone_id: str = Field(default="default", description="Zone within each camera to use")
+
+    @field_validator("group_id")
+    @classmethod
+    def validate_group_id(cls, v: str) -> str:
+        if not re.match(r"^[A-Za-z0-9_-]+$", v):
+            raise ValueError(f"group_id must be alphanumeric with hyphens/underscores, got {v!r}")
+        return v
+
+
 class SeverityThresholds(BaseModel):
     """Anomaly score thresholds for each severity level.
 
@@ -478,6 +499,33 @@ class CameraOverlapConfig(BaseModel):
     )
 
 
+class RetrainingConfig(BaseModel):
+    """Scheduled automatic retraining configuration (C4 + A4)."""
+
+    enabled: bool = Field(default=False, description="Enable scheduled retraining")
+    interval_hours: int = Field(
+        default=24, ge=1, le=168,
+        description="Hours between retraining checks",
+    )
+    min_new_baselines: int = Field(
+        default=20, ge=5, le=500,
+        description="Minimum new baseline images to trigger retraining",
+    )
+    auto_deploy: bool = Field(
+        default=False, description="Auto-deploy if quality grade meets threshold",
+    )
+    auto_deploy_min_grade: str = Field(
+        default="B", description="Minimum quality grade for auto-deploy (A/B/C/F)",
+    )
+
+    @field_validator("auto_deploy_min_grade")
+    @classmethod
+    def validate_grade(cls, v: str) -> str:
+        if v not in ("A", "B", "C", "F"):
+            raise ValueError(f"Grade must be A, B, C, or F, got {v!r}")
+        return v
+
+
 class CrossCameraConfig(BaseModel):
     """Cross-camera anomaly correlation."""
 
@@ -497,6 +545,49 @@ class CrossCameraConfig(BaseModel):
     )
 
 
+class BaselineCaptureConfig(BaseModel):
+    """Advanced baseline capture job configuration."""
+
+    default_strategy: Literal["uniform", "active", "scheduled"] = "active"
+    diversity_threshold: float = Field(
+        default=0.3, ge=0.1, le=0.9,
+        description="Min cosine distance for active sampling (higher = more diverse)",
+    )
+    dino_backbone: str = Field(
+        default="dinov2_vits14",
+        description="DINOv2 backbone for active sampling feature extraction",
+    )
+    dino_image_size: int = Field(
+        default=224, ge=112, le=518,
+        description="Input image size for DINOv2 feature extraction",
+    )
+    schedule_periods: dict[str, tuple[int, int]] = Field(
+        default_factory=lambda: {
+            "dawn": (5, 8),
+            "noon": (11, 13),
+            "dusk": (16, 19),
+            "night": (22, 2),
+        },
+        description="Time windows for scheduled sampling {name: (start_hour, end_hour)}",
+    )
+    frames_per_period: int = Field(
+        default=50, ge=5, le=200,
+        description="Target frames per time period in scheduled mode",
+    )
+    pause_on_anomaly_lock: bool = Field(
+        default=True,
+        description="Auto-pause capture when camera has anomaly lock active",
+    )
+    post_capture_review: bool = Field(
+        default=True,
+        description="Run existing model on captured frames to flag outliers",
+    )
+    review_flag_percentile: float = Field(
+        default=0.99, ge=0.9, le=1.0,
+        description="Flag frames above this anomaly score percentile for review",
+    )
+
+
 class ArgusConfig(BaseModel):
     """Top-level configuration for the Argus system."""
 
@@ -512,4 +603,10 @@ class ArgusConfig(BaseModel):
     classifier: ClassifierConfig = Field(default_factory=ClassifierConfig)
     segmenter: SegmenterConfig = Field(default_factory=SegmenterConfig)
     cross_camera: CrossCameraConfig = Field(default_factory=CrossCameraConfig)
+    retraining: RetrainingConfig = Field(default_factory=RetrainingConfig)
+    baseline_capture: BaselineCaptureConfig = Field(default_factory=BaselineCaptureConfig)
+    camera_groups: list[CameraGroupConfig] = Field(
+        default_factory=list,
+        description="Camera groups for shared baselines and models",
+    )
     log_level: str = "INFO"

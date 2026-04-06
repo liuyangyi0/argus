@@ -100,6 +100,22 @@ logging:
   backup_count: 10
   log_format: json
 
+# Scheduled retraining (C4 + A4 active learning loop)
+retraining:
+  enabled: false                 # Enable to auto-retrain when new baselines accumulate
+  interval_hours: 24             # Check for new baselines every N hours
+  min_new_baselines: 20          # Minimum new images since last training to trigger retrain
+  auto_deploy: false             # Auto-deploy retrained model if quality meets threshold
+  auto_deploy_min_grade: "B"     # Minimum quality grade for auto-deploy (A/B/C/F)
+
+# Camera groups for shared baselines and models
+# camera_groups:
+#   - group_id: "CORRIDOR-A"
+#     name: "A栋走廊摄像头组"
+#     camera_ids: ["cam_03", "cam_04", "cam_07"]
+#     zone_id: "default"
+camera_groups: []
+
 storage:
   database_url: "sqlite:///data/db/argus.db"
   baselines_dir: "data/baselines"
