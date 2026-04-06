@@ -89,6 +89,22 @@ export const rollbackModel = (versionId: string) =>
 export const batchInference = (cameraId: string, imagePaths: string[]) =>
   api.post('/models/batch-inference', { camera_id: cameraId, image_paths: imagePaths })
 
+// ── Training Jobs ──
+export const getTrainingJobs = (params?: Record<string, any>) =>
+  api.get('/training-jobs/json', { params })
+export const getTrainingJob = (jobId: string) =>
+  api.get(`/training-jobs/${jobId}`)
+export const createTrainingJob = (data: {
+  job_type: string; camera_id?: string; zone_id?: string;
+  model_type?: string; trigger_type?: string; triggered_by?: string;
+  hyperparameters?: Record<string, any>;
+}) => api.post('/training-jobs/', data)
+export const confirmTrainingJob = (jobId: string, data?: { confirmed_by?: string }) =>
+  api.post(`/training-jobs/${jobId}/confirm`, data || {})
+export const rejectTrainingJob = (jobId: string, data?: { rejected_by?: string; reason?: string }) =>
+  api.post(`/training-jobs/${jobId}/reject`, data || {})
+export const getBackbones = () => api.get('/training-jobs/backbones/json')
+
 // ── Tasks ──
 export const getTasks = () => api.get('/tasks/json')
 export const dismissTask = (taskId: string) => api.delete(`/tasks/${taskId}`)

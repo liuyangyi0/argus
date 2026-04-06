@@ -260,6 +260,7 @@ class ModelRecord(Base):
     code_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
     training_params: Mapped[str | None] = mapped_column(Text, nullable=True)
     calibration_thresholds: Mapped[str | None] = mapped_column(Text, nullable=True)
+    backbone_version_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -274,8 +275,151 @@ class ModelRecord(Base):
             "code_version": self.code_version,
             "training_params": self.training_params,
             "calibration_thresholds": self.calibration_thresholds,
+            "backbone_version_id": self.backbone_version_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "is_active": self.is_active,
+        }
+
+
+class TrainingJobStatus(str, Enum):
+    """Lifecycle status for training jobs (nuclear environment: human confirmation required)."""
+
+    PENDING_CONFIRMATION = "pending_confirmation"
+    QUEUED = "queued"
+    RUNNING = "running"
+    VALIDATING = "validating"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    REJECTED = "rejected"
+
+
+class TrainingJobType(str, Enum):
+    """Two-level training architecture job types."""
+
+    SSL_BACKBONE = "ssl_backbone"
+    ANOMALY_HEAD = "anomaly_head"
+
+
+class TrainingTriggerType(str, Enum):
+    """How a training job was triggered."""
+
+    MANUAL = "manual"
+    DRIFT_SUGGESTED = "drift_suggested"
+    SCHEDULED = "scheduled"
+
+
+class TrainingJobRecord(Base):
+    """Training job lifecycle with human confirmation gate (nuclear audit requirement).
+
+    Two-level architecture:
+    - ssl_backbone: DINOv2 continue-pretraining, shared across cameras
+    - anomaly_head: Per-camera Anomalib head training using backbone checkpoint
+    """
+
+    __tablename__ = "training_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    job_type: Mapped[str] = mapped_column(String(20), nullable=False)  # ssl_backbone / anomaly_head
+    camera_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    zone_id: Mapped[str] = mapped_column(String(50), nullable=False, default="default")
+    model_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+    # Trigger & confirmation
+    trigger_type: Mapped[str] = mapped_column(String(20), nullable=False)  # manual / drift_suggested / scheduled
+    triggered_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    confirmation_required: Mapped[bool] = mapped_column(Boolean, default=True)
+    confirmed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Status
+    status: Mapped[str] = mapped_column(
+        String(25), nullable=False, default="pending_confirmation", index=True
+    )
+
+    # Model lineage
+    base_model_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    dataset_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hyperparameters: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+
+    # Results
+    metrics: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+    artifacts_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    validation_report: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+    model_version_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # Timing
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "job_type": self.job_type,
+            "camera_id": self.camera_id,
+            "zone_id": self.zone_id,
+            "model_type": self.model_type,
+            "trigger_type": self.trigger_type,
+            "triggered_by": self.triggered_by,
+            "confirmation_required": self.confirmation_required,
+            "confirmed_by": self.confirmed_by,
+            "confirmed_at": self.confirmed_at.isoformat() if self.confirmed_at else None,
+            "status": self.status,
+            "base_model_version": self.base_model_version,
+            "dataset_version": self.dataset_version,
+            "hyperparameters": self.hyperparameters,
+            "metrics": self.metrics,
+            "artifacts_path": self.artifacts_path,
+            "validation_report": self.validation_report,
+            "model_version_id": self.model_version_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "duration_seconds": self.duration_seconds,
+            "error": self.error,
+        }
+
+
+class BackboneRecord(Base):
+    """Shared SSL backbone version (Level 1 of two-level training).
+
+    DINOv2 continue-pretraining checkpoint shared across all cameras.
+    Version evolves independently from per-camera anomaly heads.
+    """
+
+    __tablename__ = "backbones"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    backbone_version_id: Mapped[str] = mapped_column(
+        String(128), unique=True, nullable=False, index=True
+    )
+    backbone_type: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g. dinov2_vitb14
+    checkpoint_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    checkpoint_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    camera_ids_used: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list
+    training_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "backbone_version_id": self.backbone_version_id,
+            "backbone_type": self.backbone_type,
+            "checkpoint_path": self.checkpoint_path,
+            "checkpoint_hash": self.checkpoint_hash,
+            "dataset_hash": self.dataset_hash,
+            "camera_ids_used": self.camera_ids_used,
+            "training_job_id": self.training_job_id,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 

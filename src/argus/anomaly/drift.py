@@ -47,12 +47,14 @@ class DriftDetector:
         check_interval: int = 500,
         ks_threshold: float = 0.1,
         p_value_threshold: float = 0.01,
+        on_drift_callback: callable | None = None,
     ):
         self._reference = np.sort(reference_scores) if reference_scores is not None else None
         self._window: deque[float] = deque(maxlen=window_size)
         self._check_interval = check_interval
         self._ks_threshold = ks_threshold
         self._p_value_threshold = p_value_threshold
+        self._on_drift = on_drift_callback
         self._count_since_check = 0
         self._status = DriftStatus()
         if self._reference is not None:
@@ -98,6 +100,11 @@ class DriftDetector:
                 ref_mean=round(self._status.reference_mean, 4),
                 cur_mean=round(self._status.current_mean, 4),
             )
+            if self._on_drift is not None:
+                try:
+                    self._on_drift(self._status)
+                except Exception as e:
+                    logger.error("drift.callback_failed", error=str(e))
 
     @staticmethod
     def _ks_2samp(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:

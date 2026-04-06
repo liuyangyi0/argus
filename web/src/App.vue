@@ -8,6 +8,7 @@ import {
   BellOutlined,
   ExperimentOutlined,
   SettingOutlined,
+  RocketOutlined,
 } from '@ant-design/icons-vue'
 
 const router = useRouter()
@@ -18,6 +19,7 @@ const selectedKeys = computed(() => {
   const path = route.path
   if (path.startsWith('/cameras')) return ['cameras']
   if (path.startsWith('/alerts')) return ['alerts']
+  if (path.startsWith('/training')) return ['training']
   if (path.startsWith('/models')) return ['models']
   if (path.startsWith('/system')) return ['system']
   return ['overview']
@@ -27,6 +29,7 @@ const menuItems = [
   { key: 'overview', icon: () => h(HomeOutlined), label: '总览', path: '/overview' },
   { key: 'cameras', icon: () => h(CameraOutlined), label: '摄像头', path: '/cameras' },
   { key: 'alerts', icon: () => h(BellOutlined), label: '告警', path: '/alerts' },
+  { key: 'training', icon: () => h(RocketOutlined), label: '训练', path: '/training' },
   { key: 'models', icon: () => h(ExperimentOutlined), label: '模型', path: '/models' },
   { key: 'system', icon: () => h(SettingOutlined), label: '系统', path: '/system' },
 ]

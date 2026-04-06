@@ -129,6 +129,7 @@ class TrainingResult:
     threshold_recommended: float | None = None
     output_validation: dict | None = None
     model_version_id: str | None = None
+    validation_report: object | None = None  # ValidationReport from training_validator
 
 
 def _list_images(directory: Path) -> list[Path]:
@@ -207,13 +208,21 @@ class ModelTrainer:
         models_dir: str | Path = "data/models",
         exports_dir: str | Path = "data/exports",
         model_registry=None,
+        training_validator=None,
+        validation_config: dict | None = None,
     ):
         self._baseline_manager = baseline_manager
         self._models_dir = Path(models_dir)
         self._exports_dir = Path(exports_dir)
         self._model_registry = model_registry
+        self._training_validator = training_validator
+        self._validation_config = validation_config or {}
         self._status = TrainingStatus.IDLE
         self._last_result: TrainingResult | None = None
+
+    @property
+    def exports_dir(self) -> Path:
+        return self._exports_dir
 
     @property
     def status(self) -> TrainingStatus:
@@ -244,6 +253,7 @@ class ModelTrainer:
         anomaly_config: object | None = None,
         resume_from: str | None = None,
         group_id: str | None = None,
+        backbone_checkpoint: str | None = None,
     ) -> TrainingResult:
         """Train an anomaly detection model for a specific camera/zone.
 
@@ -353,6 +363,7 @@ class ModelTrainer:
                 image_size=image_size,
                 anomaly_config=anomaly_config,
                 resume_from=resume_from,
+                backbone_checkpoint=backbone_checkpoint,
             )
         except ImportError:
             return self._fail(start, error="anomalib 未安装", **common_fail_kwargs)
@@ -410,6 +421,42 @@ class ModelTrainer:
         # Quality report (TRN-004)
         quality_report = self._generate_quality_report(val_stats, threshold_recommended)
 
+        # Three-step validation pipeline (if configured)
+        validation_report = None
+        if self._training_validator is not None and detector is not None:
+            _progress(90, "正在执行三步验证（AUROC/合成Recall/历史回放）...")
+            try:
+                validation_report = self._training_validator.validate(
+                    detector=detector,
+                    camera_id=camera_id,
+                    zone_id=zone_id,
+                    val_dir=val_dir,
+                    baseline_dir=baseline_dir,
+                    threshold=threshold_recommended,
+                    auroc_threshold=self._validation_config.get(
+                        "validation_auroc_threshold", 0.99
+                    ),
+                    recall_threshold=self._validation_config.get(
+                        "validation_recall_threshold", 0.95
+                    ),
+                    replay_days=self._validation_config.get(
+                        "historical_replay_days", 30
+                    ),
+                )
+                if not validation_report.all_passed:
+                    quality_report.grade = "F"
+                    quality_report.suggestions.append(
+                        "三步验证未通过 — 模型不得部署"
+                    )
+                    logger.warning(
+                        "training.validation_failed",
+                        camera_id=camera_id,
+                        auroc=validation_report.auroc,
+                        recall=validation_report.recall,
+                    )
+            except Exception as e:
+                logger.error("training.validation_error", error=str(e))
+
         _progress(95, f"训练完成 — 质量等级: {quality_report.grade}")
 
         # C4: Register model version in registry
@@ -453,6 +500,7 @@ class ModelTrainer:
             threshold_recommended=threshold_recommended,
             output_validation=output_validation,
             model_version_id=model_version_id,
+            validation_report=validation_report,
         )
         self._status = TrainingStatus.COMPLETE
         self._last_result = result
@@ -888,6 +936,7 @@ class ModelTrainer:
         image_size: int,
         anomaly_config: object | None = None,
         resume_from: str | None = None,
+        backbone_checkpoint: str | None = None,
     ) -> tuple:
         """Execute Anomalib training. Raises ImportError if anomalib is not installed.
 
@@ -945,6 +994,24 @@ class ModelTrainer:
                     "trainer.dinomaly_created",
                     **{k: str(v) for k, v in dinomaly_kwargs.items()},
                 )
+
+                if backbone_checkpoint:
+                    try:
+                        import torch
+                        state_dict = torch.load(
+                            backbone_checkpoint, map_location="cpu", weights_only=True,
+                        )
+                        model.model.encoder.load_state_dict(state_dict, strict=False)
+                        logger.info(
+                            "trainer.custom_backbone_loaded",
+                            path=backbone_checkpoint,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "trainer.custom_backbone_failed",
+                            path=backbone_checkpoint,
+                            error=str(e),
+                        )
             except ImportError:
                 # Fallback: if Dinomaly not in current anomalib version, use PatchCore
                 logger.warning(

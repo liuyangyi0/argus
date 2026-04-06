@@ -10,11 +10,16 @@ Uses APScheduler to run maintenance tasks on configurable intervals:
 
 from __future__ import annotations
 
+import json
 import shutil
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
+
+from argus.storage.models import TrainingJobRecord, TrainingJobStatus, TrainingJobType, TrainingTriggerType
 
 if TYPE_CHECKING:
     from argus.core.health import HealthMonitor
@@ -175,6 +180,94 @@ def create_maintenance_tasks(
 
 
 _GRADE_RANK = {"A": 4, "B": 3, "C": 2, "F": 1}
+
+
+def create_job_processing_task(
+    scheduler: TaskScheduler,
+    job_executor,
+) -> None:
+    """Register a periodic task that processes queued training jobs.
+
+    Jobs must be confirmed by a human before they enter 'queued' status.
+    This task picks up queued jobs and executes them.
+    """
+    def _process_jobs():
+        try:
+            processed = job_executor.process_queued_jobs()
+            if processed > 0:
+                logger.info("scheduler.jobs_processed", count=processed)
+        except Exception as e:
+            logger.error("scheduler.job_processing_failed", error=str(e))
+
+    scheduler.add_interval_task("process_training_jobs", _process_jobs, minutes=1)
+    logger.info("scheduler.job_processing_registered")
+
+
+def create_backbone_retraining_task(
+    scheduler: TaskScheduler,
+    config,
+    database,
+) -> None:
+    """Register periodic backbone retraining check.
+
+    Creates a pending TrainingJob when the backbone is due for retraining.
+    Does NOT auto-execute — requires human confirmation.
+    """
+    retrain_cfg = config.retraining
+    if not retrain_cfg.enabled:
+        return
+
+    interval_days = retrain_cfg.backbone_retrain_interval_days
+
+    def _backbone_check():
+        try:
+            active_backbone = database.get_active_backbone()
+            if active_backbone:
+                age_days = (datetime.now(timezone.utc) - active_backbone.created_at).days
+                if age_days < interval_days:
+                    logger.debug(
+                        "scheduler.backbone_not_due",
+                        age_days=age_days,
+                        interval=interval_days,
+                    )
+                    return
+
+            existing = database.list_training_jobs(
+                status=TrainingJobStatus.PENDING_CONFIRMATION.value,
+                job_type=TrainingJobType.SSL_BACKBONE.value,
+                limit=1,
+            )
+            if existing:
+                return
+
+            job_id = str(uuid.uuid4())[:12]
+            record = TrainingJobRecord(
+                job_id=job_id,
+                job_type=TrainingJobType.SSL_BACKBONE.value,
+                trigger_type=TrainingTriggerType.SCHEDULED.value,
+                triggered_by="scheduler",
+                confirmation_required=True,
+                status=TrainingJobStatus.PENDING_CONFIRMATION.value,
+                hyperparameters=json.dumps({
+                    "backbone_type": retrain_cfg.backbone_type,
+                    "epochs": 5,
+                }),
+            )
+            database.save_training_job(record)
+            logger.info(
+                "scheduler.backbone_job_created",
+                job_id=job_id,
+                reason="backbone age exceeded interval",
+            )
+
+        except Exception as e:
+            logger.error("scheduler.backbone_check_failed", error=str(e))
+
+    scheduler.add_interval_task("backbone_retraining_check", _backbone_check, hours=24)
+    logger.info(
+        "scheduler.backbone_check_registered",
+        interval_days=interval_days,
+    )
 
 
 def create_retraining_task(

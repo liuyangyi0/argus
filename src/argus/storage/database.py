@@ -12,9 +12,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from argus.storage.models import (
     AlertRecord,
     AlertWorkflowStatus,
+    BackboneRecord,
     Base,
     BaselineRecord,
     BaselineVersionRecord,
+    TrainingJobRecord,
     TrainingRecord,
     User,
 )
@@ -65,6 +67,7 @@ class Database:
             ("alerts", "assigned_to", "VARCHAR(100)"),
             ("alerts", "resolved_at", "DATETIME"),
             ("training_records", "group_id", "VARCHAR(100)"),
+            ("models", "backbone_version_id", "VARCHAR(128)"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
@@ -325,6 +328,107 @@ class Database:
             return session.scalar(
                 select(TrainingRecord).where(TrainingRecord.id == record_id)
             )
+
+    # ── Training jobs ──
+
+    def save_training_job(self, record: TrainingJobRecord) -> TrainingJobRecord:
+        """Save a training job record."""
+        with self.get_session() as session:
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            logger.debug("database.training_job_saved", job_id=record.job_id)
+            return record
+
+    def get_training_job(self, job_id: str) -> TrainingJobRecord | None:
+        """Get a training job by job_id."""
+        with self.get_session() as session:
+            return session.scalar(
+                select(TrainingJobRecord).where(TrainingJobRecord.job_id == job_id)
+            )
+
+    def list_training_jobs(
+        self,
+        status: str | None = None,
+        job_type: str | None = None,
+        camera_id: str | None = None,
+        limit: int = 50,
+    ) -> list[TrainingJobRecord]:
+        """List training jobs with optional filters."""
+        with self.get_session() as session:
+            stmt = select(TrainingJobRecord).order_by(TrainingJobRecord.created_at.desc())
+            if status:
+                stmt = stmt.where(TrainingJobRecord.status == status)
+            if job_type:
+                stmt = stmt.where(TrainingJobRecord.job_type == job_type)
+            if camera_id:
+                stmt = stmt.where(TrainingJobRecord.camera_id == camera_id)
+            stmt = stmt.limit(limit)
+            return list(session.scalars(stmt).all())
+
+    def update_training_job(self, job_id: str, **kwargs) -> bool:
+        """Update training job fields. Returns True if found and updated."""
+        with self.get_session() as session:
+            record = session.scalar(
+                select(TrainingJobRecord).where(TrainingJobRecord.job_id == job_id)
+            )
+            if record is None:
+                return False
+            for key, value in kwargs.items():
+                if hasattr(record, key):
+                    setattr(record, key, value)
+            session.commit()
+            return True
+
+    def count_pending_jobs(self) -> int:
+        """Count training jobs pending confirmation."""
+        with self.get_session() as session:
+            return session.scalar(
+                select(sa_func.count()).select_from(TrainingJobRecord)
+                .where(TrainingJobRecord.status == "pending_confirmation")
+            ) or 0
+
+    # ── Backbones ──
+
+    def save_backbone(self, record: BackboneRecord) -> BackboneRecord:
+        """Save a backbone record."""
+        with self.get_session() as session:
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            logger.debug("database.backbone_saved", version_id=record.backbone_version_id)
+            return record
+
+    def get_active_backbone(self) -> BackboneRecord | None:
+        """Get the currently active backbone."""
+        with self.get_session() as session:
+            return session.scalar(
+                select(BackboneRecord).where(BackboneRecord.is_active == True)
+            )
+
+    def list_backbones(self, limit: int = 20) -> list[BackboneRecord]:
+        """List all backbone records."""
+        with self.get_session() as session:
+            return list(session.scalars(
+                select(BackboneRecord).order_by(BackboneRecord.created_at.desc()).limit(limit)
+            ).all())
+
+    def activate_backbone(self, backbone_version_id: str) -> bool:
+        """Set a backbone as active (deactivates others)."""
+        with self.get_session() as session:
+            record = session.scalar(
+                select(BackboneRecord).where(
+                    BackboneRecord.backbone_version_id == backbone_version_id
+                )
+            )
+            if record is None:
+                return False
+            session.query(BackboneRecord).filter(
+                BackboneRecord.is_active == True
+            ).update({"is_active": False})
+            record.is_active = True
+            session.commit()
+            return True
 
     # ── User management ──
 

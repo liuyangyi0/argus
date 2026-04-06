@@ -474,6 +474,9 @@ class StorageConfig(BaseModel):
     baselines_dir: Path = Path("data/baselines")
     models_dir: Path = Path("data/models")
     exports_dir: Path = Path("data/exports")
+    backbones_dir: Path = Path("data/backbones")
+    foe_objects_dir: Path = Path("data/foe_objects")
+    model_packages_dir: Path = Path("data/model_packages")
     alerts_dir: Path = Path("data/alerts")
     alert_retention_days: int = Field(
         default=90, ge=7, le=3650,
@@ -516,6 +519,40 @@ class RetrainingConfig(BaseModel):
     )
     auto_deploy_min_grade: str = Field(
         default="B", description="Minimum quality grade for auto-deploy (A/B/C/F)",
+    )
+
+    # Two-level training architecture
+    backbone_retrain_interval_days: int = Field(
+        default=30, ge=7, le=180,
+        description="Days between backbone SSL fine-tuning checks",
+    )
+    backbone_type: str = Field(
+        default="dinov2_vitb14",
+        description="DINOv2 backbone variant for SSL pretraining",
+    )
+
+    # Training validation thresholds
+    validation_auroc_threshold: float = Field(
+        default=0.99, ge=0.90, le=1.0,
+        description="Minimum AUROC on holdout set for validation pass",
+    )
+    validation_recall_threshold: float = Field(
+        default=0.95, ge=0.80, le=1.0,
+        description="Minimum recall on synthetic anomalies for validation pass",
+    )
+    historical_replay_days: int = Field(
+        default=30, ge=7, le=90,
+        description="Days of historical alerts to replay for regression testing",
+    )
+
+    # Human confirmation (nuclear environment)
+    require_human_confirmation: bool = Field(
+        default=True,
+        description="Require human confirmation before training starts (nuclear safety)",
+    )
+    confirmation_timeout_hours: int = Field(
+        default=72, ge=1, le=168,
+        description="Auto-reject pending jobs after this many hours",
     )
 
     @field_validator("auto_deploy_min_grade")
