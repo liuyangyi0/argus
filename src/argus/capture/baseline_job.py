@@ -112,7 +112,7 @@ def run_baseline_capture_job(
     # ── Setup ────────────────────────────────────────────────────────────
     bm = BaselineManager(job_config.storage_path)
     version_dir = bm.create_new_version(job_config.camera_id)
-    min_required_frames = max(1, min(job_config.target_frames, 10))
+    min_required_frames = min(job_config.target_frames, max(10, job_config.target_frames // 10))
 
     sampler_selection = _create_sampler(job_config)
     sampler = sampler_selection.sampler
@@ -221,7 +221,7 @@ def run_baseline_capture_job(
                     )
                     waiting_on_lock = True
                 emit_progress(progress_pct, "等待异常锁定解除...", force=True)
-                while not abort_event.is_set():
+                while not abort_event.is_set() and time.monotonic() < deadline:
                     time.sleep(2.0)
                     if not camera_manager.is_anomaly_locked(job_config.camera_id):
                         break
@@ -280,7 +280,14 @@ def run_baseline_capture_job(
 
             # Save frame
             frame_path = version_dir / f"baseline_{collected:05d}.png"
-            cv2.imwrite(str(frame_path), frame)
+            if not cv2.imwrite(str(frame_path), frame):
+                logger.warning(
+                    "baseline.capture_write_failed",
+                    camera_id=job_config.camera_id,
+                    path=str(frame_path),
+                )
+                time.sleep(sampler.get_sleep_interval())
+                continue
 
             # Write per-frame sidecar metadata
             frame_meta = {

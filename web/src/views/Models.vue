@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, h } from 'vue'
 import {
   Tabs, Table, Card, Button, Select, Form, InputNumber, Space,
   Typography, Progress, Tag, Modal, message, Descriptions, Tooltip,
@@ -308,14 +308,21 @@ function openVersionDrawer(cameraId: string) {
 }
 
 function handleVerify(record: any) {
-  let verifiedBy = ''
+  const verifiedByRef = ref('')
   Modal.confirm({
     title: '审核基线版本',
-    content: `确认审核通过 ${record.version}？请输入审核人姓名。`,
+    content: () => h('div', [
+      h('p', `确认审核通过 ${record.version}？`),
+      h(Input, {
+        placeholder: '请输入审核人姓名',
+        value: verifiedByRef.value,
+        'onUpdate:value': (v: string) => { verifiedByRef.value = v },
+      }),
+    ]),
     okText: '确认审核',
     cancelText: '取消',
     async onOk() {
-      verifiedBy = verifiedBy || 'operator'
+      const verifiedBy = verifiedByRef.value.trim() || 'operator'
       verifyingVersion.value = record.version
       try {
         await verifyBaseline({
@@ -361,9 +368,17 @@ function handleActivateBaseline(record: any) {
 }
 
 function handleRetireBaseline(record: any) {
+  const reasonRef = ref('')
   Modal.confirm({
     title: '退役基线版本',
-    content: `确定退役 ${record.version}？退役后将保留数据但不再用于训练。`,
+    content: () => h('div', [
+      h('p', `确定退役 ${record.version}？退役后将保留数据但不再用于训练。`),
+      h(Input, {
+        placeholder: '退役原因（可选）',
+        value: reasonRef.value,
+        'onUpdate:value': (v: string) => { reasonRef.value = v },
+      }),
+    ]),
     okText: '确认退役',
     okType: 'danger',
     cancelText: '取消',
@@ -372,7 +387,7 @@ function handleRetireBaseline(record: any) {
         await retireBaseline({
           camera_id: record.camera_id,
           version: record.version,
-          reason: '手动退役',
+          reason: reasonRef.value.trim() || '手动退役',
         })
         message.success(`${record.version} 已退役`)
         loadBaselineVersions(versionDrawerCamera.value)

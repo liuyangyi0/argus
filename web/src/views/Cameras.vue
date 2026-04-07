@@ -48,7 +48,20 @@ async function fetchData() {
 const { } = useWebSocket({
   topics: ['cameras'],
   onMessage(topic, data) {
-    if (topic === 'cameras') cameras.value = data
+    if (topic === 'cameras') {
+      // Backend pushes a single camera status object, not the full list.
+      // Merge into existing list by camera_id instead of replacing.
+      if (data && typeof data === 'object' && !Array.isArray(data) && data.camera_id) {
+        const idx = cameras.value.findIndex((c: any) => c.camera_id === data.camera_id)
+        if (idx >= 0) {
+          cameras.value[idx] = { ...cameras.value[idx], ...data }
+        } else {
+          cameras.value.push(data)
+        }
+      } else if (Array.isArray(data)) {
+        cameras.value = data
+      }
+    }
   },
   fallbackPoll: fetchData,
   fallbackInterval: 10000,
@@ -85,9 +98,6 @@ const columns = [
     title: '状态',
     key: 'status',
     width: 80,
-    customRender: ({ record }: any) => {
-      return record.connected ? '● 在线' : '○ 离线'
-    },
   },
   { title: '摄像头 ID', dataIndex: 'camera_id', key: 'camera_id' },
   { title: '名称', dataIndex: 'name', key: 'name' },
@@ -176,7 +186,7 @@ const columns = [
       :pagination="false"
       row-key="camera_id"
       :row-class-name="() => 'camera-row'"
-      @row:click="(record: any) => router.push(`/cameras/${record.camera_id}`)"
+      :custom-row="(record: any) => ({ onClick: () => router.push(`/cameras/${record.camera_id}`) })"
       style="cursor: pointer"
     >
       <template #bodyCell="{ column, record }">

@@ -222,14 +222,16 @@ class BaselineManager:
             return 0
 
         to_remove = versions[:-keep]
-        retired_versions: set[str] = set()
+        protected_versions: set[str] = set()
         if self._lifecycle:
             all_recs = self._lifecycle.get_versions(camera_id, zone_id)
-            retired_versions = {r.version for r in all_recs if r.state == BaselineState.RETIRED}
+            # Protect ACTIVE, VERIFIED, and RETIRED versions from deletion
+            protected_states = {BaselineState.ACTIVE, BaselineState.VERIFIED, BaselineState.RETIRED}
+            protected_versions = {r.version for r in all_recs if r.state in protected_states}
         removed = 0
         for v in to_remove:
-            if v.name in retired_versions:
-                logger.debug("baseline.skip_retired", camera_id=camera_id, version=v.name)
+            if v.name in protected_versions:
+                logger.debug("baseline.skip_protected", camera_id=camera_id, version=v.name)
                 continue
             shutil.rmtree(v)
             removed += 1
@@ -246,16 +248,14 @@ class BaselineManager:
         )
 
     def create_group_version(self, group_id: str, zone_id: str = "default") -> Path:
-        """Create a new version directory for a camera group baseline."""
+        """Create a new version directory for a camera group baseline.
+
+        Note: Does NOT auto-register with lifecycle. Callers (e.g.
+        merge_camera_baselines) should register after populating the version
+        so image_count is accurate.
+        """
         base = self.baselines_dir / "_groups" / group_id / zone_id
-        version_dir, version = self._create_version_dir(base)
-        if self._lifecycle:
-            self._lifecycle.register_version(
-                camera_id=f"group:{group_id}",
-                zone_id=zone_id,
-                version=version,
-                group_id=group_id,
-            )
+        version_dir, _version = self._create_version_dir(base)
         return version_dir
 
     def merge_camera_baselines(

@@ -279,6 +279,16 @@ class CameraManager:
         self._threads.clear()
         logger.info("manager.stopped")
 
+    def add_camera_config(self, cam_config: CameraConfig) -> None:
+        """Thread-safe addition of a new camera config to the managed list."""
+        with self._lock:
+            self._cameras.append(cam_config)
+
+    def remove_camera_config(self, camera_id: str) -> None:
+        """Thread-safe removal of a camera config from the managed list."""
+        with self._lock:
+            self._cameras[:] = [c for c in self._cameras if c.camera_id != camera_id]
+
     def start_camera(self, camera_id: str) -> bool:
         """Start a single camera by ID."""
         cam_config = next((c for c in self._cameras if c.camera_id == camera_id), None)
@@ -530,6 +540,11 @@ class CameraManager:
     def _start_camera(self, cam_config: CameraConfig) -> bool:
         """Initialize and start a single camera pipeline in a new thread."""
         camera_id = cam_config.camera_id
+
+        with self._lock:
+            if camera_id in self._threads and self._threads[camera_id].is_alive():
+                logger.warning("manager.already_running", camera_id=camera_id)
+                return True
 
         def _alert_handler(alert: Alert):
             # C3: Cross-camera correlation check before emitting

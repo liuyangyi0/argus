@@ -401,7 +401,8 @@ class TestDashboardFeatureChain:
         )
         assert add_resp.status_code == 200
         assert any(camera.camera_id == "cam_01" for camera in config.cameras)
-        assert any(camera.camera_id == "cam_01" for camera in camera_manager._cameras)
+        camera_manager.add_camera_config.assert_called_once()
+        assert camera_manager.add_camera_config.call_args[0][0].camera_id == "cam_01"
 
         saved = Path(config_path).read_text(encoding="utf-8")
         assert "cam_01" in saved

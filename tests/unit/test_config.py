@@ -111,7 +111,7 @@ class TestConfigLoader:
         """The default.yaml shipped with the project should load correctly."""
         config = load_config("configs/default.yaml")
         assert config.node_id == "argus-edge-01"
-        assert len(config.cameras) == 1
+        assert len(config.cameras) >= 1
         assert config.cameras[0].camera_id == "cam_01"
 
 

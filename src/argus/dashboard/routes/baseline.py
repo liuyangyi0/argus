@@ -931,12 +931,6 @@ async def start_capture_job(request: Request):
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
 
-    if request.headers.get("HX-Request") == "true":
-        return HTMLResponse(
-            '<div hx-get="/api/baseline/capture" hx-trigger="load" hx-swap="innerHTML"></div>',
-            headers=htmx_toast_headers("基线采集已启动"),
-        )
-
     return JSONResponse({"task_id": task_id, "status": "submitted"})
 
 

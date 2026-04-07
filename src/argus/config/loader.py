@@ -25,13 +25,24 @@ def load_config(config_path: str | Path) -> ArgusConfig:
 
 
 def save_config(config: ArgusConfig, config_path: str | Path) -> None:
-    """Save configuration to a YAML file (atomic write)."""
+    """Save configuration to a YAML file (atomic write with retry for Windows)."""
+    import time
+
     path = Path(config_path)
     data = config.model_dump(mode="json")
     tmp = path.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    tmp.replace(path)
+
+    # Atomic rename — retry on Windows where target may be briefly locked
+    for attempt in range(3):
+        try:
+            tmp.replace(path)
+            return
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(0.1)
 
 
 def load_camera_configs(cameras_dir: str | Path) -> list[dict]:

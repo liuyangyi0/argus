@@ -131,7 +131,10 @@ class TestCameraForms:
 
         assert response.status_code == 200
         assert any(camera.camera_id == "usb_cam_01" for camera in config.cameras)
-        assert any(camera.camera_id == "usb_cam_01" for camera in camera_manager._cameras)
+        # The manager's add_camera_config() is called to thread-safely sync the list
+        camera_manager.add_camera_config.assert_called_once()
+        added = camera_manager.add_camera_config.call_args[0][0]
+        assert added.camera_id == "usb_cam_01"
         assert config.cameras[-1].protocol == "usb"
         assert config.cameras[-1].resolution == (1280, 720)
 
