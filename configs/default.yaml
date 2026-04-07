@@ -1,178 +1,380 @@
 node_id: argus-edge-01
-
 cameras:
-  - camera_id: cam_01
-    name: "Demo Camera"
-    source: "data/demo4.mp4"  # Replace with RTSP URL for real deployment
-    protocol: file
-    fps_target: 5
-    resolution: [1920, 1080]
-    zones: []
-    mog2:
-      history: 500
-      var_threshold: 25.0
-      detect_shadows: true
-      change_pct_threshold: 0.005
-      enable_stabilization: true  # 相位相关防抖，补偿厂房振动引起的1-2px相机偏移
-    person_filter:
-      confidence: 0.4
-      skip_frame_on_person: false
-      model_name: yolo11n.pt
-    anomaly:
-      model_type: patchcore
-      threshold: 0.7
-      image_size: [256, 256]
-      enable_multiscale: true   # 开启后切片检测，提升小物体检出率（延迟从~30ms增到~270ms）
-      tile_size: 512            # 切片尺寸（像素），512适合1080p
-      tile_overlap: 0.25        # 切片重叠率，0.25=25%重叠防边缘遗漏
-      enable_calibration: true  # 训练后有 calibration.json 时，用共形预测校准异常分数
-      # Dinomaly2 parameters (only used when model_type="dinomaly2")
-      # dinomaly_backbone: dinov2_vitb14        # DINOv2 backbone: dinov2_vits14, dinov2_vitb14, dinov2_vitl14
-      # dinomaly_encoder_layers: [2, 5, 8, 11]  # ViT layers to extract features from
-      # dinomaly_few_shot_images: 8              # Min baseline images for few-shot mode (1-100)
-      # dinomaly_multi_class: false              # Share one detector across all cameras
-      # Model quantization: fp32 (full precision), fp16 (half, default), int8 (quantized, fastest CPU inference)
-      # INT8 requires nncf: pip install argus[quantize]
-      quantization: fp16
-      quantization_calibration_images: 100  # 用于INT8校准的验证集图片数量（50-1000）
-    simplex:
-      enabled: true             # Simplex safety channel: lightweight frame-diff detector runs parallel to Anomalib
-      diff_threshold: 30        # Binary threshold for frame difference (10-100)
-      min_area_px: 500          # Minimum contour area in pixels to track (100-50000)
-      min_static_seconds: 30.0  # Seconds a region must be static before detection (5-600)
-      morph_kernel_size: 5      # Morphology kernel size for noise removal (3-15)
-      match_radius_px: 50       # Max pixel distance to match tracked centroids (10-200)
-    drift:
-      enabled: true               # KS test drift monitoring on anomaly score distribution
-      reference_window: 500       # Initial scores to collect as reference distribution (100-5000)
-      test_window: 100            # Sliding window size; KS test runs every test_window scores (50-1000)
-      p_value_threshold: 0.01     # KS test significance level (0.001-0.1)
-      ks_threshold: 0.1           # KS statistic threshold for drift detection (0.01-0.5)
-      cooldown_minutes: 30        # Minutes before re-alerting drift for same camera (5-1440)
-
+- camera_id: cam_01
+  name: Demo Camera
+  source: data/demo4.mp4
+  protocol: file
+  fps_target: 5
+  resolution:
+  - 1920
+  - 1080
+  zones: []
+  reconnect_delay: 5.0
+  max_reconnect_attempts: -1
+  watchdog_timeout: 30.0
+  mog2:
+    history: 500
+    var_threshold: 25.0
+    detect_shadows: true
+    change_pct_threshold: 0.005
+    denoise: true
+    enable_stabilization: true
+    heartbeat_frames: 150
+    lock_score_threshold: 0.85
+    lock_clear_frames: 10
+  person_filter:
+    confidence: 0.4
+    skip_frame_on_person: false
+    model_name: yolo11n.pt
+    classes_to_detect:
+    - 0
+    enable_tracking: false
+  anomaly:
+    model_type: patchcore
+    threshold: 0.7
+    image_size:
+    - 256
+    - 256
+    enable_multiscale: true
+    tile_size: 512
+    tile_overlap: 0.25
+    dinomaly_backbone: dinov2_vitb14
+    dinomaly_encoder_layers:
+    - 2
+    - 5
+    - 8
+    - 11
+    dinomaly_few_shot_images: 8
+    dinomaly_multi_class: false
+    quantization: fp16
+    quantization_calibration_images: 100
+    enable_calibration: true
+    ssim_baseline_frames: 15
+    ssim_sensitivity: 50.0
+    ssim_midpoint: 0.015
+    shadow_sample_rate: 5
+    warmup_frames: 10
+    warmup_max_latency_ms: 500.0
+    verify_model_signature: false
+    min_shadow_days: 3
+    min_canary_days: 7
+  simplex:
+    enabled: true
+    diff_threshold: 30
+    min_area_px: 500
+    min_static_seconds: 30.0
+    morph_kernel_size: 5
+    match_radius_px: 50
+  health:
+    enabled: true
+    freeze_detection: true
+    lens_contamination_detection: true
+    displacement_detection: true
+    flash_suppression: true
+    gain_drift_detection: true
+    freeze_window_frames: 10
+    sharpness_drop_pct: 0.3
+    displacement_threshold_px: 20.0
+    flash_sigma: 3.0
+    gain_drift_threshold_pct: 20.0
+  drift:
+    enabled: true
+    reference_window: 500
+    test_window: 100
+    p_value_threshold: 0.01
+    ks_threshold: 0.1
+    cooldown_minutes: 30
+  degradation:
+    max_consecutive_failures: 5
+    refuse_start_on_backbone_failure: false
+    watchdog_check_interval_seconds: 15.0
+  ring_buffer:
+    enabled: true
+    pre_trigger_seconds: 60
+    post_trigger_seconds: 30
+    jpeg_quality: 85
+    max_recording_age_days: 30
+    archive_dir: data/recordings
+- camera_id: c
+  name: c
+  source: '0'
+  protocol: usb
+  fps_target: 5
+  resolution:
+  - 640
+  - 480
+  zones: []
+  reconnect_delay: 5.0
+  max_reconnect_attempts: -1
+  watchdog_timeout: 30.0
+  mog2:
+    history: 500
+    var_threshold: 25.0
+    detect_shadows: true
+    change_pct_threshold: 0.005
+    denoise: true
+    enable_stabilization: true
+    heartbeat_frames: 150
+    lock_score_threshold: 0.85
+    lock_clear_frames: 10
+  person_filter:
+    confidence: 0.4
+    skip_frame_on_person: false
+    model_name: yolo11n.pt
+    classes_to_detect:
+    - 0
+    enable_tracking: false
+  anomaly:
+    model_type: patchcore
+    threshold: 0.7
+    image_size:
+    - 256
+    - 256
+    enable_multiscale: false
+    tile_size: 512
+    tile_overlap: 0.25
+    dinomaly_backbone: dinov2_vitb14
+    dinomaly_encoder_layers:
+    - 2
+    - 5
+    - 8
+    - 11
+    dinomaly_few_shot_images: 8
+    dinomaly_multi_class: false
+    quantization: fp16
+    quantization_calibration_images: 100
+    enable_calibration: true
+    ssim_baseline_frames: 15
+    ssim_sensitivity: 50.0
+    ssim_midpoint: 0.015
+    shadow_sample_rate: 5
+    warmup_frames: 10
+    warmup_max_latency_ms: 500.0
+    verify_model_signature: false
+    min_shadow_days: 3
+    min_canary_days: 7
+  simplex:
+    enabled: true
+    diff_threshold: 30
+    min_area_px: 500
+    min_static_seconds: 30.0
+    morph_kernel_size: 5
+    match_radius_px: 50
+  health:
+    enabled: true
+    freeze_detection: true
+    lens_contamination_detection: true
+    displacement_detection: true
+    flash_suppression: true
+    gain_drift_detection: true
+    freeze_window_frames: 10
+    sharpness_drop_pct: 0.3
+    displacement_threshold_px: 20.0
+    flash_sigma: 3.0
+    gain_drift_threshold_pct: 20.0
+  drift:
+    enabled: true
+    reference_window: 500
+    test_window: 100
+    p_value_threshold: 0.01
+    ks_threshold: 0.1
+    cooldown_minutes: 30
+  degradation:
+    max_consecutive_failures: 5
+    refuse_start_on_backbone_failure: false
+    watchdog_check_interval_seconds: 15.0
+  ring_buffer:
+    enabled: true
+    pre_trigger_seconds: 60
+    post_trigger_seconds: 30
+    jpeg_quality: 85
+    max_recording_age_days: 30
+    archive_dir: data/recordings
 alerts:
   severity_thresholds:
-    info: 0.50
-    low: 0.70
+    info: 0.5
+    low: 0.7
     medium: 0.85
     high: 0.95
   temporal:
     min_consecutive_frames: 3
     max_gap_seconds: 10.0
-    min_spatial_overlap: 0.3   # 连续帧异常区域IoU需≥30%，过滤飘动物误报（0=关闭）
-    evidence_lambda: 0.95      # CUSUM指数衰减因子（0.8-0.99），越大衰减越慢
-    evidence_threshold: 3.0    # 累积证据阈值（0.5-20.0），超过此值触发告警
+    min_spatial_overlap: 0.3
+    evidence_lambda: 0.95
+    evidence_threshold: 3.0
   suppression:
-    same_zone_window_seconds: 300
-    same_camera_window_seconds: 60
+    same_zone_window_seconds: 300.0
+    same_camera_window_seconds: 60.0
+  calibration:
+    enabled: false
+    target_fpr_info: 0.1
+    target_fpr_low: 0.01
+    target_fpr_medium: 0.001
+    target_fpr_high: 0.0001
+    min_calibration_samples: 50
   zone_multipliers:
     critical: 1.2
     standard: 1.0
     low_priority: 0.8
   webhook:
     enabled: false
-    url: ""
+    url: ''
+    timeout: 5.0
   email:
     enabled: false
-    smtp_host: "mail.plant.local"
-    smtp_port: 587
-    smtp_username: ""
-    smtp_password: ""
-    from_address: "argus@plant.local"
-    use_tls: true
     min_severity: high
+    smtp_host: mail.plant.local
+    smtp_port: 587
+    smtp_username: ''
+    smtp_password: ''
+    from_address: argus@plant.local
+    use_tls: true
     recipients: []
-
+  circuit_breaker_threshold: 5
+  circuit_breaker_timeout: 60.0
 auth:
   enabled: false
-  api_token: ""  # Set via ARGUS_AUTH_TOKEN env var or here
+  api_token: ''
   session_timeout_minutes: 480
-
 dashboard:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 8080
   debug: false
   mjpeg_fps: 5.0
-
+  websocket_heartbeat_seconds: 30
+  websocket_max_connections: 100
+  audio_alerts:
+    low:
+      enabled: false
+      sound: beep_single
+      voice_template: ''
+    medium:
+      enabled: true
+      sound: beep_single
+      voice_template: ''
+    high:
+      enabled: true
+      sound: beep_double_voice
+      voice_template: '{camera} 高级别告警'
+storage:
+  database_url: sqlite:///data/db/argus.db
+  baselines_dir: data\baselines
+  models_dir: data\models
+  exports_dir: data\exports
+  backbones_dir: data\backbones
+  foe_objects_dir: data\foe_objects
+  model_packages_dir: data\model_packages
+  alerts_dir: data\alerts
+  inference_records_dir: data\inference_records
+  alert_retention_days: 90
+models:
+  yolo_path: yolo11n.pt
+  anomalib_model_dir: data\models
+  anomalib_export_dir: data\exports
 logging:
-  log_dir: "data/logs"
+  log_dir: data\logs
   max_file_size_mb: 50
   backup_count: 10
   log_format: json
-
-# Scheduled retraining (C4 + A4 active learning loop)
-retraining:
-  enabled: false                 # Enable to auto-retrain when new baselines accumulate
-  interval_hours: 24             # Check for new baselines every N hours
-  min_new_baselines: 20          # Minimum new images since last training to trigger retrain
-  auto_deploy: false             # Auto-deploy retrained model if quality meets threshold
-  auto_deploy_min_grade: "B"     # Minimum quality grade for auto-deploy (A/B/C/F)
-
-# Camera groups for shared baselines and models
-# camera_groups:
-#   - group_id: "CORRIDOR-A"
-#     name: "A栋走廊摄像头组"
-#     camera_ids: ["cam_03", "cam_04", "cam_07"]
-#     zone_id: "default"
-camera_groups: []
-
-storage:
-  database_url: "sqlite:///data/db/argus.db"
-  baselines_dir: "data/baselines"
-  models_dir: "data/models"
-  exports_dir: "data/exports"
-  alerts_dir: "data/alerts"
-
-models:
-  yolo_path: "yolo11n.pt"
-  anomalib_model_dir: "data/models"
-  anomalib_export_dir: "data/exports"
-
+capture_quality:
+  enabled: true
+  blur_threshold: 100.0
+  blur_adaptive_pct: 0.3
+  brightness_min: 30.0
+  brightness_max: 225.0
+  brightness_std_min: 10.0
+  saturated_pixel_max_pct: 0.3
+  ssim_dedup_threshold: 0.98
+  ssim_resize: 256
+  person_confidence: 0.3
+  entropy_min: 3.0
 classifier:
-  enabled: false                        # D1: Open vocabulary classification (requires YOLO-World model)
-  model_name: "yolov8s-worldv2.pt"      # YOLO-World model variant
-  vocabulary:                            # FOE vocabulary for nuclear plant environments
-    - wrench
-    - bolt
-    - nut
-    - screwdriver
-    - hammer
-    - rag
-    - glove
-    - plastic bag
-    - tape
-    - wire
-    - insulation
-    - debris
-    - paint chip
-    - insect
-    - bird
-    - shadow
-    - reflection
-  min_anomaly_score_to_classify: 0.5    # Only classify when anomaly score >= this (0.0-1.0)
-  high_risk_labels:                     # Labels that escalate alert severity
-    - wrench
-    - bolt
-    - nut
-    - screwdriver
-    - hammer
-  low_risk_labels:                      # Labels that suppress/downgrade alert severity
-    - insect
-    - shadow
-    - reflection
-
+  enabled: false
+  model_name: yolov8s-worldv2.pt
+  vocabulary:
+  - wrench
+  - bolt
+  - nut
+  - screwdriver
+  - hammer
+  - rag
+  - glove
+  - plastic bag
+  - tape
+  - wire
+  - insulation
+  - debris
+  - paint chip
+  - insect
+  - bird
+  - shadow
+  - reflection
+  min_anomaly_score_to_classify: 0.5
+  high_risk_labels:
+  - wrench
+  - bolt
+  - nut
+  - screwdriver
+  - hammer
+  low_risk_labels:
+  - insect
+  - shadow
+  - reflection
 segmenter:
-  enabled: false                        # D2: SAM 2 instance segmentation (requires pip install argus[segment])
-  model_size: "small"                   # SAM 2 model size: tiny, small, base_plus, large
-  max_points: 5                         # Max anomaly peaks to segment per frame (1-20)
-  min_anomaly_score: 0.7                # Minimum anomaly score to trigger segmentation (0.1-0.99)
-  min_mask_area_px: 100                 # Minimum mask area in pixels — smaller objects are discarded (10-100000)
-
+  enabled: false
+  model_size: small
+  max_points: 5
+  min_anomaly_score: 0.7
+  min_mask_area_px: 100
+  timeout_seconds: 10.0
 cross_camera:
   enabled: false
-  overlap_pairs: []  # List of {camera_a, camera_b, homography} for overlapping camera pairs
-  corroboration_threshold: 0.3  # Partner anomaly score above this = corroborated (0.1-0.9)
-  max_age_seconds: 5.0  # Max age of partner anomaly data to use (1-30s)
-  uncorroborated_severity_downgrade: 1  # Downgrade severity by N levels when uncorroborated (0=disabled)
-
+  overlap_pairs: []
+  corroboration_threshold: 0.3
+  max_age_seconds: 5.0
+  uncorroborated_severity_downgrade: 1
+retraining:
+  enabled: false
+  interval_hours: 24
+  min_new_baselines: 20
+  auto_deploy: false
+  auto_deploy_min_grade: B
+  backbone_retrain_interval_days: 30
+  backbone_type: dinov2_vitb14
+  validation_auroc_threshold: 0.99
+  validation_recall_threshold: 0.95
+  historical_replay_days: 30
+  require_human_confirmation: true
+  confirmation_timeout_hours: 72
+feedback:
+  auto_baseline_on_fp: true
+  auto_validation_on_confirmed: true
+  uncertain_escalation_role: supervisor
+  passive_feedback_enabled: true
+  validation_dir: data\validation
+baseline_capture:
+  default_strategy: active
+  diversity_threshold: 0.3
+  dino_backbone: dinov2_vits14
+  dino_image_size: 224
+  active_sleep_min_seconds: 1.0
+  active_cpu_threads: 1
+  schedule_periods:
+    dawn:
+    - 5
+    - 8
+    noon:
+    - 11
+    - 13
+    dusk:
+    - 16
+    - 19
+    night:
+    - 22
+    - 2
+  frames_per_period: 50
+  pause_on_anomaly_lock: true
+  post_capture_review: true
+  review_flag_percentile: 0.99
+camera_groups: []
 log_level: INFO

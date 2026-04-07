@@ -456,12 +456,12 @@ async def add_camera(request: Request):
     )
 
     config.cameras.append(cam_config)
-    added_to_manager = False
 
     try:
-        if isinstance(manager_cameras, list) and manager_cameras is not config.cameras:
-            manager_cameras.append(cam_config)
-            added_to_manager = True
+        # Thread-safe addition to the running manager's camera list
+        if camera_manager is not None and hasattr(camera_manager, "add_camera_config"):
+            if camera_manager._cameras is not config.cameras:
+                camera_manager.add_camera_config(cam_config)
 
         config_path = getattr(request.app.state, "config_path", None)
         if config_path:
@@ -470,19 +470,15 @@ async def add_camera(request: Request):
             _save_config(config, config_path)
     except Exception:
         config.cameras = [camera for camera in config.cameras if camera is not cam_config]
-        if added_to_manager and isinstance(manager_cameras, list):
-            manager_cameras[:] = [camera for camera in manager_cameras if camera is not cam_config]
+        if camera_manager is not None and hasattr(camera_manager, "remove_camera_config"):
+            camera_manager.remove_camera_config(camera_id)
         logger.exception("camera.add_failed", camera_id=camera_id)
         return JSONResponse({"error": "摄像头配置保存失败"}, status_code=500)
 
     # Note: camera is added to config but not started. User must click "start".
     logger.info("camera.added", camera_id=camera_id, source=source)
 
-    # Return the refreshed camera list
-    return HTMLResponse(
-        headers=htmx_toast_headers("摄像头已添加"),
-        content='<div hx-get="/api/cameras" hx-trigger="load" hx-swap="outerHTML"></div>',
-    )
+    return JSONResponse({"status": "ok", "camera_id": camera_id})
 
 
 @router.post("/{camera_id}/start")
@@ -581,7 +577,7 @@ async def cameras_json(request: Request):
 
 
 @router.get("/{camera_id}/detail/json")
-async def camera_detail(request: Request, camera_id: str):
+async def camera_detail_json(request: Request, camera_id: str):
     """Return a detailed camera payload for the detail page."""
     camera_manager = request.app.state.camera_manager
     camera_config = _find_camera_config(request, camera_id)
@@ -611,12 +607,16 @@ async def camera_detail(request: Request, camera_id: str):
             "avg_latency_ms": round(status.stats.avg_latency_ms, 1),
         }
 
+    # Lifecycle stages for pipeline stepper
+    stages = _get_lifecycle_stages(request, camera_id, cam_status=status)
+
     return JSONResponse({
         "camera_id": camera_id,
         "name": camera_config.name,
         "connected": status.connected if status is not None else False,
         "running": status.running if status is not None else False,
         "stats": stats,
+        "stages": stages,
         "config": camera_config.model_dump(mode="json"),
         "runtime": {
             "pipeline_mode": pipeline_mode,
@@ -695,7 +695,7 @@ async def camera_stream(request: Request, camera_id: str):
     if not camera_manager:
         return Response(status_code=503)
 
-    def generate_frames():
+    async def generate_frames():
         start_time = time.monotonic()
         try:
             while True:
@@ -710,8 +710,8 @@ async def camera_stream(request: Request, camera_id: str):
                         + buffer.tobytes()
                         + b"\r\n"
                     )
-                time.sleep(0.2)
-        except GeneratorExit:
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
             pass
 
     return StreamingResponse(
@@ -729,7 +729,7 @@ async def camera_heatmap_stream(request: Request, camera_id: str):
 
     import numpy as np
 
-    def generate_heatmap_frames():
+    async def generate_heatmap_frames():
         start_time = time.monotonic()
         try:
             while True:
@@ -761,8 +761,8 @@ async def camera_heatmap_stream(request: Request, camera_id: str):
                         + buffer.tobytes()
                         + b"\r\n"
                     )
-                time.sleep(0.2)
-        except GeneratorExit:
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
             pass
 
     return StreamingResponse(
@@ -787,7 +787,7 @@ async def wall_status(request: Request):
     if camera_manager is None:
         return JSONResponse({"cameras": []})
 
-    db = getattr(request.app.state, "db", None)
+    db = getattr(request.app.state, "database", None)
     health_monitor = getattr(request.app.state, "health_monitor", None)
 
     cameras = []

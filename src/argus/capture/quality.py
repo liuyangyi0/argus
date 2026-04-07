@@ -9,6 +9,8 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass, field
 
+import time
+
 import cv2
 import numpy as np
 import structlog
@@ -89,6 +91,8 @@ class FrameQualityFilter:
     the first rejection.
     """
 
+    _PERSON_DETECTOR_RETRY_SECONDS = 60.0
+
     def __init__(
         self,
         config: CaptureQualityConfig,
@@ -99,6 +103,7 @@ class FrameQualityFilter:
         self._config = config
         self._blur_scores: list[float] = []
         self._person_detector = None
+        self._person_detector_failed_at: float = 0.0
         self._enable_person_detection = enable_person_detection
         self._enable_duplicate_filter = enable_duplicate_filter
 
@@ -234,6 +239,10 @@ class FrameQualityFilter:
     def _check_person(self, frame: np.ndarray) -> bool:
         """Returns True if persons are detected in the frame."""
         if self._person_detector is None:
+            # Retry after cooldown if previous attempt failed
+            if self._person_detector_failed_at > 0:
+                if time.monotonic() - self._person_detector_failed_at < self._PERSON_DETECTOR_RETRY_SECONDS:
+                    return False
             try:
                 from argus.person.detector import YOLOPersonDetector
 
@@ -241,14 +250,11 @@ class FrameQualityFilter:
                     confidence=self._config.person_confidence,
                     skip_frame_on_person=True,
                 )
+                self._person_detector_failed_at = 0.0
             except Exception:
                 logger.warning("quality.person_detector_unavailable")
-                # Mark as permanently unavailable
-                self._person_detector = False  # type: ignore[assignment]
+                self._person_detector_failed_at = time.monotonic()
                 return False
-
-        if self._person_detector is False:
-            return False
 
         try:
             result = self._person_detector.detect(frame)

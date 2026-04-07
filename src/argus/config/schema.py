@@ -366,6 +366,15 @@ class CameraConfig(BaseModel):
 
     camera_id: str
     name: str
+
+    @field_validator("camera_id")
+    @classmethod
+    def validate_camera_id(cls, v: str) -> str:
+        if not re.match(r"^[a-zA-Z0-9_-]+$", v):
+            raise ValueError(
+                f"camera_id must contain only letters, digits, hyphens and underscores, got {v!r}"
+            )
+        return v
     source: str  # RTSP URL, USB device index, or file path
     protocol: Literal["rtsp", "usb", "file"] = "rtsp"
     fps_target: int = Field(default=5, ge=1, le=30)

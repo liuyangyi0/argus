@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Card, Steps, Tabs, Descriptions, Badge, Button, Typography, Space, Statistic, Row, Col, Empty } from 'ant-design-vue'
 import { ArrowLeftOutlined } from '@ant-design/icons-vue'
@@ -10,6 +10,7 @@ const router = useRouter()
 const cameraId = route.params.id as string
 const camera = ref<any>(null)
 const loading = ref(true)
+let pollTimer: ReturnType<typeof setInterval> | null = null
 
 async function fetchCamera() {
   try {
@@ -20,13 +21,32 @@ async function fetchCamera() {
   }
 }
 
-onMounted(fetchCamera)
+onMounted(() => {
+  fetchCamera()
+  pollTimer = setInterval(fetchCamera, 5000)
+})
+
+onUnmounted(() => {
+  if (pollTimer !== null) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+})
 
 // const snapshotUrl = computed(() => `/api/cameras/${cameraId}/snapshot?t=${Date.now()}`)
 const streamUrl = computed(() => `/api/cameras/${cameraId}/stream`)
 
 const lifecycleStep = computed(() => {
   if (!camera.value) return 0
+  const stages = camera.value.stages
+  if (stages && Array.isArray(stages)) {
+    const activeIdx = stages.findIndex((s: any) => s.status === 'active')
+    if (activeIdx >= 0) return activeIdx
+    // All completed
+    if (stages.every((s: any) => s.status === 'completed')) return stages.length - 1
+    return 0
+  }
+  // Fallback when stages not available
   const c = camera.value
   if (!c.connected) return 0
   if (!c.stats || c.stats.frames_captured === 0) return 0

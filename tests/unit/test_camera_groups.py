@@ -69,10 +69,13 @@ class TestGroupVersionCreation:
         assert v2.name == "v002"
 
     def test_group_version_registered_in_lifecycle(self, baseline_mgr, lifecycle):
-        baseline_mgr.create_group_version("CORRIDOR-A")
+        # create_group_version only creates the directory; lifecycle registration
+        # happens in merge_camera_baselines to avoid double-registration.
+        version_dir = baseline_mgr.create_group_version("CORRIDOR-A")
+        assert version_dir.is_dir()
+        # No lifecycle record yet — registration deferred to merge
         rec = lifecycle.get_version("group:CORRIDOR-A", "default", "v001")
-        assert rec is not None
-        assert rec.group_id == "CORRIDOR-A"
+        assert rec is None
 
 
 class TestMergeCameraBaselines:
