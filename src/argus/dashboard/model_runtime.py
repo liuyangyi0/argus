@@ -27,21 +27,26 @@ def _resolve_model_file(model_path: str, camera_id: str) -> str:
     if p.is_file():
         return model_path
 
-    # Directory: search for inference-ready model files
-    from argus.core.pipeline import DetectionPipeline
+    # Search the provided directory first, then exports, then global models
+    search_dirs = [p]
+    exports_dir = Path("data/exports") / camera_id
+    if exports_dir.exists():
+        search_dirs.append(exports_dir)
 
-    found = DetectionPipeline._find_model(camera_id)
-    if found is not None:
-        return str(found)
-
-    # Fallback: search inside the directory and exports
-    for search_dir in [p, Path("data/exports") / camera_id]:
+    for search_dir in search_dirs:
         if not search_dir.exists():
             continue
         for pattern in ("model.xml", "model.pt", "model.ckpt"):
             matches = sorted(search_dir.rglob(pattern), key=lambda f: f.stat().st_mtime, reverse=True)
             if matches:
                 return str(matches[0])
+
+    # Last resort: use pipeline's global model discovery
+    from argus.core.pipeline import DetectionPipeline
+
+    found = DetectionPipeline._find_model(camera_id)
+    if found is not None:
+        return str(found)
 
     return model_path  # return as-is, reload_model will report the error
 

@@ -481,7 +481,7 @@ class TestDashboardFeatureChain:
         assert publish_resp.json()["runtime_synced"] is True
         camera_manager.reload_model.assert_called_with(
             "cam_01",
-            str(model_dir),
+            str(model_dir / "model.xml"),
             version_tag=version_id,
         )
 
@@ -541,6 +541,6 @@ class TestDashboardFeatureChain:
         assert payload["runtime_synced"] is True
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
-            str(model_dir),
+            str(model_dir / "model.xml"),
             version_tag=version_id,
         )

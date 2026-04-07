@@ -712,9 +712,10 @@ class TestModelPublishRoutes:
         payload = response.json()
         assert payload["activated"] == version_id
         assert payload["runtime_synced"] is True
+        # _resolve_model_file resolves the directory to the actual model file
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
-            str(model_dir),
+            str(model_dir / "model.xml"),
             version_tag=version_id,
         )
 
@@ -808,7 +809,7 @@ class TestModelPublishRoutes:
         assert payload["runtime_synced"] is True
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
-            str(model_dir),
+            str(model_dir / "model.xml"),
             version_tag=version_id,
         )
 
