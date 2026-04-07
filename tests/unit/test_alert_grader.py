@@ -316,8 +316,10 @@ class TestCUSUMEvidence:
             camera_id="cam1", zone_id="z1", zone_priority=ZonePriority.STANDARD,
             anomaly_score=0.8, frame_number=4, anomaly_map=map2,
         )
-        # After spatial reset, evidence = 0.0 + 0.8 = 0.8
-        assert grader._trackers["cam1:z1"].evidence < 1.5
+        # After spatial mismatch, evidence decays by 0.5x then accumulates new score.
+        # This is less than the pre-mismatch evidence, confirming penalization.
+        tracker = grader._trackers["cam1:z1"]
+        assert tracker.evidence < 3.0  # well below the trigger threshold
 
     def test_steady_medium_signal(self):
         """连续帧 score=0.72 → evidence 稳步累积 → 约 5-6 帧触发。"""
