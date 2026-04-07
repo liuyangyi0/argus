@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import signal
 import sys
 import threading
@@ -28,6 +29,7 @@ from argus.dashboard.app import create_app
 from argus.dashboard.tasks import TaskManager
 from argus.storage.audit import AuditLogger
 from argus.storage.backup import BackupManager
+from argus.storage.alert_recording import AlertRecordingStore
 from argus.storage.database import Database
 from argus.storage.inference_store import InferenceRecordStore
 
@@ -217,6 +219,9 @@ def main():
     )
     record_store.start()
 
+    recordings_dir = str(Path(config.storage.alerts_dir).parent / "recordings")
+    alert_recording_store = AlertRecordingStore(archive_dir=recordings_dir)
+
     # Start camera manager with all cameras
     manager = CameraManager(
         cameras=cameras,
@@ -229,6 +234,7 @@ def main():
         audit_logger=audit_log,
         record_store=record_store,
         database=db,
+        alert_recording_store=alert_recording_store,
     )
 
     # Graceful shutdown
@@ -262,6 +268,7 @@ def main():
             task_manager=task_mgr,
         )
         app.state.audit_logger = audit_logger
+        app.state.recording_store = alert_recording_store  # FR-033: shared with pipelines
         if app.state.baseline_lifecycle is not None:
             app.state.baseline_lifecycle._audit = audit_logger
         app.state.backup_manager = backup_mgr

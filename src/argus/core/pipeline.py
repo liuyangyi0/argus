@@ -45,6 +45,7 @@ from argus.core.inference_record import (
     InferenceRecord,
     PrefilterDecision,
 )
+from argus.core.model_discovery import find_runtime_model, find_runtime_model_in_dir
 from argus.capture.camera import CameraCapture, FrameData
 from argus.config.schema import AlertConfig, CameraConfig, ClassifierConfig, SegmenterConfig, ZonePriority
 from argus.core.zone_mask import ZoneMaskEngine
@@ -356,40 +357,22 @@ class DetectionPipeline:
                 )
 
     @staticmethod
+    def _find_model_in_dir(base: Path, camera_id: str) -> Path | None:
+        """Find the best model file in a directory and its exports counterpart.
+
+        Search order: OpenVINO (.xml) > Torch (.pt)
+        Also searches data/exports/{camera_id} for inference-ready formats.
+        """
+        return find_runtime_model_in_dir(base, camera_id)
+
+    @staticmethod
     def _find_model(camera_id: str) -> Path | None:
         """Auto-discover the latest trained model for a camera.
 
-        Search order: OpenVINO (.xml) > Torch (.pt) > Lightning (.ckpt)
+        Search order: OpenVINO (.xml) > Torch (.pt)
         Search paths: data/exports/{camera_id} (preferred) then data/models/{camera_id}
         """
-        search_dirs = [
-            Path("data/exports") / camera_id,
-            Path("data/models") / camera_id,
-        ]
-        # Prefer inference-ready formats over training checkpoints
-        for pattern in ("model.xml", "model.pt"):
-            for base in search_dirs:
-                if not base.exists():
-                    continue
-                matches = sorted(
-                    base.rglob(pattern),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                if matches:
-                    return matches[0]
-        # Fallback to Lightning checkpoint (least preferred)
-        for base in search_dirs:
-            if not base.exists():
-                continue
-            matches = sorted(
-                base.rglob("model.ckpt"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if matches:
-                return matches[0]
-        return None
+        return find_runtime_model(camera_id)
 
     def initialize(self) -> bool:
         """Initialize all pipeline components. Returns True on success."""

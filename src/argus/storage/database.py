@@ -723,8 +723,15 @@ class Database:
             ).all()
             return {r.alert_id: r for r in records}
 
-    def update_alert_recording_status(self, alert_id: str, status: str) -> bool:
-        """Update the status of an alert recording. Returns True if found."""
+    def update_alert_recording_status(
+        self,
+        alert_id: str,
+        status: str,
+        frame_count: int | None = None,
+        end_timestamp: float | None = None,
+        file_size_bytes: int | None = None,
+    ) -> bool:
+        """Update the status (and optional metadata) of an alert recording."""
         with self.get_session() as session:
             record = session.scalar(
                 select(AlertRecordingRecord).where(
@@ -734,6 +741,12 @@ class Database:
             if record is None:
                 return False
             record.status = status
+            if frame_count is not None:
+                record.frame_count = frame_count
+            if end_timestamp is not None:
+                record.end_timestamp = end_timestamp
+            if file_size_bytes is not None:
+                record.file_size_bytes = file_size_bytes
             session.commit()
             return True
 

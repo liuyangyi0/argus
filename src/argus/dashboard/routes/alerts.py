@@ -850,7 +850,7 @@ def _add_fp_snapshot_to_baseline(request: Request, alert_id: str) -> None:
 
 
 @router.get("/json")
-async def alerts_json(
+def alerts_json(
     request: Request,
     camera_id: str | None = Query(None),
     severity: str | None = Query(None),

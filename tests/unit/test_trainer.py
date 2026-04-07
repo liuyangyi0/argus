@@ -220,6 +220,45 @@ class TestThresholdRecommendation:
         threshold = ModelTrainer._recommend_threshold(stats)
         assert threshold >= 0.1
 
+
+class TestExportModel:
+    def test_openvino_export_disables_dynamo(self, tmp_path):
+        """OpenVINO export should force the stable non-dynamo ONNX path."""
+        engine = MagicMock()
+        model = MagicMock()
+
+        ModelTrainer._export_model(
+            engine=engine,
+            model=model,
+            export_format="openvino",
+            export_path=str(tmp_path),
+        )
+
+        engine.export.assert_called_once_with(
+            model=model,
+            export_type="openvino",
+            export_root=str(tmp_path),
+            onnx_kwargs={"dynamo": False},
+        )
+
+    def test_torch_export_keeps_default_kwargs(self, tmp_path):
+        """Torch export should not receive ONNX-specific kwargs."""
+        engine = MagicMock()
+        model = MagicMock()
+
+        ModelTrainer._export_model(
+            engine=engine,
+            model=model,
+            export_format="torch",
+            export_path=str(tmp_path),
+        )
+
+        engine.export.assert_called_once_with(
+            model=model,
+            export_type="torch",
+            export_root=str(tmp_path),
+        )
+
     def test_empty_scores_default(self):
         """Should return default 0.7 when no validation data."""
         stats = {"scores": [], "mean": 0.0, "std": 0.0, "max": 0.0}

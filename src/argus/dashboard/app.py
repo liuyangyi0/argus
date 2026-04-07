@@ -105,14 +105,10 @@ def create_app(
     app.state.degradation_manager = GlobalDegradationManager(ws_manager=ws_manager)
 
     # FR-033: Alert recording store for replay
-    from argus.storage.alert_recording import AlertRecordingStore
-
-    storage_cfg = getattr(config, "storage", None)
-    recordings_dir = "data/recordings"
-    if storage_cfg and hasattr(storage_cfg, "alerts_dir"):
-        # Co-locate recordings near alerts directory
-        recordings_dir = str(Path(storage_cfg.alerts_dir).parent / "recordings")
-    app.state.recording_store = AlertRecordingStore(archive_dir=recordings_dir)
+    # The store is created in __main__.py and set on app.state after create_app().
+    # Initialize to None here so replay routes degrade gracefully if not wired.
+    if not hasattr(app.state, "recording_store"):
+        app.state.recording_store = None
 
     # ── Security middleware ──
     from argus.dashboard.auth import (

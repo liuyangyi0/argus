@@ -40,6 +40,8 @@ async function fetchData() {
   try {
     const res = await getCameras()
     cameras.value = res.data.cameras || []
+  } catch {
+    // Network error or timeout — keep existing data
   } finally {
     loading.value = false
   }

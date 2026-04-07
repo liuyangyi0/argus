@@ -552,7 +552,7 @@ async def usb_devices(request: Request):
 
 
 @router.get("/json")
-async def cameras_json(request: Request):
+def cameras_json(request: Request):
     """JSON API for camera status."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
@@ -577,7 +577,7 @@ async def cameras_json(request: Request):
 
 
 @router.get("/{camera_id}/detail/json")
-async def camera_detail_json(request: Request, camera_id: str):
+def camera_detail_json(request: Request, camera_id: str):
     """Return a detailed camera payload for the detail page."""
     camera_manager = request.app.state.camera_manager
     camera_config = _find_camera_config(request, camera_id)
@@ -639,7 +639,7 @@ async def camera_detail_json(request: Request, camera_id: str):
 
 
 @router.get("/{camera_id}/runner")
-async def camera_runner_snapshot(request: Request, camera_id: str):
+def camera_runner_snapshot(request: Request, camera_id: str):
     """Get the inference runner state snapshot for a camera (5.1)."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
@@ -695,19 +695,25 @@ async def camera_stream(request: Request, camera_id: str):
     if not camera_manager:
         return Response(status_code=503)
 
+    def _grab_and_encode():
+        frame = camera_manager.get_latest_frame(camera_id)
+        if frame is None:
+            return None
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        return buf.tobytes()
+
     async def generate_frames():
         start_time = time.monotonic()
         try:
             while True:
                 if time.monotonic() - start_time > _MAX_STREAM_DURATION:
                     break
-                frame = camera_manager.get_latest_frame(camera_id)
-                if frame is not None:
-                    _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                jpeg = await asyncio.to_thread(_grab_and_encode)
+                if jpeg is not None:
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n\r\n"
-                        + buffer.tobytes()
+                        + jpeg
                         + b"\r\n"
                     )
                 await asyncio.sleep(0.2)
@@ -729,36 +735,41 @@ async def camera_heatmap_stream(request: Request, camera_id: str):
 
     import numpy as np
 
+    def _grab_and_encode_heatmap():
+        frame = camera_manager.get_latest_frame(camera_id)
+        if frame is None:
+            return None
+        anomaly_map = camera_manager.get_latest_anomaly_map(camera_id)
+        if anomaly_map is not None:
+            h, w = frame.shape[:2]
+            heatmap = cv2.resize(anomaly_map, (w, h))
+            heatmap_u8 = np.clip(heatmap * 255, 0, 255).astype(np.uint8)
+            heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
+            mask = heatmap > 0.3
+            blended = frame.copy()
+            if mask.any():
+                mask_3ch = np.stack([mask] * 3, axis=-1)
+                blended = np.where(
+                    mask_3ch,
+                    cv2.addWeighted(frame, 0.6, heatmap_color, 0.4, 0),
+                    frame,
+                )
+            frame = blended
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        return buf.tobytes()
+
     async def generate_heatmap_frames():
         start_time = time.monotonic()
         try:
             while True:
                 if time.monotonic() - start_time > _MAX_STREAM_DURATION:
                     break
-                frame = camera_manager.get_latest_frame(camera_id)
-                if frame is not None:
-                    anomaly_map = camera_manager.get_latest_anomaly_map(camera_id)
-                    if anomaly_map is not None:
-                        h, w = frame.shape[:2]
-                        heatmap = cv2.resize(anomaly_map, (w, h))
-                        heatmap_u8 = np.clip(heatmap * 255, 0, 255).astype(np.uint8)
-                        heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
-                        mask = heatmap > 0.3
-                        blended = frame.copy()
-                        if mask.any():
-                            mask_3ch = np.stack([mask] * 3, axis=-1)
-                            blended = np.where(
-                                mask_3ch,
-                                cv2.addWeighted(frame, 0.6, heatmap_color, 0.4, 0),
-                                frame,
-                            )
-                        frame = blended
-
-                    _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                jpeg = await asyncio.to_thread(_grab_and_encode_heatmap)
+                if jpeg is not None:
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n\r\n"
-                        + buffer.tobytes()
+                        + jpeg
                         + b"\r\n"
                     )
                 await asyncio.sleep(0.2)
@@ -781,8 +792,6 @@ async def wall_status(request: Request):
                current_score, score_sparkline, alert_count_today,
                active_alert, degradation}]}
     """
-    from datetime import datetime, timezone
-
     camera_manager = request.app.state.camera_manager
     if camera_manager is None:
         return JSONResponse({"cameras": []})
@@ -790,61 +799,62 @@ async def wall_status(request: Request):
     db = getattr(request.app.state, "database", None)
     health_monitor = getattr(request.app.state, "health_monitor", None)
 
-    cameras = []
-    for cam_status in camera_manager.get_status():
-        cam_id = cam_status.camera_id
-        tile: dict = {
-            "camera_id": cam_id,
-            "name": getattr(cam_status, "name", cam_id),
-            "status": "online" if getattr(cam_status, "connected", False) else "offline",
-            "model_version": getattr(cam_status, "model_version_id", None),
-            "current_score": 0.0,
-            "score_sparkline": [],
-            "alert_count_today": 0,
-            "active_alert": None,
-            "degradation": None,
-        }
+    def _build_wall_data():
+        from datetime import datetime, timezone
 
-        # Get sparkline from pipeline if available
-        pipeline = getattr(cam_status, "pipeline", None)
-        if pipeline is not None and hasattr(pipeline, "get_wall_status"):
-            wall_data = pipeline.get_wall_status()
-            tile["current_score"] = wall_data.get("current_score", 0.0)
-            tile["score_sparkline"] = wall_data.get("score_sparkline", [])
+        cameras = []
+        for cam_status in camera_manager.get_status():
+            cam_id = cam_status.camera_id
+            tile: dict = {
+                "camera_id": cam_id,
+                "name": getattr(cam_status, "name", cam_id),
+                "status": "online" if getattr(cam_status, "connected", False) else "offline",
+                "model_version": getattr(cam_status, "model_version_id", None),
+                "current_score": 0.0,
+                "score_sparkline": [],
+                "alert_count_today": 0,
+                "active_alert": None,
+                "degradation": None,
+            }
 
-        # Today's alert count
-        if db is not None:
-            try:
-                today_count = db.get_alert_count(
-                    camera_id=cam_id,
-                    since=datetime.now(timezone.utc).replace(
-                        hour=0, minute=0, second=0, microsecond=0
-                    ),
-                )
-                tile["alert_count_today"] = today_count
-            except Exception:
-                pass
+            pipeline = getattr(cam_status, "pipeline", None)
+            if pipeline is not None and hasattr(pipeline, "get_wall_status"):
+                wall_data = pipeline.get_wall_status()
+                tile["current_score"] = wall_data.get("current_score", 0.0)
+                tile["score_sparkline"] = wall_data.get("score_sparkline", [])
 
-        # Active (unresolved) alert
-        if db is not None:
-            try:
-                recent = db.get_alerts(camera_id=cam_id, limit=1)
-                if recent and recent[0].workflow_status in ("new", "acknowledged", "investigating"):
-                    tile["active_alert"] = {
-                        "alert_id": recent[0].alert_id,
-                        "severity": recent[0].severity,
-                    }
-            except Exception:
-                pass
+            if db is not None:
+                try:
+                    today_count = db.get_alert_count(
+                        camera_id=cam_id,
+                        since=datetime.now(timezone.utc).replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    )
+                    tile["alert_count_today"] = today_count
+                except Exception:
+                    pass
 
-        # Degradation status from health monitor
-        if health_monitor is not None:
-            health = health_monitor.get_camera_health(cam_id)
-            if health and not health.get("connected", True):
-                tile["degradation"] = "rtsp_broken"
-            elif health and health.get("error"):
-                tile["degradation"] = "error"
+            if db is not None:
+                try:
+                    recent = db.get_alerts(camera_id=cam_id, limit=1)
+                    if recent and recent[0].workflow_status in ("new", "acknowledged", "investigating"):
+                        tile["active_alert"] = {
+                            "alert_id": recent[0].alert_id,
+                            "severity": recent[0].severity,
+                        }
+                except Exception:
+                    pass
 
-        cameras.append(tile)
+            if health_monitor is not None:
+                health = health_monitor.get_camera_health(cam_id)
+                if health and not health.get("connected", True):
+                    tile["degradation"] = "rtsp_broken"
+                elif health and health.get("error"):
+                    tile["degradation"] = "error"
 
+            cameras.append(tile)
+        return cameras
+
+    cameras = await asyncio.to_thread(_build_wall_data)
     return JSONResponse({"cameras": cameras})

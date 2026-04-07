@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from argus.capture.baseline_job import run_baseline_capture_job, BaselineCaptureJobConfig
 from argus.config.schema import BaselineCaptureConfig
+from argus.core.model_discovery import resolve_runtime_model_path
 from argus.dashboard.components import (
     confirm_button,
     empty_state,
@@ -344,6 +345,35 @@ async def models_list_json(request: Request):
                 })
 
     return JSONResponse({"models": result})
+
+
+@router.delete("/models/by-path")
+async def delete_model_by_path(request: Request):
+    """Delete a trained model file by its path (for filesystem-only models)."""
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    body = await request.json()
+    model_path = body.get("model_path")
+    if not model_path:
+        return JSONResponse({"error": "model_path is required"}, status_code=400)
+
+    target = Path(model_path).resolve()
+    models_dir = Path(config.storage.models_dir).resolve()
+    if not str(target).startswith(str(models_dir)):
+        return JSONResponse({"error": "路径不在模型目录下"}, status_code=403)
+
+    if not target.exists():
+        return JSONResponse({"error": f"文件不存在: {model_path}"}, status_code=404)
+
+    if target.is_dir():
+        shutil.rmtree(target, ignore_errors=True)
+    else:
+        target.unlink(missing_ok=True)
+    logger.info("model.file_deleted", path=model_path)
+
+    return JSONResponse({"status": "ok", "deleted": model_path})
 
 
 @router.get("/training-history/json")
@@ -803,9 +833,9 @@ async def deploy_model(request: Request):
         return JSONResponse({"error": "缺少参数"}, status_code=400)
 
     # Path safety
-    models_dir = Path("data/models").resolve()
+    allowed_roots = [Path("data/models").resolve(), Path("data/exports").resolve()]
     resolved = Path(model_path).resolve()
-    if not str(resolved).startswith(str(models_dir)):
+    if not any(str(resolved).startswith(str(root)) for root in allowed_roots):
         return JSONResponse({"error": "模型路径无效"}, status_code=400)
     if not resolved.exists():
         return JSONResponse({"error": "模型文件不存在"}, status_code=404)
@@ -813,34 +843,23 @@ async def deploy_model(request: Request):
     if camera_id not in camera_manager._pipelines:
         return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
 
-    # If model_path is a directory, find the actual model file
-    if resolved.is_dir():
-        from argus.core.pipeline import DetectionPipeline
-
-        model_file = DetectionPipeline._find_model(camera_id)
-        if model_file is None:
-            # Search exports dir as well (export output goes to data/exports/)
-            exports_dir = Path("data/exports").resolve()
-            for search_dir in [resolved, exports_dir / camera_id]:
-                if not search_dir.exists():
-                    continue
-                for pattern in ("model.xml", "model.pt", "model.ckpt"):
-                    matches = sorted(search_dir.rglob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-                    if matches:
-                        model_file = matches[0]
-                        break
-                if model_file:
-                    break
-        if model_file is None:
-            return JSONResponse({"error": "模型目录中未找到可部署的模型文件 (.xml/.pt/.ckpt)"}, status_code=404)
-        resolved = model_file
-        logger.info("deploy.resolved_model_file", path=str(resolved))
+    resolved_runtime_model = resolve_runtime_model_path(resolved, camera_id)
+    if resolved_runtime_model is None:
+        return JSONResponse({"error": "模型目录中未找到可部署的模型文件 (.xml/.pt)"}, status_code=404)
+    resolved = resolved_runtime_model
+    logger.info("deploy.resolved_model_file", path=str(resolved))
 
     registry_record = find_registered_model_by_path(
         request,
-        resolved,
+        Path(model_path),
         camera_id=camera_id,
     )
+    if registry_record is None:
+        registry_record = find_registered_model_by_path(
+            request,
+            resolved,
+            camera_id=camera_id,
+        )
     if registry_record is not None:
         _, success = activate_model_version(
             request,

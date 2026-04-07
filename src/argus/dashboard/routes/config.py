@@ -15,6 +15,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+from argus.core.model_discovery import resolve_runtime_model_path
 from argus.dashboard.components import (
     confirm_button,
     empty_state,
@@ -588,15 +589,19 @@ async def reload_model(request: Request, req: ModelReloadRequest):
         return JSONResponse({"error": f"摄像头 {req.camera_id} 不存在"}, status_code=404)
 
     # Sanitize model path
-    models_dir = Path("data/models").resolve()
+    allowed_roots = [Path("data/models").resolve(), Path("data/exports").resolve()]
     try:
         model_path = Path(req.model_path).resolve()
-        if not str(model_path).startswith(str(models_dir)):
-            return JSONResponse({"error": "模型路径必须在 data/models/ 下"}, status_code=400)
+        if not any(str(model_path).startswith(str(root)) for root in allowed_roots):
+            return JSONResponse({"error": "模型路径必须在 data/models/ 或 data/exports/ 下"}, status_code=400)
         if not model_path.exists():
             return JSONResponse({"error": f"模型文件不存在: {req.model_path}"}, status_code=404)
     except (ValueError, OSError):
         return JSONResponse({"error": "模型路径无效"}, status_code=400)
+
+    resolved_runtime_model = resolve_runtime_model_path(model_path, req.camera_id)
+    if resolved_runtime_model is None:
+        return JSONResponse({"error": "未找到可部署的模型文件 (.xml/.pt)"}, status_code=404)
 
     registry_record = find_registered_model_by_path(
         request,
@@ -606,7 +611,7 @@ async def reload_model(request: Request, req: ModelReloadRequest):
     version_tag = registry_record.model_version_id if registry_record is not None else None
     success = camera_manager.reload_model(
         req.camera_id,
-        str(model_path),
+        str(resolved_runtime_model),
         version_tag=version_tag,
     )
     return JSONResponse({"status": "ok" if success else "failed", "camera_id": req.camera_id})

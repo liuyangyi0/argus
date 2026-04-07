@@ -90,6 +90,8 @@ export const rollbackModel = (versionId: string) =>
   api.post(`/models/${versionId}/rollback`)
 export const deleteModel = (versionId: string) =>
   api.delete(`/models/${versionId}`)
+export const deleteModelByPath = (modelPath: string) =>
+  api.delete('/baseline/models/by-path', { data: { model_path: modelPath } })
 
 // ── Release Pipeline ──
 export const promoteModel = (versionId: string, data: { target_stage: string; triggered_by: string; reason?: string; canary_camera_id?: string }) =>

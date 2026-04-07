@@ -1,4 +1,4 @@
-import { ref, onMounted, onUnmounted, type Ref } from 'vue'
+import { ref, onUnmounted, type Ref } from 'vue'
 
 type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation'
 
@@ -17,8 +17,6 @@ interface UseWebSocketOptions {
   fallbackPoll?: () => void
   /** Fallback polling interval in ms (default 15000) */
   fallbackInterval?: number
-  /** Max reconnect retries before falling back to polling (default 3) */
-  maxRetries?: number
 }
 
 function getCookie(name: string): string | null {
@@ -26,138 +24,190 @@ function getCookie(name: string): string | null {
   return match ? decodeURIComponent(match[1]) : null
 }
 
-/**
- * Composable for subscribing to real-time WebSocket updates.
- *
- * Connects on mount, disconnects on unmount. Auto-reconnects with
- * exponential backoff. Falls back to polling after maxRetries failures.
- */
+// ── Singleton WebSocket connection ──
+// All components share a single WebSocket. Each useWebSocket() call adds
+// a subscriber with its own topics and callbacks. When a subscriber unmounts,
+// it is removed. The connection stays alive as long as at least one subscriber
+// exists; it closes when the last one unsubscribes.
+
+interface Subscriber {
+  id: number
+  topics: Set<Topic>
+  onMessage?: (topic: Topic, data: any) => void
+  fallbackPoll?: () => void
+  fallbackInterval: number
+  fallbackTimer: ReturnType<typeof setInterval> | null
+}
+
+let ws: WebSocket | null = null
+let subscriberIdCounter = 0
+const subscribers = new Map<number, Subscriber>()
+let retryCount = 0
+let retryTimer: ReturnType<typeof setTimeout> | null = null
+const MAX_RETRIES = 3
+const globalConnected = ref(false)
+
+function allTopics(): Topic[] {
+  const topics = new Set<Topic>()
+  for (const sub of subscribers.values()) {
+    for (const t of sub.topics) topics.add(t)
+  }
+  return [...topics]
+}
+
+function wsConnect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
+  if (subscribers.size === 0) return
+
+  const token = getCookie('argus_session')
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const url = `${proto}://${location.host}/ws${token ? `?token=${token}` : ''}`
+
+  ws = new WebSocket(url)
+
+  ws.onopen = () => {
+    globalConnected.value = true
+    retryCount = 0
+    // Stop all fallback polling
+    for (const sub of subscribers.values()) {
+      if (sub.fallbackTimer !== null) {
+        clearInterval(sub.fallbackTimer)
+        sub.fallbackTimer = null
+      }
+    }
+    // Subscribe to the union of all topics
+    ws!.send(JSON.stringify({ action: 'subscribe', topics: allTopics() }))
+  }
+
+  ws.onmessage = (event) => {
+    try {
+      const msg: WsMessage = JSON.parse(event.data)
+      if (msg.topic === 'ping') {
+        ws?.send(JSON.stringify({ action: 'pong' }))
+        return
+      }
+      // Dispatch to subscribers interested in this topic
+      for (const sub of subscribers.values()) {
+        if (sub.topics.has(msg.topic as Topic)) {
+          sub.onMessage?.(msg.topic as Topic, msg.data)
+        }
+      }
+    } catch {
+      // ignore malformed messages
+    }
+  }
+
+  ws.onclose = () => {
+    globalConnected.value = false
+    ws = null
+    scheduleReconnect()
+  }
+
+  ws.onerror = () => {
+    // onclose fires after onerror
+  }
+}
+
+function scheduleReconnect() {
+  if (subscribers.size === 0) return
+  retryCount++
+  if (retryCount > MAX_RETRIES) {
+    // Fall back to per-subscriber polling
+    for (const sub of subscribers.values()) {
+      startFallbackPolling(sub)
+    }
+    return
+  }
+  const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 30000)
+  retryTimer = setTimeout(wsConnect, delay)
+}
+
+function startFallbackPolling(sub: Subscriber) {
+  if (!sub.fallbackPoll || sub.fallbackTimer !== null) return
+  sub.fallbackPoll()
+  sub.fallbackTimer = setInterval(sub.fallbackPoll, sub.fallbackInterval)
+}
+
+function wsDisconnect() {
+  if (retryTimer !== null) {
+    clearTimeout(retryTimer)
+    retryTimer = null
+  }
+  if (ws) {
+    ws.onclose = null
+    ws.close()
+    ws = null
+  }
+  globalConnected.value = false
+  retryCount = 0
+}
+
+function resubscribe() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ action: 'subscribe', topics: allTopics() }))
+  }
+}
+
+function addSubscriber(sub: Subscriber) {
+  subscribers.set(sub.id, sub)
+  if (!ws || ws.readyState === WebSocket.CLOSED) {
+    retryCount = 0
+    wsConnect()
+  } else {
+    resubscribe()
+  }
+}
+
+function removeSubscriber(id: number) {
+  const sub = subscribers.get(id)
+  if (sub?.fallbackTimer !== null) {
+    clearInterval(sub!.fallbackTimer!)
+    sub!.fallbackTimer = null
+  }
+  subscribers.delete(id)
+  if (subscribers.size === 0) {
+    wsDisconnect()
+  } else {
+    resubscribe()
+  }
+}
+
+// ── Public composable ──
+
 export function useWebSocket(options: UseWebSocketOptions) {
   const {
     topics,
     onMessage,
     fallbackPoll,
     fallbackInterval = 15000,
-    maxRetries = 3,
   } = options
 
-  const connected = ref(false)
+  const connected = globalConnected
   const error = ref<string | null>(null)
-
-  // Reactive data per topic — consumers can read topicData.value[topic]
   const topicData: Ref<Record<string, any>> = ref({})
 
-  let ws: WebSocket | null = null
-  let retryCount = 0
-  let retryTimer: ReturnType<typeof setTimeout> | null = null
-  let fallbackTimer: ReturnType<typeof setInterval> | null = null
-  let unmounted = false
-
-  function connect() {
-    if (unmounted) return
-
-    const token = getCookie('argus_session')
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const url = `${proto}://${location.host}/ws${token ? `?token=${token}` : ''}`
-
-    ws = new WebSocket(url)
-
-    ws.onopen = () => {
-      connected.value = true
-      error.value = null
-      retryCount = 0
-
-      // Stop fallback polling if active
-      if (fallbackTimer !== null) {
-        clearInterval(fallbackTimer)
-        fallbackTimer = null
-      }
-
-      // Subscribe to requested topics
-      ws!.send(JSON.stringify({ action: 'subscribe', topics }))
-    }
-
-    ws.onmessage = (event) => {
-      try {
-        const msg: WsMessage = JSON.parse(event.data)
-
-        // Respond to heartbeat ping
-        if (msg.topic === 'ping') {
-          ws?.send(JSON.stringify({ action: 'pong' }))
-          return
-        }
-
-        // Update reactive data
-        if (topics.includes(msg.topic as Topic)) {
-          topicData.value = { ...topicData.value, [msg.topic]: msg.data }
-          onMessage?.(msg.topic as Topic, msg.data)
-        }
-      } catch {
-        // ignore malformed messages
-      }
-    }
-
-    ws.onclose = () => {
-      connected.value = false
-      ws = null
-      scheduleReconnect()
-    }
-
-    ws.onerror = () => {
-      error.value = 'WebSocket error'
-      // onclose will fire after onerror, which triggers reconnect
-    }
+  const subId = ++subscriberIdCounter
+  const sub: Subscriber = {
+    id: subId,
+    topics: new Set(topics),
+    onMessage: (topic, data) => {
+      topicData.value = { ...topicData.value, [topic]: data }
+      onMessage?.(topic, data)
+    },
+    fallbackPoll,
+    fallbackInterval,
+    fallbackTimer: null,
   }
 
-  function scheduleReconnect() {
-    if (unmounted) return
+  addSubscriber(sub)
 
-    retryCount++
-    if (retryCount > maxRetries) {
-      // Fall back to polling
-      error.value = 'WebSocket unavailable, using polling'
-      startFallbackPolling()
-      return
-    }
-
-    // Exponential backoff: 1s, 2s, 4s, ... capped at 30s
-    const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 30000)
-    retryTimer = setTimeout(connect, delay)
-  }
-
-  function startFallbackPolling() {
-    if (!fallbackPoll || fallbackTimer !== null) return
-    fallbackPoll() // immediate first poll
-    fallbackTimer = setInterval(fallbackPoll, fallbackInterval)
-  }
-
-  function disconnect() {
-    unmounted = true
-    if (retryTimer !== null) {
-      clearTimeout(retryTimer)
-      retryTimer = null
-    }
-    if (fallbackTimer !== null) {
-      clearInterval(fallbackTimer)
-      fallbackTimer = null
-    }
-    if (ws) {
-      ws.onclose = null // prevent reconnect on intentional close
-      ws.close()
-      ws = null
-    }
-    connected.value = false
-  }
-
-  onMounted(connect)
-  onUnmounted(disconnect)
+  onUnmounted(() => {
+    removeSubscriber(subId)
+  })
 
   return {
-    /** Whether the WebSocket is currently connected */
     connected,
-    /** Last error message, or null */
     error,
-    /** Reactive object keyed by topic with latest data */
     topicData,
   }
 }

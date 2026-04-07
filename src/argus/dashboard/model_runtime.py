@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import Request
 
+from argus.core.model_discovery import resolve_runtime_model_path
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.models import ModelRecord
 
@@ -23,32 +24,8 @@ def get_registry(request: Request) -> ModelRegistry | None:
 
 def _resolve_model_file(model_path: str, camera_id: str) -> str:
     """Resolve a model path to an actual model file if it's a directory."""
-    p = Path(model_path)
-    if p.is_file():
-        return model_path
-
-    # Search the provided directory first, then exports, then global models
-    search_dirs = [p]
-    exports_dir = Path("data/exports") / camera_id
-    if exports_dir.exists():
-        search_dirs.append(exports_dir)
-
-    for search_dir in search_dirs:
-        if not search_dir.exists():
-            continue
-        for pattern in ("model.xml", "model.pt", "model.ckpt"):
-            matches = sorted(search_dir.rglob(pattern), key=lambda f: f.stat().st_mtime, reverse=True)
-            if matches:
-                return str(matches[0])
-
-    # Last resort: use pipeline's global model discovery
-    from argus.core.pipeline import DetectionPipeline
-
-    found = DetectionPipeline._find_model(camera_id)
-    if found is not None:
-        return str(found)
-
-    return model_path  # return as-is, reload_model will report the error
+    resolved = resolve_runtime_model_path(model_path, camera_id)
+    return str(resolved) if resolved is not None else model_path
 
 
 def sync_model_record_runtime(request: Request, record: ModelRecord) -> bool:
@@ -58,6 +35,8 @@ def sync_model_record_runtime(request: Request, record: ModelRecord) -> bool:
         return False
 
     resolved_path = _resolve_model_file(record.model_path, record.camera_id)
+    if Path(resolved_path).suffix.lower() not in {".xml", ".pt"}:
+        return False
     return camera_manager.reload_model(
         record.camera_id,
         resolved_path,
@@ -125,7 +104,7 @@ def find_registered_model_by_path(
     resolved_target = Path(model_path).resolve()
     candidate_paths = {resolved_target}
     if resolved_target.is_file():
-        candidate_paths.add(resolved_target.parent)
+        candidate_paths.update(resolved_target.parents)
     for record in registry.list_models(camera_id=camera_id):
         if not record.model_path:
             continue

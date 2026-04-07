@@ -283,7 +283,7 @@ def overview(request: Request):
 
 
 @router.get("/health")
-async def health(request: Request):
+def health(request: Request):
     """JSON health endpoint for monitoring tools."""
     health_monitor = request.app.state.health_monitor
     if not health_monitor:
