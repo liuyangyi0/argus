@@ -459,7 +459,18 @@ async def alerts_list(
 
 @router.post("/{alert_id}/workflow")
 async def alert_workflow_transition(request: Request, alert_id: str):
-    """Transition alert workflow status (confirm/false_positive/resolve/escalate)."""
+    """Transition alert workflow status with severity-based handling (UX v2 §5.1).
+
+    Handling policy by severity:
+    - LOW/INFO: Quick actions allowed (acknowledge, false_positive) without confirmation
+    - MEDIUM: Quick actions allowed but require `confirmed: true` in request body
+    - HIGH: Only "investigate" action accepted from quick panel; must enter detail page
+            for full workflow transitions
+
+    JSON request body: {status, notes?, category?, assigned_to?, confirmed?}
+    JSON response: {success, severity, handling_policy, require_confirmation,
+                    require_detail_view, next_actions}
+    """
     db = request.app.state.db
     if not db:
         return JSONResponse({"error": "数据库不可用"}, status_code=503)
@@ -476,6 +487,8 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     notes = data.get("notes", "")
     category = data.get("category", "")
     assigned_to = data.get("assigned_to", "")
+    confirmed = data.get("confirmed", False)
+    from_detail_view = data.get("from_detail_view", False)
 
     if category and notes:
         notes = f"[{category}] {notes}"
@@ -489,16 +502,72 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     if new_status not in valid_statuses:
         return JSONResponse({"error": f"无效状态: {new_status}"}, status_code=400)
 
+    # Fetch alert to check severity
+    alert = db.get_alert(alert_id)
+    if alert is None:
+        return JSONResponse({"error": "告警不存在"}, status_code=404)
+
+    severity = alert.severity
+    quick_actions = {"acknowledged", "false_positive"}
+
+    # UX v2 §5.1: Severity-based handling enforcement
+    if severity == "high" and new_status in quick_actions and not from_detail_view:
+        return JSONResponse({
+            "success": False,
+            "severity": severity,
+            "handling_policy": "detail_required",
+            "require_confirmation": False,
+            "require_detail_view": True,
+            "next_actions": ["investigate"],
+            "message": "HIGH 级告警必须进入详情页处理",
+        }, status_code=403)
+
+    if severity == "medium" and new_status in quick_actions and not confirmed:
+        return JSONResponse({
+            "success": False,
+            "severity": severity,
+            "handling_policy": "confirm",
+            "require_confirmation": True,
+            "require_detail_view": False,
+            "next_actions": ["acknowledged", "false_positive", "investigating"],
+            "message": "MEDIUM 级告警需要确认后处理",
+        }, status_code=400)
+
+    # Execute the transition
     success = db.update_alert_workflow(
         alert_id, new_status, notes=notes or None, assigned_to=assigned_to or None,
     )
     if not success:
-        return JSONResponse({"error": "告警不存在"}, status_code=404)
+        return JSONResponse({"error": "状态转换失败"}, status_code=500)
 
     # Submit to feedback queue if applicable
     _submit_workflow_feedback(request, alert_id, new_status, category, notes)
 
-    # Re-render the detail view
+    # Determine handling metadata from canonical mapping
+    from argus.alerts.grader import HANDLING_POLICIES
+    from argus.config.schema import AlertSeverity as _Sev
+    handling_policy = HANDLING_POLICIES.get(_Sev(severity), "quick")
+
+    _next_actions_map = {
+        "new": ["acknowledged", "investigating", "false_positive"],
+        "acknowledged": ["investigating", "resolved", "false_positive"],
+        "investigating": ["resolved", "false_positive", "uncertain"],
+        "resolved": ["closed"],
+    }
+    next_actions = _next_actions_map.get(new_status, [])
+
+    # Return JSON response for API consumers
+    if "json" in content_type:
+        return JSONResponse({
+            "success": True,
+            "severity": severity,
+            "handling_policy": handling_policy,
+            "require_confirmation": severity == "medium",
+            "require_detail_view": severity == "high",
+            "next_actions": next_actions,
+        })
+
+    # Re-render the detail view for HTMX consumers
     return await alert_detail(request, alert_id)
 
 
@@ -792,4 +861,18 @@ async def alerts_json(
         return JSONResponse({"error": "数据库不可用"}, status_code=503)
 
     alerts = db.get_alerts(camera_id=camera_id, severity=severity, limit=limit)
-    return [a.to_dict() for a in alerts]
+
+    # Batch-fetch recording status to avoid N+1 queries
+    recording_map: dict = {}
+    if hasattr(db, "get_alert_recordings_batch"):
+        alert_ids = [a.alert_id for a in alerts]
+        recording_map = db.get_alert_recordings_batch(alert_ids)
+
+    result = []
+    for a in alerts:
+        d = a.to_dict()
+        rec = recording_map.get(a.alert_id)
+        d["has_recording"] = rec is not None
+        d["recording_status"] = rec.status if rec else None
+        result.append(d)
+    return result

@@ -335,6 +335,32 @@ class DriftConfig(BaseModel):
     )
 
 
+class RingBufferConfig(BaseModel):
+    """Alert ring buffer configuration for replay recordings (FR-033)."""
+
+    enabled: bool = Field(default=True, description="Enable alert replay recording")
+    pre_trigger_seconds: int = Field(
+        default=60, ge=10, le=120,
+        description="Seconds of footage to keep before alert trigger",
+    )
+    post_trigger_seconds: int = Field(
+        default=30, ge=10, le=60,
+        description="Seconds of footage to capture after alert trigger",
+    )
+    jpeg_quality: int = Field(
+        default=85, ge=60, le=95,
+        description="JPEG compression quality for buffered frames",
+    )
+    max_recording_age_days: int = Field(
+        default=30, ge=7, le=90,
+        description="Days to keep full recordings before archiving to trigger-frame-only",
+    )
+    archive_dir: str = Field(
+        default="data/recordings",
+        description="Directory for solidified alert recordings",
+    )
+
+
 class CameraConfig(BaseModel):
     """Configuration for a single camera."""
 
@@ -358,6 +384,7 @@ class CameraConfig(BaseModel):
     health: CameraHealthConfig = Field(default_factory=CameraHealthConfig)
     drift: DriftConfig = Field(default_factory=DriftConfig)
     degradation: DegradationConfig = Field(default_factory=DegradationConfig)
+    ring_buffer: RingBufferConfig = Field(default_factory=RingBufferConfig)
 
 
 class CameraGroupConfig(BaseModel):
@@ -490,6 +517,39 @@ class AuthConfig(BaseModel):
     )
 
 
+class AudioAlertSeverityConfig(BaseModel):
+    """Audio alert settings for a single severity level."""
+
+    enabled: bool = False
+    sound: str = Field(
+        default="beep_single",
+        description="Sound identifier: beep_single, beep_double, beep_double_voice",
+    )
+    voice_template: str = Field(
+        default="",
+        description="TTS voice template, e.g. '{camera} 高级别告警'",
+    )
+
+
+class AudioAlertConfig(BaseModel):
+    """Audio alert configuration per severity (UX v2 §2.5)."""
+
+    low: AudioAlertSeverityConfig = Field(
+        default_factory=lambda: AudioAlertSeverityConfig(enabled=False),
+    )
+    medium: AudioAlertSeverityConfig = Field(
+        default_factory=lambda: AudioAlertSeverityConfig(
+            enabled=True, sound="beep_single",
+        ),
+    )
+    high: AudioAlertSeverityConfig = Field(
+        default_factory=lambda: AudioAlertSeverityConfig(
+            enabled=True, sound="beep_double_voice",
+            voice_template="{camera} 高级别告警",
+        ),
+    )
+
+
 class DashboardConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8080, ge=1024, le=65535)
@@ -506,6 +566,7 @@ class DashboardConfig(BaseModel):
         default=100, ge=1, le=1000,
         description="Maximum concurrent WebSocket connections",
     )
+    audio_alerts: AudioAlertConfig = Field(default_factory=AudioAlertConfig)
 
 
 class LoggingConfig(BaseModel):

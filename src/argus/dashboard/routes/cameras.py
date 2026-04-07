@@ -631,3 +631,81 @@ async def camera_heatmap_stream(request: Request, camera_id: str):
         generate_heatmap_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+# ── Video Wall API (UX v2 §2) ──
+
+@router.get("/wall/status")
+async def wall_status(request: Request):
+    """Return aggregated status for all cameras in the video wall.
+
+    Response: {cameras: [{camera_id, name, status, model_version,
+               current_score, score_sparkline, alert_count_today,
+               active_alert, degradation}]}
+    """
+    from datetime import datetime, timezone
+
+    camera_manager = request.app.state.camera_manager
+    if camera_manager is None:
+        return JSONResponse({"cameras": []})
+
+    db = getattr(request.app.state, "db", None)
+    health_monitor = getattr(request.app.state, "health_monitor", None)
+
+    cameras = []
+    for cam_id, cam_status in camera_manager.get_all_status().items():
+        tile: dict = {
+            "camera_id": cam_id,
+            "name": getattr(cam_status, "name", cam_id),
+            "status": "online" if getattr(cam_status, "connected", False) else "offline",
+            "model_version": getattr(cam_status, "model_version_id", None),
+            "current_score": 0.0,
+            "score_sparkline": [],
+            "alert_count_today": 0,
+            "active_alert": None,
+            "degradation": None,
+        }
+
+        # Get sparkline from pipeline if available
+        pipeline = getattr(cam_status, "pipeline", None)
+        if pipeline is not None and hasattr(pipeline, "get_wall_status"):
+            wall_data = pipeline.get_wall_status()
+            tile["current_score"] = wall_data.get("current_score", 0.0)
+            tile["score_sparkline"] = wall_data.get("score_sparkline", [])
+
+        # Today's alert count
+        if db is not None:
+            try:
+                today_count = db.get_alert_count(
+                    camera_id=cam_id,
+                    since=datetime.now(timezone.utc).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ),
+                )
+                tile["alert_count_today"] = today_count
+            except Exception:
+                pass
+
+        # Active (unresolved) alert
+        if db is not None:
+            try:
+                recent = db.get_alerts(camera_id=cam_id, limit=1)
+                if recent and recent[0].workflow_status in ("new", "acknowledged", "investigating"):
+                    tile["active_alert"] = {
+                        "alert_id": recent[0].alert_id,
+                        "severity": recent[0].severity,
+                    }
+            except Exception:
+                pass
+
+        # Degradation status from health monitor
+        if health_monitor is not None:
+            health = health_monitor.get_camera_health(cam_id)
+            if health and not health.get("connected", True):
+                tile["degradation"] = "rtsp_broken"
+            elif health and health.get("error"):
+                tile["degradation"] = "error"
+
+        cameras.append(tile)
+
+    return JSONResponse({"cameras": cameras})

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from argus.storage.models import (
     AlertRecord,
+    AlertRecordingRecord,
     AlertWorkflowStatus,
     BackboneRecord,
     Base,
@@ -683,6 +684,72 @@ class Database:
         """Return total number of users."""
         with self.get_session() as session:
             return len(list(session.scalars(select(User)).all()))
+
+    # ── Alert recordings ──
+
+    def save_alert_recording(self, record: AlertRecordingRecord) -> AlertRecordingRecord:
+        """Save an alert recording metadata record."""
+        with self.get_session() as session:
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            logger.debug(
+                "database.alert_recording_saved",
+                alert_id=record.alert_id,
+            )
+            return record
+
+    def get_alert_recording(self, alert_id: str) -> AlertRecordingRecord | None:
+        """Get recording metadata for an alert."""
+        with self.get_session() as session:
+            return session.scalar(
+                select(AlertRecordingRecord).where(
+                    AlertRecordingRecord.alert_id == alert_id
+                )
+            )
+
+    def get_alert_recordings_batch(self, alert_ids: list[str]) -> dict[str, AlertRecordingRecord]:
+        """Get recording records for multiple alerts in one query.
+
+        Returns dict mapping alert_id -> AlertRecordingRecord.
+        """
+        if not alert_ids:
+            return {}
+        with self.get_session() as session:
+            records = session.scalars(
+                select(AlertRecordingRecord).where(
+                    AlertRecordingRecord.alert_id.in_(alert_ids)
+                )
+            ).all()
+            return {r.alert_id: r for r in records}
+
+    def update_alert_recording_status(self, alert_id: str, status: str) -> bool:
+        """Update the status of an alert recording. Returns True if found."""
+        with self.get_session() as session:
+            record = session.scalar(
+                select(AlertRecordingRecord).where(
+                    AlertRecordingRecord.alert_id == alert_id
+                )
+            )
+            if record is None:
+                return False
+            record.status = status
+            session.commit()
+            return True
+
+    def cleanup_old_recordings(self, max_age_days: int = 30) -> int:
+        """Delete recording records older than max_age_days. Returns count."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        with self.get_session() as session:
+            count = (
+                session.query(AlertRecordingRecord)
+                .filter(AlertRecordingRecord.created_at < cutoff)
+                .delete()
+            )
+            session.commit()
+        if count:
+            logger.info("database.recordings_cleaned", deleted=count, cutoff_days=max_age_days)
+        return count
 
     def close(self) -> None:
         """Close the database engine."""

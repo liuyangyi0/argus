@@ -21,12 +21,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+import cv2
 import numpy as np
 import structlog
 
 import uuid
 
 from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
+from argus.core.alert_ring_buffer import AlertFrameBuffer, FrameSnapshot, compress_frame
 from argus.anomaly.detector import AnomalibDetector, AnomalyResult, DetectorStatus
 from argus.anomaly.drift import DriftDetector, DriftStatus
 from argus.core.diagnostics import (
@@ -250,6 +252,23 @@ class DetectionPipeline:
 
         # DET-008: Per-frame diagnostics ring buffer
         self._diagnostics = DiagnosticsBuffer(maxlen=1500, score_maxlen=300)
+
+        # FR-033: Alert ring buffer for replay recordings
+        rb_cfg = camera_config.ring_buffer
+        if rb_cfg.enabled:
+            self._alert_ring_buffer: AlertFrameBuffer | None = AlertFrameBuffer(
+                fps=camera_config.fps_target,
+                pre_seconds=rb_cfg.pre_trigger_seconds,
+                post_seconds=rb_cfg.post_trigger_seconds,
+            )
+            self._ring_buffer_jpeg_quality = rb_cfg.jpeg_quality
+        else:
+            self._alert_ring_buffer = None
+            self._ring_buffer_jpeg_quality = 85
+
+        # FR-033: Score sparkline for video wall (30 seconds at camera FPS)
+        from collections import deque as _deque
+        self._score_sparkline: _deque[float] = _deque(maxlen=camera_config.fps_target * 30)
 
         # DET-010: Auto learning mode state
         self._learning_start_time: float | None = None
@@ -917,6 +936,132 @@ class DetectionPipeline:
             was_alert=alert is not None,
         ))
 
+        # FR-033: Append frame to ring buffer + sparkline
+        self._score_sparkline.append(anomaly_result.anomaly_score)
+        if self._alert_ring_buffer is not None:
+            try:
+                # Build CUSUM evidence snapshot for all zones
+                rb_cusum: dict[str, float] = {}
+                for zone_cfg in self.camera_config.zones:
+                    zone_key = f"{frame_data.camera_id}:{zone_cfg.zone_id}"
+                    snap = self._alert_grader.get_cusum_state(zone_key)
+                    if snap is not None:
+                        rb_cusum[zone_key] = snap.evidence
+                if not rb_cusum:
+                    default_key = f"{frame_data.camera_id}:default"
+                    snap = self._alert_grader.get_cusum_state(default_key)
+                    if snap is not None:
+                        rb_cusum[default_key] = snap.evidence
+
+                # Build YOLO persons list from detection_result
+                rb_persons: list[dict] = []
+                if detection_result is not None and hasattr(detection_result, "persons"):
+                    rb_persons = [
+                        {
+                            "bbox": [int(p.x1), int(p.y1), int(p.x2), int(p.y2)]
+                            if hasattr(p, "x1") else [],
+                            "confidence": getattr(p, "confidence", 0),
+                        }
+                        for p in detection_result.persons
+                    ]
+
+                # §1.3: Store raw anomaly map — JPEG encoding deferred to solidify
+                rb_heatmap_raw: np.ndarray | None = None
+                if anomaly_result.anomaly_map is not None:
+                    try:
+                        amap = anomaly_result.anomaly_map
+                        if len(amap.shape) == 2:
+                            rb_heatmap_raw = (np.clip(amap, 0, 1) * 255).astype(np.uint8)
+                        else:
+                            rb_heatmap_raw = amap.copy() if amap.dtype == np.uint8 else amap
+                    except Exception:
+                        pass
+
+                # §1.3: Capture all YOLO detections (not just persons)
+                rb_all_boxes: list[dict] | None = None
+                if detection_result is not None and hasattr(detection_result, "objects"):
+                    rb_all_boxes = [
+                        {
+                            "bbox": [int(getattr(o, "x1", 0)), int(getattr(o, "y1", 0)),
+                                     int(getattr(o, "x2", 0)), int(getattr(o, "y2", 0))],
+                            "class": getattr(o, "class_name", ""),
+                            "confidence": round(getattr(o, "confidence", 0), 2),
+                        }
+                        for o in detection_result.objects
+                    ]
+
+                frame_snap = FrameSnapshot(
+                    timestamp=time.time(),
+                    frame_jpeg=compress_frame(
+                        frame, quality=self._ring_buffer_jpeg_quality
+                    ),
+                    anomaly_score=anomaly_result.anomaly_score,
+                    simplex_score=getattr(simplex_result, "max_score", None) if simplex_detected else None,
+                    cusum_evidence=rb_cusum,
+                    yolo_persons=rb_persons,
+                    frame_number=frame_data.frame_number,
+                    heatmap_raw=rb_heatmap_raw,
+                    yolo_boxes=rb_all_boxes,
+                )
+                self._alert_ring_buffer.append(frame_snap)
+            except Exception:
+                logger.debug(
+                    "pipeline.ring_buffer_append_failed",
+                    camera_id=frame_data.camera_id,
+                    exc_info=True,
+                )
+
+        # FR-033: Check for expired post-captures and solidify on alert
+        if self._alert_ring_buffer is not None:
+            # Flush any expired post-trigger captures
+            try:
+                for expired_id in self._alert_ring_buffer.check_expired_captures():
+                    post_frames = self._alert_ring_buffer.finish_post_capture(expired_id)
+                    if post_frames:
+                        rec_store = getattr(self, "_recording_store", None)
+                        if rec_store is not None:
+                            rec_store.append_post_frames(expired_id, post_frames)
+            except Exception:
+                logger.debug("pipeline.post_capture_flush_failed", exc_info=True)
+
+        if alert is not None and self._alert_ring_buffer is not None:
+            try:
+                # §1.2.2: Detect overlap — if there's a pending post-capture
+                # from a recent alert, link the new alert to it (shared ring buffer)
+                linked_id: str | None = None
+                pending = self._alert_ring_buffer.get_pending_captures()
+                if pending:
+                    linked_id = pending[0]  # link to most recent pending
+                    logger.info(
+                        "pipeline.linked_alert",
+                        new_alert=alert.alert_id,
+                        linked_to=linked_id,
+                        camera_id=alert.camera_id,
+                    )
+
+                recording = self._alert_ring_buffer.solidify(
+                    alert_id=alert.alert_id,
+                    camera_id=alert.camera_id,
+                    severity=alert.severity.value,
+                    trigger_timestamp=alert.timestamp,
+                    linked_alert_id=linked_id,
+                )
+                if recording is not None:
+                    self._alert_ring_buffer.start_post_capture(
+                        alert_id=alert.alert_id,
+                        severity=alert.severity.value,
+                        trigger_timestamp=alert.timestamp,
+                    )
+                    # Store recording reference on alert for dispatcher to pick up
+                    alert._solidified_recording = recording  # type: ignore[attr-defined]
+            except Exception:
+                logger.warning(
+                    "pipeline.ring_buffer_solidify_failed",
+                    camera_id=frame_data.camera_id,
+                    alert_id=alert.alert_id,
+                    exc_info=True,
+                )
+
         return alert
 
     def run_once(self) -> Alert | None:
@@ -927,6 +1072,20 @@ class DetectionPipeline:
                 self._camera.request_reconnect()
             return None
         return self.process_frame(frame_data)
+
+    def get_wall_status(self) -> dict:
+        """Return video wall tile data for this camera (Phase 3)."""
+        sparkline = list(self._score_sparkline)
+        # Downsample sparkline to ~30 points (1 per second) for the wall tile
+        if len(sparkline) > 30:
+            step = len(sparkline) / 30
+            sparkline = [sparkline[int(i * step)] for i in range(30)]
+        return {
+            "camera_id": self.camera_config.camera_id,
+            "name": self.camera_config.name,
+            "current_score": sparkline[-1] if sparkline else 0.0,
+            "score_sparkline": [round(s, 3) for s in sparkline],
+        }
 
     def get_latest_frame(self) -> np.ndarray | None:
         """Get a copy of the latest processed frame for live preview."""

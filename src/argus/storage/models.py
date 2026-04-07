@@ -637,6 +637,54 @@ class ModelVersionEvent(Base):
         }
 
 
+class AlertRecordingRecord(Base):
+    """Tracks solidified alert recordings on disk (FR-033).
+
+    Each alert may have an associated recording containing JPEG frames
+    and signal timeseries for replay in the multi-track timeline.
+    """
+
+    __tablename__ = "alert_recordings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    alert_id: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True,
+    )
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    severity: Mapped[str] = mapped_column(String(10), nullable=False)
+    recording_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    start_timestamp: Mapped[float] = mapped_column(Float, nullable=False)
+    end_timestamp: Mapped[float] = mapped_column(Float, nullable=False)
+    trigger_timestamp: Mapped[float] = mapped_column(Float, nullable=False)
+    frame_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    fps: Mapped[int] = mapped_column(Integer, nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    linked_alert_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="complete",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "alert_id": self.alert_id,
+            "camera_id": self.camera_id,
+            "severity": self.severity,
+            "recording_path": self.recording_path,
+            "start_timestamp": self.start_timestamp,
+            "end_timestamp": self.end_timestamp,
+            "trigger_timestamp": self.trigger_timestamp,
+            "frame_count": self.frame_count,
+            "fps": self.fps,
+            "file_size_bytes": self.file_size_bytes,
+            "linked_alert_id": self.linked_alert_id,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class ShadowInferenceLog(Base):
     """Shadow model parallel inference results for comparison."""
 

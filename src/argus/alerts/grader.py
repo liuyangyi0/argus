@@ -24,6 +24,14 @@ from argus.config.schema import AlertConfig, AlertSeverity, SeverityThresholds, 
 
 logger = structlog.get_logger()
 
+# UX v2 §5.1: Canonical severity → handling policy mapping
+HANDLING_POLICIES: dict[AlertSeverity, str] = {
+    AlertSeverity.INFO: "quick",
+    AlertSeverity.LOW: "quick",
+    AlertSeverity.MEDIUM: "confirm",
+    AlertSeverity.HIGH: "detail_required",
+}
+
 
 @dataclass
 class Alert:
@@ -54,6 +62,9 @@ class Alert:
     segmentation_count: int = 0
     segmentation_total_area_px: int = 0
     segmentation_objects: list[dict] = field(default_factory=list)
+    # UX v2 §5.1: Severity-based handling policy
+    # "quick" (LOW), "confirm" (MEDIUM), "detail_required" (HIGH)
+    handling_policy: str = "quick"
 
 
 class DetectionType(str, Enum):
@@ -257,6 +268,7 @@ class AlertGrader:
             heatmap=anomaly_map,
             detection_type=detection_type,
             detected_objects=detected_objects or [],
+            handling_policy=HANDLING_POLICIES.get(final_severity, "quick"),
         )
 
         # Reset tracker after emitting alert

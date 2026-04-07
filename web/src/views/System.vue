@@ -11,6 +11,9 @@ import api, {
   deleteUser as apiDeleteUser,
   toggleUserActive,
   getAuditLogs,
+  getDegradationHistory,
+  getAudioAlerts,
+  updateAudioAlerts,
 } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
@@ -32,6 +35,15 @@ const auditUserOptions = ref<string[]>([])
 
 // ── Config ──
 const configLoading = ref(false)
+
+// ── Degradation History ──
+const degradationEvents = ref<any[]>([])
+const degradationLoading = ref(false)
+const degradationDays = ref(7)
+
+// ── Audio Alerts ──
+const audioConfig = ref<any>({ low: {}, medium: {}, high: {} })
+const audioLoading = ref(false)
 
 async function fetchHealth() {
   try {
@@ -158,10 +170,37 @@ async function createBackup() {
   }
 }
 
+async function loadDegradation() {
+  degradationLoading.value = true
+  try {
+    const res = await getDegradationHistory(degradationDays.value)
+    degradationEvents.value = res.data || []
+  } catch { /* silent */ }
+  finally { degradationLoading.value = false }
+}
+
+async function loadAudioConfig() {
+  audioLoading.value = true
+  try {
+    const res = await getAudioAlerts()
+    audioConfig.value = res.data
+  } catch { /* silent */ }
+  finally { audioLoading.value = false }
+}
+
+async function saveAudioConfig() {
+  try {
+    await updateAudioAlerts(audioConfig.value)
+    message.success('音频配置已保存')
+  } catch { message.error('保存失败') }
+}
+
 function onTabChange(key: string | number) {
   activeTab.value = String(key)
   if (key === 'users') loadUsers()
   if (key === 'audit') loadAudit()
+  if (key === 'degradation') loadDegradation()
+  if (key === 'audio') loadAudioConfig()
 }
 
 // ── Column definitions ──
@@ -182,8 +221,25 @@ const auditColumns = [
   { title: 'IP 地址', dataIndex: 'ip_address', key: 'ip_address', width: 140 },
 ]
 
-const roleLabels: Record<string, string> = { admin: '管理员', operator: '操作员', viewer: '观察者' }
-const roleColors: Record<string, string> = { admin: 'red', operator: 'blue', viewer: 'default' }
+const roleLabels: Record<string, string> = { admin: '管理员', engineer: '工程师', operator: '操作员', viewer: '观察者' }
+const roleColors: Record<string, string> = { admin: 'red', engineer: 'purple', operator: 'blue', viewer: 'default' }
+
+const degradationColumns = [
+  { title: '时间', key: 'started_at', width: 180 },
+  { title: '级别', key: 'level', width: 80 },
+  { title: '类别', dataIndex: 'category', key: 'category', width: 140 },
+  { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 100 },
+  { title: '标题', dataIndex: 'title', key: 'title', ellipsis: true },
+  { title: '持续', key: 'duration', width: 100 },
+  { title: '状态', key: 'status', width: 80 },
+]
+
+const degradationLevelColors: Record<string, string> = {
+  info: 'blue', warning: 'gold', moderate: 'orange', severe: 'red',
+}
+const degradationLevelLabels: Record<string, string> = {
+  info: '提示', warning: '警告', moderate: '中度', severe: '严重',
+}
 </script>
 
 <template>
@@ -293,6 +349,81 @@ const roleColors: Record<string, string> = { admin: 'red', operator: 'blue', vie
         </Card>
       </Tabs.TabPane>
 
+      <!-- Degradation History -->
+      <Tabs.TabPane key="degradation" tab="降级事件">
+        <Card title="降级事件历史">
+          <Space style="margin-bottom: 16px">
+            <Select v-model:value="degradationDays" style="width: 120px" @change="loadDegradation">
+              <Select.Option :value="1">最近 1 天</Select.Option>
+              <Select.Option :value="7">最近 7 天</Select.Option>
+              <Select.Option :value="30">最近 30 天</Select.Option>
+              <Select.Option :value="90">最近 90 天</Select.Option>
+            </Select>
+          </Space>
+          <Table
+            :columns="degradationColumns"
+            :data-source="degradationEvents"
+            :loading="degradationLoading"
+            :pagination="{ pageSize: 20 }"
+            row-key="event_id"
+            size="small"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'started_at'">
+                {{ new Date(record.started_at * 1000).toLocaleString('zh-CN') }}
+              </template>
+              <template v-if="column.key === 'level'">
+                <Tag :color="degradationLevelColors[record.level]">
+                  {{ degradationLevelLabels[record.level] || record.level }}
+                </Tag>
+              </template>
+              <template v-if="column.key === 'duration'">
+                {{
+                  record.resolved_at
+                    ? Math.round((record.resolved_at - record.started_at) / 60) + ' 分钟'
+                    : '进行中'
+                }}
+              </template>
+              <template v-if="column.key === 'status'">
+                <Tag v-if="record.resolved_at" color="green">已恢复</Tag>
+                <Tag v-else color="red">活跃</Tag>
+              </template>
+            </template>
+          </Table>
+        </Card>
+      </Tabs.TabPane>
+
+      <!-- Audio Config -->
+      <Tabs.TabPane key="audio" tab="音频告警">
+        <Card title="告警音频配置" style="max-width: 600px">
+          <div v-for="(sev, key) in { low: '低级 (LOW)', medium: '中级 (MEDIUM)', high: '高级 (HIGH)' }" :key="key" style="margin-bottom: 16px; padding: 12px; border: 1px solid #2d2d4a; border-radius: 6px">
+            <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px">
+              <Typography.Text strong>{{ sev }}</Typography.Text>
+              <Switch
+                v-model:checked="audioConfig[key].enabled"
+                checked-children="开"
+                un-checked-children="关"
+                size="small"
+              />
+            </div>
+            <Space v-if="audioConfig[key]?.enabled">
+              <Select v-model:value="audioConfig[key].sound" style="width: 200px" placeholder="声音">
+                <Select.Option value="beep_single">单声提示</Select.Option>
+                <Select.Option value="beep_double">双声提示</Select.Option>
+                <Select.Option value="beep_double_voice">双声 + 语音播报</Select.Option>
+              </Select>
+              <Input
+                v-if="key === 'high'"
+                v-model:value="audioConfig[key].voice_template"
+                placeholder="语音模板, 如: {camera} 高级别告警"
+                style="width: 250px"
+              />
+            </Space>
+          </div>
+          <Button type="primary" @click="saveAudioConfig">保存音频配置</Button>
+        </Card>
+      </Tabs.TabPane>
+
       <!-- Users -->
       <Tabs.TabPane key="users" tab="用户管理">
         <Card title="添加用户" style="margin-bottom: 16px">
@@ -306,6 +437,7 @@ const roleColors: Record<string, string> = { admin: 'red', operator: 'blue', vie
             <Form.Item>
               <Select v-model:value="newUser.role" style="width: 120px">
                 <Select.Option value="admin">管理员</Select.Option>
+                <Select.Option value="engineer">工程师</Select.Option>
                 <Select.Option value="operator">操作员</Select.Option>
                 <Select.Option value="viewer">观察者</Select.Option>
               </Select>
