@@ -12,7 +12,7 @@ from argus.storage.models import ModelRecord
 
 def get_registry(request: Request) -> ModelRegistry | None:
     """Build a ModelRegistry from app state when the database is available."""
-    db = getattr(request.app.state, "db", None)
+    db = getattr(request.app.state, "database", None) or getattr(request.app.state, "db", None)
     if db is None:
         return None
     session_factory = getattr(db, "get_session", None)
@@ -21,14 +21,41 @@ def get_registry(request: Request) -> ModelRegistry | None:
     return ModelRegistry(session_factory=session_factory)
 
 
+def _resolve_model_file(model_path: str, camera_id: str) -> str:
+    """Resolve a model path to an actual model file if it's a directory."""
+    p = Path(model_path)
+    if p.is_file():
+        return model_path
+
+    # Directory: search for inference-ready model files
+    from argus.core.pipeline import DetectionPipeline
+
+    found = DetectionPipeline._find_model(camera_id)
+    if found is not None:
+        return str(found)
+
+    # Fallback: search inside the directory and exports
+    for search_dir in [p, Path("data/exports") / camera_id]:
+        if not search_dir.exists():
+            continue
+        for pattern in ("model.xml", "model.pt", "model.ckpt"):
+            matches = sorted(search_dir.rglob(pattern), key=lambda f: f.stat().st_mtime, reverse=True)
+            if matches:
+                return str(matches[0])
+
+    return model_path  # return as-is, reload_model will report the error
+
+
 def sync_model_record_runtime(request: Request, record: ModelRecord) -> bool:
     """Hot-reload a registered model into the running camera pipeline when possible."""
     camera_manager = getattr(request.app.state, "camera_manager", None)
     if camera_manager is None or not record.model_path:
         return False
+
+    resolved_path = _resolve_model_file(record.model_path, record.camera_id)
     return camera_manager.reload_model(
         record.camera_id,
-        record.model_path,
+        resolved_path,
         version_tag=record.model_version_id,
     )
 
