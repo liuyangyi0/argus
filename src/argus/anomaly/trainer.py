@@ -1112,12 +1112,30 @@ class ModelTrainer:
         post-training quantization on the exported FP model using validation
         images as calibration data.
         """
-        engine.export(
-            model=model,
-            export_type=export_format,  # "openvino", "onnx", or "torch"
-            export_root=export_path,
-        )
-        logger.info("training.exported", format=export_format, path=export_path)
+        actual_format = export_format
+        try:
+            engine.export(
+                model=model,
+                export_type=export_format,
+                export_root=export_path,
+            )
+        except Exception as e:
+            if export_format != "torch":
+                logger.warning(
+                    "training.export_fallback",
+                    original_format=export_format,
+                    error=str(e),
+                    msg="Falling back to torch export",
+                )
+                actual_format = "torch"
+                engine.export(
+                    model=model,
+                    export_type="torch",
+                    export_root=export_path,
+                )
+            else:
+                raise
+        logger.info("training.exported", format=actual_format, path=export_path)
 
         # INT8 post-training quantization (B2)
         if quantization == "int8" and export_format == "openvino":
