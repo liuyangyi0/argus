@@ -225,6 +225,13 @@ class DetectionPipeline:
         self._last_heartbeat_time = 0.0
         self._frame_counter = 0
 
+        # Low-light mode: bypass MOG2 + shorten heartbeat when scene is dark
+        ll_cfg = camera_config.low_light
+        self._low_light_enabled = ll_cfg.enabled
+        self._low_light_threshold = ll_cfg.brightness_threshold
+        self._low_light_heartbeat_seconds = alert_config.temporal.max_gap_seconds / 2
+        self._was_low_light = False
+
         # Anti-absorption: anomaly region lock with time-based clearing (HIGH-03)
         self._locked = False
         self._lock_score_threshold = camera_config.mog2.lock_score_threshold
@@ -464,18 +471,44 @@ class DetectionPipeline:
         with self._latest_frame_lock:
             self._latest_frame = frame
 
+        # Low-light detection: bypass MOG2 when scene is dark
+        is_low_light = False
+        if self._low_light_enabled:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            mean_brightness = float(gray.mean())
+            is_low_light = mean_brightness < self._low_light_threshold
+            if is_low_light and not self._was_low_light:
+                logger.warning(
+                    "pipeline.low_light_entered",
+                    camera_id=frame_data.camera_id,
+                    brightness=round(mean_brightness, 1),
+                )
+            elif not is_low_light and self._was_low_light:
+                logger.info(
+                    "pipeline.low_light_exited",
+                    camera_id=frame_data.camera_id,
+                    brightness=round(mean_brightness, 1),
+                )
+            self._was_low_light = is_low_light
+        diag.low_light = is_low_light
+
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
         t1 = time.monotonic()
         # MED-05: Time-based heartbeat instead of frame-count
         now = time.monotonic()
-        is_heartbeat = (now - self._last_heartbeat_time) >= self._heartbeat_seconds
+        # Low-light: shorten heartbeat to max_gap_seconds/2 so evidence can accumulate
+        effective_heartbeat = (
+            self._low_light_heartbeat_seconds if is_low_light
+            else self._heartbeat_seconds
+        )
+        is_heartbeat = (now - self._last_heartbeat_time) >= effective_heartbeat
         if is_heartbeat:
             self._last_heartbeat_time = now
 
         # CRIT-01/02: Read lock state atomically for prefilter decision
         with self._lock_state_lock:
             is_locked = self._locked
-        skip_prefilter = is_heartbeat or is_locked
+        skip_prefilter = is_heartbeat or is_locked or is_low_light
 
         # DET-006: MAINTENANCE mode freezes MOG2 learning on all frames
         freeze_mog2 = current_mode == PipelineMode.MAINTENANCE
