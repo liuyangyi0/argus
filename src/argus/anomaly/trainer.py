@@ -1112,10 +1112,10 @@ class ModelTrainer:
         post-training quantization on the exported FP model using validation
         images as calibration data.
         """
-        # Anomalib 2.x uses export_mode (str), not export_type (enum)
         engine.export(
             model=model,
-            export_mode=export_format,  # "openvino" or "onnx"
+            export_type=export_format,  # "openvino", "onnx", or "torch"
+            export_root=export_path,
         )
         logger.info("training.exported", format=export_format, path=export_path)
 
