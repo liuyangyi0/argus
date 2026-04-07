@@ -637,7 +637,7 @@ async def bulk_false_positive(request: Request):
 # ── CSV Export ──
 
 @router.get("/export-csv")
-async def export_csv(
+def export_csv(
     request: Request,
     camera_id: str | None = Query(None),
     severity: str | None = Query(None),
@@ -674,7 +674,7 @@ async def export_csv(
 # ── Single alert operations ──
 
 @router.post("/{alert_id}/acknowledge", response_class=HTMLResponse)
-async def acknowledge_alert(request: Request, alert_id: str):
+def acknowledge_alert(request: Request, alert_id: str):
     """Acknowledge an alert."""
     db = request.app.state.db
     if db and db.acknowledge_alert(alert_id, "operator"):
@@ -693,7 +693,7 @@ async def acknowledge_alert(request: Request, alert_id: str):
 
 
 @router.post("/{alert_id}/false-positive", response_class=HTMLResponse)
-async def mark_false_positive(request: Request, alert_id: str):
+def mark_false_positive(request: Request, alert_id: str):
     """Mark an alert as a false positive and submit to feedback queue.
 
     False positive feedback loop (A4-3 / Section 6): when a normal scene

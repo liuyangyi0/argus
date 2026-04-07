@@ -2,16 +2,19 @@
 
 Backend provides /api/* JSON endpoints and /ws WebSocket.
 Frontend is a Vue 3 + Ant Design SPA served from web/dist/.
+go2rtc handles camera video streaming (WebRTC/MSE/HLS).
 """
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import structlog
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,12 +31,15 @@ from argus.dashboard.routes.reports import router as reports_router
 from argus.dashboard.routes.users import router as users_router
 from argus.dashboard.routes.zones import router as zones_router
 from argus.dashboard.websocket import ConnectionManager, verify_ws_token
+from argus.streaming.go2rtc_manager import Go2RTCManager
 
 if TYPE_CHECKING:
     from argus.capture.manager import CameraManager
     from argus.core.health import HealthMonitor
     from argus.dashboard.tasks import TaskManager
     from argus.storage.database import Database
+
+logger = structlog.get_logger()
 
 
 def create_app(
@@ -55,10 +61,42 @@ def create_app(
         max_connections=dashboard_config.websocket_max_connections,
     )
 
+    # go2rtc streaming proxy
+    go2rtc: Go2RTCManager | None = None
+    if dashboard_config.go2rtc_enabled:
+        go2rtc = Go2RTCManager(
+            api_port=dashboard_config.go2rtc_api_port,
+            rtsp_port=dashboard_config.go2rtc_rtsp_port,
+            binary_path=dashboard_config.go2rtc_binary,
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await ws_manager.start()
+
+        # Start go2rtc and register RTSP cameras
+        if go2rtc is not None:
+            cameras_cfg = getattr(config, "cameras", [])
+            rtsp_streams = {}
+            for cam in cameras_cfg:
+                if hasattr(cam, "protocol") and cam.protocol == "rtsp":
+                    rtsp_streams[cam.camera_id] = cam.source
+                elif isinstance(cam, dict) and cam.get("protocol") == "rtsp":
+                    rtsp_streams[cam["camera_id"]] = cam["source"]
+            try:
+                await asyncio.to_thread(go2rtc.start, rtsp_streams)
+            except (FileNotFoundError, TimeoutError) as exc:
+                logger.warning(
+                    "go2rtc.start_failed",
+                    error=str(exc),
+                    hint="Video streaming will fall back to MJPEG",
+                )
+                app.state.go2rtc = None
+
         yield
+
+        if go2rtc is not None:
+            go2rtc.close()
         await ws_manager.stop()
 
     app = FastAPI(
@@ -77,6 +115,7 @@ def create_app(
     app.state.config_path = config_path
     app.state.task_manager = task_manager
     app.state.ws_manager = ws_manager
+    app.state.go2rtc = go2rtc
     app.state.baseline_lifecycle = BaselineLifecycle(database) if database else None
 
     if task_manager is not None and getattr(task_manager, "_on_change", None) is None:
@@ -157,6 +196,9 @@ def create_app(
 
     from argus.dashboard.routes.training_jobs import router as training_jobs_router
     app.include_router(training_jobs_router, prefix="/api/training-jobs", tags=["training-jobs"])
+
+    from argus.dashboard.routes.streaming import router as streaming_router
+    app.include_router(streaming_router, prefix="/api/streaming", tags=["streaming"])
 
     try:
         from argus.dashboard.routes.baseline import router as baseline_router

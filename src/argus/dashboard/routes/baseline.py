@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import threading
 import time
@@ -519,7 +520,7 @@ async def capture_stats_report(request: Request):
 
 
 @router.delete("/{camera_id}/image/{filename}")
-async def delete_baseline_image(request: Request, camera_id: str, filename: str):
+def delete_baseline_image(request: Request, camera_id: str, filename: str):
     """Delete a single baseline image."""
     config = request.app.state.config
     if not config:
@@ -588,7 +589,7 @@ async def delete_baseline_version(request: Request):
         if version_record is not None and version_record.state == "active":
             return JSONResponse({"error": "生产中的基线版本不能直接删除，请先退役"}, status_code=400)
 
-    shutil.rmtree(version_dir)
+    await asyncio.to_thread(shutil.rmtree, version_dir)
     _reset_current_marker_after_delete(base_dir, version)
 
     if lifecycle is not None:

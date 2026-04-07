@@ -577,6 +577,24 @@ class DashboardConfig(BaseModel):
     )
     audio_alerts: AudioAlertConfig = Field(default_factory=AudioAlertConfig)
 
+    # go2rtc streaming proxy
+    go2rtc_enabled: bool = Field(
+        default=True,
+        description="Enable go2rtc for WebRTC/MSE camera streaming",
+    )
+    go2rtc_api_port: int = Field(
+        default=1984, ge=1024, le=65535,
+        description="go2rtc HTTP API / WebRTC signalling port",
+    )
+    go2rtc_rtsp_port: int = Field(
+        default=8554, ge=1024, le=65535,
+        description="go2rtc RTSP listener port",
+    )
+    go2rtc_binary: str | None = Field(
+        default=None,
+        description="Path to go2rtc binary (auto-detected if None)",
+    )
+
 
 class LoggingConfig(BaseModel):
     """Log rotation and output settings."""

@@ -1,6 +1,6 @@
 import { ref, onUnmounted, type Ref } from 'vue'
 
-type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation'
+type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation' | 'heatmap'
 
 interface WsMessage {
   topic: string

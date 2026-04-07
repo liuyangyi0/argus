@@ -1,8 +1,8 @@
 """WebSocket connection manager for real-time dashboard updates.
 
-Replaces HTMX polling with push-based updates. Bridges synchronous data
-sources (camera threads, alert dispatcher) to async WebSocket clients
-via an asyncio queue.
+Bridges synchronous data sources (camera threads, alert dispatcher) to
+async WebSocket clients via a ``janus`` sync/async queue — replacing the
+fragile ``call_soon_threadsafe`` approach.
 
 Topics:
 - health:      System health and camera status changes
@@ -11,6 +11,7 @@ Topics:
 - tasks:       Background task progress updates
 - wall:        Video wall aggregated score/status (UX v2 §2)
 - degradation: Degradation events new/resolved (UX v2 §5)
+- heatmap:     Per-camera anomaly heatmap data for frontend Canvas overlay
 """
 
 from __future__ import annotations
@@ -18,8 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
+import janus
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -29,7 +31,9 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-VALID_TOPICS = frozenset({"health", "cameras", "alerts", "tasks", "wall", "degradation"})
+VALID_TOPICS = frozenset({
+    "health", "cameras", "alerts", "tasks", "wall", "degradation", "heatmap",
+})
 
 
 class _ClientConnection:
@@ -47,22 +51,26 @@ class _ClientConnection:
 class ConnectionManager:
     """Manages WebSocket connections with topic-based subscriptions.
 
-    Thread-safe: the `broadcast` method can be called from any thread.
-    It enqueues events into an asyncio queue that the event loop drains.
+    Thread-safe: the ``broadcast`` method can be called from **any** thread.
+    Events are enqueued into the sync side of a ``janus`` queue and drained
+    by an asyncio task on the event-loop side.
     """
 
     def __init__(self, heartbeat_seconds: int = 30, max_connections: int = 100):
         self._connections: dict[str, _ClientConnection] = {}
         self._heartbeat_seconds = heartbeat_seconds
         self._max_connections = max_connections
-        self._event_queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue(maxsize=1000)
-        self._loop: asyncio.AbstractEventLoop | None = None
+
+        # Initialised in start() when the event loop is running
+        self._queue: janus.Queue[tuple[str, dict]] | None = None
         self._broadcast_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
 
+    # ── Lifecycle ────────────────────────────────────────────────────
+
     async def start(self) -> None:
         """Start the broadcast dispatcher loop."""
-        self._loop = asyncio.get_running_loop()
+        self._queue = janus.Queue(maxsize=1000)
         self._broadcast_task = asyncio.create_task(self._dispatch_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info("ws.manager_started", max_connections=self._max_connections)
@@ -80,7 +88,15 @@ class ConnectionManager:
         for client in list(self._connections.values()):
             await self._close_client(client)
         self._connections.clear()
+
+        if self._queue is not None:
+            self._queue.close()
+            await self._queue.wait_closed()
+            self._queue = None
+
         logger.info("ws.manager_stopped")
+
+    # ── Client management ────────────────────────────────────────────
 
     async def accept(
         self,
@@ -110,22 +126,26 @@ class ConnectionManager:
             await self._close_client(client)
             logger.info("ws.client_disconnected", client_id=client_id, total=len(self._connections))
 
+    # ── Thread-safe broadcast ────────────────────────────────────────
+
     def broadcast(self, topic: str, data: dict) -> None:
         """Thread-safe broadcast: enqueue an event for all subscribers.
 
-        Can be called from any thread (camera threads, alert dispatcher, etc.).
+        Can be called from **any** thread (camera threads, alert dispatcher,
+        etc.).  Uses the synchronous side of a ``janus`` queue so there is
+        no need for ``call_soon_threadsafe`` or direct event-loop access.
         """
         if topic not in VALID_TOPICS:
             return
+        if self._queue is None:
+            return
 
         try:
-            if self._loop and self._loop.is_running():
-                self._loop.call_soon_threadsafe(
-                    self._event_queue.put_nowait,
-                    (topic, data),
-                )
-        except (RuntimeError, asyncio.QueueFull):
-            pass  # loop closed or queue full, skip silently
+            self._queue.sync_q.put_nowait((topic, data))
+        except janus.SyncQueueFull:
+            logger.warning("ws.broadcast_queue_full", topic=topic)
+
+    # ── Client message handler ───────────────────────────────────────
 
     async def handle_client(self, client: _ClientConnection) -> None:
         """Handle incoming messages from a client (subscriptions, pong)."""
@@ -152,10 +172,15 @@ class ConnectionManager:
         except Exception as e:
             logger.debug("ws.client_error", client_id=client.client_id, error=str(e))
 
+    # ── Internal loops ───────────────────────────────────────────────
+
     async def _dispatch_loop(self) -> None:
-        """Drain the event queue and broadcast to subscribed clients."""
+        """Drain the async side of the janus queue and broadcast."""
+        assert self._queue is not None
+        async_q = self._queue.async_q
+
         while True:
-            topic, data = await self._event_queue.get()
+            topic, data = await async_q.get()
 
             message = json.dumps({
                 "topic": topic,
@@ -163,7 +188,7 @@ class ConnectionManager:
                 "timestamp": time.time(),
             }, ensure_ascii=False, default=str)
 
-            dead_clients = []
+            dead_clients: list[str] = []
             for client_id, client in self._connections.items():
                 if topic not in client.subscriptions:
                     continue
@@ -181,7 +206,7 @@ class ConnectionManager:
         while True:
             await asyncio.sleep(self._heartbeat_seconds)
             now = time.monotonic()
-            dead_clients = []
+            dead_clients: list[str] = []
 
             for client_id, client in self._connections.items():
                 # If no pong received within 2x heartbeat interval, consider dead
