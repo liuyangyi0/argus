@@ -8,6 +8,7 @@ dependencies = [
     "ultralytics>=8.3.0",
     "anomalib>=2.0.0,<3.0.0",
     "openvino>=2024.0.0",
+    "onnxscript>=0.6.0",
     "fastapi>=0.115.0",
     "python-multipart>=0.0.9",
     "uvicorn[standard]>=0.32.0",
