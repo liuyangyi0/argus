@@ -670,7 +670,7 @@ async def camera_runner_snapshot(request: Request, camera_id: str):
 
 
 @router.get("/{camera_id}/snapshot")
-async def camera_snapshot(request: Request, camera_id: str):
+def camera_snapshot(request: Request, camera_id: str):
     """Get the latest frame from a camera as a JPEG image."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:

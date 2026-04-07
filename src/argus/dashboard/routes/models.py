@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import structlog
@@ -137,6 +138,44 @@ async def rollback_model(request: Request, version_id: str):
     })
 
 
+def _run_batch_inference(
+    image_paths: list[str], detector: object,
+) -> tuple[list[dict], int]:
+    """Run inference on a batch of images (blocking, runs in thread pool)."""
+    import cv2
+
+    results: list[dict] = []
+    scored = 0
+    threshold = getattr(detector, "threshold", 0.5)
+
+    for img_path in image_paths:
+        entry: dict = {"path": img_path}
+        try:
+            p = Path(img_path)
+            if not p.exists():
+                entry["error"] = "File not found"
+                results.append(entry)
+                continue
+
+            frame = cv2.imread(str(p))
+            if frame is None:
+                entry["error"] = "Could not read image"
+                results.append(entry)
+                continue
+
+            prediction = detector.predict(frame)
+            score = float(prediction.get("score", 0.0)) if isinstance(prediction, dict) else float(prediction)
+            entry["score"] = round(score, 4)
+            entry["is_anomalous"] = score >= threshold
+            scored += 1
+        except Exception as e:
+            entry["error"] = str(e)
+
+        results.append(entry)
+
+    return results, scored
+
+
 @router.post("/batch-inference")
 async def batch_inference(request: Request):
     """Score multiple images against a camera's active anomaly model.
@@ -181,36 +220,9 @@ async def batch_inference(request: Request):
             status_code=503,
         )
 
-    import cv2
-
-    results = []
-    scored = 0
-    threshold = getattr(detector, "threshold", 0.5)
-
-    for img_path in image_paths:
-        entry = {"path": img_path}
-        try:
-            p = Path(img_path)
-            if not p.exists():
-                entry["error"] = "File not found"
-                results.append(entry)
-                continue
-
-            frame = cv2.imread(str(p))
-            if frame is None:
-                entry["error"] = "Could not read image"
-                results.append(entry)
-                continue
-
-            prediction = detector.predict(frame)
-            score = float(prediction.get("score", 0.0)) if isinstance(prediction, dict) else float(prediction)
-            entry["score"] = round(score, 4)
-            entry["is_anomalous"] = score >= threshold
-            scored += 1
-        except Exception as e:
-            entry["error"] = str(e)
-
-        results.append(entry)
+    results, scored = await asyncio.to_thread(
+        _run_batch_inference, image_paths, detector,
+    )
 
     logger.info(
         "batch_inference.complete",
@@ -399,7 +411,7 @@ async def backbone_upgrade(request: Request):
         )
 
     manager = BackboneManager.get_instance()
-    success = manager.upgrade(Path(backbone_path), version)
+    success = await asyncio.to_thread(manager.upgrade, Path(backbone_path), version)
 
     if success:
         return JSONResponse({

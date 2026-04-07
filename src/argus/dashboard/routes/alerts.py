@@ -45,7 +45,7 @@ def _is_safe_path(file_path: str, alerts_dir: Path) -> bool:
 # ── Image serving (must be before /{alert_id} catch-all) ──
 
 @router.get("/{alert_id}/image/{image_type}")
-async def alert_image(request: Request, alert_id: str, image_type: str):
+def alert_image(request: Request, alert_id: str, image_type: str):
     """Serve alert snapshot, heatmap, or composite overlay image."""
     if image_type not in ("snapshot", "heatmap", "composite"):
         return Response(status_code=400)

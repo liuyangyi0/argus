@@ -225,7 +225,7 @@ async def capture_form(request: Request):
 
 
 @router.get("/list", response_class=HTMLResponse)
-async def baseline_list(request: Request):
+def baseline_list(request: Request):
     """List baselines by camera with version info."""
     config = request.app.state.config
     if not config:
@@ -273,7 +273,7 @@ async def baseline_list(request: Request):
 
 
 @router.get("/list/json")
-async def baseline_list_json(request: Request):
+def baseline_list_json(request: Request):
     """JSON API: list baselines by camera with version info."""
     config = request.app.state.config
     if not config:
@@ -359,7 +359,7 @@ async def training_history_json(request: Request):
 
 
 @router.get("/{camera_id}/images", response_class=HTMLResponse)
-async def baseline_images(request: Request, camera_id: str):
+def baseline_images(request: Request, camera_id: str):
     """Show baseline image thumbnails for a camera version."""
     config = request.app.state.config
     version = request.query_params.get("version", "default")
@@ -406,7 +406,7 @@ async def baseline_images(request: Request, camera_id: str):
 
 
 @router.get("/{camera_id}/image/{filename}")
-async def baseline_image(request: Request, camera_id: str, filename: str):
+def baseline_image(request: Request, camera_id: str, filename: str):
     """Serve a single baseline image."""
     config = request.app.state.config
     version = request.query_params.get("version", "default")

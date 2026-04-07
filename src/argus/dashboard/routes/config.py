@@ -339,7 +339,7 @@ async def test_email(request: Request):
             headers=htmx_toast_headers("请先配置邮件服务器", toast_type="error"),
         )
 
-    try:
+    def _send():
         import smtplib
         from email.mime.text import MIMEText
 
@@ -356,6 +356,8 @@ async def test_email(request: Request):
         server.sendmail(email.from_address, email.recipients, msg.as_string())
         server.quit()
 
+    try:
+        await asyncio.to_thread(_send)
         return JSONResponse(
             {"status": "ok"},
             headers=htmx_toast_headers("测试邮件已发送"),
@@ -378,7 +380,7 @@ async def test_webhook(request: Request):
     if not webhook.url:
         return JSONResponse({"error": "请先配置 Webhook URL"}, status_code=400)
 
-    try:
+    def _send():
         import httpx
         payload = {
             "alert_id": "TEST-000",
@@ -390,6 +392,8 @@ async def test_webhook(request: Request):
             resp = client.post(webhook.url, json=payload)
             resp.raise_for_status()
 
+    try:
+        await asyncio.to_thread(_send)
         return JSONResponse(
             {"status": "ok"},
             headers=htmx_toast_headers("Webhook 测试成功"),
@@ -399,7 +403,7 @@ async def test_webhook(request: Request):
 
 
 @router.get("/storage", response_class=HTMLResponse)
-async def storage_tab(request: Request):
+def storage_tab(request: Request):
     """Storage usage and maintenance."""
     config = request.app.state.config
     db = request.app.state.db
@@ -457,7 +461,7 @@ async def storage_tab(request: Request):
 
 
 @router.post("/cleanup")
-async def cleanup_data(request: Request):
+def cleanup_data(request: Request):
     """Cleanup old alert data."""
     db = request.app.state.db
     config = request.app.state.config
@@ -483,7 +487,7 @@ async def cleanup_data(request: Request):
 
 
 @router.get("/logs", response_class=HTMLResponse)
-async def logs_tab(request: Request):
+def logs_tab(request: Request):
     """Tail log file."""
     config = request.app.state.config
     log_dir = Path(config.logging.log_dir) if config else Path("data/logs")
@@ -652,7 +656,7 @@ async def restart_camera(request: Request, camera_id: str):
 
 
 @router.post("/reload")
-async def reload_config(request: Request):
+def reload_config(request: Request):
     """Reload configuration from YAML."""
     config_path = getattr(request.app.state, "config_path", None)
     camera_manager = request.app.state.camera_manager
@@ -684,7 +688,7 @@ async def reload_config(request: Request):
 
 
 @router.post("/save")
-async def save_config(request: Request):
+def save_config(request: Request):
     """Save current config to YAML file."""
     config = request.app.state.config
     config_path = getattr(request.app.state, "config_path", None)
