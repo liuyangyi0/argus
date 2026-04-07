@@ -813,21 +813,28 @@ async def deploy_model(request: Request):
     if camera_id not in camera_manager._pipelines:
         return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
 
-    # If model_path is a directory, find the actual model file inside it
+    # If model_path is a directory, find the actual model file
     if resolved.is_dir():
         from argus.core.pipeline import DetectionPipeline
 
         model_file = DetectionPipeline._find_model(camera_id)
         if model_file is None:
-            # Fallback: search inside the provided directory directly
-            for pattern in ("model.xml", "model.pt", "model.ckpt"):
-                matches = list(resolved.rglob(pattern))
-                if matches:
-                    model_file = matches[0]
+            # Search exports dir as well (export output goes to data/exports/)
+            exports_dir = Path("data/exports").resolve()
+            for search_dir in [resolved, exports_dir / camera_id]:
+                if not search_dir.exists():
+                    continue
+                for pattern in ("model.xml", "model.pt", "model.ckpt"):
+                    matches = sorted(search_dir.rglob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+                    if matches:
+                        model_file = matches[0]
+                        break
+                if model_file:
                     break
         if model_file is None:
-            return JSONResponse({"error": "模型目录中未找到模型文件"}, status_code=404)
+            return JSONResponse({"error": "模型目录中未找到可部署的模型文件 (.xml/.pt/.ckpt)"}, status_code=404)
         resolved = model_file
+        logger.info("deploy.resolved_model_file", path=str(resolved))
 
     registry_record = find_registered_model_by_path(
         request,
