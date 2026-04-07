@@ -204,7 +204,7 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
 
 
 @router.get("/snapshot/{camera_id}")
-async def camera_snapshot(request: Request, camera_id: str):
+def camera_snapshot(request: Request, camera_id: str):
     """Get a JPEG snapshot from a camera for the zone editor."""
     import cv2
 

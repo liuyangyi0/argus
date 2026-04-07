@@ -50,7 +50,7 @@ async def system_page(request: Request):
 
 
 @router.get("/overview", response_class=HTMLResponse)
-async def overview(request: Request):
+def overview(request: Request):
     """Dashboard overview with key metrics, camera grid, and pending actions."""
     health_monitor = request.app.state.health_monitor
     camera_manager = request.app.state.camera_manager
