@@ -958,15 +958,23 @@ class ModelTrainer:
         """
         from anomalib.data import Folder
         from anomalib.engine import Engine
+        from torchvision.transforms.v2 import Compose, Resize, ToDtype, ToImage
+        import torch
+
+        resize_transform = Compose([
+            ToImage(),
+            Resize((image_size, image_size)),
+            ToDtype(torch.float32, scale=True),
+        ])
 
         datamodule = Folder(
             name="baseline",
             root=str(data_dir),
             normal_dir="normal",
-            image_size=(image_size, image_size),
             train_batch_size=32,
             eval_batch_size=32,
             num_workers=0,
+            augmentations=resize_transform,
         )
 
         if model_type == "efficient_ad":
