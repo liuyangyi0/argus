@@ -28,7 +28,8 @@ import structlog
 import uuid
 
 from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
-from argus.core.alert_ring_buffer import AlertFrameBuffer, FrameSnapshot, compress_frame
+from argus.core.alert_ring_buffer import AlertFrameBuffer, FrameSnapshot, RecordingStatus, compress_frame
+from argus.storage.models import AlertRecordingRecord
 from argus.anomaly.detector import AnomalibDetector, AnomalyResult, DetectorStatus
 from argus.anomaly.drift import DriftDetector, DriftStatus
 from argus.core.diagnostics import (
@@ -111,6 +112,8 @@ class DetectionPipeline:
         shared_anomaly_detector: object | None = None,
         shadow_runner: object | None = None,
         feedback_manager: object | None = None,
+        recording_store: object | None = None,
+        database: object | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
@@ -118,6 +121,8 @@ class DetectionPipeline:
         self._model_version_id = model_version_id
         self._shadow_runner = shadow_runner
         self._feedback_manager = feedback_manager
+        self._recording_store = recording_store
+        self._database = database
         self.stats = PipelineStats()
         self._classifier_config = classifier_config
         self._segmenter_config = segmenter_config
@@ -355,14 +360,30 @@ class DetectionPipeline:
         """Auto-discover the latest trained model for a camera.
 
         Search order: OpenVINO (.xml) > Torch (.pt) > Lightning (.ckpt)
+        Search paths: data/exports/{camera_id} (preferred) then data/models/{camera_id}
         """
-        models_base = Path("data/models") / camera_id
-        if not models_base.exists():
-            return None
-        # Prefer OpenVINO exports (fastest inference)
-        for pattern in ("model.xml", "model.pt", "model.ckpt"):
+        search_dirs = [
+            Path("data/exports") / camera_id,
+            Path("data/models") / camera_id,
+        ]
+        # Prefer inference-ready formats over training checkpoints
+        for pattern in ("model.xml", "model.pt"):
+            for base in search_dirs:
+                if not base.exists():
+                    continue
+                matches = sorted(
+                    base.rglob(pattern),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if matches:
+                    return matches[0]
+        # Fallback to Lightning checkpoint (least preferred)
+        for base in search_dirs:
+            if not base.exists():
+                continue
             matches = sorted(
-                models_base.rglob(pattern),
+                base.rglob("model.ckpt"),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
@@ -1018,10 +1039,23 @@ class DetectionPipeline:
             try:
                 for expired_id in self._alert_ring_buffer.check_expired_captures():
                     post_frames = self._alert_ring_buffer.finish_post_capture(expired_id)
-                    if post_frames:
-                        rec_store = getattr(self, "_recording_store", None)
-                        if rec_store is not None:
-                            rec_store.append_post_frames(expired_id, post_frames)
+                    if post_frames and self._recording_store is not None:
+                        self._recording_store.append_post_frames(expired_id, post_frames)
+                        if self._database is not None:
+                            try:
+                                meta = self._recording_store.load_metadata(expired_id)
+                                self._database.update_alert_recording_status(
+                                    expired_id,
+                                    RecordingStatus.COMPLETE.value,
+                                    frame_count=meta["frame_count"] if meta else None,
+                                    end_timestamp=meta["end_timestamp"] if meta else None,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "pipeline.recording_db_update_failed",
+                                    alert_id=expired_id,
+                                    exc_info=True,
+                                )
             except Exception:
                 logger.debug("pipeline.post_capture_flush_failed", exc_info=True)
 
@@ -1053,7 +1087,45 @@ class DetectionPipeline:
                         severity=alert.severity.value,
                         trigger_timestamp=alert.timestamp,
                     )
-                    # Store recording reference on alert for dispatcher to pick up
+                    # Persist recording to disk and insert DB record
+                    rec_path = ""
+                    if self._recording_store is not None:
+                        try:
+                            rec_path = self._recording_store.save(recording)
+                            logger.info(
+                                "pipeline.recording_saved",
+                                alert_id=alert.alert_id,
+                                path=rec_path,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "pipeline.recording_save_failed",
+                                alert_id=alert.alert_id,
+                                exc_info=True,
+                            )
+                    if self._database is not None and rec_path:
+                        try:
+                            db_rec = AlertRecordingRecord(
+                                alert_id=recording.alert_id,
+                                camera_id=recording.camera_id,
+                                severity=recording.severity,
+                                recording_path=rec_path,
+                                start_timestamp=recording.frames[0].timestamp if recording.frames else 0,
+                                end_timestamp=recording.frames[-1].timestamp if recording.frames else 0,
+                                trigger_timestamp=recording.trigger_timestamp,
+                                frame_count=len(recording.frames),
+                                fps=recording.fps,
+                                file_size_bytes=sum(len(f.frame_jpeg) for f in recording.frames),
+                                linked_alert_id=recording.linked_alert_id,
+                                status=recording.status.value,
+                            )
+                            self._database.save_alert_recording(db_rec)
+                        except Exception:
+                            logger.warning(
+                                "pipeline.recording_db_insert_failed",
+                                alert_id=alert.alert_id,
+                                exc_info=True,
+                            )
                     alert._solidified_recording = recording  # type: ignore[attr-defined]
             except Exception:
                 logger.warning(
