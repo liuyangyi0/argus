@@ -15,7 +15,7 @@ import {
 } from '@ant-design/icons-vue'
 import {
   getCameras, getBaselines, startCapture, startTraining,
-  getModels, deployModel, getTrainingHistory, getTasks, dismissTask,
+  getModels, deployModel, deleteModel, getTrainingHistory, getTasks, dismissTask,
   optimizeBaseline, previewOptimize, getModelRegistry, activateModel,
   rollbackModel, compareModels, batchInference,
   startCaptureJob, pauseCaptureJob, resumeCaptureJob, abortCaptureJob,
@@ -529,6 +529,26 @@ async function handleDeploy(record: any) {
   } finally {
     deployingModel.value = null
   }
+}
+
+function handleDeleteModel(record: any) {
+  Modal.confirm({
+    title: '删除模型',
+    content: `确定删除模型 ${record.model_version_id}？模型文件将从磁盘永久删除。`,
+    okText: '确认删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        await deleteModel(record.model_version_id)
+        message.success('模型已删除')
+        loadModels()
+        loadRegistry()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '删除失败')
+      }
+    },
+  })
 }
 
 async function handleDismissTask(taskId: string) {
@@ -1523,17 +1543,28 @@ onMounted(async () => {
                 </Tag>
               </template>
               <template v-if="column.key === 'action'">
-                <Tooltip title="部署到摄像头">
-                  <Button
-                    type="primary"
-                    size="small"
-                    :loading="deployingModel === record.model_path"
-                    @click="handleDeploy(record)"
-                  >
-                    <template #icon><RocketOutlined /></template>
-                    部署
-                  </Button>
-                </Tooltip>
+                <Space>
+                  <Tooltip title="部署到摄像头">
+                    <Button
+                      type="primary"
+                      size="small"
+                      :loading="deployingModel === record.model_path"
+                      @click="handleDeploy(record)"
+                    >
+                      <template #icon><RocketOutlined /></template>
+                      部署
+                    </Button>
+                  </Tooltip>
+                  <Tooltip title="删除模型">
+                    <Button
+                      size="small"
+                      danger
+                      @click="handleDeleteModel(record)"
+                    >
+                      <template #icon><DeleteOutlined /></template>
+                    </Button>
+                  </Tooltip>
+                </Space>
               </template>
             </template>
           </Table>

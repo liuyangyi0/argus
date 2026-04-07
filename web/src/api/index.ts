@@ -88,6 +88,8 @@ export const activateModel = (versionId: string) =>
   api.post(`/models/${versionId}/activate`)
 export const rollbackModel = (versionId: string) =>
   api.post(`/models/${versionId}/rollback`)
+export const deleteModel = (versionId: string) =>
+  api.delete(`/models/${versionId}`)
 
 // ── Release Pipeline ──
 export const promoteModel = (versionId: string, data: { target_stage: string; triggered_by: string; reason?: string; canary_camera_id?: string }) =>
