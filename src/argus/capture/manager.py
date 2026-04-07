@@ -69,6 +69,7 @@ class CameraManager:
         audit_logger: AuditLogger | None = None,
         record_store: InferenceRecordStore | None = None,
         database: Database | None = None,
+        alert_recording_store: object | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
@@ -80,6 +81,7 @@ class CameraManager:
         self._audit_logger = audit_logger
         self._record_store = record_store
         self._db = database
+        self._alert_recording_store = alert_recording_store
         self._runners: dict[str, CameraInferenceRunner] = {}
         self._pipelines: dict[str, DetectionPipeline] = {}  # backward compat
         self._threads: dict[str, threading.Thread] = {}
@@ -425,7 +427,7 @@ class CameraManager:
         if version_tag:
             pipeline.set_model_version_id(version_tag)
 
-        self._notify_status_change(camera_id)
+        self._notify_camera_status(camera_id)
         return True
 
     def get_latest_anomaly_map(self, camera_id: str) -> np.ndarray | None:
@@ -508,8 +510,15 @@ class CameraManager:
         record = self._get_active_model_record(cam_config.camera_id)
         if record and record.model_path:
             model_path = Path(record.model_path)
-            if model_path.exists():
+            if model_path.is_file():
                 return model_path
+            # Registry path is a directory — resolve to actual model file
+            if model_path.is_dir():
+                resolved = DetectionPipeline._find_model_in_dir(
+                    model_path, cam_config.camera_id
+                )
+                if resolved:
+                    return resolved
         return DetectionPipeline._find_model(cam_config.camera_id)
 
     def _model_version_id(self, cam_config: CameraConfig, model_path: Path | None = None) -> str:
@@ -612,6 +621,8 @@ class CameraManager:
             model_path=model_path,
             shared_anomaly_detector=shared_detector,
             shadow_runner=shadow_runner,
+            recording_store=self._alert_recording_store,
+            database=self._db,
         )
 
         # 5.1: Wrap pipeline in CameraInferenceRunner

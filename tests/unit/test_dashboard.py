@@ -759,6 +759,152 @@ class TestModelPublishRoutes:
             version_tag=version_id,
         )
 
+    def test_config_reload_model_resolves_checkpoint_to_exported_torch(
+        self,
+        db,
+        health,
+        alerts_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Config reload-model should resolve nested ckpt paths to deployable torch exports."""
+        monkeypatch.chdir(tmp_path)
+
+        model_dir = tmp_path / "data" / "models" / "cam_01" / "default"
+        ckpt_dir = model_dir / "Patchcore" / "baseline" / "v0" / "weights" / "lightning"
+        ckpt_dir.mkdir(parents=True)
+        ckpt_path = ckpt_dir / "model.ckpt"
+        ckpt_path.write_text("checkpoint")
+
+        export_dir = tmp_path / "data" / "exports" / "cam_01" / "default" / "weights" / "torch"
+        export_dir.mkdir(parents=True)
+        exported_model = export_dir / "model.pt"
+        exported_model.write_text("torch model")
+
+        baseline_dir = tmp_path / "baseline"
+        baseline_dir.mkdir()
+        (baseline_dir / "img.png").write_bytes(b"img")
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+
+        camera_manager = MagicMock()
+        camera_manager._pipelines = {"cam_01": MagicMock()}
+        camera_manager.reload_model.return_value = True
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/config/reload-model",
+            json={"camera_id": "cam_01", "model_path": str(ckpt_path)},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        camera_manager.reload_model.assert_called_once_with(
+            "cam_01",
+            str(exported_model),
+            version_tag=version_id,
+        )
+
+    def test_config_reload_model_rejects_checkpoint_without_runtime_artifact(
+        self,
+        db,
+        health,
+        alerts_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Config reload-model should fail clearly when only a training checkpoint exists."""
+        monkeypatch.chdir(tmp_path)
+
+        model_dir = tmp_path / "data" / "models" / "cam_01" / "default"
+        ckpt_dir = model_dir / "Patchcore" / "baseline" / "v0" / "weights" / "lightning"
+        ckpt_dir.mkdir(parents=True)
+        ckpt_path = ckpt_dir / "model.ckpt"
+        ckpt_path.write_text("checkpoint")
+
+        camera_manager = MagicMock()
+        camera_manager._pipelines = {"cam_01": MagicMock()}
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/config/reload-model",
+            json={"camera_id": "cam_01", "model_path": str(ckpt_path)},
+        )
+
+        assert response.status_code == 404
+        assert response.json()["error"] == "未找到可部署的模型文件 (.xml/.pt)"
+        camera_manager.reload_model.assert_not_called()
+
+    def test_baseline_deploy_resolves_checkpoint_to_exported_torch(
+        self,
+        db,
+        health,
+        alerts_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Baseline deploy should prefer exported torch artifacts over nested lightning checkpoints."""
+        monkeypatch.chdir(tmp_path)
+
+        model_dir = tmp_path / "data" / "models" / "cam_01" / "default"
+        ckpt_dir = model_dir / "Patchcore" / "baseline" / "v0" / "weights" / "lightning"
+        ckpt_dir.mkdir(parents=True)
+        ckpt_path = ckpt_dir / "model.ckpt"
+        ckpt_path.write_text("checkpoint")
+
+        export_dir = tmp_path / "data" / "exports" / "cam_01" / "default" / "weights" / "torch"
+        export_dir.mkdir(parents=True)
+        exported_model = export_dir / "model.pt"
+        exported_model.write_text("torch model")
+
+        baseline_dir = tmp_path / "baseline"
+        baseline_dir.mkdir()
+        (baseline_dir / "img.png").write_bytes(b"img")
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+
+        camera_manager = MagicMock()
+        camera_manager._pipelines = {"cam_01": MagicMock()}
+        camera_manager.reload_model.return_value = True
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/baseline/deploy",
+            json={"camera_id": "cam_01", "model_path": str(ckpt_path)},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        assert response.json()["model_version_id"] == version_id
+        camera_manager.reload_model.assert_called_once_with(
+            "cam_01",
+            str(exported_model),
+            version_tag=version_id,
+        )
+
     def test_promote_production_syncs_runtime(self, db, health, alerts_dir, tmp_path):
         """Promoting a canary model to production should sync the runtime model."""
         model_dir = tmp_path / "model"
@@ -903,8 +1049,9 @@ class TestCameraManagerModelRouting:
             database=db,
         )
 
-        assert manager._resolve_model_path(cam_config) == model_dir
-        assert manager._model_version_id(cam_config, model_dir) == version_id
+        resolved = manager._resolve_model_path(cam_config)
+        assert resolved == model_dir / "model.xml"
+        assert manager._model_version_id(cam_config, resolved) == version_id
         db.close()
 
     def test_reload_model_updates_pipeline_version_id(self):

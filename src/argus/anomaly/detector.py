@@ -98,6 +98,13 @@ class AnomalibDetector:
 
         # Try OpenVINO first (faster inference), then fall back to Torch
         suffix = self._model_path.suffix.lower()
+        if suffix == ".ckpt":
+            logger.error(
+                "anomaly.unsupported_checkpoint",
+                path=str(self._model_path),
+                msg="Lightning checkpoint is not deployable; use model.pt or model.xml",
+            )
+            return False
         if suffix in (".xml", ".onnx", ".bin"):
             try:
                 from anomalib.deploy import OpenVINOInferencer
@@ -452,6 +459,9 @@ class AnomalibDetector:
         logger.info("anomaly.hot_reload_start", path=str(new_model_path))
 
         try:
+            if new_model_path.suffix.lower() == ".ckpt":
+                raise ValueError("Lightning checkpoint is not deployable; use model.pt or model.xml")
+
             # Try OpenVINO first
             try:
                 from anomalib.deploy import OpenVINOInferencer

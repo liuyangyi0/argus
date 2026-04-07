@@ -15,11 +15,24 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import cv2
+import numpy as np
 import structlog
 
 from argus.core.alert_ring_buffer import FrameSnapshot, SolidifiedRecording, RecordingStatus
 
 logger = structlog.get_logger()
+
+
+def _encode_heatmap_jpeg(heatmap_raw: np.ndarray, quality: int = 60) -> bytes | None:
+    """Encode a raw anomaly map to a JET-colorized JPEG. Returns None on failure."""
+    hmap = heatmap_raw
+    if len(hmap.shape) == 2:
+        hmap = cv2.applyColorMap(hmap, cv2.COLORMAP_JET)
+    ok, buf = cv2.imencode(".jpg", hmap, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return None
+    return buf.tobytes()
 
 
 class AlertRecordingStore:
@@ -53,15 +66,9 @@ class AlertRecordingStore:
             frame_path = frames_dir / f"{i:06d}.jpg"
             frame_path.write_bytes(snap.frame_jpeg)
             total_size += len(snap.frame_jpeg)
-            # JPEG-encode heatmap at save time (deferred from per-frame hot path)
             if snap.heatmap_raw is not None and has_heatmaps:
-                import cv2
-                hmap = snap.heatmap_raw
-                if len(hmap.shape) == 2:
-                    hmap = cv2.applyColorMap(hmap, cv2.COLORMAP_JET)
-                ok, buf = cv2.imencode(".jpg", hmap, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                if ok:
-                    heatmap_bytes = buf.tobytes()
+                heatmap_bytes = _encode_heatmap_jpeg(snap.heatmap_raw)
+                if heatmap_bytes:
                     (heatmaps_dir / f"{i:06d}.jpg").write_bytes(heatmap_bytes)
                     total_size += len(heatmap_bytes)
 
@@ -121,10 +128,21 @@ class AlertRecordingStore:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         existing_count = metadata["frame_count"]
 
-        # Append new frames
+        # Append new frames + heatmaps
+        has_heatmaps = any(snap.heatmap_raw is not None for snap in post_frames)
+        heatmaps_dir = rec_dir / "heatmaps"
+        if has_heatmaps:
+            heatmaps_dir.mkdir(parents=True, exist_ok=True)
+
         for i, snap in enumerate(post_frames):
             frame_path = frames_dir / f"{existing_count + i:06d}.jpg"
             frame_path.write_bytes(snap.frame_jpeg)
+            if snap.heatmap_raw is not None and has_heatmaps:
+                heatmap_bytes = _encode_heatmap_jpeg(snap.heatmap_raw)
+                if heatmap_bytes:
+                    (heatmaps_dir / f"{existing_count + i:06d}.jpg").write_bytes(
+                        heatmap_bytes
+                    )
 
         # Update signals
         existing_signals = json.loads(signals_path.read_text(encoding="utf-8"))
@@ -138,6 +156,14 @@ class AlertRecordingStore:
                 post_signals["cusum_evidence"][zone_id]
             )
         existing_signals["yolo_persons"].extend(post_signals["yolo_persons"])
+        # Merge yolo_boxes for overlay toggle
+        if "yolo_boxes" in post_signals:
+            if "yolo_boxes" not in existing_signals:
+                existing_signals["yolo_boxes"] = []
+            existing_signals["yolo_boxes"].extend(post_signals["yolo_boxes"])
+        # Update has_heatmaps flag if post frames have heatmaps
+        if has_heatmaps:
+            existing_signals["has_heatmaps"] = True
         signals_path.write_text(
             json.dumps(existing_signals, ensure_ascii=False), encoding="utf-8"
         )

@@ -43,7 +43,7 @@ async def tasks_list(request: Request):
 
 
 @router.get("/json")
-async def tasks_list_json(request: Request):
+def tasks_list_json(request: Request):
     """JSON API: active tasks with progress."""
     task_manager = getattr(request.app.state, "task_manager", None)
     if not task_manager:

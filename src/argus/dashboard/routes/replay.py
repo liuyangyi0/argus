@@ -28,7 +28,7 @@ def _get_db(request: Request):
 
 
 @router.get("/{alert_id}/metadata")
-async def replay_metadata(request: Request, alert_id: str):
+def replay_metadata(request: Request, alert_id: str):
     """Return recording metadata for an alert.
 
     Response: {alert_id, camera_id, severity, start_ts, end_ts, trigger_ts,
@@ -46,7 +46,7 @@ async def replay_metadata(request: Request, alert_id: str):
 
 
 @router.get("/{alert_id}/signals")
-async def replay_signals(request: Request, alert_id: str):
+def replay_signals(request: Request, alert_id: str):
     """Return signal timeseries for the 5 replay tracks.
 
     Response: {timestamps[], anomaly_scores[], simplex_scores[],
@@ -84,7 +84,7 @@ async def replay_signals(request: Request, alert_id: str):
 
 
 @router.get("/{alert_id}/frame/{index}")
-async def replay_frame(request: Request, alert_id: str, index: int):
+def replay_frame(request: Request, alert_id: str, index: int):
     """Return a single JPEG frame by index."""
     store = _get_recording_store(request)
     if store is None:
@@ -105,7 +105,7 @@ async def replay_frame(request: Request, alert_id: str, index: int):
 
 
 @router.get("/{alert_id}/heatmap/{index}")
-async def replay_heatmap_frame(request: Request, alert_id: str, index: int):
+def replay_heatmap_frame(request: Request, alert_id: str, index: int):
     """Return a single heatmap overlay JPEG by index (§1.3 overlay toggle)."""
     store = _get_recording_store(request)
     if store is None:
@@ -167,7 +167,7 @@ async def replay_frames_stream(
 
 
 @router.get("/{alert_id}/reference")
-async def replay_reference(
+def replay_reference(
     request: Request,
     alert_id: str,
     date: str = Query(default="", description="Reference date YYYY-MM-DD"),

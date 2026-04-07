@@ -810,10 +810,12 @@ class ModelTrainer:
         }
         loaded_detector = None
 
-        # Search both training output and export directories for model files
-        model_file = self._find_best_model_file(output_dir)
-        if model_file is None and export_path and export_path.exists():
+        # Search export directory first (inference-ready formats), then training output
+        model_file = None
+        if export_path and export_path.exists():
             model_file = self._find_best_model_file(export_path)
+        if model_file is None:
+            model_file = self._find_best_model_file(output_dir)
         if model_file is None:
             result["errors"].append("未找到模型文件")
         elif model_file.stat().st_size == 0:
@@ -1117,11 +1119,17 @@ class ModelTrainer:
         images as calibration data.
         """
         actual_format = export_format
+        export_kwargs = {}
+        if export_format in {"openvino", "onnx"}:
+            # PyTorch 2.11 + anomalib currently trips over dynamic_axes when
+            # torch.onnx.export uses the dynamo exporter. Force the stable path.
+            export_kwargs["onnx_kwargs"] = {"dynamo": False}
         try:
             engine.export(
                 model=model,
                 export_type=export_format,
                 export_root=export_path,
+                **export_kwargs,
             )
         except Exception as e:
             if export_format != "torch":

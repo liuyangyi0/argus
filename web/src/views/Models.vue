@@ -15,7 +15,7 @@ import {
 } from '@ant-design/icons-vue'
 import {
   getCameras, getBaselines, startCapture, startTraining,
-  getModels, deployModel, deleteModel, getTrainingHistory, getTasks, dismissTask,
+  getModels, deployModel, deleteModel, deleteModelByPath, getTrainingHistory, getTasks, dismissTask,
   optimizeBaseline, previewOptimize, getModelRegistry, activateModel,
   rollbackModel, compareModels, batchInference,
   startCaptureJob, pauseCaptureJob, resumeCaptureJob, abortCaptureJob,
@@ -532,15 +532,21 @@ async function handleDeploy(record: any) {
 }
 
 function handleDeleteModel(record: any) {
+  const hasVersionId = !!record.model_version_id
+  const label = hasVersionId ? record.model_version_id : record.model_path
   Modal.confirm({
     title: '删除模型',
-    content: `确定删除模型 ${record.model_version_id}？模型文件将从磁盘永久删除。`,
+    content: `确定删除模型 ${label}？模型文件将从磁盘永久删除。`,
     okText: '确认删除',
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
       try {
-        await deleteModel(record.model_version_id)
+        if (hasVersionId) {
+          await deleteModel(record.model_version_id)
+        } else {
+          await deleteModelByPath(record.model_path)
+        }
         message.success('模型已删除')
         loadModels()
         loadRegistry()
@@ -1633,6 +1639,16 @@ onMounted(async () => {
                     >
                       <template #icon><RollbackOutlined /></template>
                       回滚
+                    </Button>
+                  </Tooltip>
+                  <Tooltip title="删除此版本">
+                    <Button
+                      size="small"
+                      danger
+                      :disabled="record.is_active"
+                      @click="handleDeleteModel(record)"
+                    >
+                      <template #icon><DeleteOutlined /></template>
                     </Button>
                   </Tooltip>
                 </Space>

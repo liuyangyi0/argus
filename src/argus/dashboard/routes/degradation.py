@@ -18,7 +18,7 @@ def _get_degradation_manager(request: Request):
 
 
 @router.get("/active")
-async def active_degradations(request: Request):
+def active_degradations(request: Request):
     """Return all active degradation events.
 
     Response: [{event_id, level, category, camera_id, title, impact,
@@ -32,7 +32,7 @@ async def active_degradations(request: Request):
 
 
 @router.get("/history")
-async def degradation_history(
+def degradation_history(
     request: Request,
     days: int = Query(default=7, ge=1, le=90),
 ):
@@ -48,7 +48,7 @@ async def degradation_history(
 
 
 @router.get("/summary")
-async def degradation_summary(request: Request):
+def degradation_summary(request: Request):
     """Return a summary suitable for the global degradation bar.
 
     Response: {active_count, max_level, events: [...top 3...]}
