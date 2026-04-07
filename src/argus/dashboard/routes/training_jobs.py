@@ -29,7 +29,7 @@ router = APIRouter()
 
 
 def _get_db(request: Request):
-    return getattr(request.app.state, "db", None)
+    return getattr(request.app.state, "database", None) or getattr(request.app.state, "db", None)
 
 
 def _write_audit(db, user: str, action: str, target_id: str, detail: str) -> None:
@@ -77,7 +77,7 @@ async def list_training_jobs(
     jobs = db.list_training_jobs(
         status=status, job_type=job_type, camera_id=camera_id, limit=min(limit, 200),
     )
-    pending_count = sum(1 for j in jobs if j.status == TrainingJobStatus.PENDING_CONFIRMATION.value) if not status else db.count_pending_jobs()
+    pending_count = db.count_pending_jobs()
     return JSONResponse({
         "jobs": [j.to_dict() for j in jobs],
         "total": len(jobs),
@@ -144,6 +144,15 @@ async def create_training_job(request: Request):
             status_code=400,
         )
 
+    # Validate camera_id exists in config
+    if camera_id:
+        config = getattr(request.app.state, "config", None)
+        if config and not any(c.camera_id == camera_id for c in config.cameras):
+            return JSONResponse(
+                {"error": f"Camera '{camera_id}' not found in configuration"},
+                status_code=400,
+            )
+
     hyperparams = body.get("hyperparameters")
     job_id = str(uuid.uuid4())[:12]
 
@@ -198,12 +207,18 @@ async def confirm_training_job(request: Request, job_id: str):
     confirmed_by = body.get("confirmed_by", "operator")
     now = datetime.now(timezone.utc)
 
-    db.update_training_job(
+    # Atomic update: only transition if still pending (prevents double-confirm race)
+    updated = db.update_training_job(
         job_id,
         status=TrainingJobStatus.QUEUED.value,
         confirmed_by=confirmed_by,
         confirmed_at=now,
     )
+    if updated is False:
+        return JSONResponse(
+            {"error": "Job was already confirmed or status changed"},
+            status_code=409,
+        )
 
     _write_audit(
         db, confirmed_by, "training_job.confirm", job_id,

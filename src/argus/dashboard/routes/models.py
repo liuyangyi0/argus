@@ -35,14 +35,17 @@ def _get_registry(request: Request) -> ModelRegistry | None:
 
 
 def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
-    """Get ReleasePipeline from app state, or None if unavailable."""
-    db = getattr(request.app.state, "db", None)
+    """Get or create ReleasePipeline singleton from app state."""
+    cached = getattr(request.app.state, "_release_pipeline", None)
+    if cached is not None:
+        return cached
+
+    db = getattr(request.app.state, "database", None) or getattr(request.app.state, "db", None)
     if db is None:
         return None
     session_factory = getattr(db, "get_session", None)
     if session_factory is None:
         return None
-    # Get config for min_shadow_days / min_canary_days
     config = getattr(request.app.state, "config", None)
     kwargs = {}
     if config:
@@ -50,7 +53,9 @@ def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
         if anomaly_cfg:
             kwargs["min_shadow_days"] = getattr(anomaly_cfg, "min_shadow_days", 3)
             kwargs["min_canary_days"] = getattr(anomaly_cfg, "min_canary_days", 7)
-    return ReleasePipeline(session_factory=session_factory, **kwargs)
+    pipeline = ReleasePipeline(session_factory=session_factory, **kwargs)
+    request.app.state._release_pipeline = pipeline
+    return pipeline
 
 
 @router.get("/json")
@@ -201,19 +206,20 @@ async def batch_inference(request: Request):
             status_code=400,
         )
 
-    # Get the camera's pipeline to access the detector
+    # Get the camera's anomaly detector via public API
     camera_manager = getattr(request.app.state, "camera_manager", None)
     if camera_manager is None:
         return JSONResponse({"error": "Camera manager not available"}, status_code=503)
 
-    pipeline = camera_manager._pipelines.get(camera_id)
-    if pipeline is None:
+    det_status = camera_manager.get_detector_status(camera_id)
+    if det_status is None:
         return JSONResponse(
             {"error": f"Camera '{camera_id}' not running or not found"},
             status_code=404,
         )
 
-    detector = getattr(pipeline, "_detector", None)
+    pipeline = camera_manager._pipelines.get(camera_id)
+    detector = getattr(pipeline, "_anomaly_detector", None) if pipeline else None
     if detector is None:
         return JSONResponse(
             {"error": f"No anomaly detector available for camera '{camera_id}'"},
