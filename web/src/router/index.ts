@@ -39,9 +39,7 @@ const router = createRouter({
     },
     {
       path: '/training',
-      name: 'training',
-      component: () => import('../views/TrainingJobs.vue'),
-      meta: { title: '训练任务' },
+      redirect: '/models?tab=training',
     },
     {
       path: '/system',
