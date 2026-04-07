@@ -78,6 +78,7 @@ class AnomalibDetector:
         self._ssim_baseline_count = 0
         self._ssim_noise_floor: float | None = None
         self._reload_lock = threading.Lock()
+        self._minmax_broken = False  # True when PostProcessor MinMax is not fit
 
     def load(self) -> bool:
         """Load the Anomalib model for inference.
@@ -110,6 +111,7 @@ class AnomalibDetector:
                 from anomalib.deploy import OpenVINOInferencer
                 self._engine = OpenVINOInferencer(path=self._model_path)
                 self._loaded = True
+                self._check_minmax_normalization()
                 logger.info("anomaly.model_loaded_openvino", path=str(self._model_path))
                 self._load_calibration()
                 return True
@@ -126,12 +128,110 @@ class AnomalibDetector:
             from anomalib.deploy import TorchInferencer
             self._engine = TorchInferencer(path=self._model_path)
             self._loaded = True
+            self._check_minmax_normalization()
             logger.info("anomaly.model_loaded_torch", path=str(self._model_path))
             self._load_calibration()
             return True
         except Exception as e:
             logger.error("anomaly.load_failed", error=str(e))
             return False
+
+    def _check_minmax_normalization(self) -> None:
+        """Detect broken PostProcessor MinMax normalization.
+
+        When a model is exported without fitting the PostProcessor (e.g.
+        min=inf, max=-inf), all scores are normalized to 1.0 regardless
+        of input. We detect this at load time and flag it so predict()
+        can fall back to raw scores with sigmoid normalization.
+        """
+        try:
+            model = getattr(self._engine, "model", None)
+            if model is None:
+                return
+            pp = getattr(model, "post_processor", None)
+            if pp is None:
+                return
+            img_mm = getattr(pp, "_image_min_max_metric", None)
+            if img_mm is None:
+                return
+            mm_min = getattr(img_mm, "min", None)
+            mm_max = getattr(img_mm, "max", None)
+            if mm_min is None or mm_max is None:
+                return
+            import math
+            min_val = float(mm_min)
+            max_val = float(mm_max)
+            if math.isinf(min_val) or math.isinf(max_val) or min_val >= max_val:
+                self._minmax_broken = True
+                logger.warning(
+                    "anomaly.minmax_not_fit",
+                    min=min_val,
+                    max=max_val,
+                    msg="PostProcessor MinMax not fit — using raw score with sigmoid normalization",
+                )
+        except Exception:
+            pass
+
+    def calibrate_raw_scores(self, baseline_dir: Path | None = None) -> None:
+        """Calibrate raw score normalization using baseline images.
+
+        When MinMax is broken, this method runs baseline images through the
+        inner model to determine the normal score range, then sets a sigmoid
+        midpoint at mean + 3*std. Call this after load() when _minmax_broken.
+        """
+        if not self._minmax_broken or not self._loaded:
+            return
+        if baseline_dir is None or not baseline_dir.is_dir():
+            return
+
+        import torch
+        model = self._engine.model
+        inner = getattr(model, "model", model)
+        scores = []
+        for img_path in sorted(baseline_dir.iterdir())[:30]:
+            if img_path.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+                continue
+            frame = cv2.imread(str(img_path))
+            if frame is None:
+                continue
+            resized = cv2.resize(frame, self.image_size)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            inp = torch.from_numpy(rgb.transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
+            with torch.no_grad():
+                out = inner(inp)
+            raw = float(out.pred_score.squeeze().item())
+            if np.isfinite(raw):
+                scores.append(raw)
+
+        if len(scores) >= 3:
+            mean = float(np.mean(scores))
+            std = max(float(np.std(scores)), 1.0)
+            self._raw_score_midpoint = mean + 3 * std
+            self._raw_score_scale = std * 3
+            logger.info(
+                "anomaly.raw_score_calibrated",
+                n_baselines=len(scores),
+                mean=round(mean, 2),
+                std=round(std, 2),
+                midpoint=round(self._raw_score_midpoint, 2),
+                scale=round(self._raw_score_scale, 2),
+            )
+        else:
+            logger.warning(
+                "anomaly.raw_score_calibration_insufficient",
+                n_baselines=len(scores),
+                msg="Not enough baselines for calibration, using default sigmoid",
+            )
+
+    def _normalize_raw_score(self, raw_val: float) -> float:
+        """Normalize a raw PatchCore score to 0-1 using sigmoid.
+
+        Uses calibrated midpoint/scale if available, otherwise defaults.
+        """
+        import math
+        midpoint = getattr(self, "_raw_score_midpoint", 55.0)
+        scale = getattr(self, "_raw_score_scale", 8.0)
+        return 1.0 / (1.0 + math.exp(-(raw_val - midpoint) / scale))
 
     def _load_calibration(self) -> None:
         """Load conformal calibration data from calibration.json near the model.
@@ -236,6 +336,21 @@ class AnomalibDetector:
                     msg="Model returned NaN/Inf score, treating as normal",
                 )
                 return self._safe_result()
+
+            # When PostProcessor MinMax is not fit, the normalized score is
+            # always 1.0 (useless). Fall back to the raw model score and
+            # apply sigmoid normalization to map it to 0-1.
+            if self._minmax_broken:
+                import torch
+                model = self._engine.model
+                inner = getattr(model, "model", model)
+                inp = torch.from_numpy(rgb.transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
+                with torch.no_grad():
+                    raw_out = inner(inp)
+                raw_val = float(raw_out.pred_score.squeeze().item())
+                if not np.isfinite(raw_val):
+                    return self._safe_result()
+                anomaly_score = self._normalize_raw_score(raw_val)
 
             # Clamp to valid range
             anomaly_score = max(0.0, min(anomaly_score, 1.0))
