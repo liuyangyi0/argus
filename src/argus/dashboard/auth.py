@@ -103,6 +103,74 @@ def require_role(request: Request, *roles: str) -> bool:
     return user.get("role", "viewer") in roles
 
 
+# ── UX v2 §11.1: Permission matrix (4-tier RBAC) ──
+
+PERMISSION_MAP: dict[str, list[str]] = {
+    "viewer": [
+        "read_alerts", "read_cameras", "read_system", "read_models",
+        "read_degradation",
+    ],
+    "operator": [
+        "read_alerts", "read_cameras", "read_system", "read_models",
+        "read_degradation",
+        "handle_alerts", "shift_handoff", "mute_audio",
+        "view_replay", "pin_frame",
+    ],
+    "engineer": [
+        "read_alerts", "read_cameras", "read_system", "read_models",
+        "read_degradation",
+        "handle_alerts", "shift_handoff", "mute_audio",
+        "view_replay", "pin_frame",
+        "edit_zones", "edit_thresholds", "edit_config",
+        "manage_baselines", "manage_training", "manage_models",
+        "rollback_model",
+    ],
+    "admin": ["*"],  # wildcard: all permissions
+}
+
+# Valid roles (includes 'engineer' added in UX v2)
+VALID_ROLES = frozenset(PERMISSION_MAP.keys())
+
+
+def has_permission(request: Request, permission: str) -> bool:
+    """Check if the current user has a specific permission.
+
+    Uses the PERMISSION_MAP to resolve role → permissions.
+    Admin role has wildcard access to all permissions.
+    """
+    user = getattr(request.state, "user", None)
+    if user is None:
+        return False
+    role = user.get("role", "viewer")
+    perms = PERMISSION_MAP.get(role, [])
+    return "*" in perms or permission in perms
+
+
+def require_permission(request: Request, permission: str) -> bool:
+    """Check permission and return True if authorized.
+
+    For use in route handlers:
+        if not require_permission(request, "handle_alerts"):
+            return JSONResponse({"error": "权限不足", ...}, status_code=403)
+    """
+    return has_permission(request, permission)
+
+
+def get_denied_response(request: Request, permission: str) -> dict:
+    """Build a standardized 403 response body for permission denial.
+
+    Returns dict suitable for JSONResponse(body, status_code=403).
+    """
+    user = getattr(request.state, "user", None)
+    role = user.get("role", "unknown") if user else "anonymous"
+    return {
+        "error": "权限不足",
+        "required_permission": permission,
+        "your_role": role,
+        "message": f"角色 '{role}' 没有 '{permission}' 权限",
+    }
+
+
 # ── Auth Middleware ──
 
 class AuthMiddleware(BaseHTTPMiddleware):

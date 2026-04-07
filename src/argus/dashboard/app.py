@@ -93,6 +93,21 @@ def create_app(
     else:
         app.state.feedback_manager = None
 
+    # UX v2 §5: Global degradation manager
+    from argus.core.degradation import GlobalDegradationManager
+
+    app.state.degradation_manager = GlobalDegradationManager(ws_manager=ws_manager)
+
+    # FR-033: Alert recording store for replay
+    from argus.storage.alert_recording import AlertRecordingStore
+
+    storage_cfg = getattr(config, "storage", None)
+    recordings_dir = "data/recordings"
+    if storage_cfg and hasattr(storage_cfg, "alerts_dir"):
+        # Co-locate recordings near alerts directory
+        recordings_dir = str(Path(storage_cfg.alerts_dir).parent / "recordings")
+    app.state.recording_store = AlertRecordingStore(archive_dir=recordings_dir)
+
     # ── Security middleware ──
     from argus.dashboard.auth import (
         AuthMiddleware,
@@ -131,6 +146,12 @@ def create_app(
 
     from argus.dashboard.routes.models import router as models_router
     app.include_router(models_router, prefix="/api/models", tags=["models"])
+
+    from argus.dashboard.routes.replay import router as replay_router
+    app.include_router(replay_router, prefix="/api/replay", tags=["replay"])
+
+    from argus.dashboard.routes.degradation import router as degradation_router
+    app.include_router(degradation_router, prefix="/api/degradation", tags=["degradation"])
 
     from argus.dashboard.routes.training_jobs import router as training_jobs_router
     app.include_router(training_jobs_router, prefix="/api/training-jobs", tags=["training-jobs"])

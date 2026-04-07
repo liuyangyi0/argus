@@ -59,12 +59,14 @@ class HealthMonitor:
         self,
         on_change: Callable[[str, dict], None] | None = None,
         feedback_manager: object | None = None,
+        degradation_manager: object | None = None,
     ):
         self._start_time = time.monotonic()
         self._camera_health: dict[str, CameraHealth] = {}
         self._total_alerts = 0
         self._on_change = on_change
         self._feedback_manager = feedback_manager
+        self._degradation_manager = degradation_manager
         self._last_status: str = ""
         self._last_connected_count: int = -1
         self._degradation_feedback_sent: set[str] = set()  # cameras already reported
@@ -109,6 +111,28 @@ class HealthMonitor:
         elif connected and camera_id in self._degradation_feedback_sent:
             # Camera recovered — allow future feedback
             self._degradation_feedback_sent.discard(camera_id)
+
+        # UX v2 §5: Report degradation events to global bar
+        if self._degradation_manager is not None:
+            if not connected and was_connected:
+                try:
+                    self._degradation_manager.report(
+                        category="rtsp_broken",
+                        camera_id=camera_id,
+                        camera=camera_id,
+                        n=reconnect_count,
+                        max=10,
+                        t=0,
+                    )
+                except Exception:
+                    logger.debug("health.degradation_report_failed", camera_id=camera_id)
+            elif connected and not was_connected:
+                try:
+                    self._degradation_manager.resolve_by_category(
+                        category="rtsp_broken", camera_id=camera_id
+                    )
+                except Exception:
+                    logger.debug("health.degradation_resolve_failed", camera_id=camera_id)
 
     def record_alert(self) -> None:
         """Increment the total alert counter."""

@@ -5,10 +5,12 @@ sources (camera threads, alert dispatcher) to async WebSocket clients
 via an asyncio queue.
 
 Topics:
-- health:  System health and camera status changes
-- cameras: Camera statistics updates
-- alerts:  New alert notifications
-- tasks:   Background task progress updates
+- health:      System health and camera status changes
+- cameras:     Camera statistics updates
+- alerts:      New alert notifications
+- tasks:       Background task progress updates
+- wall:        Video wall aggregated score/status (UX v2 §2)
+- degradation: Degradation events new/resolved (UX v2 §5)
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-VALID_TOPICS = frozenset({"health", "cameras", "alerts", "tasks"})
+VALID_TOPICS = frozenset({"health", "cameras", "alerts", "tasks", "wall", "degradation"})
 
 
 class _ClientConnection:

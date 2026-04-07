@@ -137,4 +137,31 @@ export const toggleUserActive = (username: string) =>
 export const getAuditLogs = (params?: { page?: number; page_size?: number; user?: string; action?: string }) =>
   api.get('/audit/json', { params })
 
+// ── Replay (FR-033) ──
+export const getReplayMetadata = (alertId: string) =>
+  api.get(`/replay/${alertId}/metadata`)
+export const getReplaySignals = (alertId: string) =>
+  api.get(`/replay/${alertId}/signals`)
+export const getReplayFrameUrl = (alertId: string, index: number) =>
+  `/api/replay/${alertId}/frame/${index}`
+export const getReplayHeatmapUrl = (alertId: string, index: number) =>
+  `/api/replay/${alertId}/heatmap/${index}`
+export const getReplayReference = (alertId: string, params?: { date?: string; time?: string }) =>
+  api.get(`/replay/${alertId}/reference`, { params })
+export const pinReplayFrame = (alertId: string, data: { index: number; label: string }) =>
+  api.post(`/replay/${alertId}/pin-frame`, data)
+
+// ── Video Wall ──
+export const getWallStatus = () => api.get('/cameras/wall/status')
+
+// ── Degradation ──
+export const getDegradationActive = () => api.get('/degradation/active')
+export const getDegradationSummary = () => api.get('/degradation/summary')
+export const getDegradationHistory = (days?: number) =>
+  api.get('/degradation/history', { params: { days } })
+
+// ── Audio Alerts ──
+export const getAudioAlerts = () => api.get('/config/audio-alerts')
+export const updateAudioAlerts = (data: any) => api.put('/config/audio-alerts', data)
+
 export default api

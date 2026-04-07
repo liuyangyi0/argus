@@ -3,13 +3,14 @@ import { h, ref, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { theme, Layout, Menu, Typography } from 'ant-design-vue'
 import {
-  HomeOutlined,
+  DesktopOutlined,
   CameraOutlined,
   BellOutlined,
   ExperimentOutlined,
   SettingOutlined,
   RocketOutlined,
 } from '@ant-design/icons-vue'
+import DegradationBar from './components/DegradationBar.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -26,7 +27,7 @@ const selectedKeys = computed(() => {
 })
 
 const menuItems = [
-  { key: 'overview', icon: () => h(HomeOutlined), label: '总览', path: '/overview' },
+  { key: 'overview', icon: () => h(DesktopOutlined), label: '值班台', path: '/overview' },
   { key: 'cameras', icon: () => h(CameraOutlined), label: '摄像头', path: '/cameras' },
   { key: 'alerts', icon: () => h(BellOutlined), label: '告警', path: '/alerts' },
   { key: 'training', icon: () => h(RocketOutlined), label: '训练', path: '/training' },
@@ -87,6 +88,7 @@ function onMenuClick({ key }: { key: string | number }) {
         </div>
       </Layout.Sider>
       <Layout>
+        <DegradationBar />
         <Layout.Content style="padding: 24px; overflow-y: auto">
           <router-view />
         </Layout.Content>

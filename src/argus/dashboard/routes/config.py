@@ -687,3 +687,48 @@ async def save_config(request: Request):
         {"status": "ok"},
         headers={"HX-Trigger": '{"showToast": {"message": "配置已保存到文件", "type": "success"}}'},
     )
+
+
+# ── UX v2 §2.5: Audio alert configuration ──
+
+@router.get("/audio-alerts")
+async def get_audio_alerts(request: Request):
+    """Return current audio alert settings per severity."""
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+    dashboard_cfg = getattr(config, "dashboard", None)
+    if dashboard_cfg is None:
+        from argus.config.schema import DashboardConfig
+        dashboard_cfg = DashboardConfig()
+    audio_cfg = getattr(dashboard_cfg, "audio_alerts", None)
+    if audio_cfg is None:
+        from argus.config.schema import AudioAlertConfig
+        audio_cfg = AudioAlertConfig()
+    return JSONResponse(audio_cfg.model_dump())
+
+
+@router.put("/audio-alerts")
+async def update_audio_alerts(request: Request):
+    """Update audio alert settings.
+
+    Request body: {low: {enabled, sound, voice_template},
+                   medium: {...}, high: {...}}
+    """
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    data = await request.json()
+
+    from argus.config.schema import AudioAlertConfig
+    try:
+        new_audio_cfg = AudioAlertConfig(**data)
+    except Exception as e:
+        return JSONResponse({"error": f"无效配置: {e}"}, status_code=400)
+
+    dashboard_cfg = getattr(config, "dashboard", None)
+    if dashboard_cfg is not None:
+        dashboard_cfg.audio_alerts = new_audio_cfg
+
+    return JSONResponse({"status": "ok", "audio_alerts": new_audio_cfg.model_dump()})

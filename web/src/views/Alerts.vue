@@ -6,6 +6,7 @@ import {
 } from 'ant-design-vue'
 import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
+import ReplayPlayer from '../components/ReplayPlayer.vue'
 
 const alerts = ref<any[]>([])
 const cameras = ref<any[]>([])
@@ -27,7 +28,7 @@ async function fetchData() {
   }
 }
 
-const { } = useWebSocket({
+useWebSocket({
   topics: ['alerts'],
   onMessage(topic, data) {
     if (topic === 'alerts') alerts.value = data
@@ -170,11 +171,19 @@ const columns = [
     <Drawer
       v-model:open="detailVisible"
       :title="`告警详情 — ${selectedAlert?.alert_id?.slice(0, 24)}`"
-      width="640"
+      :width="selectedAlert?.has_recording ? 900 : 640"
       placement="right"
     >
       <template v-if="selectedAlert">
-        <div v-if="selectedAlert.snapshot_path" style="margin-bottom: 24px; text-align: center">
+        <!-- Replay Player (when recording exists) -->
+        <ReplayPlayer
+          v-if="selectedAlert.has_recording"
+          :alert-id="selectedAlert.alert_id"
+          style="margin-bottom: 16px"
+        />
+
+        <!-- Static snapshot fallback -->
+        <div v-if="selectedAlert.snapshot_path && !selectedAlert.has_recording" style="margin-bottom: 24px; text-align: center">
           <Image
             :src="`/api/alerts/${selectedAlert.alert_id}/image/composite`"
             :fallback="`/api/alerts/${selectedAlert.alert_id}/image/snapshot`"
