@@ -810,7 +810,10 @@ class ModelTrainer:
         }
         loaded_detector = None
 
+        # Search both training output and export directories for model files
         model_file = self._find_best_model_file(output_dir)
+        if model_file is None and export_path and export_path.exists():
+            model_file = self._find_best_model_file(export_path)
         if model_file is None:
             result["errors"].append("未找到模型文件")
         elif model_file.stat().st_size == 0:
@@ -822,6 +825,7 @@ class ModelTrainer:
             export_files = (
                 list(export_path.rglob("*.xml"))
                 + list(export_path.rglob("*.onnx"))
+                + list(export_path.rglob("*.pt"))
             )
             if export_files and all(f.stat().st_size > 0 for f in export_files):
                 result["export_valid"] = True
@@ -930,9 +934,9 @@ class ModelTrainer:
     def _find_best_model_file(model_dir: Path) -> Path | None:
         """Find the best model file in a training output directory.
 
-        Preference: .xml (OpenVINO) > .onnx > .ckpt > .pt
+        Preference: .xml (OpenVINO) > .onnx > .pt (Torch) > .ckpt (Lightning)
         """
-        for pattern in ("**/*.xml", "**/*.onnx", "**/*.ckpt", "**/*.pt"):
+        for pattern in ("**/*.xml", "**/*.onnx", "**/*.pt", "**/*.ckpt"):
             files = sorted(model_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
             if files:
                 return files[0]
