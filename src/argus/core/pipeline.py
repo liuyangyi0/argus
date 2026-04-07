@@ -381,12 +381,40 @@ class DetectionPipeline:
         """
         return find_runtime_model(camera_id)
 
+    @staticmethod
+    def _find_baseline_dir(camera_id: str) -> Path | None:
+        """Find the latest baseline directory for a camera."""
+        base = Path("data/baselines") / camera_id
+        if not base.is_dir():
+            return None
+        # Check for zone subdirectories (e.g. data/baselines/c/default/)
+        for zone_dir in sorted(base.iterdir()):
+            if not zone_dir.is_dir():
+                continue
+            # Find current version
+            current_file = zone_dir / "current.txt"
+            if current_file.exists():
+                version = current_file.read_text().strip()
+                version_dir = zone_dir / version
+                if version_dir.is_dir():
+                    return version_dir
+            # Fall back to latest version directory
+            versions = sorted([d for d in zone_dir.iterdir() if d.is_dir()])
+            if versions:
+                return versions[-1]
+        return None
+
     def initialize(self) -> bool:
         """Initialize all pipeline components. Returns True on success."""
         if not self._camera.connect():
             return False
 
         self._anomaly_detector.load()
+
+        # Calibrate raw scores if PostProcessor MinMax is broken
+        if getattr(self._anomaly_detector, "_minmax_broken", False):
+            baseline_dir = self._find_baseline_dir(self.camera_config.camera_id)
+            self._anomaly_detector.calibrate_raw_scores(baseline_dir)
 
         # DET-010: Auto-enter learning mode on first start
         fps = max(1, self.camera_config.fps_target)
@@ -455,6 +483,22 @@ class DetectionPipeline:
         self, frame_data: FrameData, frame: np.ndarray, start: float, diag: FrameDiagnostics
     ) -> Alert | None:
         """Inner frame processing logic (extracted for CRIT-03 exception safety)."""
+        # DET-010: Auto-exit learning mode after duration expires
+        if (
+            self._learning_start_time is not None
+            and self.mode == PipelineMode.LEARNING
+            and (time.monotonic() - self._learning_start_time) >= self._learning_duration
+        ):
+            with self._mode_lock:
+                self._mode = PipelineMode.ACTIVE
+            self._auto_learning_complete = True
+            self._learning_start_time = None
+            logger.info(
+                "pipeline.learning_mode_complete",
+                camera_id=frame_data.camera_id,
+                msg="Learning mode expired, switching to ACTIVE",
+            )
+
         current_mode = self.mode
         # Save raw frame before zone masking (need copy since zone_mask mutates frame)
         with self._latest_raw_frame_lock:
