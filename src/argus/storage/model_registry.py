@@ -274,6 +274,19 @@ class ModelRegistry:
 
         logger.info("model_registry.activated", model_version_id=model_version_id)
 
+    def delete_model(self, model_version_id: str) -> None:
+        """Delete a model record from the database."""
+        with self._session_factory() as session:
+            record = (
+                session.query(ModelRecord)
+                .filter_by(model_version_id=model_version_id)
+                .first()
+            )
+            if record is not None:
+                session.delete(record)
+                session.commit()
+        logger.info("model_registry.deleted", model_version_id=model_version_id)
+
     def list_models(self, camera_id: str | None = None) -> list[ModelRecord]:
         """List all models, optionally filtered by camera_id."""
         with self._session_factory() as session:

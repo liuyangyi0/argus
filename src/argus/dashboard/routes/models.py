@@ -324,6 +324,40 @@ async def retire_model(request: Request, version_id: str):
         return JSONResponse({"error": str(e)}, status_code=409)
 
 
+@router.delete("/{version_id}")
+async def delete_model(request: Request, version_id: str):
+    """Delete a model version (only non-active, non-production models)."""
+    registry = _get_registry(request)
+    if registry is None:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    record = registry.get_by_version_id(version_id)
+    if record is None:
+        return JSONResponse({"error": f"Model not found: {version_id}"}, status_code=404)
+
+    if record.is_active:
+        return JSONResponse({"error": "无法删除当前激活的模型"}, status_code=400)
+    if record.stage == ModelStage.PRODUCTION.value:
+        return JSONResponse({"error": "无法删除生产中的模型"}, status_code=400)
+
+    # Delete model files from disk
+    if record.model_path:
+        import shutil
+        model_dir = Path(record.model_path)
+        if model_dir.exists():
+            if model_dir.is_dir():
+                shutil.rmtree(model_dir, ignore_errors=True)
+            else:
+                model_dir.unlink(missing_ok=True)
+            logger.info("model.files_deleted", path=str(model_dir))
+
+    # Delete from database
+    registry.delete_model(version_id)
+    logger.info("model.deleted", model_version_id=version_id)
+
+    return JSONResponse({"status": "ok", "deleted": version_id})
+
+
 @router.get("/{version_id}/stage-history")
 async def stage_history(request: Request, version_id: str):
     """Get version event history for a specific model."""
