@@ -677,6 +677,7 @@ async def start_training(request: Request):
     export_format = form.get("export_format", "openvino")
     quantization = form.get("quantization", "fp16")
     resume_from = form.get("resume_from", "") or None
+    skip_validation = form.get("skip_baseline_validation", "").lower() in ("true", "1", "yes")
 
     if not camera_id:
         return JSONResponse({"error": "请选择摄像头"}, status_code=400)
@@ -717,6 +718,7 @@ async def start_training(request: Request):
             database_url=database_url,
             anomaly_config=anomaly_config,
             resume_from=resume_from,
+            skip_baseline_validation=skip_validation,
         )
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -1289,7 +1291,7 @@ async def compare_models_route(request: Request):
 def _train_model_task(
     progress_callback, *, baselines_dir, models_dir, camera_id, model_type,
     export_format, quantization="fp16", database_url=None, anomaly_config=None,
-    resume_from=None,
+    resume_from=None, skip_baseline_validation=False,
 ):
     """Train an anomaly detection model with full validation pipeline.
 
@@ -1323,6 +1325,7 @@ def _train_model_task(
         progress_callback=progress_callback,
         anomaly_config=anomaly_config,
         resume_from=resume_from,
+        skip_baseline_validation=skip_baseline_validation,
     )
 
     if result.status == TrainingStatus.FAILED:

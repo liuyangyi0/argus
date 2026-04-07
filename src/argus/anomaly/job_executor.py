@@ -203,6 +203,7 @@ class TrainingJobExecutor:
             export_format=params.get("export_format", "openvino"),
             quantization=params.get("quantization", "fp16"),
             backbone_checkpoint=backbone_checkpoint,
+            skip_baseline_validation=params.get("skip_baseline_validation", False),
         )
 
         if result.status.value != TrainingStatus.COMPLETE.value:

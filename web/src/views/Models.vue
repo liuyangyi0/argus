@@ -3,7 +3,7 @@ import { ref, computed, onMounted, h } from 'vue'
 import {
   Tabs, Table, Card, Button, Select, Form, InputNumber, Space,
   Typography, Progress, Tag, Modal, message, Descriptions, Tooltip,
-  Radio, Collapse, Slider, Drawer, Input, Divider,
+  Radio, Collapse, Slider, Drawer, Input, Divider, Checkbox,
 } from 'ant-design-vue'
 import {
   PlayCircleOutlined, RocketOutlined, ReloadOutlined,
@@ -52,7 +52,7 @@ const advCaptureSubmitting = ref(false)
 const optimizingBaseline = ref<string | null>(null)
 
 // ── Tab 2: Training ──
-const trainForm = ref({ camera_id: '', model_type: 'patchcore', export_format: 'openvino' })
+const trainForm = ref({ camera_id: '', model_type: 'patchcore', export_format: 'openvino', skip_baseline_validation: false })
 const trainSubmitting = ref(false)
 const tasks = ref<any[]>([])
 
@@ -503,6 +503,9 @@ async function handleTrain() {
     form.append('camera_id', trainForm.value.camera_id)
     form.append('model_type', trainForm.value.model_type)
     form.append('export_format', trainForm.value.export_format)
+    if (trainForm.value.skip_baseline_validation) {
+      form.append('skip_baseline_validation', 'true')
+    }
     await startTraining(form)
     message.success('训练任务已启动')
     loadTasks()
@@ -1428,6 +1431,11 @@ onMounted(async () => {
                   {{ ef.label }}
                 </Select.Option>
               </Select>
+            </Form.Item>
+            <Form.Item>
+              <Checkbox v-model:checked="trainForm.skip_baseline_validation">
+                跳过基线质量验证（仅用于测试）
+              </Checkbox>
             </Form.Item>
             <Form.Item>
               <Button type="primary" :loading="trainSubmitting" @click="handleTrain">

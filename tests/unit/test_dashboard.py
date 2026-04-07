@@ -293,7 +293,7 @@ class TestBaselineForms:
 
         original_train = dashboard_routes.baseline._train_model_task
 
-        def fake_train_model_task(progress_callback, *, baselines_dir, models_dir, camera_id, model_type, export_format, quantization="fp16", database_url=None, anomaly_config=None, resume_from=None):
+        def fake_train_model_task(progress_callback, *, baselines_dir, models_dir, camera_id, model_type, export_format, quantization="fp16", database_url=None, anomaly_config=None, resume_from=None, skip_baseline_validation=False):
             return {
                 "camera_id": camera_id,
                 "baselines_dir": baselines_dir,
