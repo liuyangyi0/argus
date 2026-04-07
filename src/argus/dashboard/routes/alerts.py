@@ -12,6 +12,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from argus.dashboard.components import empty_state, page_header, status_badge
+from argus.dashboard.forms import parse_request_form
 
 router = APIRouter()
 
@@ -480,7 +481,7 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     if "json" in content_type:
         data = await request.json()
     else:
-        form = await request.form()
+        form = await parse_request_form(request)
         data = dict(form)
 
     new_status = data.get("status", "")

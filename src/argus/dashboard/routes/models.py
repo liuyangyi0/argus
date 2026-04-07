@@ -8,6 +8,12 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from argus.dashboard.model_runtime import (
+    activate_model_version,
+    get_registry,
+    rollback_camera_model,
+    sync_active_camera_model,
+)
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.models import ModelRecord, ModelStage
 from argus.storage.release_pipeline import (
@@ -24,13 +30,7 @@ MAX_BATCH_SIZE = 100
 
 def _get_registry(request: Request) -> ModelRegistry | None:
     """Get ModelRegistry from app state, or None if unavailable."""
-    db = getattr(request.app.state, "db", None)
-    if db is None:
-        return None
-    session_factory = getattr(db, "get_session", None)
-    if session_factory is None:
-        return None
-    return ModelRegistry(session_factory=session_factory)
+    return get_registry(request)
 
 
 def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
@@ -69,13 +69,29 @@ async def list_models(request: Request, camera_id: str | None = None):
 @router.post("/{version_id}/activate")
 async def activate_model(request: Request, version_id: str):
     """Activate a specific model version."""
-    registry = _get_registry(request)
-    if registry is None:
+    if _get_registry(request) is None:
         return JSONResponse({"error": "Database not available"}, status_code=503)
 
     try:
-        registry.activate(version_id)
-        return JSONResponse({"status": "ok", "activated": version_id})
+        triggered_by = "dashboard"
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                triggered_by = body.get("triggered_by", triggered_by)
+        except Exception:
+            pass
+
+        record, runtime_synced = activate_model_version(
+            request,
+            version_id,
+            triggered_by=triggered_by,
+        )
+        return JSONResponse({
+            "status": "ok",
+            "activated": record.model_version_id,
+            "camera_id": record.camera_id,
+            "runtime_synced": runtime_synced,
+        })
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
 
@@ -102,7 +118,11 @@ async def rollback_model(request: Request, version_id: str):
     if camera_id is None:
         return JSONResponse({"error": f"Model version not found: {version_id}"}, status_code=404)
 
-    previous = registry.rollback(camera_id)
+    previous, runtime_synced = rollback_camera_model(
+        request,
+        camera_id,
+        triggered_by="dashboard",
+    )
     if previous is None:
         return JSONResponse(
             {"error": "No previous model to rollback to"},
@@ -113,6 +133,7 @@ async def rollback_model(request: Request, version_id: str):
         "status": "ok",
         "activated": previous.model_version_id,
         "camera_id": camera_id,
+        "runtime_synced": runtime_synced,
     })
 
 
@@ -242,6 +263,11 @@ async def promote_model(request: Request, version_id: str):
         return JSONResponse({
             "status": "ok",
             "model": record.to_dict(),
+            "runtime_synced": (
+                sync_active_camera_model(request, record.camera_id)
+                if target_stage == ModelStage.PRODUCTION.value
+                else False
+            ),
         })
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)

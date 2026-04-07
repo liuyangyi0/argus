@@ -1,3 +1,5 @@
+# baseline_job.py
+
 """Baseline capture job — stateful, long-running frame collection task.
 
 Supports three sampling strategies (uniform, active, scheduled),
@@ -9,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -26,6 +29,7 @@ from argus.capture.samplers import (
     UniformSampler,
     ActiveSampler,
     ScheduledSampler,
+    get_active_sampler_unavailable_reason,
 )
 from argus.config.schema import CaptureQualityConfig, BaselineCaptureConfig
 
@@ -41,11 +45,14 @@ class BaselineCaptureJobConfig:
     duration_hours: float
     sampling_strategy: str  # "uniform" / "active" / "scheduled"
     storage_path: str  # baselines root dir
+    session_label: str = "daytime"
     quality_config: CaptureQualityConfig = field(default_factory=CaptureQualityConfig)
     pause_on_anomaly_lock: bool = True
     diversity_threshold: float = 0.3
     dino_backbone: str = "dinov2_vits14"
     dino_image_size: int = 224
+    active_sleep_min_seconds: float = 1.0
+    active_cpu_threads: int = 1
     schedule_periods: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
             "dawn": (5, 8),
@@ -61,6 +68,13 @@ class BaselineCaptureJobConfig:
     exports_dir: str = "data/exports"
 
 
+@dataclass
+class SamplerSelection:
+    sampler: BaseSampler
+    effective_strategy: str
+    warning: str | None = None
+
+
 def run_baseline_capture_job(
     progress_callback: Callable[[int, str], None],
     *,
@@ -68,6 +82,7 @@ def run_baseline_capture_job(
     camera_manager: Any,  # CameraManager (avoid circular import)
     pause_event: Any,  # threading.Event
     abort_event: Any,  # threading.Event
+    lifecycle: Any | None = None,
 ) -> dict:
     """Run a baseline capture job to completion.
 
@@ -97,21 +112,89 @@ def run_baseline_capture_job(
     # ── Setup ────────────────────────────────────────────────────────────
     bm = BaselineManager(job_config.storage_path)
     version_dir = bm.create_new_version(job_config.camera_id)
+    min_required_frames = max(1, min(job_config.target_frames, 10))
 
-    sampler = _create_sampler(job_config)
-    quality_filter = FrameQualityFilter(job_config.quality_config)
+    sampler_selection = _create_sampler(job_config)
+    sampler = sampler_selection.sampler
+    effective_strategy = sampler_selection.effective_strategy
+    enable_duplicate_filter = effective_strategy != "uniform"
+    # Baseline capture runs alongside a live pipeline that is already using YOLO.
+    # Keep capture filtering lightweight to avoid concurrent detector contention
+    # freezing the dashboard during manual capture.
+    quality_filter = FrameQualityFilter(
+        job_config.quality_config,
+        enable_person_detection=False,
+        enable_duplicate_filter=enable_duplicate_filter,
+    )
     stats = CaptureStats()
 
     collected = 0
     last_saved_frame = None
     start_time = time.monotonic()
     deadline = start_time + job_config.duration_hours * 3600
+    last_logged_progress = -1
+    last_progress_log_time = start_time
+    last_null_log_time = start_time
+    last_rejection_log_time = start_time
+    waiting_on_lock = False
+    loop_error: Exception | None = None
 
-    progress_callback(
-        0,
-        f"开始采集: {job_config.sampling_strategy} 策略, "
-        f"目标 {job_config.target_frames} 帧",
+    def emit_progress(progress: int, message: str, *, force: bool = False) -> None:
+        nonlocal last_logged_progress, last_progress_log_time
+
+        now = time.monotonic()
+        progress_callback(progress, message)
+        should_log = force
+        if not should_log and progress >= last_logged_progress + 5:
+            should_log = True
+        if not should_log and now - last_progress_log_time >= 5.0:
+            should_log = True
+        if should_log:
+            logger.info(
+                "baseline.capture_progress",
+                camera_id=job_config.camera_id,
+                session_label=job_config.session_label,
+                requested_strategy=job_config.sampling_strategy,
+                strategy=effective_strategy,
+                progress=progress,
+                message=message,
+                collected=collected,
+                target_frames=job_config.target_frames,
+                total_grabbed=stats.total_grabbed,
+                null_frames=stats.null_frames,
+                total_rejected=stats.total_rejected,
+            )
+            last_logged_progress = progress
+            last_progress_log_time = now
+
+    logger.info(
+        "baseline.capture_started",
+        camera_id=job_config.camera_id,
+        session_label=job_config.session_label,
+        requested_strategy=job_config.sampling_strategy,
+        strategy=effective_strategy,
+        duplicate_filter_enabled=enable_duplicate_filter,
+        target_frames=job_config.target_frames,
+        duration_hours=job_config.duration_hours,
+        min_required_frames=min_required_frames,
+        output_dir=str(version_dir),
     )
+
+    emit_progress(
+        0,
+        f"开始采集: {effective_strategy} 策略, "
+        f"目标 {job_config.target_frames} 帧",
+        force=True,
+    )
+    if sampler_selection.warning:
+        emit_progress(0, sampler_selection.warning, force=True)
+        logger.warning(
+            "baseline.capture_sampler_fallback",
+            camera_id=job_config.camera_id,
+            requested_strategy=job_config.sampling_strategy,
+            effective_strategy=effective_strategy,
+            reason=sampler_selection.warning,
+        )
 
     # ── Main capture loop ────────────────────────────────────────────────
     try:
@@ -129,18 +212,43 @@ def run_baseline_capture_job(
                 and camera_manager.is_anomaly_locked(job_config.camera_id)
             ):
                 progress_pct = int(100 * collected / job_config.target_frames)
-                progress_callback(progress_pct, "等待异常锁定解除...")
+                if not waiting_on_lock:
+                    logger.info(
+                        "baseline.capture_waiting_on_lock",
+                        camera_id=job_config.camera_id,
+                        collected=collected,
+                        target_frames=job_config.target_frames,
+                    )
+                    waiting_on_lock = True
+                emit_progress(progress_pct, "等待异常锁定解除...", force=True)
                 while not abort_event.is_set():
                     time.sleep(2.0)
                     if not camera_manager.is_anomaly_locked(job_config.camera_id):
                         break
-                progress_callback(progress_pct, "异常锁定已解除, 继续采集")
+                logger.info(
+                    "baseline.capture_lock_released",
+                    camera_id=job_config.camera_id,
+                    collected=collected,
+                    target_frames=job_config.target_frames,
+                )
+                waiting_on_lock = False
+                emit_progress(progress_pct, "异常锁定已解除, 继续采集", force=True)
                 continue
 
             # Grab raw frame
             frame = camera_manager.get_raw_frame(job_config.camera_id)
             if frame is None:
                 stats.null_frames += 1
+                now = time.monotonic()
+                if stats.null_frames == 1 or now - last_null_log_time >= 5.0:
+                    logger.warning(
+                        "baseline.capture_no_frame",
+                        camera_id=job_config.camera_id,
+                        null_frames=stats.null_frames,
+                        collected=collected,
+                        target_frames=job_config.target_frames,
+                    )
+                    last_null_log_time = now
                 time.sleep(1.0)
                 continue
 
@@ -150,6 +258,17 @@ def run_baseline_capture_job(
             qr = quality_filter.check(frame, last_saved_frame)
             if not qr.accepted:
                 stats.record_rejection(qr.rejection_reason)
+                now = time.monotonic()
+                if stats.total_rejected == 1 or now - last_rejection_log_time >= 5.0:
+                    logger.info(
+                        "baseline.capture_filtering",
+                        camera_id=job_config.camera_id,
+                        rejection_reason=qr.rejection_reason,
+                        total_rejected=stats.total_rejected,
+                        collected=collected,
+                        total_grabbed=stats.total_grabbed,
+                    )
+                    last_rejection_log_time = now
                 time.sleep(sampler.get_sleep_interval())
                 continue
 
@@ -187,7 +306,7 @@ def run_baseline_capture_job(
 
             # Progress
             progress_pct = int(100 * collected / job_config.target_frames)
-            progress_callback(
+            emit_progress(
                 progress_pct,
                 f"已采集 {collected}/{job_config.target_frames} 帧",
             )
@@ -195,16 +314,65 @@ def run_baseline_capture_job(
             # Sleep before next grab
             time.sleep(sampler.get_sleep_interval())
 
+    except Exception as exc:
+        loop_error = exc
+        raise
+
     finally:
         # ── Finalization ─────────────────────────────────────────────────
         # Always write outputs even on abort/error so partial data is usable.
-        bm.set_current_version(
-            job_config.camera_id, "default", version_dir.name
-        )
+        if loop_error is not None and collected < min_required_frames:
+            shutil.rmtree(version_dir, ignore_errors=True)
+            logger.warning(
+                "baseline.capture_partial_removed",
+                camera_id=job_config.camera_id,
+                version=version_dir.name,
+                collected=collected,
+                error=str(loop_error),
+            )
+        else:
+            _write_manifest(version_dir)
+            _write_stats(version_dir, stats, collected, start_time)
+            _write_job_config(version_dir, job_config)
+            _write_capture_meta(version_dir, job_config, stats)
+            if collected >= min_required_frames:
+                bm.set_current_version(
+                    job_config.camera_id, "default", version_dir.name
+                )
+            if lifecycle is not None and collected >= min_required_frames:
+                lifecycle.register_version(
+                    job_config.camera_id,
+                    "default",
+                    version_dir.name,
+                    image_count=collected,
+                )
+            logger.info(
+                "baseline.capture_finalized",
+                camera_id=job_config.camera_id,
+                version=version_dir.name,
+                collected=collected,
+                target_frames=job_config.target_frames,
+                total_grabbed=stats.total_grabbed,
+                null_frames=stats.null_frames,
+                total_rejected=stats.total_rejected,
+                output_dir=str(version_dir),
+            )
 
-        _write_manifest(version_dir)
-        _write_stats(version_dir, stats, collected, start_time)
-        _write_job_config(version_dir, job_config)
+    if collected < min_required_frames:
+        shutil.rmtree(version_dir, ignore_errors=True)
+        logger.error(
+            "baseline.capture_failed",
+            camera_id=job_config.camera_id,
+            collected=collected,
+            min_required_frames=min_required_frames,
+            total_grabbed=stats.total_grabbed,
+            null_frames=stats.null_frames,
+            total_rejected=stats.total_rejected,
+        )
+        raise RuntimeError(
+            f"采集失败: 仅采集到 {collected} 帧，至少需要 {min_required_frames} 帧。"
+            "请检查摄像头实时画面、连接状态或采集间隔设置。"
+        )
 
     # ── Layer 3: Post-capture review ─────────────────────────────────────
     review_result = None
@@ -224,14 +392,32 @@ def run_baseline_capture_job(
             logger.warning("post_review.failed", error=str(e))
             review_result = {"skipped": True, "reason": str(e)}
 
-    progress_callback(100, f"采集完成: {collected} 帧")
+    emit_progress(100, f"采集完成: {collected} 帧", force=True)
+    logger.info(
+        "baseline.capture_completed",
+        camera_id=job_config.camera_id,
+        version=version_dir.name,
+        session_label=job_config.session_label,
+        requested_strategy=job_config.sampling_strategy,
+        strategy=effective_strategy,
+        collected=collected,
+        target_frames=job_config.target_frames,
+        total_grabbed=stats.total_grabbed,
+        null_frames=stats.null_frames,
+        total_rejected=stats.total_rejected,
+        duration_seconds=round(time.monotonic() - start_time, 1),
+        output_dir=str(version_dir),
+    )
 
     return {
         "camera_id": job_config.camera_id,
+        "session_label": job_config.session_label,
         "version": version_dir.name,
         "collected_frames": collected,
         "target_frames": job_config.target_frames,
-        "strategy": job_config.sampling_strategy,
+        "requested_strategy": job_config.sampling_strategy,
+        "strategy": effective_strategy,
+        "strategy_warning": sampler_selection.warning,
         "duration_seconds": round(time.monotonic() - start_time, 1),
         "stats": stats.to_dict(),
         "review": review_result,
@@ -242,31 +428,70 @@ def run_baseline_capture_job(
 # ── Internal helpers ─────────────────────────────────────────────────────
 
 
-def _create_sampler(job_config: BaselineCaptureJobConfig) -> BaseSampler:
+def _create_sampler(job_config: BaselineCaptureJobConfig) -> SamplerSelection:
     """Instantiate the sampling strategy from job config."""
     strategy = job_config.sampling_strategy
+    duration_based_interval = max(
+        job_config.active_sleep_min_seconds,
+        (job_config.duration_hours * 3600) / max(job_config.target_frames, 1),
+    )
 
     if strategy == "uniform":
-        return UniformSampler(job_config.duration_hours, job_config.target_frames)
+        return SamplerSelection(
+            sampler=UniformSampler(job_config.duration_hours, job_config.target_frames),
+            effective_strategy="uniform",
+        )
+
+    unavailable_reason = get_active_sampler_unavailable_reason()
 
     if strategy == "active":
-        return ActiveSampler(
-            diversity_threshold=job_config.diversity_threshold,
-            backbone=job_config.dino_backbone,
-            image_size=job_config.dino_image_size,
+        if unavailable_reason is not None:
+            return SamplerSelection(
+                sampler=UniformSampler(job_config.duration_hours, job_config.target_frames),
+                effective_strategy="uniform",
+                warning=(
+                    "高级采集依赖不可用"
+                    f"（{unavailable_reason}），已自动降级为均匀采集"
+                ),
+            )
+
+        return SamplerSelection(
+            sampler=ActiveSampler(
+                diversity_threshold=job_config.diversity_threshold,
+                backbone=job_config.dino_backbone,
+                image_size=job_config.dino_image_size,
+                sleep_interval_seconds=duration_based_interval,
+                cpu_threads=job_config.active_cpu_threads,
+            ),
+            effective_strategy="active",
         )
 
     if strategy == "scheduled":
-        inner = ActiveSampler(
-            diversity_threshold=job_config.diversity_threshold,
-            backbone=job_config.dino_backbone,
-            image_size=job_config.dino_image_size,
-        )
-        return ScheduledSampler(
-            schedule_periods=job_config.schedule_periods,
-            frames_per_period=job_config.frames_per_period,
-            inner_sampler=inner,
-            duration_hours=job_config.duration_hours,
+        inner = None
+        warning = None
+        if unavailable_reason is None:
+            inner = ActiveSampler(
+                diversity_threshold=job_config.diversity_threshold,
+                backbone=job_config.dino_backbone,
+                image_size=job_config.dino_image_size,
+                sleep_interval_seconds=duration_based_interval,
+                cpu_threads=job_config.active_cpu_threads,
+            )
+        else:
+            warning = (
+                "高级采集依赖不可用"
+                f"（{unavailable_reason}），已切换为定时采集（不含多样性筛选）"
+            )
+
+        return SamplerSelection(
+            sampler=ScheduledSampler(
+                schedule_periods=job_config.schedule_periods,
+                frames_per_period=job_config.frames_per_period,
+                inner_sampler=inner,
+                duration_hours=job_config.duration_hours,
+            ),
+            effective_strategy="scheduled",
+            warning=warning,
         )
 
     raise ValueError(f"Unknown sampling strategy: {strategy!r}")
@@ -352,4 +577,22 @@ def _write_job_config(
             config_dict[f] = val
     path = version_dir / "capture_job.json"
     path.write_text(json.dumps(config_dict, indent=2, default=str))
+    return path
+
+
+def _write_capture_meta(
+    version_dir: Path,
+    job_config: BaselineCaptureJobConfig,
+    stats: CaptureStats,
+) -> Path:
+    """Write capture metadata compatible with dashboard reporting."""
+    meta = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "camera_id": job_config.camera_id,
+        "session_label": job_config.session_label,
+        "quality_filter_enabled": job_config.quality_config.enabled,
+        "stats": stats.to_dict(),
+    }
+    path = version_dir / "capture_meta.json"
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     return path

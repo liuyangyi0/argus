@@ -18,7 +18,12 @@ from argus.capture.manager import CameraManager
 from argus.config.loader import load_config
 from argus.config.schema import AlertSeverity
 from argus.core.health import HealthMonitor
-from argus.core.scheduler import TaskScheduler, create_maintenance_tasks, create_retraining_task
+from argus.core.scheduler import (
+    TaskScheduler,
+    create_job_processing_task,
+    create_maintenance_tasks,
+    create_retraining_task,
+)
 from argus.dashboard.app import create_app
 from argus.dashboard.tasks import TaskManager
 from argus.storage.audit import AuditLogger
@@ -27,6 +32,37 @@ from argus.storage.database import Database
 from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
+
+
+def _register_training_job_processing(
+    scheduler: TaskScheduler,
+    *,
+    config,
+    database: Database,
+) -> None:
+    """Attach queued training job execution to the scheduler."""
+    from argus.anomaly.baseline import BaselineManager
+    from argus.anomaly.backbone_trainer import BackboneTrainer
+    from argus.anomaly.job_executor import TrainingJobExecutor
+    from argus.anomaly.trainer import ModelTrainer
+    from argus.storage.model_registry import ModelRegistry
+
+    baseline_manager = BaselineManager(baselines_dir=config.storage.baselines_dir)
+    trainer = ModelTrainer(
+        baseline_manager=baseline_manager,
+        models_dir=config.storage.models_dir,
+        exports_dir=config.storage.exports_dir,
+    )
+    backbone_trainer = BackboneTrainer(output_dir=config.storage.backbones_dir)
+    model_registry = ModelRegistry(session_factory=database.get_session)
+    job_executor = TrainingJobExecutor(
+        database=database,
+        trainer=trainer,
+        backbone_trainer=backbone_trainer,
+        model_registry=model_registry,
+        baselines_dir=config.storage.baselines_dir,
+    )
+    create_job_processing_task(scheduler, job_executor)
 
 
 def _setup_file_logging(config, log_level: int) -> None:
@@ -192,6 +228,7 @@ def main():
         health_monitor=health,
         audit_logger=audit_log,
         record_store=record_store,
+        database=db,
     )
 
     # Graceful shutdown
@@ -225,6 +262,8 @@ def main():
             task_manager=task_mgr,
         )
         app.state.audit_logger = audit_logger
+        if app.state.baseline_lifecycle is not None:
+            app.state.baseline_lifecycle._audit = audit_logger
         app.state.backup_manager = backup_mgr
 
         def run_dashboard():
@@ -252,6 +291,7 @@ def main():
         health_monitor=health,
         alerts_dir=config.storage.alerts_dir,
     )
+    _register_training_job_processing(scheduler, config=config, database=db)
 
     # Scheduled retraining (C4 + A4: active learning loop)
     if config.retraining.enabled:

@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Card, Steps, Tabs, Descriptions, Badge, Button, Typography, Space, Statistic, Row, Col } from 'ant-design-vue'
+import { Card, Steps, Tabs, Descriptions, Badge, Button, Typography, Space, Statistic, Row, Col, Empty } from 'ant-design-vue'
 import { ArrowLeftOutlined } from '@ant-design/icons-vue'
-import { getCameras } from '../api'
+import { getCameraDetail } from '../api'
 
 const route = useRoute()
 const router = useRouter()
@@ -13,8 +13,8 @@ const loading = ref(true)
 
 async function fetchCamera() {
   try {
-    const res = await getCameras()
-    camera.value = res.data.find((c: any) => c.camera_id === cameraId) || null
+    const res = await getCameraDetail(cameraId)
+    camera.value = res.data || null
   } finally {
     loading.value = false
   }
@@ -33,6 +33,53 @@ const lifecycleStep = computed(() => {
   if (c.stats.frames_analyzed === 0) return 2
   return 4
 })
+
+function formatLabel(key: string) {
+  return key
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function formatValue(value: any): string {
+  if (value === null || value === undefined || value === '') return '-'
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  if (Array.isArray(value)) return value.length ? value.map(formatValue).join(', ') : '-'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+
+function flattenEntries(value: any, prefix = ''): Array<{ key: string; label: string; value: string }> {
+  if (value === null || value === undefined) return []
+
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return [{ key: prefix, label: formatLabel(prefix || 'value'), value: formatValue(value) }]
+  }
+
+  return Object.entries(value).flatMap(([key, nested]) => {
+    const nextPrefix = prefix ? `${prefix}.${key}` : key
+    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+      return flattenEntries(nested, nextPrefix)
+    }
+    return [{ key: nextPrefix, label: formatLabel(nextPrefix), value: formatValue(nested) }]
+  })
+}
+
+const basicEntries = computed(() => flattenEntries({
+  camera_id: camera.value?.camera_id,
+  name: camera.value?.name,
+  connected: camera.value?.connected,
+  running: camera.value?.running,
+}))
+
+const runtimeEntries = computed(() => flattenEntries({
+  stats: camera.value?.stats,
+  runtime: camera.value?.runtime,
+  runner: camera.value?.runner,
+}))
+
+const healthEntries = computed(() => flattenEntries(camera.value?.health))
+const detectorEntries = computed(() => flattenEntries(camera.value?.detector))
+const configEntries = computed(() => flattenEntries(camera.value?.config))
 </script>
 
 <template>
@@ -86,17 +133,52 @@ const lifecycleStep = computed(() => {
       </Tabs.TabPane>
 
       <Tabs.TabPane key="info" tab="摄像头信息">
-        <Card>
-          <Descriptions :column="2" bordered size="small">
-            <Descriptions.Item label="摄像头 ID">{{ cameraId }}</Descriptions.Item>
-            <Descriptions.Item label="名称">{{ camera?.name }}</Descriptions.Item>
-            <Descriptions.Item label="状态">
-              <Badge :status="camera?.connected ? 'success' : 'default'" />
-              {{ camera?.connected ? '在线' : '离线' }}
-            </Descriptions.Item>
-            <Descriptions.Item label="运行中">{{ camera?.running ? '是' : '否' }}</Descriptions.Item>
-          </Descriptions>
-        </Card>
+        <Space direction="vertical" style="width: 100%" :size="16">
+          <Card title="基础信息">
+            <Descriptions v-if="basicEntries.length > 0" :column="2" bordered size="small">
+              <Descriptions.Item v-for="item in basicEntries" :key="item.key" :label="item.label">
+                {{ item.value }}
+              </Descriptions.Item>
+            </Descriptions>
+            <Empty v-else description="暂无基础信息" />
+          </Card>
+
+          <Card title="运行状态">
+            <Descriptions v-if="runtimeEntries.length > 0" :column="2" bordered size="small">
+              <Descriptions.Item v-for="item in runtimeEntries" :key="item.key" :label="item.label">
+                {{ item.value }}
+              </Descriptions.Item>
+            </Descriptions>
+            <Empty v-else description="暂无运行状态" />
+          </Card>
+
+          <Card title="健康信息">
+            <Descriptions v-if="healthEntries.length > 0" :column="2" bordered size="small">
+              <Descriptions.Item v-for="item in healthEntries" :key="item.key" :label="item.label">
+                {{ item.value }}
+              </Descriptions.Item>
+            </Descriptions>
+            <Empty v-else description="暂无健康信息" />
+          </Card>
+
+          <Card title="检测器参数">
+            <Descriptions v-if="detectorEntries.length > 0" :column="2" bordered size="small">
+              <Descriptions.Item v-for="item in detectorEntries" :key="item.key" :label="item.label">
+                {{ item.value }}
+              </Descriptions.Item>
+            </Descriptions>
+            <Empty v-else description="暂无检测器参数" />
+          </Card>
+
+          <Card title="摄像头配置">
+            <Descriptions v-if="configEntries.length > 0" :column="2" bordered size="small">
+              <Descriptions.Item v-for="item in configEntries" :key="item.key" :label="item.label">
+                {{ item.value }}
+              </Descriptions.Item>
+            </Descriptions>
+            <Empty v-else description="暂无摄像头配置" />
+          </Card>
+        </Space>
       </Tabs.TabPane>
     </Tabs>
   </div>

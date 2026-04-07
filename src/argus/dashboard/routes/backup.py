@@ -13,6 +13,7 @@ from argus.dashboard.components import (
     empty_state,
     page_header,
 )
+from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 
 logger = structlog.get_logger()
 
@@ -79,11 +80,11 @@ async def create_backup(request: Request):
         return JSONResponse(
             {"error": "备份管理器不可用"},
             status_code=503,
-            headers={"HX-Trigger": '{"showToast": {"message": "备份管理器不可用", "type": "error"}}'},
+            headers=htmx_toast_headers("备份管理器不可用", toast_type="error"),
         )
 
     # Parse include_models from form
-    form = await request.form()
+    form = await parse_request_form(request)
     include_models = form.get("include_models") == "true"
 
     def _do_backup(progress_callback, include_models: bool = False):
@@ -112,7 +113,7 @@ async def create_backup(request: Request):
             return JSONResponse(
                 {"error": str(e)},
                 status_code=429,
-                headers={"HX-Trigger": f'{{"showToast": {{"message": "{e}", "type": "error"}}}}'},
+                headers=htmx_toast_headers(str(e), toast_type="error"),
             )
     else:
         # Fallback: run synchronously
@@ -135,7 +136,7 @@ async def create_backup(request: Request):
             return JSONResponse(
                 {"error": str(e)},
                 status_code=500,
-                headers={"HX-Trigger": f'{{"showToast": {{"message": "备份失败: {e}", "type": "error"}}}}'},
+                headers=htmx_toast_headers(f"备份失败: {e}", toast_type="error"),
             )
 
 
@@ -147,10 +148,10 @@ async def restore_backup(request: Request):
         return JSONResponse(
             {"error": "备份管理器不可用"},
             status_code=503,
-            headers={"HX-Trigger": '{"showToast": {"message": "备份管理器不可用", "type": "error"}}'},
+            headers=htmx_toast_headers("备份管理器不可用", toast_type="error"),
         )
 
-    form = await request.form()
+    form = await parse_request_form(request)
     backup_name = form.get("backup_name", "").strip()
     if not backup_name:
         return JSONResponse({"error": "未指定备份名称"}, status_code=400)
@@ -177,7 +178,7 @@ async def restore_backup(request: Request):
         return JSONResponse(
             {"error": "恢复失败，请查看日志"},
             status_code=500,
-            headers={"HX-Trigger": '{"showToast": {"message": "数据库恢复失败", "type": "error"}}'},
+            headers=htmx_toast_headers("数据库恢复失败", toast_type="error"),
         )
 
 

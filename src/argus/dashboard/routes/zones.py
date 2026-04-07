@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from argus.dashboard.components import empty_state, page_header
+from argus.dashboard.forms import htmx_toast_headers
 
 router = APIRouter()
 
@@ -166,7 +167,7 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
 
     return JSONResponse(
         {"status": "ok", "zone_id": zone_req.zone_id},
-        headers={"HX-Trigger": '{"showToast": {"message": "区域已添加", "type": "success"}}'},
+        headers=htmx_toast_headers("区域已添加"),
     )
 
 
@@ -198,7 +199,7 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
 
     return JSONResponse(
         {"status": "ok"},
-        headers={"HX-Trigger": '{"showToast": {"message": "区域已删除", "type": "success"}}'},
+        headers=htmx_toast_headers("区域已删除"),
     )
 
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import {
   Typography, Card, Table, Button, Tag, Space, Modal, Form, Select,
   Input, Descriptions, Badge, Popconfirm, message, Drawer, Empty, Tabs,
@@ -25,22 +25,6 @@ const detailDrawer = ref(false)
 const detailJob = ref<any>(null)
 const createModalVisible = ref(false)
 const activeTab = ref('jobs')
-
-function syncTrainingJobUpdate(task: any) {
-  if (task.task_type !== 'model_training') {
-    return
-  }
-
-  const index = jobs.value.findIndex(existing => existing.task_id === task.task_id)
-  if (index >= 0) {
-    jobs.value[index] = { ...jobs.value[index], ...task }
-    jobs.value = [...jobs.value]
-  } else {
-    jobs.value = [task, ...jobs.value]
-  }
-
-  pendingCount.value = jobs.value.filter(job => job.status === 'pending_confirmation').length
-}
 
 // ── Filters ──
 const filterStatus = ref<string | undefined>(undefined)
@@ -185,24 +169,29 @@ const backboneColumns = [
 // ── WebSocket ──
 useWebSocket({
   topics: ['tasks'],
-  onMessage: (_topic: string, data: any) => {
-    if (Array.isArray(data?.tasks)) {
-      jobs.value = data.tasks.filter((task: any) => task.task_type === 'model_training')
-      pendingCount.value = jobs.value.filter((job: any) => job.status === 'pending_confirmation').length
-      return
-    }
-    if (data?.task_id) {
-      syncTrainingJobUpdate(data)
-    }
+  onMessage: () => {
+    loadJobs()
   },
   fallbackPoll: loadJobs,
   fallbackInterval: 5000,
 })
 
+let refreshTimer: number | null = null
+
 onMounted(() => {
   loadJobs()
   loadBackbones()
   loadCameras()
+  refreshTimer = window.setInterval(() => {
+    loadJobs()
+  }, 5000)
+})
+
+onUnmounted(() => {
+  if (refreshTimer !== null) {
+    window.clearInterval(refreshTimer)
+    refreshTimer = null
+  }
 })
 </script>
 

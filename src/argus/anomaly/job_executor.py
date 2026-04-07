@@ -208,6 +208,22 @@ class TrainingJobExecutor:
         if result.status.value != TrainingStatus.COMPLETE.value:
             raise RuntimeError(result.error or f"Training failed with status {result.status}")
 
+        model_version_id = result.model_version_id
+        if model_version_id is None and self._registry is not None and result.model_path:
+            baseline_dir = self._baselines_dir / camera_id / (job.zone_id or "default")
+            model_version_id = self._registry.register(
+                model_path=result.model_path,
+                baseline_dir=baseline_dir,
+                camera_id=camera_id,
+                model_type=job.model_type or params.get("model_type", "patchcore"),
+                training_params={
+                    "image_size": params.get("image_size", 256),
+                    "export_format": params.get("export_format", "openvino"),
+                    "quantization": params.get("quantization", "fp16"),
+                    "job_id": job.job_id,
+                },
+            )
+
         # Build validation report dict
         val_report_dict = None
         if result.validation_report is not None:
@@ -256,7 +272,7 @@ class TrainingJobExecutor:
             metrics=json.dumps(metrics),
             validation_report=json.dumps(val_report_dict) if val_report_dict else None,
             artifacts_path=artifacts_path,
-            model_version_id=result.model_version_id,
+            model_version_id=model_version_id,
         )
 
         logger.info(
@@ -264,5 +280,5 @@ class TrainingJobExecutor:
             job_id=job.job_id,
             camera_id=camera_id,
             grade=result.quality_report.grade if result.quality_report else "?",
-            version=result.model_version_id,
+            version=model_version_id,
         )

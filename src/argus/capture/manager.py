@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 import numpy as np
@@ -24,6 +25,7 @@ from argus.core.runner import CameraInferenceRunner, RunnerSnapshot
 if TYPE_CHECKING:
     from argus.core.health import HealthMonitor
     from argus.storage.audit import AuditLogger
+    from argus.storage.database import Database
     from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
@@ -66,6 +68,7 @@ class CameraManager:
         health_monitor: HealthMonitor | None = None,
         audit_logger: AuditLogger | None = None,
         record_store: InferenceRecordStore | None = None,
+        database: Database | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
@@ -76,6 +79,7 @@ class CameraManager:
         self._health_monitor = health_monitor
         self._audit_logger = audit_logger
         self._record_store = record_store
+        self._db = database
         self._runners: dict[str, CameraInferenceRunner] = {}
         self._pipelines: dict[str, DetectionPipeline] = {}  # backward compat
         self._threads: dict[str, threading.Thread] = {}
@@ -389,6 +393,31 @@ class CameraManager:
             "ssim_noise_floor": status.ssim_noise_floor,
         }
 
+    def reload_model(
+        self,
+        camera_id: str,
+        model_path: str,
+        *,
+        version_tag: str | None = None,
+    ) -> bool:
+        """Hot-reload a camera's anomaly model and refresh exposed status."""
+        pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            return False
+
+        success = pipeline.reload_anomaly_model(model_path)
+        if not success:
+            return False
+
+        runner = self._runners.get(camera_id)
+        if runner is not None and version_tag:
+            runner.set_version_tag(version_tag)
+        if version_tag:
+            pipeline.set_model_version_id(version_tag)
+
+        self._notify_status_change(camera_id)
+        return True
+
     def get_latest_anomaly_map(self, camera_id: str) -> np.ndarray | None:
         """Get the latest anomaly heatmap from a camera for overlay stream."""
         pipeline = self._pipelines.get(camera_id)
@@ -452,12 +481,35 @@ class CameraManager:
         except Exception as e:
             logger.debug("manager.notify_failed", error=str(e))
 
-    @staticmethod
-    def _model_version_id(cam_config: CameraConfig) -> str:
+    def _get_active_model_record(self, camera_id: str):
+        db = getattr(self, "_db", None)
+        if db is None:
+            return None
+        try:
+            from argus.storage.model_registry import ModelRegistry
+
+            registry = ModelRegistry(session_factory=db.get_session)
+            return registry.get_active(camera_id)
+        except Exception as e:
+            logger.warning("manager.active_model_lookup_failed", camera_id=camera_id, error=str(e))
+            return None
+
+    def _resolve_model_path(self, cam_config: CameraConfig) -> Path | None:
+        record = self._get_active_model_record(cam_config.camera_id)
+        if record and record.model_path:
+            model_path = Path(record.model_path)
+            if model_path.exists():
+                return model_path
+        return DetectionPipeline._find_model(cam_config.camera_id)
+
+    def _model_version_id(self, cam_config: CameraConfig, model_path: Path | None = None) -> str:
         """Derive a version tag for the camera's model."""
-        model_path = DetectionPipeline._find_model(cam_config.camera_id)
-        if model_path:
-            return f"{cam_config.anomaly.model_type}:{model_path.parent.name}"
+        record = self._get_active_model_record(cam_config.camera_id)
+        if record is not None:
+            return record.model_version_id
+        resolved_model_path = model_path or DetectionPipeline._find_model(cam_config.camera_id)
+        if resolved_model_path:
+            return f"{cam_config.anomaly.model_type}:{resolved_model_path.parent.name}"
         return f"{cam_config.anomaly.model_type}:ssim_fallback"
 
     def get_runner_snapshot(self, camera_id: str) -> RunnerSnapshot | None:
@@ -530,6 +582,8 @@ class CameraManager:
 
         # Shadow runner: check for shadow-stage model to evaluate
         shadow_runner = self._create_shadow_runner(cam_config)
+        model_path = self._resolve_model_path(cam_config)
+        model_version_id = self._model_version_id(cam_config, model_path)
 
         pipeline = DetectionPipeline(
             camera_config=cam_config,
@@ -539,6 +593,8 @@ class CameraManager:
             on_drift=self._on_status_change,
             segmenter_config=self._segmenter_config,
             classifier_config=self._classifier_config,
+            model_version_id=model_version_id,
+            model_path=model_path,
             shared_anomaly_detector=shared_detector,
             shadow_runner=shadow_runner,
         )
@@ -548,7 +604,7 @@ class CameraManager:
         runner = CameraInferenceRunner(
             pipeline=pipeline,
             health_monitor=self._health_monitor,
-            version_tag=self._model_version_id(cam_config),
+            version_tag=model_version_id,
             audit_logger=self._audit_logger,
             max_consecutive_failures=deg_config.max_consecutive_failures,
             refuse_start_on_backbone_failure=deg_config.refuse_start_on_backbone_failure,

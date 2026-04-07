@@ -61,3 +61,16 @@ class TestHealthMonitor:
         health = monitor.get_health()
         assert health.platform != ""
         assert health.python_version != ""
+
+    def test_get_camera_health_returns_single_camera_snapshot(self):
+        """Should expose a single camera snapshot for dashboard consumers."""
+        monitor = HealthMonitor()
+        monitor.update_camera("cam_01", connected=False, frames_captured=12, error="offline")
+
+        camera_health = monitor.get_camera_health("cam_01")
+
+        assert camera_health is not None
+        assert camera_health["camera_id"] == "cam_01"
+        assert camera_health["connected"] is False
+        assert camera_health["frames_captured"] == 12
+        assert camera_health["error"] == "offline"

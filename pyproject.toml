@@ -9,6 +9,7 @@ dependencies = [
     "anomalib>=2.0.0,<3.0.0",
     "openvino>=2024.0.0",
     "fastapi>=0.115.0",
+    "python-multipart>=0.0.9",
     "uvicorn[standard]>=0.32.0",
     "sqlalchemy>=2.0.0",
     "pydantic>=2.0.0",

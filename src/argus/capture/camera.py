@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -12,6 +13,12 @@ import numpy as np
 import structlog
 
 logger = structlog.get_logger()
+
+_BACKEND_NAMES = {
+    getattr(cv2, "CAP_DSHOW", -1): "dshow",
+    getattr(cv2, "CAP_MSMF", -1): "msmf",
+    getattr(cv2, "CAP_FFMPEG", -1): "ffmpeg",
+}
 
 
 @dataclass
@@ -75,20 +82,59 @@ class CameraCapture:
     def state(self) -> CameraState:
         return self._state
 
+    def _usb_backend_candidates(self) -> list[tuple[int | None, str]]:
+        """Return preferred OpenCV backends for USB cameras."""
+        if sys.platform.startswith("win"):
+            candidates = []
+            if hasattr(cv2, "CAP_DSHOW"):
+                candidates.append((cv2.CAP_DSHOW, "dshow"))
+            if hasattr(cv2, "CAP_MSMF"):
+                candidates.append((cv2.CAP_MSMF, "msmf"))
+            candidates.append((None, "default"))
+            return candidates
+        return [(None, "default")]
+
+    def _open_capture(self) -> tuple[cv2.VideoCapture | None, str | None]:
+        """Open a VideoCapture with protocol-appropriate backend fallbacks."""
+        if self.protocol == "usb":
+            source_index = int(self.source)
+            for backend, backend_name in self._usb_backend_candidates():
+                cap = (
+                    cv2.VideoCapture(source_index)
+                    if backend is None
+                    else cv2.VideoCapture(source_index, backend)
+                )
+                if cap is not None and cap.isOpened():
+                    return cap, backend_name
+                if cap is not None:
+                    cap.release()
+                logger.warning(
+                    "camera.backend_open_failed",
+                    camera_id=self.camera_id,
+                    source=self.source,
+                    backend=backend_name,
+                )
+            return None, None
+
+        if self.protocol == "file":
+            return cv2.VideoCapture(self.source), "default"
+
+        return cv2.VideoCapture(self.source, cv2.CAP_FFMPEG), "ffmpeg"
+
     def connect(self) -> bool:
         """Establish connection to the camera source."""
         try:
-            if self.protocol == "usb":
-                self._cap = cv2.VideoCapture(int(self.source))
-            elif self.protocol == "file":
-                self._cap = cv2.VideoCapture(self.source)
-            else:  # rtsp
-                self._cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            self._cap, backend_name = self._open_capture()
 
             if self._cap is None or not self._cap.isOpened():
                 self._state.connected = False
                 self._state.error = f"Failed to open source: {self.source}"
-                logger.error("camera.connect_failed", camera_id=self.camera_id, source=self.source)
+                logger.error(
+                    "camera.connect_failed",
+                    camera_id=self.camera_id,
+                    source=self.source,
+                    protocol=self.protocol,
+                )
                 return False
 
             # Set timeouts to prevent frozen streams from blocking threads
@@ -102,7 +148,13 @@ class CameraCapture:
 
             self._state.connected = True
             self._state.error = None
-            logger.info("camera.connected", camera_id=self.camera_id, source=self.source)
+            logger.info(
+                "camera.connected",
+                camera_id=self.camera_id,
+                source=self.source,
+                protocol=self.protocol,
+                backend=backend_name,
+            )
             return True
 
         except Exception as e:

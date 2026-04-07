@@ -733,6 +733,14 @@ class BaselineCaptureConfig(BaseModel):
         default=224, ge=112, le=518,
         description="Input image size for DINOv2 feature extraction",
     )
+    active_sleep_min_seconds: float = Field(
+        default=1.0, ge=0.1, le=60.0,
+        description="Minimum seconds between active-sampling frame grabs to avoid CPU starvation",
+    )
+    active_cpu_threads: int = Field(
+        default=1, ge=1, le=8,
+        description="Maximum CPU threads used by active-sampling DINOv2/FAISS inference",
+    )
     schedule_periods: dict[str, tuple[int, int]] = Field(
         default_factory=lambda: {
             "dawn": (5, 8),

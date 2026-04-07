@@ -11,7 +11,7 @@ import {
   HistoryOutlined, ExperimentOutlined, SwapOutlined,
   RollbackOutlined, CheckOutlined, PauseCircleOutlined,
   StopOutlined, CaretRightOutlined, SafetyCertificateOutlined,
-  TeamOutlined, MergeCellsOutlined,
+  TeamOutlined, MergeCellsOutlined, DeleteOutlined,
 } from '@ant-design/icons-vue'
 import {
   getCameras, getBaselines, startCapture, startTraining,
@@ -19,7 +19,7 @@ import {
   optimizeBaseline, previewOptimize, getModelRegistry, activateModel,
   rollbackModel, compareModels, batchInference,
   startCaptureJob, pauseCaptureJob, resumeCaptureJob, abortCaptureJob,
-  getBaselineVersions, verifyBaseline, activateBaseline, retireBaseline,
+  getBaselineVersions, verifyBaseline, activateBaseline, retireBaseline, deleteBaselineVersion,
   getCameraGroups, mergeGroupBaseline, mergeFalsePositives,
   promoteModel, retireModel, getStageHistory, getVersionEvents, getShadowReport,
 } from '../api'
@@ -91,6 +91,7 @@ const mergingGroup = ref<string | null>(null)
 
 // ── FP Merge ──
 const mergingFP = ref<string | null>(null)
+const deletingBaseline = ref<string | null>(null)
 
 function upsertTaskUpdate(task: any) {
   const index = tasks.value.findIndex(existing => existing.task_id === task.task_id)
@@ -154,6 +155,35 @@ const JOB_STATUS_MAP: Record<string, { text: string; color: string }> = {
   aborted: { text: '已中止', color: 'default' },
 }
 
+function taskProgressStatus(task: any) {
+  if (task.status === 'failed') return 'exception'
+  if (task.status === 'complete') return 'success'
+  if (task.status === 'paused') return 'normal'
+  return 'active'
+}
+
+function taskTitle(task: any) {
+  if (task.task_type === 'model_training') return '模型训练'
+  if (task.task_type === 'baseline_capture') return '基线采集'
+  return task.task_type
+}
+
+function canPauseTask(task: any) {
+  return task.task_type === 'baseline_capture' && task.status === 'running'
+}
+
+function canResumeTask(task: any) {
+  return task.task_type === 'baseline_capture' && task.status === 'paused'
+}
+
+function canAbortTask(task: any) {
+  return task.task_type === 'baseline_capture' && (task.status === 'running' || task.status === 'paused')
+}
+
+function canDismissTask(task: any) {
+  return task.status === 'complete' || task.status === 'failed' || task.status === 'aborted'
+}
+
 const GRADE_COLORS: Record<string, string> = {
   A: 'green', B: 'blue', C: 'orange', F: 'red',
 }
@@ -177,7 +207,7 @@ const BASELINE_STATE_MAP: Record<string, { text: string; color: string }> = {
 async function loadCameras() {
   try {
     const res = await getCameras()
-    cameras.value = res.data
+    cameras.value = res.data.cameras || []
     if (cameras.value.length > 0 && !captureForm.value.camera_id) {
       captureForm.value.camera_id = cameras.value[0].camera_id
       trainForm.value.camera_id = cameras.value[0].camera_id
@@ -349,6 +379,34 @@ function handleRetireBaseline(record: any) {
         loadBaselines()
       } catch (e: any) {
         message.error(e.response?.data?.error || '退役失败')
+      }
+    },
+  })
+}
+
+function handleDeleteBaseline(record: any) {
+  Modal.confirm({
+    title: '删除基线版本',
+    content: `确定删除 ${record.camera_id} / ${record.version}？该操作会删除磁盘中的整套基线数据。`,
+    okText: '确认删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      deletingBaseline.value = `${record.camera_id}-${record.version}`
+      try {
+        await deleteBaselineVersion({
+          camera_id: record.camera_id,
+          version: record.version,
+        })
+        message.success(`${record.version} 已删除`)
+        if (versionDrawerVisible.value && versionDrawerCamera.value === record.camera_id) {
+          loadBaselineVersions(versionDrawerCamera.value)
+        }
+        loadBaselines()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '删除失败')
+      } finally {
+        deletingBaseline.value = null
       }
     },
   })
@@ -669,7 +727,7 @@ const baselineColumns = [
   { title: '图片数量', dataIndex: 'image_count', key: 'image_count' },
   { title: '采集场景', dataIndex: 'session_label', key: 'session_label' },
   { title: '生命周期', key: 'state', width: 100 },
-  { title: '操作', key: 'action', width: 280 },
+  { title: '操作', key: 'action', width: 360 },
 ]
 
 const versionColumns = [
@@ -678,7 +736,7 @@ const versionColumns = [
   { title: '图片', dataIndex: 'image_count', key: 'image_count', width: 70 },
   { title: '审核人', dataIndex: 'verified_by', key: 'verified_by', width: 100 },
   { title: '审核时间', dataIndex: 'verified_at', key: 'verified_at', width: 140 },
-  { title: '操作', key: 'action', width: 120 },
+  { title: '操作', key: 'action', width: 180 },
 ]
 
 const groupColumns = [
@@ -961,7 +1019,7 @@ onMounted(async () => {
                 <CloseCircleOutlined v-else-if="task.status === 'failed'" style="color: #ff4d4f" />
                 <StopOutlined v-else-if="task.status === 'aborted'" style="color: #8890a0" />
                 <span style="font-weight: 500">
-                  {{ task.task_type === 'baseline_capture_job' ? '高级基线采集' : '基线采集' }}
+                  {{ taskTitle(task) }}
                 </span>
                 <span v-if="task.camera_id" style="color: #8890a0">{{ task.camera_id }}</span>
                 <Tag :color="(JOB_STATUS_MAP[task.status] || {}).color || 'default'">
@@ -969,37 +1027,34 @@ onMounted(async () => {
                 </Tag>
               </Space>
               <Space>
-                <!-- Pause/Resume/Abort for advanced capture jobs -->
-                <template v-if="task.task_type === 'baseline_capture_job'">
-                  <Button
-                    v-if="task.status === 'running'"
-                    size="small"
-                    @click="handlePauseJob(task.task_id)"
-                  >
-                    <template #icon><PauseCircleOutlined /></template>
-                    暂停
-                  </Button>
-                  <Button
-                    v-if="task.status === 'paused'"
-                    size="small"
-                    type="primary"
-                    @click="handleResumeJob(task.task_id)"
-                  >
-                    <template #icon><CaretRightOutlined /></template>
-                    恢复
-                  </Button>
-                  <Button
-                    v-if="task.status === 'running' || task.status === 'paused'"
-                    size="small"
-                    danger
-                    @click="handleAbortJob(task.task_id)"
-                  >
-                    <template #icon><StopOutlined /></template>
-                    中止
-                  </Button>
-                </template>
                 <Button
-                  v-if="task.status === 'complete' || task.status === 'failed' || task.status === 'aborted'"
+                  v-if="canPauseTask(task)"
+                  size="small"
+                  @click="handlePauseJob(task.task_id)"
+                >
+                  <template #icon><PauseCircleOutlined /></template>
+                  暂停
+                </Button>
+                <Button
+                  v-if="canResumeTask(task)"
+                  size="small"
+                  type="primary"
+                  @click="handleResumeJob(task.task_id)"
+                >
+                  <template #icon><CaretRightOutlined /></template>
+                  恢复
+                </Button>
+                <Button
+                  v-if="canAbortTask(task)"
+                  size="small"
+                  danger
+                  @click="handleAbortJob(task.task_id)"
+                >
+                  <template #icon><StopOutlined /></template>
+                  中止
+                </Button>
+                <Button
+                  v-if="canDismissTask(task)"
                   size="small"
                   @click="handleDismissTask(task.task_id)"
                 >关闭</Button>
@@ -1007,7 +1062,7 @@ onMounted(async () => {
             </div>
             <Progress
               :percent="task.progress"
-              :status="task.status === 'failed' ? 'exception' : task.status === 'complete' ? 'success' : task.status === 'paused' ? 'normal' : 'active'"
+              :status="taskProgressStatus(task)"
               size="small"
             />
             <div style="font-size: 12px; color: #8890a0; margin-top: 4px">{{ task.message }}</div>
@@ -1089,6 +1144,16 @@ onMounted(async () => {
                       合并误报
                     </Button>
                   </Tooltip>
+                  <Button
+                    size="small"
+                    danger
+                    :loading="deletingBaseline === `${record.camera_id}-${record.version}`"
+                    :disabled="record.state === 'active'"
+                    @click="handleDeleteBaseline(record)"
+                  >
+                    <DeleteOutlined />
+                    删除
+                  </Button>
                 </Space>
               </template>
             </template>
@@ -1184,6 +1249,15 @@ onMounted(async () => {
                   @click="handleRetireBaseline(record)"
                 >
                   退役
+                </Button>
+                <Button
+                  v-if="record.state !== 'active'"
+                  size="small"
+                  danger
+                  :loading="deletingBaseline === `${record.camera_id}-${record.version}`"
+                  @click="handleDeleteBaseline(record)"
+                >
+                  删除
                 </Button>
                 <span v-if="record.state === 'retired'" style="color: #999">已退役</span>
               </template>
