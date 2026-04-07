@@ -194,6 +194,22 @@ class HealthMonitor:
             python_version=platform.python_version(),
         )
 
+    def get_camera_health(self, camera_id: str) -> dict | None:
+        """Get a single camera health record as a dashboard-friendly dict."""
+        health = self._camera_health.get(camera_id)
+        if health is None:
+            return None
+
+        return {
+            "camera_id": health.camera_id,
+            "connected": health.connected,
+            "frames_captured": health.frames_captured,
+            "avg_latency_ms": health.avg_latency_ms,
+            "reconnect_count": health.reconnect_count,
+            "last_frame_time": health.last_frame_time,
+            "error": health.error,
+        }
+
     def check_stale_cameras(self, max_stale_seconds: float = 30.0) -> list[str]:
         """Find cameras that haven't produced frames recently."""
         now = time.monotonic()

@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from argus.dashboard.auth import hash_password, require_role
 from argus.dashboard.components import empty_state, page_header
+from argus.dashboard.forms import parse_request_form
 
 router = APIRouter()
 
@@ -252,7 +253,7 @@ async def create_user(request: Request):
     if not db:
         return JSONResponse({"error": "数据库不可用"}, status_code=503)
 
-    form = await request.form()
+    form = await parse_request_form(request)
     username = str(form.get("username", "")).strip()
     password = str(form.get("password", ""))
     display_name = str(form.get("display_name", "")).strip() or None

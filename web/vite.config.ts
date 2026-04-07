@@ -1,5 +1,9 @@
+// vite.config.ts
+
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+
+const backendHost = '127.0.0.1'
 
 export default defineConfig({
   plugins: [vue()],
@@ -7,11 +11,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: `http://${backendHost}:8080`,
         changeOrigin: true,
       },
       '/ws': {
-        target: 'ws://localhost:8080',
+        target: `ws://${backendHost}:8080`,
         ws: true,
       },
     },

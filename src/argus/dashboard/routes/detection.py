@@ -20,6 +20,7 @@ from argus.dashboard.components import (
     stat_card,
     status_badge,
 )
+from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 
 logger = structlog.get_logger()
 
@@ -219,7 +220,7 @@ async def set_mode(request: Request, camera_id: str):
     if not camera_manager:
         return HTMLResponse("", status_code=404)
 
-    form = await request.form()
+    form = await parse_request_form(request)
     mode_str = form.get("mode", "active")
     try:
         mode = PipelineMode(mode_str)
@@ -232,7 +233,7 @@ async def set_mode(request: Request, camera_id: str):
 
     return HTMLResponse(
         "",
-        headers={"HX-Trigger": '{"showToast": "模式已切换"}'},
+        headers=htmx_toast_headers("模式已切换"),
     )
 
 

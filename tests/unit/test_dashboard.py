@@ -2,16 +2,26 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from starlette import requests as starlette_requests
 
+from argus.__main__ import _register_training_job_processing
+from argus.capture.manager import CameraManager
+from argus.config.loader import load_config, save_config
+from argus.config.schema import AlertConfig, ArgusConfig, CameraConfig
 from argus.core.health import HealthMonitor
 from argus.dashboard.app import create_app
+from argus.dashboard.routes.baseline import _train_model_task
 from argus.dashboard.routes.alerts import _generate_composite, _is_safe_path
+from argus.storage.model_registry import ModelRegistry
 from argus.storage.database import Database
+from argus.storage.models import ModelVersionEvent
 
 
 @pytest.fixture
@@ -83,6 +93,860 @@ class TestHealthAPI:
         response = client.get("/api/system/overview")
         assert response.status_code == 200
         assert "摄像头在线" in response.text or "System Status" in response.text
+
+
+class TestCameraForms:
+    def test_add_camera_accepts_urlencoded_form_without_multipart(self, db, health, alerts_dir, monkeypatch, tmp_path):
+        """Add-camera form should persist config and sync runtime state for urlencoded bodies."""
+        config = ArgusConfig()
+        config_path = tmp_path / "config.yaml"
+        save_config(config, config_path)
+
+        camera_manager = MagicMock()
+        camera_manager._cameras = []
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+            config_path=str(config_path),
+        )
+        client = TestClient(app)
+
+        monkeypatch.setattr(starlette_requests, "parse_options_header", None)
+
+        response = client.post(
+            "/api/cameras",
+            data={
+                "camera_id": "usb_cam_01",
+                "name": "USB Camera 01",
+                "source": "0",
+                "protocol": "usb",
+                "fps_target": "10",
+                "resolution": "1280,720",
+            },
+        )
+
+        assert response.status_code == 200
+        assert any(camera.camera_id == "usb_cam_01" for camera in config.cameras)
+        assert any(camera.camera_id == "usb_cam_01" for camera in camera_manager._cameras)
+        assert config.cameras[-1].protocol == "usb"
+        assert config.cameras[-1].resolution == (1280, 720)
+
+        saved_config = load_config(config_path)
+        assert any(camera.camera_id == "usb_cam_01" for camera in saved_config.cameras)
+
+    def test_wall_status_uses_health_monitor_snapshot(self, health, alerts_dir):
+        """Video wall status should not crash when reading per-camera health."""
+        health.update_camera("cam_02", connected=False, error="stream lost")
+
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = [
+            SimpleNamespace(
+                camera_id="cam_02",
+                name="Camera 02",
+                connected=False,
+                model_version_id=None,
+                pipeline=None,
+            ),
+        ]
+
+        app = create_app(
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.get("/api/cameras/wall/status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["cameras"][0]["camera_id"] == "cam_02"
+        assert data["cameras"][0]["degradation"] == "rtsp_broken"
+
+
+class TestBaselineForms:
+    def test_create_app_initializes_baseline_lifecycle(self, db, health, alerts_dir):
+        """Dashboard app should expose a baseline lifecycle manager when a database is available."""
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+
+        assert app.state.baseline_lifecycle is not None
+
+    def test_start_capture_submits_task(self, db, health, alerts_dir):
+        """Baseline capture form should submit through the unified job endpoint."""
+        task_manager = MagicMock()
+        task_manager.submit.return_value = "baseline_capture-test1234"
+        task_manager.get_task.return_value = None
+
+        camera_manager = MagicMock()
+        config = ArgusConfig()
+        config.cameras = []
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+            task_manager=task_manager,
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/baseline/job",
+            data={
+                "camera_id": "cam_01",
+                "count": "5",
+                "interval": "0.1",
+                "session_label": "daytime",
+            },
+        )
+
+        assert response.status_code == 200
+        task_manager.submit.assert_called_once()
+        assert task_manager.submit.call_args.args[0] == "baseline_capture"
+        submit_kwargs = task_manager.submit.call_args.kwargs
+        assert submit_kwargs["camera_id"] == "cam_01"
+        job_config = submit_kwargs["job_config"]
+        assert job_config.camera_id == "cam_01"
+        assert job_config.session_label == "daytime"
+        assert job_config.target_frames == 5
+        assert job_config.sampling_strategy == "uniform"
+        assert job_config.quality_config == config.capture_quality
+        assert submit_kwargs["lifecycle"] is app.state.baseline_lifecycle
+
+    def test_legacy_capture_endpoint_alias_submits_task(self, db, health, alerts_dir):
+        """Quick capture clients posting to /capture should still start the same job flow."""
+        task_manager = MagicMock()
+        task_manager.submit.return_value = "baseline_capture-legacy"
+        task_manager.get_task.return_value = None
+
+        camera_manager = MagicMock()
+        config = ArgusConfig()
+        config.cameras = []
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+            task_manager=task_manager,
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/baseline/capture",
+            data={
+                "camera_id": "cam_01",
+                "count": "3",
+                "interval": "0.2",
+                "session_label": "daytime",
+            },
+        )
+
+        assert response.status_code == 200
+        task_manager.submit.assert_called_once()
+        assert task_manager.submit.call_args.args[0] == "baseline_capture"
+
+    def test_start_training_binds_camera_id_into_task(self, db, health, alerts_dir, tmp_path):
+        """Training route should pass camera_id through to the background training function."""
+        config = ArgusConfig()
+        config.storage.baselines_dir = tmp_path / "baselines"
+        config.storage.models_dir = tmp_path / "models"
+        camera_cfg = CameraConfig(
+            camera_id="cam_01",
+            name="Camera 01",
+            source="rtsp://example/stream",
+            protocol="rtsp",
+        )
+        config.cameras = [camera_cfg]
+
+        task_manager = MagicMock()
+        called = {}
+
+        def fake_submit(task_type, func, camera_id="", **kwargs):
+            called["task_type"] = task_type
+            called["camera_id"] = camera_id
+            called["result"] = func(lambda *_: None, **kwargs)
+            return "model_training-test"
+
+        task_manager.submit.side_effect = fake_submit
+
+        app = create_app(
+            database=db,
+            camera_manager=MagicMock(),
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+            task_manager=task_manager,
+        )
+        client = TestClient(app)
+
+        from argus.dashboard import routes as dashboard_routes
+
+        original_train = dashboard_routes.baseline._train_model_task
+
+        def fake_train_model_task(progress_callback, *, baselines_dir, models_dir, camera_id, model_type, export_format, quantization="fp16", database_url=None, anomaly_config=None, resume_from=None):
+            return {
+                "camera_id": camera_id,
+                "baselines_dir": baselines_dir,
+                "models_dir": models_dir,
+                "model_type": model_type,
+                "export_format": export_format,
+            }
+
+        dashboard_routes.baseline._train_model_task = fake_train_model_task
+        try:
+            response = client.post(
+                "/api/baseline/train",
+                data={
+                    "camera_id": "cam_01",
+                    "model_type": "patchcore",
+                    "export_format": "openvino",
+                },
+            )
+        finally:
+            dashboard_routes.baseline._train_model_task = original_train
+
+        assert response.status_code == 200
+        assert called["task_type"] == "model_training"
+        assert called["camera_id"] == "cam_01"
+        assert called["result"]["camera_id"] == "cam_01"
+
+    def test_baseline_list_json_reads_default_zone_versions(self, db, health, alerts_dir, tmp_path):
+        """Baseline list JSON should surface default-zone captures after a reload."""
+        baselines_dir = tmp_path / "baselines"
+        version_dir = baselines_dir / "cam_01" / "default" / "v001"
+        version_dir.mkdir(parents=True)
+        (version_dir / "baseline_00000.png").write_bytes(b"img")
+        (version_dir / "capture_meta.json").write_text('{"session_label": "daytime"}')
+
+        config = ArgusConfig()
+        config.storage.baselines_dir = baselines_dir
+
+        app = create_app(
+            database=db,
+            camera_manager=MagicMock(),
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        app.state.baseline_lifecycle.register_version("cam_01", "default", "v001", image_count=1)
+        client = TestClient(app)
+
+        response = client.get("/api/baseline/list/json")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["baselines"] == [{
+            "camera_id": "cam_01",
+            "version": "v001",
+            "image_count": 1,
+            "session_label": "daytime",
+            "status": "ready",
+            "state": "draft",
+        }]
+
+    def test_delete_baseline_version_removes_directory_and_record(self, db, health, alerts_dir, tmp_path):
+        """Deleting a baseline version should remove both disk data and lifecycle record."""
+        baselines_dir = tmp_path / "baselines"
+        version_dir = baselines_dir / "cam_01" / "default" / "v001"
+        version_dir.mkdir(parents=True)
+        (version_dir / "baseline_00000.png").write_bytes(b"img")
+        (version_dir.parent / "current.txt").write_text("v001")
+
+        config = ArgusConfig()
+        config.storage.baselines_dir = baselines_dir
+
+        app = create_app(
+            database=db,
+            camera_manager=MagicMock(),
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        app.state.baseline_lifecycle.register_version("cam_01", "default", "v001", image_count=1)
+        client = TestClient(app)
+
+        response = client.request(
+            "DELETE",
+            "/api/baseline/version",
+            json={"camera_id": "cam_01", "version": "v001"},
+        )
+
+        assert response.status_code == 200
+        assert not version_dir.exists()
+        assert not (version_dir.parent / "current.txt").exists()
+        assert app.state.baseline_lifecycle.get_version("cam_01", "default", "v001") is None
+
+    def test_delete_baseline_version_rejects_active_version(self, db, health, alerts_dir, tmp_path):
+        """Active baseline versions must be retired before deletion."""
+        baselines_dir = tmp_path / "baselines"
+        version_dir = baselines_dir / "cam_01" / "default" / "v001"
+        version_dir.mkdir(parents=True)
+        (version_dir / "baseline_00000.png").write_bytes(b"img")
+
+        config = ArgusConfig()
+        config.storage.baselines_dir = baselines_dir
+
+        app = create_app(
+            database=db,
+            camera_manager=MagicMock(),
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        lifecycle = app.state.baseline_lifecycle
+        lifecycle.register_version("cam_01", "default", "v001", image_count=1)
+        lifecycle.verify("cam_01", "default", "v001", verified_by="tester")
+        lifecycle.activate("cam_01", "default", "v001", user="tester")
+        client = TestClient(app)
+
+        response = client.request(
+            "DELETE",
+            "/api/baseline/version",
+            json={"camera_id": "cam_01", "version": "v001"},
+        )
+
+        assert response.status_code == 400
+        assert version_dir.exists()
+
+    def test_delete_baseline_version_post_alias(self, db, health, alerts_dir, tmp_path):
+        """Frontend-friendly POST alias should delete the same baseline version."""
+        baselines_dir = tmp_path / "baselines"
+        version_dir = baselines_dir / "cam_01" / "default" / "v001"
+        version_dir.mkdir(parents=True)
+        (version_dir / "baseline_00000.png").write_bytes(b"img")
+
+        config = ArgusConfig()
+        config.storage.baselines_dir = baselines_dir
+
+        app = create_app(
+            database=db,
+            camera_manager=MagicMock(),
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/baseline/version/delete",
+            json={"camera_id": "cam_01", "version": "v001"},
+        )
+
+        assert response.status_code == 200
+        assert not version_dir.exists()
+
+    def test_train_form_counts_current_baseline_version_only(self, db, health, alerts_dir, tmp_path, monkeypatch):
+        """Training form should reflect the current baseline version instead of summing stale files."""
+        baselines_dir = tmp_path / "baselines"
+        default_dir = baselines_dir / "cam_01" / "default"
+        current_dir = default_dir / "v002"
+        current_dir.mkdir(parents=True)
+        (default_dir / "current.txt").write_text("v002")
+        (current_dir / "baseline_00000.png").write_bytes(b"img")
+        (default_dir / "baseline_legacy_00000.png").write_bytes(b"legacy")
+        for index in range(9):
+            (current_dir / f"baseline_{index + 1:05d}.png").write_bytes(b"img")
+
+        config = ArgusConfig()
+        config.storage.baselines_dir = baselines_dir
+        config.cameras = [
+            CameraConfig(
+                camera_id="cam_01",
+                name="Camera 01",
+                source="rtsp://example/stream",
+                protocol="rtsp",
+            )
+        ]
+
+        captured = {}
+
+        def fake_form_select(label, name, options=None, **kwargs):
+            captured[name] = options or []
+            return f'<select name="{name}"></select>'
+
+        monkeypatch.setattr("argus.dashboard.routes.baseline.form_select", fake_form_select)
+
+        app = create_app(
+            database=db,
+            camera_manager=MagicMock(),
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        client = TestClient(app)
+
+        response = client.get("/api/baseline/train")
+
+        assert response.status_code == 200
+        assert captured["camera_id"] == [("cam_01", "cam_01 / v002 (10 张基线图片)")]
+
+
+class TestCameraJsonAPI:
+    def test_cameras_json_returns_wrapped_list(self, db, health, alerts_dir):
+        """Camera JSON API should return a stable object with a cameras field."""
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = [
+            SimpleNamespace(
+                camera_id="cam_01",
+                name="Camera 01",
+                connected=True,
+                running=True,
+                stats=SimpleNamespace(
+                    frames_captured=12,
+                    frames_analyzed=8,
+                    anomalies_detected=1,
+                    alerts_emitted=1,
+                    avg_latency_ms=15.2,
+                ),
+            ),
+        ]
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.get("/api/cameras/json")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert list(data.keys()) == ["cameras"]
+        assert data["cameras"][0]["camera_id"] == "cam_01"
+        assert data["cameras"][0]["stats"]["frames_captured"] == 12
+
+    def test_camera_detail_returns_config_and_runtime_sections(self, db, health, alerts_dir):
+        """Camera detail API should aggregate config, runtime, detector and health data."""
+        camera_config = CameraConfig(
+            camera_id="cam_01",
+            name="Camera 01",
+            source="rtsp://example/stream",
+            protocol="rtsp",
+            fps_target=8,
+            resolution=(1280, 720),
+        )
+
+        camera_manager = MagicMock()
+        camera_manager._cameras = [camera_config]
+        camera_manager.get_status.return_value = [
+            SimpleNamespace(
+                camera_id="cam_01",
+                name="Camera 01",
+                connected=True,
+                running=True,
+                stats=SimpleNamespace(
+                    frames_captured=12,
+                    frames_analyzed=8,
+                    anomalies_detected=1,
+                    alerts_emitted=1,
+                    avg_latency_ms=15.2,
+                ),
+            ),
+        ]
+        camera_manager.get_runner_snapshot.return_value = SimpleNamespace(
+            model_ref="patchcore",
+            health_status="healthy",
+            cusum_state="stable",
+            lock_state=SimpleNamespace(value="unlocked"),
+            last_heartbeat=123.4,
+            version_tag="v1",
+            degradation_state=SimpleNamespace(value="normal"),
+            consecutive_failures=0,
+        )
+        camera_manager.get_detector_status.return_value = {
+            "mode": "ssim",
+            "model_path": None,
+            "model_loaded": False,
+            "threshold": 0.15,
+            "ssim_calibration_progress": 0.5,
+            "ssim_calibrated": False,
+            "ssim_noise_floor": 0.01,
+        }
+        camera_manager.get_learning_progress.return_value = {"progress_pct": 10}
+        camera_manager.get_pipeline_mode.return_value = "learning"
+        camera_manager.is_anomaly_locked.return_value = False
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.get("/api/cameras/cam_01/detail/json")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["camera_id"] == "cam_01"
+        assert data["config"]["source"] == "rtsp://example/stream"
+        assert data["runtime"]["pipeline_mode"] == "learning"
+        assert data["runner"]["version_tag"] == "v1"
+        assert data["detector"]["threshold"] == 0.15
+        assert data["health"]["camera_id"] == "cam_01"
+
+
+class TestCameraControlRoutes:
+    def test_start_camera_offloads_to_thread(self, db, health, alerts_dir, monkeypatch):
+        """Camera start route should offload blocking initialization from the event loop."""
+        camera_manager = MagicMock()
+        calls = []
+
+        async def fake_to_thread(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            return True
+
+        monkeypatch.setattr("argus.dashboard.routes.cameras.asyncio.to_thread", fake_to_thread)
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/cameras/cam_01/start")
+
+        assert response.status_code == 200
+        assert len(calls) == 1
+        assert calls[0][0] == camera_manager.start_camera
+        assert calls[0][1] == ("cam_01",)
+
+    def test_stop_camera_offloads_to_thread(self, db, health, alerts_dir, monkeypatch):
+        """Camera stop route should offload thread joins from the event loop."""
+        camera_manager = MagicMock()
+        calls = []
+
+        async def fake_to_thread(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            return None
+
+        monkeypatch.setattr("argus.dashboard.routes.cameras.asyncio.to_thread", fake_to_thread)
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/cameras/cam_01/stop")
+
+        assert response.status_code == 200
+        assert len(calls) == 1
+        assert calls[0][0] == camera_manager.stop_camera
+        assert calls[0][1] == ("cam_01",)
+
+    def test_restart_camera_offloads_stop_and_start(self, db, health, alerts_dir, monkeypatch):
+        """Camera restart route should offload stop/start instead of blocking the server."""
+        camera_manager = MagicMock()
+        calls = []
+
+        async def fake_to_thread(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            if func == camera_manager.start_camera:
+                return True
+            return None
+
+        monkeypatch.setattr("argus.dashboard.routes.config.asyncio.to_thread", fake_to_thread)
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/config/camera/cam_01/restart")
+
+        assert response.status_code == 200
+        assert len(calls) == 2
+        assert calls[0][0] == camera_manager.stop_camera
+        assert calls[1][0] == camera_manager.start_camera
+        assert calls[0][1] == ("cam_01",)
+        assert calls[1][1] == ("cam_01",)
+
+
+class TestModelPublishRoutes:
+    def test_activate_model_syncs_runtime(self, db, health, alerts_dir, tmp_path):
+        """Activating a registered model should also hot-reload the running camera."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "model.xml").write_text("model")
+        baseline_dir = tmp_path / "baseline"
+        baseline_dir.mkdir()
+        (baseline_dir / "img.png").write_bytes(b"img")
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+
+        camera_manager = MagicMock()
+        camera_manager.reload_model.return_value = True
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post(f"/api/models/{version_id}/activate")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["activated"] == version_id
+        assert payload["runtime_synced"] is True
+        camera_manager.reload_model.assert_called_once_with(
+            "cam_01",
+            str(model_dir),
+            version_tag=version_id,
+        )
+
+    def test_config_reload_model_uses_manager_reload(self, db, health, alerts_dir, tmp_path, monkeypatch):
+        """Config reload-model route should use the shared runtime reload path."""
+        monkeypatch.chdir(tmp_path)
+
+        model_dir = tmp_path / "data" / "models" / "cam_01" / "default"
+        model_dir.mkdir(parents=True)
+        model_path = model_dir / "model.xml"
+        model_path.write_text("model")
+        baseline_dir = tmp_path / "baseline"
+        baseline_dir.mkdir()
+        (baseline_dir / "img.png").write_bytes(b"img")
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+
+        camera_manager = MagicMock()
+        camera_manager._pipelines = {"cam_01": MagicMock()}
+        camera_manager.reload_model.return_value = True
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/config/reload-model",
+            json={"camera_id": "cam_01", "model_path": str(model_path)},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        camera_manager.reload_model.assert_called_once_with(
+            "cam_01",
+            str(model_path.resolve()),
+            version_tag=version_id,
+        )
+
+    def test_promote_production_syncs_runtime(self, db, health, alerts_dir, tmp_path):
+        """Promoting a canary model to production should sync the runtime model."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "model.xml").write_text("model")
+        baseline_dir = tmp_path / "baseline"
+        baseline_dir.mkdir()
+        (baseline_dir / "img.png").write_bytes(b"img")
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+
+        with db.get_session() as session:
+            record = registry.get_by_version_id(version_id)
+            record = session.merge(record)
+            record.stage = "canary"
+            session.add(ModelVersionEvent(
+                camera_id="cam_01",
+                from_version=version_id,
+                to_version=version_id,
+                from_stage="shadow",
+                to_stage="canary",
+                triggered_by="tester",
+                reason="seed",
+                timestamp=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            ))
+            session.commit()
+
+        camera_manager = MagicMock()
+        camera_manager.reload_model.return_value = True
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            f"/api/models/{version_id}/promote",
+            json={"target_stage": "production", "triggered_by": "operator"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["model"]["stage"] == "production"
+        assert payload["runtime_synced"] is True
+        camera_manager.reload_model.assert_called_once_with(
+            "cam_01",
+            str(model_dir),
+            version_tag=version_id,
+        )
+
+
+class TestTrainingRegistration:
+    def test_train_model_task_registers_candidate_model(self, monkeypatch, tmp_path):
+        """Manual training task should register its output into the model registry."""
+        baselines_dir = tmp_path / "baselines"
+        current_dir = baselines_dir / "cam_01" / "default" / "v001"
+        current_dir.mkdir(parents=True)
+        (current_dir.parent / "current.txt").write_text("v001")
+        (current_dir / "img.png").write_bytes(b"img")
+
+        models_dir = tmp_path / "models"
+        output_dir = models_dir / "cam_01" / "default"
+        output_dir.mkdir(parents=True)
+        (output_dir / "model.xml").write_text("model")
+
+        db = Database(database_url=f"sqlite:///{tmp_path / 'train.db'}")
+        db.initialize()
+
+        from argus.anomaly.trainer import QualityReport, TrainingResult, TrainingStatus
+
+        def fake_train(self, **kwargs):
+            return TrainingResult(
+                status=TrainingStatus.COMPLETE,
+                model_path=str(output_dir),
+                duration_seconds=1.0,
+                image_count=30,
+                train_count=24,
+                val_count=6,
+                pre_validation={"passed": True},
+                val_stats={"mean": 0.1, "std": 0.01, "max": 0.2, "p95": 0.18},
+                quality_report=QualityReport(grade="A"),
+                threshold_recommended=0.42,
+                output_validation={"checkpoint_valid": True, "export_valid": True, "smoke_test_passed": True},
+            )
+
+        monkeypatch.setattr("argus.anomaly.trainer.ModelTrainer.train", fake_train)
+
+        messages = []
+
+        result = _train_model_task(
+            lambda progress, message: messages.append((progress, message)),
+            baselines_dir=str(baselines_dir),
+            models_dir=str(models_dir),
+            camera_id="cam_01",
+            model_type="patchcore",
+            export_format="openvino",
+            quantization="fp16",
+            database_url=f"sqlite:///{tmp_path / 'train.db'}",
+        )
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        models = registry.list_models(camera_id="cam_01")
+
+        assert result["model_version_id"] is not None
+        assert len(models) == 1
+        assert models[0].stage == "candidate"
+        assert messages[-1][0] == 100
+        db.close()
+
+
+class TestCameraManagerModelRouting:
+    def test_prefers_active_registry_model_on_startup(self, tmp_path):
+        """CameraManager should restore the active registry model for restarted cameras."""
+        db = Database(database_url=f"sqlite:///{tmp_path / 'camera.db'}")
+        db.initialize()
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "model.xml").write_text("model")
+        baseline_dir = tmp_path / "baseline"
+        baseline_dir.mkdir()
+        (baseline_dir / "img.png").write_bytes(b"img")
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        registry.activate(version_id)
+
+        cam_config = CameraConfig(
+            camera_id="cam_01",
+            name="Camera 01",
+            source="0",
+            protocol="file",
+        )
+
+        manager = CameraManager(
+            cameras=[cam_config],
+            alert_config=AlertConfig(),
+            database=db,
+        )
+
+        assert manager._resolve_model_path(cam_config) == model_dir
+        assert manager._model_version_id(cam_config, model_dir) == version_id
+        db.close()
+
+    def test_reload_model_updates_pipeline_version_id(self):
+        """Hot reload should update both runner snapshot tag and pipeline record tag."""
+        manager = CameraManager(cameras=[], alert_config=AlertConfig())
+        pipeline = MagicMock()
+        pipeline.reload_anomaly_model.return_value = True
+        runner = MagicMock()
+        manager._pipelines["cam_01"] = pipeline
+        manager._runners["cam_01"] = runner
+        manager._notify_status_change = MagicMock()
+
+        ok = manager.reload_model("cam_01", "data/models/cam_01/model.xml", version_tag="v2")
+
+        assert ok is True
+        runner.set_version_tag.assert_called_once_with("v2")
+        pipeline.set_model_version_id.assert_called_once_with("v2")
+
+
+class TestSchedulerWiring:
+    def test_register_training_job_processing_wires_executor(self, monkeypatch):
+        """Main scheduler setup should register queued training job processing."""
+        scheduler = MagicMock()
+        database = MagicMock()
+        database.get_session = MagicMock()
+        config = ArgusConfig()
+
+        baseline_manager_cls = MagicMock(return_value=MagicMock())
+        backbone_trainer_cls = MagicMock(return_value=MagicMock())
+        trainer_cls = MagicMock(return_value=MagicMock())
+        registry_cls = MagicMock(return_value=MagicMock())
+        executor_cls = MagicMock(return_value=MagicMock())
+        register_task = MagicMock()
+
+        monkeypatch.setattr("argus.anomaly.baseline.BaselineManager", baseline_manager_cls)
+        monkeypatch.setattr("argus.anomaly.backbone_trainer.BackboneTrainer", backbone_trainer_cls)
+        monkeypatch.setattr("argus.anomaly.trainer.ModelTrainer", trainer_cls)
+        monkeypatch.setattr("argus.storage.model_registry.ModelRegistry", registry_cls)
+        monkeypatch.setattr("argus.anomaly.job_executor.TrainingJobExecutor", executor_cls)
+        monkeypatch.setattr("argus.__main__.create_job_processing_task", register_task)
+
+        _register_training_job_processing(scheduler, config=config, database=database)
+
+        backbone_trainer_cls.assert_called_once()
+        executor_cls.assert_called_once()
+        register_task.assert_called_once()
 
 
 class TestAlertsAPI:

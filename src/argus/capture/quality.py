@@ -89,10 +89,18 @@ class FrameQualityFilter:
     the first rejection.
     """
 
-    def __init__(self, config: CaptureQualityConfig) -> None:
+    def __init__(
+        self,
+        config: CaptureQualityConfig,
+        *,
+        enable_person_detection: bool = True,
+        enable_duplicate_filter: bool = True,
+    ) -> None:
         self._config = config
         self._blur_scores: list[float] = []
         self._person_detector = None
+        self._enable_person_detection = enable_person_detection
+        self._enable_duplicate_filter = enable_duplicate_filter
 
     def check(
         self, frame: np.ndarray, prev_frame: np.ndarray | None = None
@@ -144,7 +152,7 @@ class FrameQualityFilter:
             return result
 
         # 4. Frame deduplication (CAP-005)
-        if prev_frame is not None:
+        if self._enable_duplicate_filter and prev_frame is not None:
             ssim_val = self._compute_ssim(gray, prev_frame)
             result.ssim_to_prev = ssim_val
             if ssim_val >= self._config.ssim_dedup_threshold:
@@ -153,7 +161,7 @@ class FrameQualityFilter:
                 return result
 
         # 5. Person detection (CAP-003) — most expensive
-        if self._check_person(frame):
+        if self._enable_person_detection and self._check_person(frame):
             result.accepted = False
             result.rejection_reason = "person"
             return result

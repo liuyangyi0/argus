@@ -89,6 +89,10 @@ class CameraInferenceRunner:
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
 
+    def set_version_tag(self, version_tag: str) -> None:
+        """Update the runner's externally visible model version tag."""
+        self._version_tag = version_tag
+
     def initialize(self) -> bool:
         """Initialize the pipeline. Returns False if backbone load fails and strict mode is on."""
         result = self._pipeline.initialize()

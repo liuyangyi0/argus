@@ -6,7 +6,6 @@ import shutil
 import threading
 import time
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -28,27 +27,14 @@ from argus.dashboard.components import (
     stat_card,
     tab_bar,
 )
-
-
-@dataclass
-class CaptureStats:
-    """Statistics for a completed baseline capture session."""
-
-    total_frames: int
-    captured_frames: int
-    filtered_frames: int
-    filter_reasons: dict[str, int] = field(default_factory=dict)
-    retention_rate: float = 0.0
-    brightness_range: tuple[float, float] = (0.0, 0.0)
-    capture_duration_seconds: float = 0.0
-
-    def __post_init__(self):
-        if self.total_frames > 0:
-            self.retention_rate = self.captured_frames / self.total_frames
+from argus.dashboard.forms import htmx_toast_headers, parse_request_form
+from argus.dashboard.model_runtime import activate_model_version, find_registered_model_by_path
 
 logger = structlog.get_logger()
 
 router = APIRouter()
+
+_DEFAULT_ZONE_ID = "default"
 
 _GRADE_COLORS = {
     "A": "var(--status-ok)",
@@ -64,6 +50,77 @@ _TABS = [
     ("models", "模型管理", "/api/baseline/models"),
     ("history", "训练报告", "/api/baseline/training-history"),
 ]
+
+
+def _camera_baseline_root(
+    baselines_dir: Path,
+    camera_id: str,
+    zone_id: str = _DEFAULT_ZONE_ID,
+) -> Path:
+    """Return the default-zone root for a camera, with legacy flat-layout fallback."""
+    zone_root = baselines_dir / camera_id / zone_id
+    if zone_root.is_dir():
+        return zone_root
+    return baselines_dir / camera_id
+
+
+def _iter_camera_baseline_versions(
+    baselines_dir: Path,
+    camera_id: str,
+    zone_id: str = _DEFAULT_ZONE_ID,
+):
+    """Yield version directories for one camera's default baseline zone."""
+    base_dir = _camera_baseline_root(baselines_dir, camera_id, zone_id)
+    if not base_dir.exists():
+        return
+    for version_dir in sorted(base_dir.iterdir()):
+        if version_dir.is_dir():
+            yield version_dir
+
+
+def _resolve_baseline_version_dir(
+    baselines_dir: Path,
+    camera_id: str,
+    version: str,
+    zone_id: str = _DEFAULT_ZONE_ID,
+) -> Path:
+    """Resolve a version directory for the default zone, including legacy flat paths."""
+    return _camera_baseline_root(baselines_dir, camera_id, zone_id) / version
+
+
+def _read_capture_meta(version_dir: Path) -> dict:
+    """Load capture metadata if present."""
+    import json as _json
+
+    meta_path = version_dir / "capture_meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        return _json.loads(meta_path.read_text())
+    except (ValueError, OSError):
+        return {}
+
+
+def _count_version_images(version_dir: Path) -> int:
+    """Count images stored in a baseline version directory."""
+    return len(list(version_dir.glob("*.png"))) + len(list(version_dir.glob("*.jpg")))
+
+
+def _reset_current_marker_after_delete(base_dir: Path, deleted_version: str) -> None:
+    """Update current.txt when the referenced version has been deleted."""
+    marker = base_dir / "current.txt"
+    if not marker.exists():
+        return
+    current_version = marker.read_text().strip()
+    if current_version != deleted_version:
+        return
+
+    remaining_versions = sorted([path for path in base_dir.iterdir() if path.is_dir()])
+    if remaining_versions:
+        marker.write_text(remaining_versions[-1].name)
+        return
+
+    marker.unlink(missing_ok=True)
 
 
 @router.get("", response_class=HTMLResponse)
@@ -111,12 +168,10 @@ async def capture_form(request: Request):
         existing_sessions: set[str] = set()
         for cam_dir in (sorted(baselines_dir.iterdir()) if baselines_dir.exists() else []):
             if cam_dir.is_dir():
-                for ver_dir in cam_dir.iterdir():
-                    if ver_dir.is_dir():
-                        name = ver_dir.name.lower()
-                        for label_key in ("daytime", "night", "maintenance"):
-                            if label_key in name:
-                                existing_sessions.add(label_key)
+                for ver_dir in _iter_camera_baseline_versions(baselines_dir, cam_dir.name):
+                    session_label = str(_read_capture_meta(ver_dir).get("session_label", "")).lower()
+                    if session_label in {"daytime", "night", "maintenance"}:
+                        existing_sessions.add(session_label)
         if existing_sessions and len(existing_sessions) < 3:
             missing = {"daytime", "night", "maintenance"} - existing_sessions
             labels_map = {"daytime": "白天/日间", "night": "夜间", "maintenance": "检修期间"}
@@ -155,7 +210,7 @@ async def capture_form(request: Request):
             从在线摄像头采集"正常"场景的参考图片，用于训练异常检测模型。
             确保采集期间场景中没有异物。
         </p>
-        <form hx-post="/api/baseline/capture" hx-target="#tab-content" hx-swap="innerHTML">
+        <form hx-post="/api/baseline/job" hx-target="#tab-content" hx-swap="innerHTML">
             {cam_select}
             {session_label_select}
             <div class="form-row">
@@ -169,55 +224,6 @@ async def capture_form(request: Request):
     </div>""")
 
 
-@router.post("/capture")
-async def start_capture(request: Request):
-    """Start a baseline capture background task."""
-    task_manager = getattr(request.app.state, "task_manager", None)
-    camera_manager = request.app.state.camera_manager
-    config = request.app.state.config
-
-    if not task_manager or not camera_manager or not config:
-        return JSONResponse({"error": "服务不可用"}, status_code=503)
-
-    form = await request.form()
-    camera_id = form.get("camera_id", "")
-    count = int(form.get("count", 100))
-    interval = float(form.get("interval", 2.0))
-    session_label = form.get("session_label", "daytime")
-
-    if not camera_id:
-        return JSONResponse({"error": "请选择摄像头"}, status_code=400)
-
-    baselines_dir = str(config.storage.baselines_dir)
-
-    # Build quality config from global config, respecting form toggle
-    from argus.config.schema import CaptureQualityConfig
-
-    quality_config = CaptureQualityConfig(
-        **{**config.capture_quality.model_dump(), "enabled": quality_enabled}
-    )
-
-    try:
-        task_id = task_manager.submit(
-            "baseline_capture",
-            _capture_baseline_task,
-            camera_id=camera_id,
-            camera_manager=camera_manager,
-            output_dir=baselines_dir,
-            count=count,
-            interval=interval,
-            session_label=session_label,
-        )
-    except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-    # Return the capture tab with task status
-    return HTMLResponse(
-        f'<div hx-get="/api/baseline/capture" hx-trigger="load" hx-swap="innerHTML"></div>',
-        headers={"HX-Trigger": '{"showToast": {"message": "基线采集已启动", "type": "success"}}'},
-    )
-
-
 @router.get("/list", response_class=HTMLResponse)
 async def baseline_list(request: Request):
     """List baselines by camera with version info."""
@@ -226,20 +232,14 @@ async def baseline_list(request: Request):
         return HTMLResponse(empty_state("配置不可用"))
 
     baselines_dir = Path(config.storage.baselines_dir)
-    if not baselines_dir.exists():
-        return HTMLResponse(empty_state("暂无基线数据", "请先采集基线图片"))
-
     html = ""
-    for cam_dir in sorted(baselines_dir.iterdir()):
+    for cam_dir in sorted(baselines_dir.iterdir()) if baselines_dir.exists() else []:
         if not cam_dir.is_dir():
             continue
         camera_id = cam_dir.name
         versions = []
-        for ver_dir in sorted(cam_dir.iterdir()):
-            if not ver_dir.is_dir():
-                continue
-            images = list(ver_dir.glob("*.png")) + list(ver_dir.glob("*.jpg"))
-            versions.append((ver_dir.name, len(images)))
+        for ver_dir in _iter_camera_baseline_versions(baselines_dir, camera_id):
+            versions.append((ver_dir.name, _count_version_images(ver_dir)))
 
         if not versions:
             continue
@@ -283,36 +283,25 @@ async def baseline_list_json(request: Request):
     if not baselines_dir.exists():
         return JSONResponse({"baselines": []})
 
-    import json as _json
-
     baselines = []
     for cam_dir in sorted(baselines_dir.iterdir()):
         if not cam_dir.is_dir():
             continue
         camera_id = cam_dir.name
-        for ver_dir in sorted(cam_dir.iterdir()):
-            if not ver_dir.is_dir():
+        for ver_dir in _iter_camera_baseline_versions(baselines_dir, camera_id):
+            image_count = _count_version_images(ver_dir)
+            if not image_count:
                 continue
-            images = list(ver_dir.glob("*.png")) + list(ver_dir.glob("*.jpg"))
-            if not images:
-                continue
-            # Read capture metadata if available
-            meta = {}
-            meta_path = ver_dir / "capture_meta.json"
-            if meta_path.exists():
-                try:
-                    meta = _json.loads(meta_path.read_text())
-                except (ValueError, OSError):
-                    pass
+            meta = _read_capture_meta(ver_dir)
             lifecycle = _get_lifecycle(request)
             version_state = None
             if lifecycle:
-                ver_rec = lifecycle.get_version(camera_id, "default", ver_dir.name)
+                ver_rec = lifecycle.get_version(camera_id, _DEFAULT_ZONE_ID, ver_dir.name)
                 version_state = ver_rec.state if ver_rec else None
             baselines.append({
                 "camera_id": camera_id,
                 "version": ver_dir.name,
-                "image_count": len(images),
+                "image_count": image_count,
                 "session_label": meta.get("session_label", ""),
                 "status": "ready",
                 "state": version_state,
@@ -374,7 +363,7 @@ async def baseline_images(request: Request, camera_id: str):
     """Show baseline image thumbnails for a camera version."""
     config = request.app.state.config
     version = request.query_params.get("version", "default")
-    baselines_dir = Path(config.storage.baselines_dir) / camera_id / version
+    baselines_dir = _resolve_baseline_version_dir(Path(config.storage.baselines_dir), camera_id, version)
 
     if not baselines_dir.exists():
         return HTMLResponse(empty_state("未找到基线图片"))
@@ -422,9 +411,10 @@ async def baseline_image(request: Request, camera_id: str, filename: str):
     config = request.app.state.config
     version = request.query_params.get("version", "default")
     baselines_dir = Path(config.storage.baselines_dir)
+    version_dir = _resolve_baseline_version_dir(baselines_dir, camera_id, version)
 
     # Path safety
-    img_path = (baselines_dir / camera_id / version / filename).resolve()
+    img_path = (version_dir / filename).resolve()
     if not str(img_path).startswith(str(baselines_dir.resolve())):
         return Response(status_code=400)
 
@@ -507,9 +497,10 @@ async def delete_baseline_image(request: Request, camera_id: str, filename: str)
 
     version = request.query_params.get("version", "default")
     baselines_dir = Path(config.storage.baselines_dir)
+    version_dir = _resolve_baseline_version_dir(baselines_dir, camera_id, version)
 
     # Path safety: validate the resolved path is under baselines directory
-    img_path = (baselines_dir / camera_id / version / filename).resolve()
+    img_path = (version_dir / filename).resolve()
     if not str(img_path).startswith(str(baselines_dir.resolve())):
         return Response(status_code=400)
 
@@ -523,8 +514,71 @@ async def delete_baseline_image(request: Request, camera_id: str, filename: str)
     return HTMLResponse(
         f'<div hx-get="/api/baseline/{camera_id}/images?version={version}" '
         f'hx-trigger="load" hx-target="#tab-content" hx-swap="innerHTML"></div>',
-        headers={"HX-Trigger": '{"showToast": {"message": "图片已删除", "type": "success"}}'},
+        headers=htmx_toast_headers("图片已删除"),
     )
+
+
+@router.delete("/version")
+async def delete_baseline_version(request: Request):
+    """Delete an entire baseline version directory and its lifecycle record."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    camera_id = data.get("camera_id", "")
+    zone_id = data.get("zone_id", _DEFAULT_ZONE_ID)
+    version = data.get("version", "")
+    user = data.get("user", "operator")
+
+    if not camera_id:
+        camera_id = request.query_params.get("camera_id", "")
+    if not version:
+        version = request.query_params.get("version", "")
+    if zone_id == _DEFAULT_ZONE_ID:
+        zone_id = request.query_params.get("zone_id", zone_id)
+    if user == "operator":
+        user = request.query_params.get("user", user)
+
+    if not camera_id or not version:
+        return JSONResponse({"error": "camera_id and version are required"}, status_code=400)
+
+    config = request.app.state.config
+    if not config:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    baselines_dir = Path(config.storage.baselines_dir)
+    base_dir = _camera_baseline_root(baselines_dir, camera_id, zone_id)
+    version_dir = _resolve_baseline_version_dir(baselines_dir, camera_id, version, zone_id)
+    if not version_dir.exists() or not version_dir.is_dir():
+        return JSONResponse({"error": "基线版本不存在"}, status_code=404)
+
+    lifecycle = _get_lifecycle(request)
+    if lifecycle is not None:
+        version_record = lifecycle.get_version(camera_id, zone_id, version)
+        if version_record is not None and version_record.state == "active":
+            return JSONResponse({"error": "生产中的基线版本不能直接删除，请先退役"}, status_code=400)
+
+    shutil.rmtree(version_dir)
+    _reset_current_marker_after_delete(base_dir, version)
+
+    if lifecycle is not None:
+        client_ip = request.client.host if request.client else ""
+        lifecycle.delete_version(camera_id, zone_id, version, user=user, ip_address=client_ip)
+
+    logger.info(
+        "baseline.version_dir_deleted",
+        camera_id=camera_id,
+        zone_id=zone_id,
+        version=version,
+        user=user,
+    )
+    return JSONResponse({"status": "ok", "camera_id": camera_id, "version": version})
+
+
+@router.post("/version/delete")
+async def delete_baseline_version_post(request: Request):
+    """POST alias for version deletion to avoid DELETE-body compatibility issues."""
+    return await delete_baseline_version(request)
 
 
 @router.get("/train", response_class=HTMLResponse)
@@ -538,12 +592,18 @@ async def train_form(request: Request):
 
     # List cameras that have baselines
     baselines_dir = Path(config.storage.baselines_dir)
+    from argus.anomaly.baseline import BaselineManager
+
+    baseline_manager = BaselineManager(baselines_dir=str(baselines_dir))
     cam_options = []
     for cam_dir in sorted(baselines_dir.iterdir()) if baselines_dir.exists() else []:
         if cam_dir.is_dir():
-            img_count = len(list(cam_dir.rglob("*.png"))) + len(list(cam_dir.rglob("*.jpg")))
+            baseline_dir = baseline_manager.get_baseline_dir(cam_dir.name, _DEFAULT_ZONE_ID)
+            img_count = baseline_manager.count_images(cam_dir.name, _DEFAULT_ZONE_ID)
             if img_count >= 10:
-                cam_options.append((cam_dir.name, f"{cam_dir.name} ({img_count} 张基线图片)"))
+                cam_options.append(
+                    (cam_dir.name, f"{cam_dir.name} / {baseline_dir.name} ({img_count} 张基线图片)")
+                )
 
     if not cam_options:
         return HTMLResponse(empty_state(
@@ -611,7 +671,7 @@ async def start_training(request: Request):
     if not task_manager or not config:
         return JSONResponse({"error": "服务不可用"}, status_code=503)
 
-    form = await request.form()
+    form = await parse_request_form(request)
     camera_id = form.get("camera_id", "")
     model_type = form.get("model_type", "patchcore")
     export_format = form.get("export_format", "openvino")
@@ -637,10 +697,17 @@ async def start_training(request: Request):
     if cam_cfg is not None:
         anomaly_config = cam_cfg.anomaly
 
+    def _run_training(progress_callback, **kwargs):
+        return _train_model_task(
+            progress_callback,
+            camera_id=camera_id,
+            **kwargs,
+        )
+
     try:
         task_manager.submit(
             "model_training",
-            _train_model_task,
+            _run_training,
             camera_id=camera_id,
             baselines_dir=str(config.storage.baselines_dir),
             models_dir=str(config.storage.models_dir),
@@ -656,7 +723,7 @@ async def start_training(request: Request):
 
     return HTMLResponse(
         '<div hx-get="/api/baseline/train" hx-trigger="load" hx-swap="innerHTML"></div>',
-        headers={"HX-Trigger": '{"showToast": {"message": "模型训练已启动", "type": "success"}}'},
+        headers=htmx_toast_headers("模型训练已启动"),
     )
 
 
@@ -741,11 +808,22 @@ async def deploy_model(request: Request):
     if not resolved.exists():
         return JSONResponse({"error": "模型文件不存在"}, status_code=404)
 
-    pipeline = camera_manager._pipelines.get(camera_id)
-    if not pipeline:
+    if camera_id not in camera_manager._pipelines:
         return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
 
-    success = pipeline.reload_anomaly_model(str(resolved))
+    registry_record = find_registered_model_by_path(
+        request,
+        resolved,
+        camera_id=camera_id,
+    )
+    if registry_record is not None:
+        _, success = activate_model_version(
+            request,
+            registry_record.model_version_id,
+            triggered_by="dashboard",
+        )
+    else:
+        success = camera_manager.reload_model(camera_id, str(resolved))
 
     if success:
         audit = getattr(request.app.state, "audit_logger", None)
@@ -760,8 +838,11 @@ async def deploy_model(request: Request):
                 ip_address=client_ip,
             )
         return JSONResponse(
-            {"status": "ok"},
-            headers={"HX-Trigger": '{"showToast": {"message": "模型已部署", "type": "success"}}'},
+            {
+                "status": "ok",
+                "model_version_id": registry_record.model_version_id if registry_record else None,
+            },
+            headers=htmx_toast_headers("模型已部署"),
         )
     return JSONResponse({"error": "模型部署失败"}, status_code=500)
 
@@ -769,27 +850,44 @@ async def deploy_model(request: Request):
 # ── Advanced Baseline Capture Job Endpoints ──
 
 
-@router.post("/api/baseline/job")
+@router.post("/job")
 async def start_capture_job(request: Request):
     """Start an advanced baseline capture job with strategy selection."""
-    form = await request.form()
-    camera_id = form.get("camera_id", "")
-    target_frames = int(form.get("target_frames", 1000))
-    duration_hours = float(form.get("duration_hours", 24.0))
-    sampling_strategy = form.get("sampling_strategy", "active")
-    diversity_threshold = float(form.get("diversity_threshold", 0.3))
-    frames_per_period = int(form.get("frames_per_period", 50))
-
-    if not camera_id:
-        return JSONResponse({"error": "camera_id is required"}, status_code=400)
-
     app = request.app
     camera_manager = app.state.camera_manager
     task_manager = app.state.task_manager
     config = app.state.config
+    if not camera_manager or not task_manager or not config:
+        return JSONResponse({"error": "服务不可用"}, status_code=503)
+
+    form = await parse_request_form(request)
+    camera_id = form.get("camera_id", "")
+    session_label = form.get("session_label", "daytime")
+
+    if not camera_id:
+        return JSONResponse({"error": "请选择摄像头"}, status_code=400)
+
+    if "count" in form or "interval" in form:
+        target_frames = int(form.get("count", 100))
+        interval = float(form.get("interval", 2.0))
+        duration_hours = max(target_frames * interval / 3600, 1 / 3600)
+        sampling_strategy = "uniform"
+        diversity_threshold = config.baseline_capture.diversity_threshold
+        frames_per_period = config.baseline_capture.frames_per_period
+    else:
+        target_frames = int(form.get("target_frames", 1000))
+        duration_hours = float(form.get("duration_hours", 24.0))
+        sampling_strategy = form.get("sampling_strategy", config.baseline_capture.default_strategy)
+        diversity_threshold = float(
+            form.get("diversity_threshold", config.baseline_capture.diversity_threshold)
+        )
+        frames_per_period = int(
+            form.get("frames_per_period", config.baseline_capture.frames_per_period)
+        )
 
     job_config = BaselineCaptureJobConfig(
         camera_id=camera_id,
+        session_label=session_label,
         target_frames=target_frames,
         duration_hours=duration_hours,
         sampling_strategy=sampling_strategy,
@@ -799,6 +897,8 @@ async def start_capture_job(request: Request):
         diversity_threshold=diversity_threshold,
         dino_backbone=config.baseline_capture.dino_backbone,
         dino_image_size=config.baseline_capture.dino_image_size,
+        active_sleep_min_seconds=config.baseline_capture.active_sleep_min_seconds,
+        active_cpu_threads=config.baseline_capture.active_cpu_threads,
         schedule_periods=dict(config.baseline_capture.schedule_periods),
         frames_per_period=frames_per_period,
         post_capture_review=config.baseline_capture.post_capture_review,
@@ -810,16 +910,18 @@ async def start_capture_job(request: Request):
     pause_ev = threading.Event()
     pause_ev.set()  # not paused
     abort_ev = threading.Event()
+    lifecycle = getattr(app.state, "baseline_lifecycle", None)
 
     try:
         task_id = task_manager.submit(
-            "baseline_capture_job",
+            "baseline_capture",
             run_baseline_capture_job,
             camera_id=camera_id,
             job_config=job_config,
             camera_manager=camera_manager,
             pause_event=pause_ev,
             abort_event=abort_ev,
+            lifecycle=lifecycle,
         )
         # Sync events so TaskManager.pause_task/abort_task work
         task_info = task_manager.get_task(task_id)
@@ -829,10 +931,22 @@ async def start_capture_job(request: Request):
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
 
+    if request.headers.get("HX-Request") == "true":
+        return HTMLResponse(
+            '<div hx-get="/api/baseline/capture" hx-trigger="load" hx-swap="innerHTML"></div>',
+            headers=htmx_toast_headers("基线采集已启动"),
+        )
+
     return JSONResponse({"task_id": task_id, "status": "submitted"})
 
 
-@router.post("/api/baseline/job/{task_id}/pause")
+@router.post("/capture")
+async def start_capture_legacy(request: Request):
+    """Backward-compatible alias for quick capture clients still posting to /capture."""
+    return await start_capture_job(request)
+
+
+@router.post("/job/{task_id}/pause")
 async def pause_capture_job(task_id: str, request: Request):
     """Pause a running baseline capture job."""
     task_manager = request.app.state.task_manager
@@ -841,7 +955,7 @@ async def pause_capture_job(task_id: str, request: Request):
     return JSONResponse({"error": "Task not found or not running"}, status_code=404)
 
 
-@router.post("/api/baseline/job/{task_id}/resume")
+@router.post("/job/{task_id}/resume")
 async def resume_capture_job(task_id: str, request: Request):
     """Resume a paused baseline capture job."""
     task_manager = request.app.state.task_manager
@@ -850,7 +964,7 @@ async def resume_capture_job(task_id: str, request: Request):
     return JSONResponse({"error": "Task not found or not paused"}, status_code=404)
 
 
-@router.post("/api/baseline/job/{task_id}/abort")
+@router.post("/job/{task_id}/abort")
 async def abort_capture_job(task_id: str, request: Request):
     """Abort a running or paused baseline capture job."""
     task_manager = request.app.state.task_manager
@@ -859,7 +973,7 @@ async def abort_capture_job(task_id: str, request: Request):
     return JSONResponse({"error": "Task not found or not active"}, status_code=404)
 
 
-@router.get("/api/baseline/job/{task_id}")
+@router.get("/job/{task_id}")
 async def get_capture_job_status(task_id: str, request: Request):
     """Get the status of a baseline capture job."""
     task_manager = request.app.state.task_manager
@@ -1178,122 +1292,6 @@ async def compare_models_route(request: Request):
 # ── Background task functions ──
 
 
-def _capture_baseline_task(
-    progress_callback, *, camera_manager, camera_id, output_dir, count, interval,
-    session_label="daytime",
-):
-    """Capture raw (unmasked) baseline frames from a running camera.
-
-    Uses get_raw_frame() to get frames BEFORE zone masking is applied,
-    ensuring training data is clean of zone mask artifacts (CRIT-05).
-    Uses BaselineManager-compatible directory structure (HIGH-07).
-    Session label is stored as a directory prefix for multi-session support (CAP-008).
-    """
-    import json
-
-    from argus.anomaly.baseline import BaselineManager
-    from argus.capture.quality import CaptureStats, FrameQualityFilter
-    from argus.config.schema import CaptureQualityConfig
-
-    bm = BaselineManager(baselines_dir=output_dir)
-    # Use session_label as zone_id prefix for directory organization
-    zone_id = f"{session_label}_default" if session_label != "daytime" else "default"
-    version_dir = bm.create_new_version(camera_id, zone_id)
-
-    captured = 0
-    skipped_none = 0
-    filter_reasons: dict[str, int] = {}
-    brightness_values: list[float] = []
-    start_time = time.monotonic()
-
-    for i in range(count):
-        stats.total_grabbed += 1
-
-        # Use raw frame (before zone mask) for training data
-        frame = camera_manager.get_raw_frame(camera_id)
-        if frame is None:
-            # Fallback to latest processed frame if raw not available
-            frame = camera_manager.get_latest_frame(camera_id)
-
-        if frame is not None:
-            # Track brightness for stats
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-            mean_brightness = float(np.mean(gray))
-            brightness_values.append(mean_brightness)
-
-            path = version_dir / f"baseline_{captured:05d}.png"
-            cv2.imwrite(str(path), frame)
-            captured += 1
-        else:
-            skipped_none += 1
-            filter_reasons["no_frame"] = filter_reasons.get("no_frame", 0) + 1
-
-        # Progress message with filter stats
-        rejected = stats.total_rejected
-        msg = f"已采集 {stats.accepted}/{count} 帧"
-        if rejected > 0 or stats.null_frames > 0:
-            msg += f" (过滤 {rejected}, 空帧 {stats.null_frames})"
-
-        progress_callback(int((i + 1) / count * 100), msg)
-        time.sleep(interval)
-
-    capture_duration = time.monotonic() - start_time
-
-    # Set as current version
-    if captured > 0:
-        bm.set_current_version(camera_id, zone_id, version_dir.name)
-
-    # Build capture stats
-    brightness_range = (
-        (min(brightness_values), max(brightness_values)) if brightness_values else (0.0, 0.0)
-    )
-    stats = CaptureStats(
-        total_frames=count,
-        captured_frames=captured,
-        filtered_frames=skipped_none,
-        filter_reasons=filter_reasons,
-        brightness_range=brightness_range,
-        capture_duration_seconds=capture_duration,
-    )
-
-    # Write capture metadata for session tracking (CAP-008)
-    meta = {
-        "session_label": session_label,
-        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "camera_id": camera_id,
-        "quality_filter_enabled": quality_config.enabled,
-        "stats": stats.to_dict(),
-    }
-    meta_path = version_dir / "capture_meta.json"
-    try:
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
-    except OSError:
-        logger.warning("baseline.meta_write_failed", path=str(meta_path))
-
-    logger.info(
-        "baseline.capture_complete",
-        camera_id=camera_id, captured=captured, skipped=skipped_none, total=count,
-        session_label=session_label, retention_rate=f"{stats.retention_rate:.1%}",
-    )
-    return {
-        "captured": captured,
-        "skipped": skipped_none,
-        "total": count,
-        "output_dir": str(version_dir),
-        "session_label": session_label,
-        "stats": {
-            "total_frames": stats.total_frames,
-            "captured_frames": stats.captured_frames,
-            "filtered_frames": stats.filtered_frames,
-            "filter_reasons": stats.filter_reasons,
-            "retention_rate": stats.retention_rate,
-            "brightness_min": stats.brightness_range[0],
-            "brightness_max": stats.brightness_range[1],
-            "capture_duration_seconds": stats.capture_duration_seconds,
-        },
-    }
-
-
 def _train_model_task(
     progress_callback, *, baselines_dir, models_dir, camera_id, model_type,
     export_format, quantization="fp16", database_url=None, anomaly_config=None,
@@ -1340,6 +1338,7 @@ def _train_model_task(
     if database_url:
         try:
             from argus.storage.database import Database
+            from argus.storage.model_registry import ModelRegistry
             from argus.storage.models import TrainingRecord
 
             db = Database(database_url=database_url)
@@ -1385,6 +1384,22 @@ def _train_model_task(
                 trained_at=datetime.now(timezone.utc),
             )
             db.save_training_record(record)
+
+            if result.model_path and not result.model_version_id:
+                registry = ModelRegistry(session_factory=db.get_session)
+                result.model_version_id = registry.register(
+                    model_path=result.model_path,
+                    baseline_dir=baseline_dir,
+                    camera_id=camera_id,
+                    model_type=model_type,
+                    training_params={
+                        "export_format": fmt,
+                        "quantization": quantization,
+                        "train_count": result.train_count,
+                        "val_count": result.val_count,
+                        "quality_grade": result.quality_report.grade if result.quality_report else None,
+                    },
+                )
             db.close()
         except Exception as e:
             logger.warning("training.record_save_failed", error=str(e))
@@ -1395,6 +1410,7 @@ def _train_model_task(
 
     return {
         "model_path": result.model_path,
+        "model_version_id": result.model_version_id,
         "status": result.status.value,
         "duration": result.duration_seconds,
         "image_count": result.image_count,
@@ -1408,7 +1424,7 @@ def _train_model_task(
 @router.post("/optimize", response_class=HTMLResponse)
 async def optimize_baseline(request: Request):
     """Optimize baseline by selecting most diverse subset (A4-2)."""
-    form = await request.form()
+    form = await parse_request_form(request)
     camera_id = form.get("camera_id", "")
     target_ratio = float(form.get("target_ratio", 0.2))
 

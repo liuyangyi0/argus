@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -25,6 +26,35 @@ _FEATURE_DIMS: dict[str, int] = {
 # ImageNet normalization constants
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+_ACTIVE_SAMPLER_DEPENDENCIES: tuple[str, ...] = ("faiss", "timm", "torch")
+
+
+def get_active_sampler_unavailable_reason() -> str | None:
+    """Return a human-readable reason when active sampling dependencies are unavailable."""
+    missing: list[str] = []
+    for module_name in _ACTIVE_SAMPLER_DEPENDENCIES:
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing.append(module_name)
+
+    if not missing:
+        return None
+
+    return f"缺少依赖: {', '.join(missing)}"
+
+
+def _resolve_model_image_size(model: Any, fallback: int) -> int:
+    """Resolve the preferred square input size from a timm model config."""
+    cfg = getattr(model, "pretrained_cfg", None) or getattr(model, "default_cfg", None) or {}
+    input_size = cfg.get("input_size")
+    if isinstance(input_size, (tuple, list)) and len(input_size) >= 3:
+        height = int(input_size[-2])
+        width = int(input_size[-1])
+        if height > 0 and width > 0 and height == width:
+            return height
+    return int(fallback)
 
 
 class BaseSampler(ABC):
@@ -68,10 +98,14 @@ class ActiveSampler(BaseSampler):
         diversity_threshold: float = 0.3,
         backbone: str = "dinov2_vits14",
         image_size: int = 224,
+        sleep_interval_seconds: float = 1.0,
+        cpu_threads: int = 1,
     ) -> None:
         self.diversity_threshold = diversity_threshold
         self.backbone = backbone
         self.image_size = image_size
+        self.sleep_interval_seconds = max(0.0, float(sleep_interval_seconds))
+        self.cpu_threads = max(1, int(cpu_threads))
         self._feature_dim = _FEATURE_DIMS[backbone]
 
         # Lazy-loaded on first should_accept call
@@ -84,6 +118,10 @@ class ActiveSampler(BaseSampler):
         if self._model is not None:
             return
 
+        unavailable_reason = get_active_sampler_unavailable_reason()
+        if unavailable_reason is not None:
+            raise RuntimeError(f"高级采样不可用: {unavailable_reason}")
+
         import faiss
         import timm
         import torch
@@ -95,12 +133,34 @@ class ActiveSampler(BaseSampler):
         self._model = timm.create_model(timm_name, pretrained=True, num_classes=0)
         self._model.eval()
         self._torch = torch
+        resolved_image_size = _resolve_model_image_size(self._model, self.image_size)
+        if resolved_image_size != self.image_size:
+            logger.info(
+                "active_sampler_image_size_adjusted",
+                requested_image_size=self.image_size,
+                resolved_image_size=resolved_image_size,
+                backbone=self.backbone,
+            )
+            self.image_size = resolved_image_size
+
+        try:
+            torch.set_num_threads(self.cpu_threads)
+        except Exception:
+            logger.debug("active_sampler_set_num_threads_failed", exc_info=True)
+
+        if hasattr(faiss, "omp_set_num_threads"):
+            try:
+                faiss.omp_set_num_threads(self.cpu_threads)
+            except Exception:
+                logger.debug("active_sampler_set_faiss_threads_failed", exc_info=True)
 
         self._faiss_index = faiss.IndexFlatIP(self._feature_dim)
         logger.info(
             "active_sampler_ready",
             feature_dim=self._feature_dim,
             threshold=self.diversity_threshold,
+            sleep_interval_seconds=self.sleep_interval_seconds,
+            cpu_threads=self.cpu_threads,
         )
 
     def _extract_features(self, frame: np.ndarray) -> np.ndarray:
@@ -180,7 +240,7 @@ class ActiveSampler(BaseSampler):
             )
 
     def get_sleep_interval(self) -> float:
-        return 0.0
+        return self.sleep_interval_seconds
 
 
 class ScheduledSampler(BaseSampler):

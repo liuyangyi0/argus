@@ -138,6 +138,52 @@ class BaselineLifecycle:
                 ).all()
             )
 
+    def delete_version(
+        self,
+        camera_id: str,
+        zone_id: str,
+        version: str,
+        user: str = "operator",
+        ip_address: str = "",
+    ) -> bool:
+        """Delete a non-active baseline version record."""
+        with self._db.get_session() as session:
+            record = session.scalar(
+                select(BaselineVersionRecord)
+                .where(BaselineVersionRecord.camera_id == camera_id)
+                .where(BaselineVersionRecord.zone_id == zone_id)
+                .where(BaselineVersionRecord.version == version)
+            )
+            if record is None:
+                return False
+            if record.state == BaselineState.ACTIVE:
+                raise BaselineLifecycleError(
+                    f"Cannot delete active baseline {camera_id}/{zone_id}/{version}"
+                )
+
+            session.delete(record)
+            session.commit()
+
+        logger.info(
+            "baseline.version_deleted",
+            camera_id=camera_id,
+            zone_id=zone_id,
+            version=version,
+            user=user,
+        )
+
+        if self._audit:
+            self._audit.log(
+                user=user,
+                action="baseline_deleted",
+                target_type="baseline_version",
+                target_id=f"{camera_id}/{zone_id}/{version}",
+                detail="Baseline version deleted",
+                ip_address=ip_address,
+            )
+
+        return True
+
     def _transition(
         self,
         camera_id: str,

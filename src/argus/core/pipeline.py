@@ -107,6 +107,7 @@ class DetectionPipeline:
         classifier_config: ClassifierConfig | None = None,
         segmenter_config: SegmenterConfig | None = None,
         model_version_id: str | None = None,
+        model_path: Path | None = None,
         shared_anomaly_detector: object | None = None,
         shadow_runner: object | None = None,
         feedback_manager: object | None = None,
@@ -157,7 +158,7 @@ class DetectionPipeline:
                 camera_id=camera_config.camera_id,
             )
         else:
-            model_path = self._find_model(camera_config.camera_id)
+            model_path = model_path or self._find_model(camera_config.camera_id)
             base_detector = AnomalibDetector(
                 model_path=model_path,
                 threshold=camera_config.anomaly.threshold,
@@ -1196,6 +1197,10 @@ class DetectionPipeline:
     def reload_anomaly_model(self, model_path: str | Path) -> bool:
         """Hot-reload the anomaly detection model without stopping the pipeline."""
         return self._anomaly_detector.hot_reload(Path(model_path))
+
+    def set_model_version_id(self, model_version_id: str | None) -> None:
+        """Update the model version tag used in alerts and inference records."""
+        self._model_version_id = model_version_id
 
     def shutdown(self) -> None:
         """Clean up all pipeline resources."""

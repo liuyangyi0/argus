@@ -1,7 +1,10 @@
+# config.py
+
 """Configuration management API routes (Chinese UI with tabs)."""
 
 from __future__ import annotations
 
+import asyncio
 import html
 import shutil
 from pathlib import Path
@@ -20,6 +23,8 @@ from argus.dashboard.components import (
     page_header,
     tab_bar,
 )
+from argus.dashboard.forms import htmx_toast_headers, parse_request_form
+from argus.dashboard.model_runtime import find_registered_model_by_path
 
 logger = structlog.get_logger()
 
@@ -162,7 +167,7 @@ async def update_detection_params(request: Request):
     if not config or not camera_manager:
         return JSONResponse({"error": "不可用"}, status_code=503)
 
-    form = await request.form()
+    form = await parse_request_form(request)
 
     # Update severity thresholds
     try:
@@ -215,7 +220,7 @@ async def update_detection_params(request: Request):
         )
     return JSONResponse(
         {"status": "ok", "pipelines_updated": updated},
-        headers={"HX-Trigger": '{"showToast": {"message": "检测参数已更新", "type": "success"}}'},
+        headers=htmx_toast_headers("检测参数已更新"),
     )
 
 
@@ -282,7 +287,7 @@ async def update_notifications(request: Request):
     if not config:
         return JSONResponse({"error": "不可用"}, status_code=503)
 
-    form = await request.form()
+    form = await parse_request_form(request)
 
     # Email settings
     email = config.alerts.email
@@ -315,7 +320,7 @@ async def update_notifications(request: Request):
 
     return JSONResponse(
         {"status": "ok"},
-        headers={"HX-Trigger": '{"showToast": {"message": "通知设置已更新", "type": "success"}}'},
+        headers=htmx_toast_headers("通知设置已更新"),
     )
 
 
@@ -331,7 +336,7 @@ async def test_email(request: Request):
         return JSONResponse(
             {"error": "请先配置 SMTP 服务器和收件人"},
             status_code=400,
-            headers={"HX-Trigger": '{"showToast": {"message": "请先配置邮件服务器", "type": "error"}}'},
+            headers=htmx_toast_headers("请先配置邮件服务器", toast_type="error"),
         )
 
     try:
@@ -353,12 +358,12 @@ async def test_email(request: Request):
 
         return JSONResponse(
             {"status": "ok"},
-            headers={"HX-Trigger": '{"showToast": {"message": "测试邮件已发送", "type": "success"}}'},
+            headers=htmx_toast_headers("测试邮件已发送"),
         )
     except Exception as e:
         return JSONResponse(
             {"error": str(e)},
-            headers={"HX-Trigger": f'{{"showToast": {{"message": "发送失败: {e}", "type": "error"}}}}'},
+            headers=htmx_toast_headers(f"发送失败: {e}", toast_type="error"),
         )
 
 
@@ -387,7 +392,7 @@ async def test_webhook(request: Request):
 
         return JSONResponse(
             {"status": "ok"},
-            headers={"HX-Trigger": '{"showToast": {"message": "Webhook 测试成功", "type": "success"}}'},
+            headers=htmx_toast_headers("Webhook 测试成功"),
         )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -473,7 +478,7 @@ async def cleanup_data(request: Request):
 
     return JSONResponse(
         {"status": "ok", "deleted": deleted, "files": removed_files},
-        headers={"HX-Trigger": f'{{"showToast": {{"message": "已清理 {deleted} 条旧告警", "type": "success"}}}}'},
+        headers=htmx_toast_headers(f"已清理 {deleted} 条旧告警"),
     )
 
 
@@ -575,8 +580,7 @@ async def reload_model(request: Request, req: ModelReloadRequest):
     if not camera_manager:
         return JSONResponse({"error": "不可用"}, status_code=503)
 
-    pipeline = camera_manager._pipelines.get(req.camera_id)
-    if not pipeline:
+    if req.camera_id not in camera_manager._pipelines:
         return JSONResponse({"error": f"摄像头 {req.camera_id} 不存在"}, status_code=404)
 
     # Sanitize model path
@@ -590,7 +594,17 @@ async def reload_model(request: Request, req: ModelReloadRequest):
     except (ValueError, OSError):
         return JSONResponse({"error": "模型路径无效"}, status_code=400)
 
-    success = pipeline.reload_anomaly_model(str(model_path))
+    registry_record = find_registered_model_by_path(
+        request,
+        model_path,
+        camera_id=req.camera_id,
+    )
+    version_tag = registry_record.model_version_id if registry_record is not None else None
+    success = camera_manager.reload_model(
+        req.camera_id,
+        str(model_path),
+        version_tag=version_tag,
+    )
     return JSONResponse({"status": "ok" if success else "failed", "camera_id": req.camera_id})
 
 
@@ -618,7 +632,7 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
         )
     return HTMLResponse(
         '<span style="color:#4caf50;">锁定已解除</span>',
-        headers={"HX-Trigger": '{"showToast": {"message": "异常锁定已解除", "type": "success"}}'},
+        headers=htmx_toast_headers("异常锁定已解除"),
     )
 
 
@@ -629,11 +643,11 @@ async def restart_camera(request: Request, camera_id: str):
     if not camera_manager:
         return JSONResponse({"error": "不可用"}, status_code=503)
 
-    camera_manager.stop_camera(camera_id)
-    success = camera_manager.start_camera(camera_id)
+    await asyncio.to_thread(camera_manager.stop_camera, camera_id)
+    success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
     return JSONResponse(
         {"status": "ok" if success else "failed"},
-        headers={"HX-Trigger": '{"showToast": {"message": "摄像头已重启", "type": "success"}}'},
+        headers=htmx_toast_headers("摄像头已重启"),
     )
 
 
@@ -665,7 +679,7 @@ async def reload_config(request: Request):
 
     return JSONResponse(
         {"status": "ok", "pipelines_updated": updated},
-        headers={"HX-Trigger": '{"showToast": {"message": "配置已重新加载", "type": "success"}}'},
+        headers=htmx_toast_headers("配置已重新加载"),
     )
 
 
@@ -685,7 +699,7 @@ async def save_config(request: Request):
 
     return JSONResponse(
         {"status": "ok"},
-        headers={"HX-Trigger": '{"showToast": {"message": "配置已保存到文件", "type": "success"}}'},
+        headers=htmx_toast_headers("配置已保存到文件"),
     )
 
 

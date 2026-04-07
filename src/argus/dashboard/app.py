@@ -46,6 +46,7 @@ def create_app(
     task_manager: object | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
+    from argus.anomaly.baseline_lifecycle import BaselineLifecycle
     from argus.config.schema import AuthConfig, DashboardConfig
 
     dashboard_config = getattr(config, "dashboard", None) or DashboardConfig()
@@ -68,6 +69,7 @@ def create_app(
 
     # ── App state (dependency injection) ──
     app.state.db = database
+    app.state.database = database
     app.state.camera_manager = camera_manager
     app.state.health_monitor = health_monitor
     app.state.alerts_dir = Path(alerts_dir) if alerts_dir else Path("data/alerts")
@@ -75,6 +77,10 @@ def create_app(
     app.state.config_path = config_path
     app.state.task_manager = task_manager
     app.state.ws_manager = ws_manager
+    app.state.baseline_lifecycle = BaselineLifecycle(database) if database else None
+
+    if task_manager is not None and getattr(task_manager, "_on_change", None) is None:
+        task_manager._on_change = ws_manager.broadcast
 
     # Feedback manager for the feedback queue (Section 6)
     if database:

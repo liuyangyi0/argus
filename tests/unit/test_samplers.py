@@ -1,9 +1,40 @@
 """Tests for baseline capture sampling strategies (Phase 3)."""
 
+import importlib
 import numpy as np
 import pytest
 from unittest.mock import patch, MagicMock
-from argus.capture.samplers import UniformSampler, ActiveSampler, ScheduledSampler
+from argus.capture.samplers import (
+    UniformSampler,
+    ActiveSampler,
+    ScheduledSampler,
+    get_active_sampler_unavailable_reason,
+    _resolve_model_image_size,
+)
+
+
+class FakeFaissIndex:
+    def __init__(self, dim: int):
+        self.dim = dim
+        self._vectors = np.empty((0, dim), dtype=np.float32)
+
+    @property
+    def ntotal(self) -> int:
+        return int(self._vectors.shape[0])
+
+    def add(self, vectors: np.ndarray) -> None:
+        self._vectors = np.vstack([self._vectors, vectors.astype(np.float32)])
+
+    def search(self, vectors: np.ndarray, k: int = 1) -> tuple[np.ndarray, np.ndarray]:
+        if self.ntotal == 0:
+            scores = np.full((vectors.shape[0], k), -1.0, dtype=np.float32)
+            indices = np.full((vectors.shape[0], k), -1, dtype=np.int64)
+            return scores, indices
+
+        similarities = vectors @ self._vectors.T
+        best_idx = np.argmax(similarities, axis=1)
+        best_scores = similarities[np.arange(vectors.shape[0]), best_idx]
+        return best_scores.reshape(-1, 1).astype(np.float32), best_idx.reshape(-1, 1)
 
 
 class TestUniformSampler:
@@ -21,14 +52,38 @@ class TestUniformSampler:
 
 
 class TestActiveSampler:
+    def test_model_image_size_uses_pretrained_cfg(self):
+        model = MagicMock()
+        model.pretrained_cfg = {"input_size": (3, 518, 518)}
+
+        assert _resolve_model_image_size(model, 224) == 518
+
+    def test_configured_sleep_interval(self):
+        sampler = ActiveSampler(diversity_threshold=0.3, sleep_interval_seconds=2.5)
+
+        assert sampler.get_sleep_interval() == 2.5
+
+    def test_dependency_probe_reports_missing_module(self, monkeypatch):
+        real_import_module = importlib.import_module
+
+        def fake_import_module(name, package=None):
+            if name == "faiss":
+                raise ImportError("No module named 'faiss'")
+            return real_import_module(name, package)
+
+        monkeypatch.setattr("argus.capture.samplers.importlib.import_module", fake_import_module)
+
+        reason = get_active_sampler_unavailable_reason()
+
+        assert reason == "缺少依赖: faiss"
+
     def _make_sampler(self):
-        """Create an ActiveSampler with mocked model, using real FAISS."""
-        import faiss
+        """Create an ActiveSampler with mocked model and an in-memory index."""
 
         sampler = ActiveSampler(diversity_threshold=0.3)
         sampler._model = MagicMock()  # prevent real model loading
         sampler._torch = MagicMock()  # prevent real torch usage
-        sampler._faiss_index = faiss.IndexFlatIP(384)
+        sampler._faiss_index = FakeFaissIndex(384)
         return sampler
 
     def test_first_frame_always_accepted(self):

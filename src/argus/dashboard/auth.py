@@ -31,6 +31,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
 from argus.config.schema import AuthConfig
+from argus.dashboard.forms import parse_request_form
 
 if TYPE_CHECKING:
     from argus.storage.database import Database
@@ -357,7 +358,7 @@ async def login_page(request: Request):
 @auth_router.post("/login")
 async def login_handler(request: Request):
     """Handle login form submission."""
-    form = await request.form()
+    form = await parse_request_form(request)
     username = str(form.get("username", "")).strip()
     password = str(form.get("password", ""))
     next_url = str(form.get("next", "/"))
