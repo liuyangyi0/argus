@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import structlog
@@ -160,7 +161,7 @@ async def restore_backup(request: Request):
     if "/" in backup_name or "\\" in backup_name or ".." in backup_name:
         return JSONResponse({"error": "备份名称无效"}, status_code=400)
 
-    success = backup_manager.restore_database(backup_name)
+    success = await asyncio.to_thread(backup_manager.restore_database, backup_name)
     if success:
         logger.info("restore.ok", backup=backup_name)
         return JSONResponse(
@@ -183,7 +184,7 @@ async def restore_backup(request: Request):
 
 
 @router.delete("/{backup_name}")
-async def delete_backup(request: Request, backup_name: str):
+def delete_backup(request: Request, backup_name: str):
     """Delete a specific backup."""
     backup_manager = getattr(request.app.state, "backup_manager", None)
     if not backup_manager:

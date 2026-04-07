@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { Card, Steps, Tabs, Descriptions, Badge, Button, Typography, Space, Statistic, Row, Col, Empty } from 'ant-design-vue'
 import { ArrowLeftOutlined } from '@ant-design/icons-vue'
 import { getCameraDetail } from '../api'
+import { useGo2RTC } from '../composables/useGo2RTC'
 
 const route = useRoute()
 const router = useRouter()
@@ -24,6 +25,7 @@ async function fetchCamera() {
 onMounted(() => {
   fetchCamera()
   pollTimer = setInterval(fetchCamera, 5000)
+  startStream()
 })
 
 onUnmounted(() => {
@@ -31,10 +33,12 @@ onUnmounted(() => {
     clearInterval(pollTimer)
     pollTimer = null
   }
+  stopStream()
 })
 
-// const snapshotUrl = computed(() => `/api/cameras/${cameraId}/snapshot?t=${Date.now()}`)
-const streamUrl = computed(() => `/api/cameras/${cameraId}/stream`)
+// go2rtc WebRTC/MSE player
+const { videoRef, status: streamStatus, start: startStream, stop: stopStream } = useGo2RTC(cameraId)
+const mjpegUrl = computed(() => `/api/cameras/${cameraId}/stream`)
 
 const lifecycleStep = computed(() => {
   if (!camera.value) return 0
@@ -133,12 +137,26 @@ const configEntries = computed(() => flattenEntries(camera.value?.config))
     <Tabs>
       <Tabs.TabPane key="live" tab="实时画面">
         <Card>
-          <div v-if="camera?.connected" style="text-align: center">
+          <div v-if="camera?.connected" style="text-align: center; position: relative">
+            <!-- WebRTC / MSE via go2rtc -->
+            <video
+              v-if="streamStatus === 'playing' || streamStatus === 'connecting'"
+              ref="videoRef"
+              autoplay
+              muted
+              playsinline
+              style="max-width: 100%; border-radius: 8px; background: #000"
+            />
+            <!-- MJPEG fallback -->
             <img
-              :src="streamUrl"
+              v-else-if="streamStatus === 'fallback'"
+              :src="mjpegUrl"
               style="max-width: 100%; border-radius: 8px; background: #000"
               alt="实时画面"
             />
+            <div v-if="streamStatus === 'connecting'" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #999; font-size: 14px">
+              连接中...
+            </div>
           </div>
           <div v-else style="text-align: center; padding: 64px; color: #666">
             摄像头离线

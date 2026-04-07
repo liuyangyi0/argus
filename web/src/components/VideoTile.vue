@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted, watch, ref } from 'vue'
 import { Badge, Typography } from 'ant-design-vue'
 import Sparkline from './Sparkline.vue'
+import { useGo2RTC } from '../composables/useGo2RTC'
 
 export interface CameraTileData {
   camera_id: string
@@ -42,11 +43,52 @@ const statusBadge = computed(() => {
   return 'default'
 })
 
-const streamUrl = computed(() => `/api/cameras/${props.camera.camera_id}/stream`)
+// go2rtc WebRTC/MSE player
+const cameraIdRef = computed(() => props.camera.camera_id)
+const { videoRef, status: streamStatus, start, stop } = useGo2RTC(cameraIdRef)
+
+// Legacy MJPEG fallback URL
+const mjpegUrl = computed(() => `/api/cameras/${props.camera.camera_id}/stream`)
+
+// Visibility-based streaming: stop when tile is not visible
+const tileRef = ref<HTMLElement | null>(null)
+let observer: IntersectionObserver | null = null
+
+onMounted(() => {
+  // IntersectionObserver is the sole trigger for start/stop —
+  // it fires immediately for visible elements on mount.
+  if (tileRef.value) {
+    observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting && props.camera.status === 'online') {
+          if (streamStatus.value === 'idle') start()
+        } else if (!entry.isIntersecting) {
+          stop()
+        }
+      },
+      { threshold: 0.1 },
+    )
+    observer.observe(tileRef.value)
+  }
+})
+
+watch(() => props.camera.status, (newStatus, oldStatus) => {
+  if (newStatus === oldStatus) return
+  if (newStatus === 'online') {
+    start()
+  } else {
+    stop()
+  }
+})
+
+onUnmounted(() => {
+  observer?.disconnect()
+})
 </script>
 
 <template>
   <div
+    ref="tileRef"
     :style="{
       ...borderStyle,
       borderRadius: '6px',
@@ -71,17 +113,35 @@ const streamUrl = computed(() => `/api/cameras/${props.camera.camera_id}/stream`
 
     <!-- Video stream -->
     <div style="flex: 1; min-height: 0; position: relative; background: #000">
+      <!-- WebRTC / MSE via go2rtc -->
+      <video
+        v-if="camera.status === 'online' && (streamStatus === 'playing' || streamStatus === 'connecting')"
+        ref="videoRef"
+        autoplay
+        muted
+        playsinline
+        style="width: 100%; height: 100%; object-fit: contain; display: block"
+      />
+      <!-- MJPEG fallback when go2rtc is unavailable -->
       <img
-        v-if="camera.status === 'online'"
-        :src="streamUrl"
+        v-else-if="camera.status === 'online' && streamStatus === 'fallback'"
+        :src="mjpegUrl"
         style="width: 100%; height: 100%; object-fit: contain; display: block"
         :alt="camera.camera_id"
       />
+      <!-- Offline state -->
       <div
-        v-else
+        v-else-if="camera.status !== 'online'"
         style="width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #4a5568; font-size: 13px"
       >
         {{ camera.degradation === 'rtsp_broken' ? '重连中...' : '离线' }}
+      </div>
+      <!-- Connecting indicator -->
+      <div
+        v-if="streamStatus === 'connecting'"
+        style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #64748b; font-size: 12px"
+      >
+        连接中...
       </div>
     </div>
 

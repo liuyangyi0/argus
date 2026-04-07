@@ -325,7 +325,7 @@ async def retire_model(request: Request, version_id: str):
 
 
 @router.delete("/{version_id}")
-async def delete_model(request: Request, version_id: str):
+def delete_model(request: Request, version_id: str):
     """Delete a model version (only non-active, non-production models)."""
     registry = _get_registry(request)
     if registry is None:

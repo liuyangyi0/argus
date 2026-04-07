@@ -21,6 +21,11 @@ export const startCamera = (id: string) => api.post(`/cameras/${id}/start`)
 export const stopCamera = (id: string) => api.post(`/cameras/${id}/stop`)
 export const getUsbDevices = () => api.get('/cameras/usb-devices')
 
+// ── Streaming (go2rtc) ──
+export const getStreamInfo = (id: string) => api.get(`/streaming/${id}`)
+export const getStreams = () => api.get('/streaming')
+export const registerStream = (id: string) => api.post(`/streaming/${id}/register`)
+
 // ── Alerts ──
 export const getAlerts = (params?: Record<string, any>) => api.get('/alerts/json', { params })
 export const getAlert = (id: string) => api.get(`/alerts/${id}/detail`)
