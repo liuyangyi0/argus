@@ -159,8 +159,8 @@ class AlertDispatcher:
                     "severity": alert.severity.value,
                     "anomaly_score": round(alert.anomaly_score, 4),
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("dispatch.websocket_failed", alert_id=alert.alert_id, error=str(e))
 
         logger.info(
             "alert.dispatched",

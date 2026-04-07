@@ -836,6 +836,17 @@ class CameraManager:
                             error=str(e),
                         )
 
+            # Prune stale alert grader trackers (hourly equivalent)
+            # Watchdog runs every ~15s, prune every ~240 iterations ≈ hourly
+            if not hasattr(self, "_watchdog_ticks"):
+                self._watchdog_ticks = 0
+            self._watchdog_ticks += 1
+            if self._watchdog_ticks % max(1, int(3600 / interval)) == 0:
+                for pipeline in list(self._pipelines.values()):
+                    grader = getattr(pipeline, "_alert_grader", None)
+                    if grader and hasattr(grader, "prune_stale_trackers"):
+                        grader.prune_stale_trackers()
+
             # Write heartbeat file for external process monitors
             try:
                 from pathlib import Path
