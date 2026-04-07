@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +27,7 @@ class ModelRegistry:
     def __init__(self, session_factory):
         self._session_factory = session_factory
         self._counter = 0
+        self._counter_lock = threading.Lock()
 
     def register(
         self,
@@ -46,8 +48,10 @@ class ModelRegistry:
         code_version = self._get_git_hash()
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        self._counter += 1
-        model_version_id = f"{camera_id}-{model_type}-{ts}-{self._counter:04d}"
+        with self._counter_lock:
+            self._counter += 1
+            counter_val = self._counter
+        model_version_id = f"{camera_id}-{model_type}-{ts}-{counter_val:04d}"
 
         record = ModelRecord(
             model_version_id=model_version_id,
@@ -104,10 +108,14 @@ class ModelRegistry:
                 .first()
             )
 
-    # Valid stage transitions (nuclear safety: no skipping stages)
+    # Valid stage transitions — must match release_pipeline._VALID_TRANSITIONS
     _VALID_TRANSITIONS: dict[str, set[str]] = {
         ModelStage.CANDIDATE.value: {ModelStage.SHADOW.value, ModelStage.RETIRED.value},
-        ModelStage.SHADOW.value: {ModelStage.CANARY.value, ModelStage.RETIRED.value},
+        ModelStage.SHADOW.value: {
+            ModelStage.CANARY.value,
+            ModelStage.CANDIDATE.value,
+            ModelStage.RETIRED.value,
+        },
         ModelStage.CANARY.value: {
             ModelStage.PRODUCTION.value,
             ModelStage.SHADOW.value,
@@ -289,19 +297,37 @@ class ModelRegistry:
                 .first()
             )
 
-            # Find the previous model (most recent non-active, or second most recent)
-            query = (
-                session.query(ModelRecord)
-                .filter_by(camera_id=camera_id)
-                .order_by(ModelRecord.created_at.desc())
-            )
-            candidates = list(query.all())
-
+            # Find the previous production model via version event history
             previous = None
-            for candidate in candidates:
-                if current is None or candidate.model_version_id != current.model_version_id:
-                    previous = candidate
-                    break
+            if current is not None:
+                # Look for the model that was retired when current was promoted
+                prev_event = (
+                    session.query(ModelVersionEvent)
+                    .filter_by(
+                        camera_id=camera_id,
+                        to_stage=ModelStage.RETIRED.value,
+                    )
+                    .filter(ModelVersionEvent.reason.contains(current.model_version_id))
+                    .order_by(ModelVersionEvent.timestamp.desc())
+                    .first()
+                )
+                if prev_event:
+                    previous = (
+                        session.query(ModelRecord)
+                        .filter_by(model_version_id=prev_event.from_version)
+                        .first()
+                    )
+
+            # Fallback: find most recent non-current model that was ever in production
+            if previous is None:
+                candidates = (
+                    session.query(ModelRecord)
+                    .filter_by(camera_id=camera_id)
+                    .filter(ModelRecord.model_version_id != (current.model_version_id if current else ""))
+                    .order_by(ModelRecord.created_at.desc())
+                    .all()
+                )
+                previous = candidates[0] if candidates else None
 
             if previous is None:
                 logger.warning("model_registry.rollback_no_previous", camera_id=camera_id)

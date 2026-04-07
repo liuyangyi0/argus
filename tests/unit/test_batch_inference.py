@@ -50,6 +50,7 @@ class TestBatchInferenceEndpoint:
 
         mgr = MagicMock()
         mgr._pipelines = {}
+        mgr.get_detector_status.return_value = None
         request = self._make_request(
             {"camera_id": "cam_99", "image_paths": ["/tmp/a.jpg"]},
             camera_manager=mgr,
@@ -62,7 +63,7 @@ class TestBatchInferenceEndpoint:
         from argus.dashboard.routes.models import batch_inference
 
         pipeline = MagicMock()
-        pipeline._detector = None
+        pipeline._anomaly_detector = None
         mgr = MagicMock()
         mgr._pipelines = {"cam_01": pipeline}
         request = self._make_request(
@@ -86,7 +87,7 @@ class TestBatchInferenceEndpoint:
         detector.predict.return_value = {"score": 0.7}
 
         pipeline = MagicMock()
-        pipeline._detector = detector
+        pipeline._anomaly_detector = detector
 
         mgr = MagicMock()
         mgr._pipelines = {"cam_01": pipeline}
@@ -115,7 +116,7 @@ class TestBatchInferenceEndpoint:
         detector.threshold = 0.5
 
         pipeline = MagicMock()
-        pipeline._detector = detector
+        pipeline._anomaly_detector = detector
 
         mgr = MagicMock()
         mgr._pipelines = {"cam_01": pipeline}
