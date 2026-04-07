@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import cv2
@@ -16,6 +17,7 @@ from argus.dashboard.components import (
     pipeline_stepper,
     status_dot,
 )
+from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 
 logger = structlog.get_logger()
 
@@ -36,6 +38,20 @@ class AddCameraRequest(BaseModel):
 
 _STAGE_IDS = ["capture", "review", "training", "deploy", "inference"]
 _STAGE_NAMES = {"capture": "采集", "review": "基线审查", "training": "训练", "deploy": "发布", "inference": "推理"}
+
+
+def _find_camera_config(request: Request, camera_id: str):
+    """Find camera config from the running manager first, then persisted app config."""
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    if camera_manager is not None:
+        config = next((c for c in getattr(camera_manager, "_cameras", []) if c.camera_id == camera_id), None)
+        if config is not None:
+            return config
+
+    app_config = getattr(request.app.state, "config", None)
+    if app_config is not None:
+        return next((c for c in getattr(app_config, "cameras", []) if c.camera_id == camera_id), None)
+    return None
 
 
 def _get_lifecycle_stages(request: Request, camera_id: str, *, cam_status=None) -> list[dict]:
@@ -400,7 +416,7 @@ async def add_camera(request: Request):
     if not camera_manager or not config:
         return JSONResponse({"error": "不可用"}, status_code=503)
 
-    form = await request.form()
+    form = await parse_request_form(request)
     camera_id = form.get("camera_id", "").strip()
     name = form.get("name", "").strip()
     source = form.get("source", "").strip()
@@ -411,8 +427,13 @@ async def add_camera(request: Request):
     if not camera_id or not name or not source:
         return JSONResponse({"error": "请填写所有必填字段"}, status_code=400)
 
-    # Check for duplicate
-    existing_ids = [c.camera_id for c in config.cameras]
+    manager_cameras = getattr(camera_manager, "_cameras", None)
+
+    # Check for duplicate across config and running manager state
+    existing_ids = {c.camera_id for c in config.cameras}
+    if isinstance(manager_cameras, list):
+        existing_ids.update(c.camera_id for c in manager_cameras)
+
     if camera_id in existing_ids:
         return JSONResponse({"error": f"摄像头 {camera_id} 已存在"}, status_code=400)
 
@@ -435,12 +456,31 @@ async def add_camera(request: Request):
     )
 
     config.cameras.append(cam_config)
+    added_to_manager = False
+
+    try:
+        if isinstance(manager_cameras, list) and manager_cameras is not config.cameras:
+            manager_cameras.append(cam_config)
+            added_to_manager = True
+
+        config_path = getattr(request.app.state, "config_path", None)
+        if config_path:
+            from argus.config.loader import save_config as _save_config
+
+            _save_config(config, config_path)
+    except Exception:
+        config.cameras = [camera for camera in config.cameras if camera is not cam_config]
+        if added_to_manager and isinstance(manager_cameras, list):
+            manager_cameras[:] = [camera for camera in manager_cameras if camera is not cam_config]
+        logger.exception("camera.add_failed", camera_id=camera_id)
+        return JSONResponse({"error": "摄像头配置保存失败"}, status_code=500)
+
     # Note: camera is added to config but not started. User must click "start".
     logger.info("camera.added", camera_id=camera_id, source=source)
 
     # Return the refreshed camera list
     return HTMLResponse(
-        headers={"HX-Trigger": '{"showToast": {"message": "摄像头已添加", "type": "success"}}'},
+        headers=htmx_toast_headers("摄像头已添加"),
         content='<div hx-get="/api/cameras" hx-trigger="load" hx-swap="outerHTML"></div>',
     )
 
@@ -452,11 +492,11 @@ async def start_camera(request: Request, camera_id: str):
     if not camera_manager:
         return JSONResponse({"error": "不可用"}, status_code=503)
 
-    success = camera_manager.start_camera(camera_id)
+    success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
     if success:
         return JSONResponse(
             {"status": "ok"},
-            headers={"HX-Trigger": '{"showToast": {"message": "摄像头已启动", "type": "success"}}'},
+            headers=htmx_toast_headers("摄像头已启动"),
         )
     return JSONResponse({"error": "启动失败"}, status_code=500)
 
@@ -468,11 +508,51 @@ async def stop_camera(request: Request, camera_id: str):
     if not camera_manager:
         return JSONResponse({"error": "不可用"}, status_code=503)
 
-    camera_manager.stop_camera(camera_id)
+    await asyncio.to_thread(camera_manager.stop_camera, camera_id)
     return JSONResponse(
         {"status": "ok"},
-        headers={"HX-Trigger": '{"showToast": {"message": "摄像头已停止", "type": "success"}}'},
+        headers=htmx_toast_headers("摄像头已停止"),
     )
+
+
+@router.get("/usb-devices")
+async def usb_devices(request: Request):
+    """Probe USB camera indices 0-9 and return available devices."""
+    import asyncio
+
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    # Indices already occupied by running USB cameras
+    in_use: set[int] = set()
+    if camera_manager:
+        for cfg in camera_manager._cameras:
+            if cfg.protocol == "usb" and cfg.camera_id in camera_manager._threads:
+                try:
+                    in_use.add(int(cfg.source))
+                except (ValueError, TypeError):
+                    pass
+
+    def _probe() -> list[dict]:
+        results = []
+        for idx in range(10):
+            if idx in in_use:
+                continue
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            try:
+                if cap.isOpened():
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    results.append({
+                        "index": idx,
+                        "name": f"USB Camera {idx}",
+                        "width": w,
+                        "height": h,
+                    })
+            finally:
+                cap.release()
+        return results
+
+    devices = await asyncio.to_thread(_probe)
+    return JSONResponse(devices)
 
 
 @router.get("/json")
@@ -480,9 +560,9 @@ async def cameras_json(request: Request):
     """JSON API for camera status."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return []
+        return JSONResponse({"cameras": []})
 
-    return [
+    return JSONResponse({"cameras": [
         {
             "camera_id": s.camera_id,
             "name": s.name,
@@ -497,7 +577,65 @@ async def cameras_json(request: Request):
             } if s.stats else None,
         }
         for s in camera_manager.get_status()
-    ]
+    ]})
+
+
+@router.get("/{camera_id}/detail/json")
+async def camera_detail(request: Request, camera_id: str):
+    """Return a detailed camera payload for the detail page."""
+    camera_manager = request.app.state.camera_manager
+    camera_config = _find_camera_config(request, camera_id)
+    if camera_config is None:
+        return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
+
+    status = None
+    if camera_manager is not None:
+        status = next((item for item in camera_manager.get_status() if item.camera_id == camera_id), None)
+
+    runner = camera_manager.get_runner_snapshot(camera_id) if camera_manager else None
+    detector = camera_manager.get_detector_status(camera_id) if camera_manager else None
+    learning = camera_manager.get_learning_progress(camera_id) if camera_manager else None
+    pipeline_mode = camera_manager.get_pipeline_mode(camera_id) if camera_manager else None
+    anomaly_locked = camera_manager.is_anomaly_locked(camera_id) if camera_manager else False
+
+    health_monitor = getattr(request.app.state, "health_monitor", None)
+    health = health_monitor.get_camera_health(camera_id) if health_monitor is not None else None
+
+    stats = None
+    if status is not None and status.stats is not None:
+        stats = {
+            "frames_captured": status.stats.frames_captured,
+            "frames_analyzed": status.stats.frames_analyzed,
+            "anomalies_detected": status.stats.anomalies_detected,
+            "alerts_emitted": status.stats.alerts_emitted,
+            "avg_latency_ms": round(status.stats.avg_latency_ms, 1),
+        }
+
+    return JSONResponse({
+        "camera_id": camera_id,
+        "name": camera_config.name,
+        "connected": status.connected if status is not None else False,
+        "running": status.running if status is not None else False,
+        "stats": stats,
+        "config": camera_config.model_dump(mode="json"),
+        "runtime": {
+            "pipeline_mode": pipeline_mode,
+            "anomaly_locked": anomaly_locked,
+            "learning_progress": learning,
+        },
+        "runner": {
+            "model_ref": runner.model_ref,
+            "health_status": runner.health_status,
+            "cusum_state": runner.cusum_state,
+            "lock_state": runner.lock_state.value,
+            "last_heartbeat": runner.last_heartbeat,
+            "version_tag": runner.version_tag,
+            "degradation_state": runner.degradation_state.value,
+            "consecutive_failures": runner.consecutive_failures,
+        } if runner is not None else None,
+        "detector": detector,
+        "health": health,
+    })
 
 
 @router.get("/{camera_id}/runner")
@@ -653,7 +791,8 @@ async def wall_status(request: Request):
     health_monitor = getattr(request.app.state, "health_monitor", None)
 
     cameras = []
-    for cam_id, cam_status in camera_manager.get_all_status().items():
+    for cam_status in camera_manager.get_status():
+        cam_id = cam_status.camera_id
         tile: dict = {
             "camera_id": cam_id,
             "name": getattr(cam_status, "name", cam_id),

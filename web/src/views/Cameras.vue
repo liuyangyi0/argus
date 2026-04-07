@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Table, Badge, Button, Typography, Space, Modal, Form, Input, Select, InputNumber, message } from 'ant-design-vue'
 import { PlusOutlined } from '@ant-design/icons-vue'
-import api, { getCameras, startCamera, stopCamera } from '../api'
+import api, { getCameras, startCamera, stopCamera, getUsbDevices } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
 const router = useRouter()
@@ -19,10 +19,27 @@ const addForm = ref({
   resolution: '1920,1080',
 })
 
+const usbDevices = ref<{ index: number; name: string; width: number; height: number }[]>([])
+const usbLoading = ref(false)
+
+watch(() => addForm.value.protocol, async (proto) => {
+  if (proto === 'usb') {
+    usbLoading.value = true
+    try {
+      const res = await getUsbDevices()
+      usbDevices.value = res.data
+      if (res.data.length > 0) {
+        addForm.value.source = String(res.data[0].index)
+      }
+    } catch { usbDevices.value = [] }
+    finally { usbLoading.value = false }
+  }
+})
+
 async function fetchData() {
   try {
     const res = await getCameras()
-    cameras.value = res.data
+    cameras.value = res.data.cameras || []
   } finally {
     loading.value = false
   }
@@ -117,7 +134,18 @@ const columns = [
           <Input v-model:value="addForm.name" placeholder="反应堆厂房入口" />
         </Form.Item>
         <Form.Item label="视频源" required>
-          <Input v-model:value="addForm.source" placeholder="rtsp://admin:pass@192.168.1.100:554/stream" />
+          <Select
+            v-if="addForm.protocol === 'usb'"
+            v-model:value="addForm.source"
+            :loading="usbLoading"
+            :placeholder="usbLoading ? '正在检测...' : '选择 USB 摄像头'"
+            :not-found-content="usbLoading ? '检测中...' : '未检测到 USB 摄像头'"
+          >
+            <Select.Option v-for="d in usbDevices" :key="d.index" :value="String(d.index)">
+              {{ d.name }} ({{ d.width }}x{{ d.height }})
+            </Select.Option>
+          </Select>
+          <Input v-else v-model:value="addForm.source" :placeholder="addForm.protocol === 'file' ? 'data/video.mp4' : 'rtsp://admin:pass@192.168.1.100:554/stream'" />
         </Form.Item>
         <Space>
           <Form.Item label="协议">

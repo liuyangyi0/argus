@@ -16,8 +16,10 @@ api.interceptors.response.use(
 
 // ── Cameras ──
 export const getCameras = () => api.get('/cameras/json')
+export const getCameraDetail = (id: string) => api.get(`/cameras/${id}/detail/json`)
 export const startCamera = (id: string) => api.post(`/cameras/${id}/start`)
 export const stopCamera = (id: string) => api.post(`/cameras/${id}/stop`)
+export const getUsbDevices = () => api.get('/cameras/usb-devices')
 
 // ── Alerts ──
 export const getAlerts = (params?: Record<string, any>) => api.get('/alerts/json', { params })
@@ -36,7 +38,7 @@ export const getHealth = () => api.get('/system/health')
 
 // ── Baselines ──
 export const getBaselines = () => api.get('/baseline/list/json')
-export const startCapture = (data: FormData) => api.post('/baseline/capture', data)
+export const startCapture = (data: FormData) => api.post('/baseline/job', data)
 export const optimizeBaseline = (data: { camera_id: string; zone_id?: string; target_ratio?: number }) =>
   api.post('/baseline/optimize/json', data)
 export const previewOptimize = (params: { camera_id: string; zone_id?: string; target_ratio?: number }) =>
@@ -67,6 +69,8 @@ export const activateBaseline = (data: { camera_id: string; zone_id?: string; ve
   api.post('/baseline/activate-baseline', data)
 export const retireBaseline = (data: { camera_id: string; zone_id?: string; version: string; user?: string; reason?: string }) =>
   api.post('/baseline/retire', data)
+export const deleteBaselineVersion = (data: { camera_id: string; zone_id?: string; version: string; user?: string }) =>
+  api.post('/baseline/version/delete', data)
 
 // ── Training ──
 export const startTraining = (data: FormData) => api.post('/baseline/train', data)
