@@ -95,6 +95,9 @@ cameras:
     jpeg_quality: 85
     max_recording_age_days: 30
     archive_dir: data/recordings
+  low_light:
+    enabled: true
+    brightness_threshold: 40.0
 - camera_id: c
   name: c
   source: '0'
@@ -190,6 +193,9 @@ cameras:
     jpeg_quality: 85
     max_recording_age_days: 30
     archive_dir: data/recordings
+  low_light:
+    enabled: true
+    brightness_threshold: 40.0
 alerts:
   severity_thresholds:
     info: 0.5

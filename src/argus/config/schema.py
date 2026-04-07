@@ -361,6 +361,22 @@ class RingBufferConfig(BaseModel):
     )
 
 
+class LowLightConfig(BaseModel):
+    """Low-light detection: bypass MOG2 when scene is dark.
+
+    When mean frame brightness drops below ``brightness_threshold``, the
+    pipeline skips the MOG2 pre-filter (which would otherwise discard the
+    frame as "no change") and shortens the heartbeat interval so that
+    temporal evidence can accumulate and trigger alerts.
+    """
+
+    enabled: bool = Field(default=True, description="Enable automatic low-light MOG2 bypass")
+    brightness_threshold: float = Field(
+        default=40.0, ge=5.0, le=128.0,
+        description="Mean grayscale brightness below which low-light mode activates",
+    )
+
+
 class CameraConfig(BaseModel):
     """Configuration for a single camera."""
 
@@ -394,6 +410,7 @@ class CameraConfig(BaseModel):
     drift: DriftConfig = Field(default_factory=DriftConfig)
     degradation: DegradationConfig = Field(default_factory=DegradationConfig)
     ring_buffer: RingBufferConfig = Field(default_factory=RingBufferConfig)
+    low_light: LowLightConfig = Field(default_factory=LowLightConfig)
 
 
 class CameraGroupConfig(BaseModel):
