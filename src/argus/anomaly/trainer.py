@@ -254,6 +254,7 @@ class ModelTrainer:
         resume_from: str | None = None,
         group_id: str | None = None,
         backbone_checkpoint: str | None = None,
+        skip_baseline_validation: bool = False,
     ) -> TrainingResult:
         """Train an anomaly detection model for a specific camera/zone.
 
@@ -314,13 +315,21 @@ class ModelTrainer:
 
         pre_validation = self._validate_baseline_quality(baseline_dir, min_images=min_images)
         if not pre_validation["passed"]:
-            error_msg = "; ".join(pre_validation["errors"])
-            return self._fail(
-                start,
-                error=f"基线质量验证失败: {error_msg}",
-                image_count=image_count,
-                pre_validation=pre_validation,
-            )
+            if skip_baseline_validation:
+                logger.warning(
+                    "training.validation_skipped",
+                    camera_id=camera_id,
+                    errors=pre_validation["errors"],
+                    msg="Baseline validation failed but skip_baseline_validation=True",
+                )
+            else:
+                error_msg = "; ".join(pre_validation["errors"])
+                return self._fail(
+                    start,
+                    error=f"基线质量验证失败: {error_msg}",
+                    image_count=image_count,
+                    pre_validation=pre_validation,
+                )
 
         logger.info(
             "training.started",
@@ -331,6 +340,7 @@ class ModelTrainer:
             corruption_rate=pre_validation["corruption_rate"],
             near_duplicate_rate=pre_validation["near_duplicate_rate"],
             brightness_std=round(pre_validation["brightness_std"], 2),
+            validation_skipped=skip_baseline_validation,
         )
 
         output_dir = self._models_dir / camera_id / zone_id
