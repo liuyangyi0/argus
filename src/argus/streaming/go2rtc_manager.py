@@ -118,6 +118,7 @@ class Go2RTCManager:
         cfg: dict[str, Any] = {
             "api": {
                 "listen": f":{self.api_port}",
+                "origin": "*",
             },
             "rtsp": {
                 "listen": f":{self.rtsp_port}",
@@ -142,6 +143,49 @@ class Go2RTCManager:
     # Process lifecycle
     # ------------------------------------------------------------------
 
+    def _kill_stale_process(self) -> None:
+        """Kill any orphaned go2rtc still occupying our API port."""
+        try:
+            resp = self._http.get("/api", timeout=2)
+            if resp.status_code == 200:
+                logger.warning("go2rtc.killing_stale", port=self.api_port)
+                # Try graceful exit via API first
+                try:
+                    self._http.post("/api/exit", timeout=2)
+                except Exception:
+                    pass
+                time.sleep(1)
+                # If still alive, find and kill by port (Windows)
+                if platform.system() == "Windows":
+                    try:
+                        result = subprocess.run(
+                            ["netstat", "-ano"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        for line in result.stdout.splitlines():
+                            if f":{self.api_port}" in line and "LISTENING" in line:
+                                pid = line.strip().split()[-1]
+                                subprocess.run(
+                                    ["taskkill", "/F", "/PID", pid],
+                                    capture_output=True, timeout=5,
+                                )
+                                logger.info("go2rtc.stale_killed", pid=pid)
+                                break
+                    except Exception as exc:
+                        logger.warning("go2rtc.stale_kill_failed", error=str(exc))
+                else:
+                    # Unix: use fuser or lsof
+                    try:
+                        subprocess.run(
+                            ["fuser", "-k", f"{self.api_port}/tcp"],
+                            capture_output=True, timeout=5,
+                        )
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+        except (httpx.ConnectError, httpx.ReadTimeout):
+            pass  # No stale process — port is free
+
     def start(self, initial_streams: dict[str, str] | None = None) -> None:
         """Start the go2rtc process.
 
@@ -154,6 +198,9 @@ class Go2RTCManager:
         if self._process and self._process.poll() is None:
             logger.warning("go2rtc.already_running", pid=self._process.pid)
             return
+
+        # Kill orphaned go2rtc from a previous run that wasn't cleaned up
+        self._kill_stale_process()
 
         if self._binary is None:
             logger.error(
@@ -336,10 +383,18 @@ class Go2RTCManager:
         except ValueError:
             pass  # stdout closed
 
+    _closed = False
+
     def close(self) -> None:
-        """Stop the process and release HTTP resources."""
+        """Stop the process and release HTTP resources (idempotent)."""
+        if self._closed:
+            return
+        self._closed = True
         self.stop()
-        self._http.close()
+        try:
+            self._http.close()
+        except Exception:
+            pass
         # Clean up auto-created temp config directory
         if self._auto_config_dir and self._config_dir.exists():
             shutil.rmtree(self._config_dir, ignore_errors=True)

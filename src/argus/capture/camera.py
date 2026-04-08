@@ -172,6 +172,17 @@ class CameraCapture:
         if self._cap is None or not self._state.connected:
             return None
 
+        # FPS throttle: sleep until next frame interval to avoid busy-read loop.
+        # This MUST happen before _cap.read() — decoding frames only to discard
+        # them wastes CPU, especially for video files at 25-30fps with a low
+        # fps_target (e.g. 5).
+        if self._frame_interval > 0:
+            now = time.monotonic()
+            elapsed = now - self._state.last_frame_time
+            remaining = self._frame_interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
         ret, frame = self._cap.read()
         # CRIT-05: Copy immediately to decouple from VideoCapture's internal buffer
         if ret and frame is not None:
@@ -195,15 +206,8 @@ class CameraCapture:
                 return None
 
         self._frame_count += 1
-        now = time.monotonic()
 
-        # FPS decimation: skip frames to match target FPS
-        if self._frame_interval > 0:
-            elapsed = now - self._state.last_frame_time
-            if elapsed < self._frame_interval:
-                return None
-
-        self._state.last_frame_time = now
+        self._state.last_frame_time = time.monotonic()
         self._state.total_frames += 1
 
         h, w = frame.shape[:2]

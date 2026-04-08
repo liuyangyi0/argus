@@ -1240,3 +1240,238 @@ class ModelTrainer:
                 "training.int8_fallback",
                 msg="Keeping FP model — INT8 quantization failed",
             )
+
+    # ── Re-export & Re-calibrate ──
+
+    @staticmethod
+    def _find_checkpoint(model_dir: Path) -> Path | None:
+        """Find the best Lightning checkpoint in a model directory."""
+        ckpts = sorted(
+            model_dir.rglob("*.ckpt"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return ckpts[0] if ckpts else None
+
+    @staticmethod
+    def _instantiate_model(model_type: str):
+        """Instantiate an Anomalib model class by type name."""
+        if model_type == "efficient_ad":
+            from anomalib.models import EfficientAd
+            return EfficientAd()
+        elif model_type == "fastflow":
+            from anomalib.models import Fastflow
+            return Fastflow(backbone="resnet18", flow_steps=8)
+        elif model_type == "padim":
+            from anomalib.models import Padim
+            return Padim(backbone="resnet18", layers=["layer1", "layer2", "layer3"])
+        elif model_type == "dinomaly2":
+            try:
+                from anomalib.models import Dinomaly
+                return Dinomaly()
+            except ImportError:
+                from anomalib.models import Patchcore
+                return Patchcore(
+                    backbone="wide_resnet50_2",
+                    layers=["layer2", "layer3"],
+                    coreset_sampling_ratio=0.1,
+                )
+        else:  # patchcore (default)
+            from anomalib.models import Patchcore
+            return Patchcore(
+                backbone="wide_resnet50_2",
+                layers=["layer2", "layer3"],
+                coreset_sampling_ratio=0.1,
+            )
+
+    def reexport_model(
+        self,
+        model_dir: Path,
+        export_format: str = "openvino",
+        quantization: str = "fp16",
+        model_type: str = "patchcore",
+        image_size: int = 256,
+        calibration_images: int = 100,
+    ) -> dict:
+        """Re-export a model from its checkpoint, fitting PostProcessor MinMax.
+
+        This is the definitive fix for the MinMax normalization bug (min=inf,
+        max=-inf) — engine.export() internally calls post_processor.fit().
+
+        Args:
+            model_dir: Path to the model training output directory.
+            export_format: Target format: openvino, onnx, or torch.
+            quantization: fp16, fp32, or int8 (int8 only for openvino).
+            model_type: Anomalib model type for class instantiation.
+            image_size: Input image size used during training.
+            calibration_images: Number of images for INT8 calibration.
+
+        Returns:
+            Dict with status, export_path, and format.
+        """
+        ckpt = self._find_checkpoint(model_dir)
+        if ckpt is None:
+            return {"status": "error", "error": "未找到 checkpoint (.ckpt) 文件"}
+
+        # Derive camera_id / zone_id from model_dir path structure:
+        # data/models/{camera_id}/{zone_id}
+        parts = model_dir.parts
+        zone_id = parts[-1] if len(parts) >= 2 else "default"
+        camera_id = parts[-2] if len(parts) >= 2 else "unknown"
+
+        export_path = str(self._exports_dir / camera_id / zone_id)
+
+        try:
+            from anomalib.engine import Engine
+
+            model = self._instantiate_model(model_type)
+            export_kwargs = {}
+            if export_format in {"openvino", "onnx"}:
+                export_kwargs["onnx_kwargs"] = {"dynamo": False}
+
+            engine = Engine(default_root_dir=str(model_dir), max_epochs=1)
+            engine.export(
+                model=model,
+                export_type=export_format,
+                export_root=export_path,
+                ckpt_path=str(ckpt),
+                **export_kwargs,
+            )
+            logger.info(
+                "reexport.complete",
+                format=export_format,
+                export_path=export_path,
+                checkpoint=str(ckpt),
+            )
+        except Exception as e:
+            logger.error("reexport.failed", error=str(e))
+            return {"status": "error", "error": f"导出失败: {e}"}
+
+        # INT8 post-training quantization
+        if quantization == "int8" and export_format == "openvino":
+            # Use baseline dir as calibration source (split dir is cleaned up)
+            baseline_dir = self._baseline_manager.get_baseline_dir(camera_id, zone_id)
+            val_dir = baseline_dir if baseline_dir.is_dir() else None
+            self._quantize_int8(
+                export_path=Path(export_path),
+                val_dir=val_dir,
+                calibration_images=calibration_images,
+            )
+
+        return {
+            "status": "ok",
+            "export_path": export_path,
+            "format": export_format,
+            "quantization": quantization,
+        }
+
+    def recalibrate_model(
+        self,
+        model_dir: Path,
+        baseline_dir: Path,
+        camera_id: str,
+        zone_id: str = "default",
+    ) -> dict:
+        """Re-calibrate score normalization using baseline images.
+
+        Performs two calibrations:
+        1. Conformal calibration — statistically guaranteed FPR thresholds,
+           saved to calibration.json (used by AlertGrader).
+        2. Sigmoid calibration — raw score normalization when PostProcessor
+           MinMax is broken (midpoint + scale parameters).
+
+        Args:
+            model_dir: Path to the model training output directory.
+            baseline_dir: Path to baseline images for the camera/zone.
+            camera_id: Camera identifier.
+            zone_id: Zone identifier.
+
+        Returns:
+            Dict with status, n_samples, and calibration thresholds.
+        """
+        # Find the exported model file (prefer export dir, fallback to model dir)
+        export_dir = self._exports_dir / camera_id / zone_id
+        model_file = self._find_best_model_file(export_dir)
+        if model_file is None:
+            model_file = self._find_best_model_file(model_dir)
+        if model_file is None:
+            return {"status": "error", "error": "未找到已导出的模型文件"}
+
+        if not baseline_dir.is_dir():
+            return {"status": "error", "error": f"基线目录不存在: {baseline_dir}"}
+
+        try:
+            from argus.anomaly.detector import AnomalibDetector
+
+            detector = AnomalibDetector(model_path=model_file, threshold=0.5)
+            if not detector.load():
+                return {"status": "error", "error": "模型加载失败"}
+
+            # Collect anomaly scores from baseline images
+            scores = []
+            for img_path in sorted(baseline_dir.iterdir()):
+                if img_path.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+                    continue
+                frame = cv2.imread(str(img_path))
+                if frame is None:
+                    continue
+                prediction = detector.predict(frame)
+                score = (
+                    float(prediction.get("score", 0.0))
+                    if isinstance(prediction, dict)
+                    else float(prediction)
+                )
+                if np.isfinite(score):
+                    scores.append(score)
+
+            if len(scores) < 50:
+                return {
+                    "status": "error",
+                    "error": f"基线图片不足: {len(scores)} 个有效分数 (需要 >= 50)",
+                }
+
+            # Conformal calibration
+            from argus.alerts.calibration import ConformalCalibrator
+
+            cal_scores = np.array(scores)
+            calibrator = ConformalCalibrator()
+            cal_result = calibrator.calibrate(cal_scores)
+
+            # Save to model_dir (primary) and export_dir (if exists)
+            for save_dir in (model_dir, export_dir):
+                if save_dir.is_dir():
+                    cal_path = save_dir / "calibration.json"
+                    calibrator.save(
+                        cal_result, cal_path, sorted_scores=np.sort(cal_scores)
+                    )
+                    logger.info("recalibrate.saved", path=str(cal_path))
+
+            # Sigmoid recalibration if MinMax is broken
+            sigmoid_recalibrated = False
+            if getattr(detector, "_minmax_broken", False):
+                detector.calibrate_raw_scores(baseline_dir)
+                sigmoid_recalibrated = True
+
+            logger.info(
+                "recalibrate.complete",
+                camera_id=camera_id,
+                zone_id=zone_id,
+                n_samples=len(scores),
+                sigmoid_recalibrated=sigmoid_recalibrated,
+            )
+
+            return {
+                "status": "ok",
+                "n_samples": len(scores),
+                "thresholds": {
+                    "info": round(cal_result.info_threshold, 4),
+                    "low": round(cal_result.low_threshold, 4),
+                    "medium": round(cal_result.medium_threshold, 4),
+                    "high": round(cal_result.high_threshold, 4),
+                },
+                "sigmoid_recalibrated": sigmoid_recalibrated,
+            }
+
+        except Exception as e:
+            logger.error("recalibrate.failed", error=str(e))
+            return {"status": "error", "error": f"校准失败: {e}"}

@@ -5,21 +5,30 @@ import { Card, Button, Tag, Typography, Space, Modal, Badge, message } from 'ant
 import { getAlerts, updateAlertWorkflow, getHealth, getTasks } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
+const props = defineProps<{
+  health?: any
+}>()
+
 const router = useRouter()
 const alerts = ref<any[]>([])
-const health = ref<any>(null)
+const internalHealth = ref<any>(null)
 const tasks = ref<any[]>([])
+
+const healthData = computed(() => props.health ?? internalHealth.value)
 
 async function fetchData() {
   try {
-    const [a, h, t] = await Promise.all([
+    const fetches: Promise<any>[] = [
       getAlerts({ limit: 20 }),
-      getHealth(),
       getTasks(),
-    ])
-    alerts.value = a.data
-    health.value = h.data
-    tasks.value = t.data || []
+    ]
+    // Only fetch health internally if not provided via prop
+    if (!props.health) fetches.push(getHealth())
+
+    const results = await Promise.all(fetches)
+    alerts.value = results[0].alerts
+    tasks.value = (results[1].data || results[1])?.tasks || []
+    if (!props.health && results[2]) internalHealth.value = results[2]
   } catch { /* silent */ }
 }
 
@@ -27,7 +36,7 @@ useWebSocket({
   topics: ['alerts', 'health', 'tasks'],
   onMessage(topic, data) {
     if (topic === 'alerts') alerts.value = data
-    else if (topic === 'health') health.value = data
+    else if (topic === 'health' && !props.health) internalHealth.value = data
     else if (topic === 'tasks') tasks.value = data
   },
   fallbackPoll: fetchData,
@@ -47,9 +56,9 @@ const lowAlerts = computed(() => pendingAlerts.value.filter((a: any) =>
 ))
 
 const connectedCount = computed(() =>
-  health.value?.cameras?.filter((c: any) => c.connected).length || 0
+  healthData.value?.cameras?.filter((c: any) => c.connected).length || 0
 )
-const totalCameras = computed(() => health.value?.cameras?.length || 0)
+const totalCameras = computed(() => healthData.value?.cameras?.length || 0)
 
 const severityColor: Record<string, string> = {
   high: '#ef4444', medium: '#f97316', low: '#f59e0b', info: '#3b82f6',
@@ -90,7 +99,7 @@ async function quickAction(alertId: string, severity: string, action: string) {
     <Card size="small" style="background: #1a1a2e">
       <div style="display: flex; justify-content: space-between; align-items: center">
         <Typography.Text type="secondary">摄像头</Typography.Text>
-        <Badge :status="connectedCount === totalCameras ? 'success' : 'warning'" />
+        <Badge :status="connectedCount === totalCameras && totalCameras > 0 ? 'success' : 'warning'" />
       </div>
       <Typography.Title :level="4" style="margin: 4px 0 0">
         {{ connectedCount }}/{{ totalCameras }} 在线

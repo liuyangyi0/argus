@@ -1,4 +1,12 @@
-import axios from 'axios'
+import axios, { type AxiosResponse } from 'axios'
+import type {
+  ApiResponse,
+  CamerasPayload,
+  AlertsPayload,
+  HealthPayload,
+  TasksPayload,
+} from '../types/api'
+import { ApiError } from '../types/api'
 
 const api = axios.create({
   baseURL: '/api',
@@ -8,38 +16,64 @@ const api = axios.create({
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    const msg = err.response?.data?.error || err.message || '请求失败'
+    const body = err.response?.data
+    // {code, msg, data} envelope format
+    const msg = body?.msg
+      // Legacy format fallback
+      ?? body?.error
+      ?? err.message
+      ?? '请求失败'
     console.error('[API]', msg)
     return Promise.reject(err)
   }
 )
 
-// ── Cameras ──
-export const getCameras = () => api.get('/cameras/json')
-export const getCameraDetail = (id: string) => api.get(`/cameras/${id}/detail/json`)
-export const startCamera = (id: string) => api.post(`/cameras/${id}/start`)
-export const stopCamera = (id: string) => api.post(`/cameras/${id}/stop`)
-export const getUsbDevices = () => api.get('/cameras/usb-devices')
+/**
+ * Unwrap the unified response envelope {code, msg, data}.
+ * code=0: success, returns data directly.
+ * code>0: throws ApiError.
+ */
+function unwrap<T>(res: AxiosResponse<ApiResponse<T>>): T {
+  const body = res.data
+  if (body.code === 0) {
+    return body.data
+  }
+  throw new ApiError(body.code, body.msg, body.data)
+}
+
+// ── Cameras (P0 — envelope) ──
+export const getCameras = () =>
+  api.get<ApiResponse<CamerasPayload>>('/cameras/json').then(unwrap)
+export const getCameraDetail = (id: string) =>
+  api.get<ApiResponse<Record<string, any>>>(`/cameras/${id}/detail/json`).then(unwrap)
+export const startCamera = (id: string) =>
+  api.post<ApiResponse<Record<string, any>>>(`/cameras/${id}/start`).then(unwrap)
+export const stopCamera = (id: string) =>
+  api.post<ApiResponse<Record<string, any>>>(`/cameras/${id}/stop`).then(unwrap)
+export const getUsbDevices = () =>
+  api.get<ApiResponse<{ devices: any[] }>>('/cameras/usb-devices').then(unwrap)
 
 // ── Streaming (go2rtc) ──
 export const getStreamInfo = (id: string) => api.get(`/streaming/${id}`)
 export const getStreams = () => api.get('/streaming')
 export const registerStream = (id: string) => api.post(`/streaming/${id}/register`)
 
-// ── Alerts ──
-export const getAlerts = (params?: Record<string, any>) => api.get('/alerts/json', { params })
+// ── Alerts (P0 — envelope) ──
+export const getAlerts = (params?: Record<string, any>) =>
+  api.get<ApiResponse<AlertsPayload>>('/alerts/json', { params }).then(unwrap)
 export const getAlert = (id: string) => api.get(`/alerts/${id}/detail`)
 export const acknowledgeAlert = (id: string) => api.post(`/alerts/${id}/acknowledge`)
 export const markFalsePositive = (id: string) => api.post(`/alerts/${id}/false-positive`)
 export const updateAlertWorkflow = (id: string, data: Record<string, any>) =>
-  api.post(`/alerts/${id}/workflow`, data)
+  api.post<ApiResponse<Record<string, any>>>(`/alerts/${id}/workflow`, data).then(unwrap)
 export const bulkAcknowledge = (ids: string[]) =>
-  api.post('/alerts/bulk-acknowledge', { alert_ids: ids })
+  api.post<ApiResponse<{ count: number; message: string }>>('/alerts/bulk-acknowledge', { alert_ids: ids }).then(unwrap)
 export const bulkFalsePositive = (ids: string[]) =>
-  api.post('/alerts/bulk-false-positive', { alert_ids: ids })
+  api.post<ApiResponse<{ count: number; message: string }>>('/alerts/bulk-false-positive', { alert_ids: ids }).then(unwrap)
 
-// ── System ──
-export const getHealth = () => api.get('/system/health')
+// ── System (P0 — envelope) ──
+export const getHealth = () =>
+  api.get<ApiResponse<HealthPayload>>('/system/health').then(unwrap)
 
 // ── Baselines ──
 export const getBaselines = () => api.get('/baseline/list/json')
@@ -97,6 +131,10 @@ export const deleteModel = (versionId: string) =>
   api.delete(`/models/${versionId}`)
 export const deleteModelByPath = (modelPath: string) =>
   api.delete('/baseline/models/by-path', { data: { model_path: modelPath } })
+export const reexportModel = (versionId: string, data: { export_format?: string; quantization?: string }) =>
+  api.post(`/models/${versionId}/reexport`, data, { timeout: 300000 })
+export const recalibrateModel = (versionId: string) =>
+  api.post(`/models/${versionId}/recalibrate`, {}, { timeout: 120000 })
 
 // ── Release Pipeline ──
 export const promoteModel = (versionId: string, data: { target_stage: string; triggered_by: string; reason?: string; canary_camera_id?: string }) =>
@@ -164,8 +202,9 @@ export const getReplayReference = (alertId: string, params?: { date?: string; ti
 export const pinReplayFrame = (alertId: string, data: { index: number; label: string }) =>
   api.post(`/replay/${alertId}/pin-frame`, data)
 
-// ── Video Wall ──
-export const getWallStatus = () => api.get('/cameras/wall/status')
+// ── Video Wall (envelope) ──
+export const getWallStatus = () =>
+  api.get<ApiResponse<{ cameras: any[] }>>('/cameras/wall/status').then(unwrap)
 
 // ── Degradation ──
 export const getDegradationActive = () => api.get('/degradation/active')

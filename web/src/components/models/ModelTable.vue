@@ -2,27 +2,32 @@
 import { ref, computed } from 'vue'
 import {
   Card, Table, Button, Tag, Space, Modal, Form, Select, Input,
-  Descriptions, Drawer, Steps, message, Tooltip,
+  Descriptions, Drawer, Steps, Tooltip, Dropdown, Menu, message,
 } from 'ant-design-vue'
 import {
-  ReloadOutlined, SafetyCertificateOutlined,
+  ReloadOutlined, CheckOutlined, RollbackOutlined, DeleteOutlined,
   ExperimentOutlined, HistoryOutlined, LoadingOutlined,
+  DownOutlined, ExportOutlined, AimOutlined,
 } from '@ant-design/icons-vue'
 import {
+  activateModel, rollbackModel, deleteModel,
   promoteModel, retireModel,
   getStageHistory, getShadowReport,
+  reexportModel, recalibrateModel,
 } from '../../api'
 import { STAGE_MAP, VALID_TRANSITIONS, STAGE_LABELS } from '../../composables/useModelState'
 
 const props = defineProps<{
-  cameras: any[]
   models: any[]
+  cameras: any[]
 }>()
 
 const emit = defineEmits<{
   changed: []
 }>()
 
+// ── State ──
+const activatingModel = ref<string | null>(null)
 const promotingModel = ref<string | null>(null)
 const promoteModalVisible = ref(false)
 const promoteForm = ref({ version_id: '', target_stage: '', triggered_by: '', reason: '', canary_camera_id: '' })
@@ -32,6 +37,10 @@ const shadowReportLoading = ref(false)
 const stageHistoryVisible = ref(false)
 const stageHistory = ref<any[]>([])
 const stageHistoryLoading = ref(false)
+const reexportModalVisible = ref(false)
+const reexportForm = ref({ version_id: '', export_format: 'openvino', quantization: 'fp16' })
+const reexportLoading = ref(false)
+const recalibrateLoading = ref<string | null>(null)
 
 // ── Pipeline stats ──
 const stageCounts = computed(() => {
@@ -49,7 +58,69 @@ const sortedModels = computed(() => {
   )
 })
 
-// ── Actions ──
+// ── Actions: activate / rollback / delete ──
+
+function handleActivate(record: any) {
+  Modal.confirm({
+    title: '确认激活',
+    content: `确定要激活模型版本 ${record.model_version_id} 吗？这将停用该摄像头的其他模型。`,
+    okText: '确认',
+    cancelText: '取消',
+    async onOk() {
+      activatingModel.value = record.model_version_id
+      try {
+        await activateModel(record.model_version_id)
+        message.success(`模型 ${record.model_version_id} 已激活`)
+        emit('changed')
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '激活失败')
+      } finally {
+        activatingModel.value = null
+      }
+    },
+  })
+}
+
+function handleRollback(record: any) {
+  Modal.confirm({
+    title: '确认回滚',
+    content: `确定要回滚摄像头 ${record.camera_id} 到上一个模型版本吗？`,
+    okText: '确认回滚',
+    cancelText: '取消',
+    okType: 'danger',
+    async onOk() {
+      try {
+        const res = await rollbackModel(record.model_version_id)
+        message.success(`已回滚到 ${res.data.activated}`)
+        emit('changed')
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '回滚失败')
+      }
+    },
+  })
+}
+
+function handleDeleteModel(record: any) {
+  Modal.confirm({
+    title: '删除模型',
+    content: `确定删除模型 ${record.model_version_id}？模型文件将从磁盘永久删除。`,
+    okText: '确认删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        await deleteModel(record.model_version_id)
+        message.success('模型已删除')
+        emit('changed')
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '删除失败')
+      }
+    },
+  })
+}
+
+// ── Actions: promote / retire ──
+
 function handlePromote(record: any) {
   const transitions = VALID_TRANSITIONS[record.stage] || []
   if (transitions.length === 0) {
@@ -112,6 +183,8 @@ function handleRetire(record: any) {
   })
 }
 
+// ── Drawers: shadow report / stage history ──
+
 async function handleViewShadowReport(record: any) {
   shadowReportLoading.value = true
   shadowReportVisible.value = true
@@ -140,21 +213,85 @@ async function handleViewStageHistory(record: any) {
   }
 }
 
-const releaseColumns = [
+// ── Actions: reexport / recalibrate ──
+
+function handleReexport(record: any) {
+  reexportForm.value = {
+    version_id: record.model_version_id,
+    export_format: 'openvino',
+    quantization: 'fp16',
+  }
+  reexportModalVisible.value = true
+}
+
+async function submitReexport() {
+  reexportLoading.value = true
+  try {
+    await reexportModel(reexportForm.value.version_id, {
+      export_format: reexportForm.value.export_format,
+      quantization: reexportForm.value.quantization,
+    })
+    message.success('重新导出成功')
+    reexportModalVisible.value = false
+    emit('changed')
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '重新导出失败')
+  } finally {
+    reexportLoading.value = false
+  }
+}
+
+function handleRecalibrate(record: any) {
+  Modal.confirm({
+    title: '确认重新校准',
+    content: `确定要重新校准模型 ${record.model_version_id} 的评分标准化吗？将使用基线图片重新计算校准参数。`,
+    okText: '确认',
+    cancelText: '取消',
+    async onOk() {
+      recalibrateLoading.value = record.model_version_id
+      try {
+        const res = await recalibrateModel(record.model_version_id)
+        const n = res.data.n_samples
+        message.success(`重新校准成功 (${n} 个样本)`)
+        emit('changed')
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '重新校准失败')
+      } finally {
+        recalibrateLoading.value = null
+      }
+    },
+  })
+}
+
+// ── Dropdown menu dispatcher ──
+
+function handleMenuClick(record: any, { key }: { key: string }) {
+  switch (key) {
+    case 'reexport': handleReexport(record); break
+    case 'recalibrate': handleRecalibrate(record); break
+    case 'retire': handleRetire(record); break
+    case 'delete': handleDeleteModel(record); break
+    case 'shadow-report': handleViewShadowReport(record); break
+    case 'stage-history': handleViewStageHistory(record); break
+  }
+}
+
+// ── Table columns ──
+const columns = [
   { title: '版本 ID', dataIndex: 'model_version_id', key: 'version_id', ellipsis: true },
-  { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id' },
-  { title: '模型类型', dataIndex: 'model_type', key: 'model_type' },
-  { title: '阶段', key: 'stage', width: 100 },
-  { title: '组件', key: 'component_type', width: 80 },
-  { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 160 },
-  { title: '操作', key: 'action', width: 300 },
+  { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 90 },
+  { title: '类型', dataIndex: 'model_type', key: 'model_type', width: 100 },
+  { title: '阶段', key: 'stage', width: 90 },
+  { title: '状态', key: 'is_active', width: 80 },
+  { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 150 },
+  { title: '操作', key: 'action', width: 220 },
 ]
 </script>
 
 <template>
   <!-- Pipeline Steps visualization -->
-  <Card style="margin-bottom: 16px">
-    <Steps :current="-1" size="small" style="padding: 8px 0">
+  <Card size="small" style="margin-bottom: 16px">
+    <Steps :current="-1" size="small" style="padding: 4px 0">
       <Steps.Step title="候选" :description="`${stageCounts.candidate} 个模型`" status="process" />
       <Steps.Step title="影子" :description="`${stageCounts.shadow} 个模型`" :status="stageCounts.shadow > 0 ? 'process' : 'wait'" />
       <Steps.Step title="金丝雀" :description="`${stageCounts.canary} 个模型`" :status="stageCounts.canary > 0 ? 'process' : 'wait'" />
@@ -162,25 +299,19 @@ const releaseColumns = [
     </Steps>
   </Card>
 
-  <!-- Release table -->
+  <!-- Unified model table -->
   <Card style="margin-bottom: 16px">
     <template #title>
       <div style="display: flex; justify-content: space-between; align-items: center">
-        <Space>
-          <SafetyCertificateOutlined />
-          <span>发布流水线</span>
-        </Space>
-        <Button @click="$emit('changed')">
+        <span>模型版本</span>
+        <Button size="small" @click="$emit('changed')">
           <template #icon><ReloadOutlined /></template>
           刷新
         </Button>
       </div>
     </template>
-    <p style="color: #8890a0; margin-bottom: 16px">
-      四阶段发布流程：候选 → 影子 → 金丝雀 → 生产。每次推进需工程师显式操作。
-    </p>
     <Table
-      :columns="releaseColumns"
+      :columns="columns"
       :data-source="sortedModels"
       :pagination="{ pageSize: 15, showSizeChanger: false }"
       row-key="model_version_id"
@@ -195,43 +326,79 @@ const releaseColumns = [
             {{ (STAGE_MAP[record.stage] || { text: record.stage }).text }}
           </Tag>
         </template>
-        <template v-if="column.key === 'component_type'">
-          <Tag v-if="record.component_type === 'head'" color="cyan">Head</Tag>
-          <Tag v-else-if="record.component_type === 'backbone'" color="geekblue">Backbone</Tag>
-          <Tag v-else>Full</Tag>
+        <template v-if="column.key === 'is_active'">
+          <Tag v-if="record.is_active" color="green">已激活</Tag>
+          <Tag v-else color="default">未激活</Tag>
         </template>
         <template v-if="column.key === 'created_at'">
           {{ record.created_at ? record.created_at.replace('T', ' ').substring(0, 16) : '-' }}
         </template>
         <template v-if="column.key === 'action'">
-          <Space>
-            <Button
-              size="small"
-              type="primary"
-              :disabled="record.stage === 'retired' || record.stage === 'production'"
-              :loading="promotingModel === record.model_version_id"
-              @click="handlePromote(record)"
-            >
-              推进
-            </Button>
-            <Button
-              size="small"
-              danger
-              :disabled="record.stage === 'retired'"
-              @click="handleRetire(record)"
-            >
-              退役
-            </Button>
-            <Tooltip title="查看影子推理报告" v-if="record.stage === 'shadow'">
-              <Button size="small" @click="handleViewShadowReport(record)">
-                <template #icon><ExperimentOutlined /></template>
+          <Space :size="4">
+            <!-- Activate -->
+            <Tooltip title="激活此版本">
+              <Button
+                v-if="!record.is_active"
+                size="small"
+                type="primary"
+                :loading="activatingModel === record.model_version_id"
+                @click="handleActivate(record)"
+              >
+                <template #icon><CheckOutlined /></template>
               </Button>
             </Tooltip>
-            <Tooltip title="阶段变更历史">
-              <Button size="small" @click="handleViewStageHistory(record)">
-                <template #icon><HistoryOutlined /></template>
+            <!-- Promote -->
+            <Tooltip title="推进阶段">
+              <Button
+                v-if="record.stage !== 'production' && record.stage !== 'retired'"
+                size="small"
+                type="primary"
+                ghost
+                :loading="promotingModel === record.model_version_id"
+                @click="handlePromote(record)"
+              >
+                推进
               </Button>
             </Tooltip>
+            <!-- Rollback -->
+            <Tooltip title="回滚到上一版本">
+              <Button
+                v-if="record.is_active"
+                size="small"
+                danger
+                @click="handleRollback(record)"
+              >
+                <template #icon><RollbackOutlined /></template>
+              </Button>
+            </Tooltip>
+            <!-- More dropdown -->
+            <Dropdown>
+              <Button size="small">更多 <DownOutlined /></Button>
+              <template #overlay>
+                <Menu @click="handleMenuClick(record, $event)">
+                  <Menu.Item key="reexport">
+                    <ExportOutlined /> 重新导出
+                  </Menu.Item>
+                  <Menu.Item key="recalibrate">
+                    <AimOutlined /> 重新校准
+                  </Menu.Item>
+                  <Menu.Divider />
+                  <Menu.Item v-if="record.stage === 'shadow'" key="shadow-report">
+                    <ExperimentOutlined /> 影子报告
+                  </Menu.Item>
+                  <Menu.Item key="stage-history">
+                    <HistoryOutlined /> 阶段历史
+                  </Menu.Item>
+                  <Menu.Divider />
+                  <Menu.Item v-if="record.stage !== 'retired'" key="retire" danger>
+                    退役
+                  </Menu.Item>
+                  <Menu.Item v-if="!record.is_active" key="delete" danger>
+                    <DeleteOutlined /> 删除
+                  </Menu.Item>
+                </Menu>
+              </template>
+            </Dropdown>
           </Space>
         </template>
       </template>
@@ -274,6 +441,33 @@ const releaseColumns = [
       </Form.Item>
       <Form.Item label="原因">
         <Input.TextArea v-model:value="promoteForm.reason" :rows="2" placeholder="推进原因（可选）" />
+      </Form.Item>
+    </Form>
+  </Modal>
+
+  <!-- Reexport Modal -->
+  <Modal
+    v-model:open="reexportModalVisible"
+    title="重新导出模型"
+    :confirmLoading="reexportLoading"
+    @ok="submitReexport"
+    okText="确认导出"
+    cancelText="取消"
+  >
+    <Form layout="vertical" style="margin-top: 16px">
+      <Form.Item label="导出格式">
+        <Select v-model:value="reexportForm.export_format" style="width: 100%">
+          <Select.Option value="openvino">OpenVINO</Select.Option>
+          <Select.Option value="onnx">ONNX</Select.Option>
+          <Select.Option value="torch">Torch</Select.Option>
+        </Select>
+      </Form.Item>
+      <Form.Item label="量化">
+        <Select v-model:value="reexportForm.quantization" style="width: 100%">
+          <Select.Option value="fp32">FP32 (无量化)</Select.Option>
+          <Select.Option value="fp16">FP16 (半精度)</Select.Option>
+          <Select.Option value="int8">INT8 (仅 OpenVINO)</Select.Option>
+        </Select>
       </Form.Item>
     </Form>
   </Modal>
@@ -324,7 +518,7 @@ const releaseColumns = [
             <Tag :color="(STAGE_MAP[event.from_stage] || { color: 'default' }).color">
               {{ (STAGE_MAP[event.from_stage] || { text: event.from_stage || '?' }).text }}
             </Tag>
-            <span style="color: #8890a0">→</span>
+            <span style="color: #8890a0">&rarr;</span>
             <Tag :color="(STAGE_MAP[event.to_stage] || { color: 'default' }).color">
               {{ (STAGE_MAP[event.to_stage] || { text: event.to_stage }).text }}
             </Tag>

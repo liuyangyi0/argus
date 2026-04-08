@@ -12,6 +12,7 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
+from argus.dashboard.api_response import api_success
 from argus.dashboard.components import (
     page_header,
     stat_card,
@@ -287,10 +288,10 @@ def health(request: Request):
     """JSON health endpoint for monitoring tools."""
     health_monitor = request.app.state.health_monitor
     if not health_monitor:
-        return {"status": "unknown"}
+        return api_success({"status": "unknown"})
 
     h = health_monitor.get_health()
-    return {
+    return api_success({
         "status": h.status.value,
         "uptime_seconds": round(h.uptime_seconds, 1),
         "total_alerts": h.total_alerts,
@@ -305,7 +306,7 @@ def health(request: Request):
         ],
         "platform": h.platform,
         "python_version": h.python_version,
-    }
+    })
 
 
 @router.get("/details", response_class=HTMLResponse)

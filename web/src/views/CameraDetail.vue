@@ -15,8 +15,7 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 
 async function fetchCamera() {
   try {
-    const res = await getCameraDetail(cameraId)
-    camera.value = res.data || null
+    camera.value = await getCameraDetail(cameraId) || null
   } finally {
     loading.value = false
   }
@@ -138,18 +137,18 @@ const configEntries = computed(() => flattenEntries(camera.value?.config))
       <Tabs.TabPane key="live" tab="实时画面">
         <Card>
           <div v-if="camera?.connected" style="text-align: center; position: relative">
-            <!-- WebRTC / MSE via go2rtc -->
+            <!-- WebRTC / MSE via go2rtc — always in DOM so videoRef is never null -->
             <video
-              v-if="streamStatus === 'playing' || streamStatus === 'connecting'"
               ref="videoRef"
               autoplay
               muted
               playsinline
+              v-show="streamStatus === 'playing' || streamStatus === 'connecting'"
               style="max-width: 100%; border-radius: 8px; background: #000"
             />
             <!-- MJPEG fallback -->
             <img
-              v-else-if="streamStatus === 'fallback'"
+              v-if="streamStatus === 'fallback'"
               :src="mjpegUrl"
               style="max-width: 100%; border-radius: 8px; background: #000"
               alt="实时画面"

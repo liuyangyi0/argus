@@ -13,6 +13,9 @@ import axios from 'axios'
 export type StreamStatus = 'idle' | 'connecting' | 'playing' | 'error' | 'fallback'
 
 const MAX_MSE_BUFFER_QUEUE = 30
+const MAX_RETRIES = 3
+const RETRY_BASE_MS = 2000
+const MAX_RECONNECT = 3
 
 interface StreamInfo {
   camera_id: string
@@ -30,6 +33,8 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
   let ws: WebSocket | null = null
   let mseWs: WebSocket | null = null
   let mediaSource: MediaSource | null = null
+  let generation = 0
+  let reconnectCount = 0
 
   const getCameraId = () => typeof cameraId === 'string' ? cameraId : cameraId.value
 
@@ -37,34 +42,52 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
     try {
       const resp = await axios.get(`/api/streaming/${getCameraId()}`)
       return resp.data as StreamInfo
-    } catch {
+    } catch (e) {
+      console.warn(`[go2rtc] fetchStreamInfo failed for ${getCameraId()}:`, e)
       return null
     }
   }
 
   async function connectWebRTC(wsUrl: string): Promise<boolean> {
+    const cam = getCameraId()
     return new Promise((resolve) => {
       let settled = false
       const settle = (ok: boolean) => { if (!settled) { settled = true; clearTimeout(timeout); resolve(ok) } }
 
       const timeout = setTimeout(() => {
+        console.warn(`[go2rtc] WebRTC timeout for ${cam}, pc state: ${pc?.connectionState}`)
         cleanup()
         settle(false)
-      }, 10_000)
+      }, 15_000)
 
       try {
+        console.debug(`[go2rtc] WebRTC connecting: ${wsUrl}`)
         ws = new WebSocket(wsUrl)
 
         ws.onopen = () => {
+          console.debug(`[go2rtc] WebRTC ws open for ${cam}`)
           pc = new RTCPeerConnection({
             iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
           })
 
           pc.ontrack = (event) => {
+            console.debug(`[go2rtc] WebRTC ontrack for ${cam}, videoRef=${!!videoRef.value}`)
             if (videoRef.value && event.streams[0]) {
               videoRef.value.srcObject = event.streams[0]
               status.value = 'playing'
               settle(true)
+            }
+          }
+
+          pc.onconnectionstatechange = () => {
+            console.debug(`[go2rtc] WebRTC state: ${pc?.connectionState} for ${cam}`)
+            if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')) {
+              if (reconnectCount < MAX_RECONNECT) {
+                reconnectCount++
+                start()
+              } else {
+                status.value = 'error'
+              }
             }
           }
 
@@ -82,6 +105,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
           pc.createOffer().then((offer) => {
             pc!.setLocalDescription(offer).then(() => {
+              console.debug(`[go2rtc] WebRTC offer sent for ${cam}`)
               ws!.send(JSON.stringify({
                 type: 'webrtc/offer',
                 value: offer.sdp,
@@ -92,6 +116,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
         ws.onmessage = (event) => {
           const msg = JSON.parse(event.data)
+          console.debug(`[go2rtc] WebRTC msg: ${msg.type} for ${cam}`)
           if (msg.type === 'webrtc/answer' && pc) {
             pc.setRemoteDescription(new RTCSessionDescription({
               type: 'answer',
@@ -102,17 +127,19 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
           }
         }
 
-        ws.onerror = () => { cleanup(); settle(false) }
-
-        // Handle signalling channel closure after connection established
-        ws.onclose = () => {
-          if (settled && status.value === 'playing') {
-            // Signalling channel closed but media may still flow via ICE;
-            // RTCPeerConnection.onconnectionstatechange handles media failure.
-          }
+        ws.onerror = (ev) => {
+          console.warn(`[go2rtc] WebRTC ws error for ${cam}:`, ev)
+          cleanup()
+          settle(false)
         }
 
-        // No separate onclose needed before settlement — onerror fires first.
+        ws.onclose = (ev) => {
+          console.debug(`[go2rtc] WebRTC ws close for ${cam}, code=${ev.code}`)
+          if (!settled) {
+            cleanup()
+            settle(false)
+          }
+        }
       } catch {
         settle(false)
       }
@@ -127,18 +154,23 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
       const settle = (ok: boolean) => { if (!settled) { settled = true; clearTimeout(timeout); resolve(ok) } }
 
       const timeout = setTimeout(() => {
+        console.warn(`[go2rtc] MSE timeout for ${getCameraId()}`)
         cleanupMSE()
         settle(false)
-      }, 10_000)
+      }, 15_000)
 
       try {
-        mediaSource = new MediaSource()
-        if (videoRef.value) {
-          videoRef.value.srcObject = null
-          videoRef.value.src = URL.createObjectURL(mediaSource)
+        if (!videoRef.value) {
+          console.warn(`[go2rtc] MSE: videoRef is null for ${getCameraId()}, skipping`)
+          settle(false)
+          return
         }
+        mediaSource = new MediaSource()
+        videoRef.value.srcObject = null
+        videoRef.value.src = URL.createObjectURL(mediaSource)
 
         mediaSource.addEventListener('sourceopen', () => {
+          console.debug(`[go2rtc] MSE sourceopen for ${getCameraId()}, connecting: ${wsUrl}`)
           mseWs = new WebSocket(wsUrl)
           mseWs.binaryType = 'arraybuffer'
 
@@ -179,11 +211,24 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
             }
           }
 
-          mseWs.onerror = () => { cleanupMSE(); settle(false) }
+          mseWs.onerror = (ev) => {
+            console.warn(`[go2rtc] MSE ws error for ${getCameraId()}:`, ev)
+            cleanupMSE()
+            settle(false)
+          }
 
-          mseWs.onclose = () => {
-            if (settled && status.value === 'playing') {
-              status.value = 'error'
+          mseWs.onclose = (ev) => {
+            console.debug(`[go2rtc] MSE ws close for ${getCameraId()}, code=${ev.code}`)
+            if (!settled) {
+              cleanupMSE()
+              settle(false)
+            } else if (status.value === 'playing') {
+              if (reconnectCount < MAX_RECONNECT) {
+                reconnectCount++
+                start()
+              } else {
+                status.value = 'error'
+              }
             }
           }
         })
@@ -195,22 +240,39 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
   async function start() {
     stop()
+    const thisGen = ++generation
     status.value = 'connecting'
 
-    const info = await fetchStreamInfo()
-    if (!info) {
-      status.value = 'error'
-      return
-    }
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (thisGen !== generation) return
 
-    if (info.go2rtc) {
-      if (info.webrtc_ws) {
-        const ok = await connectWebRTC(info.webrtc_ws)
-        if (ok) return
+      if (attempt > 0) {
+        await new Promise(r => setTimeout(r, RETRY_BASE_MS * Math.pow(2, attempt - 1)))
+        if (thisGen !== generation) return
       }
-      if (info.mse_ws) {
-        const ok = await connectMSE(info.mse_ws)
-        if (ok) return
+
+      const info = await fetchStreamInfo()
+      if (thisGen !== generation) return
+
+      if (!info) {
+        if (attempt === MAX_RETRIES) { status.value = 'error'; return }
+        continue
+      }
+
+      if (info.go2rtc) {
+        if (info.webrtc_ws) {
+          const ok = await connectWebRTC(info.webrtc_ws)
+          if (thisGen !== generation) return
+          if (ok) { reconnectCount = 0; return }
+        }
+        if (info.mse_ws) {
+          const ok = await connectMSE(info.mse_ws)
+          if (thisGen !== generation) return
+          if (ok) { reconnectCount = 0; return }
+        }
+      } else {
+        // go2rtc not available, no point retrying
+        break
       }
     }
 
@@ -219,10 +281,17 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
   function cleanup() {
     if (pc) {
+      pc.onconnectionstatechange = null
+      pc.ontrack = null
+      pc.onicecandidate = null
       pc.close()
       pc = null
     }
     if (ws) {
+      ws.onopen = null
+      ws.onclose = null
+      ws.onerror = null
+      ws.onmessage = null
       ws.close()
       ws = null
     }
@@ -230,6 +299,10 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
   function cleanupMSE() {
     if (mseWs) {
+      mseWs.onopen = null
+      mseWs.onclose = null
+      mseWs.onerror = null
+      mseWs.onmessage = null
       mseWs.close()
       mseWs = null
     }
@@ -240,6 +313,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
   }
 
   function stop() {
+    generation++  // cancel any in-flight start()
     cleanup()
     cleanupMSE()
     if (videoRef.value) {

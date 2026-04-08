@@ -113,25 +113,25 @@ onUnmounted(() => {
 
     <!-- Video stream -->
     <div style="flex: 1; min-height: 0; position: relative; background: #000">
-      <!-- WebRTC / MSE via go2rtc -->
+      <!-- WebRTC / MSE via go2rtc — always in DOM so videoRef is never null -->
       <video
-        v-if="camera.status === 'online' && (streamStatus === 'playing' || streamStatus === 'connecting')"
         ref="videoRef"
         autoplay
         muted
         playsinline
+        v-show="camera.status === 'online' && (streamStatus === 'playing' || streamStatus === 'connecting')"
         style="width: 100%; height: 100%; object-fit: contain; display: block"
       />
       <!-- MJPEG fallback when go2rtc is unavailable -->
       <img
-        v-else-if="camera.status === 'online' && streamStatus === 'fallback'"
+        v-if="camera.status === 'online' && streamStatus === 'fallback'"
         :src="mjpegUrl"
         style="width: 100%; height: 100%; object-fit: contain; display: block"
         :alt="camera.camera_id"
       />
       <!-- Offline state -->
       <div
-        v-else-if="camera.status !== 'online'"
+        v-if="camera.status !== 'online'"
         style="width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #4a5568; font-size: 13px"
       >
         {{ camera.degradation === 'rtsp_broken' ? '重连中...' : '离线' }}

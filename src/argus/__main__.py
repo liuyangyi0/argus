@@ -250,6 +250,7 @@ def main():
 
     # Start dashboard in a background thread
     dashboard_thread = None
+    app = None
     if not args.no_dashboard:
         task_mgr = TaskManager(max_concurrent=2)
         audit_logger = AuditLogger(database=db)
@@ -368,6 +369,14 @@ def main():
                     uptime=f"{h.uptime_seconds:.0f}s",
                 )
     finally:
+        # Stop go2rtc FIRST — daemon thread may not get cleanup time
+        if app is not None:
+            _go2rtc = getattr(app.state, "go2rtc", None)
+            if _go2rtc is not None:
+                try:
+                    _go2rtc.close()
+                except Exception:
+                    pass
         scheduler.stop()
         manager.stop_all()
         record_store.stop()

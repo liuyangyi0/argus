@@ -9,18 +9,30 @@ import {
 } from '@ant-design/icons-vue'
 import VideoTile, { type CameraTileData } from '../components/VideoTile.vue'
 import AlertSidebar from '../components/AlertSidebar.vue'
-import { getWallStatus } from '../api'
+import StatusStrip from '../components/StatusStrip.vue'
+import { getWallStatus, getHealth } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
 const cameras = ref<CameraTileData[]>([])
+const health = ref<any>(null)
 const loading = ref(true)
 const layout = ref<'1x1' | '2x2' | '3x3' | 'focus'>('2x2')
 const focusCamera = ref<string | null>(null)
 
+const systemStatus = computed(() => health.value?.status ?? 'unknown')
+const statusLabel = computed(() => {
+  const m: Record<string, string> = { healthy: '运行正常', degraded: '降级运行', unhealthy: '系统异常' }
+  return m[systemStatus.value] || ''
+})
+const statusColor = computed(() => {
+  const m: Record<string, string> = { healthy: '#22c55e', degraded: '#f59e0b', unhealthy: '#ef4444' }
+  return m[systemStatus.value] || '#6b7280'
+})
+
 async function fetchWallStatus() {
   try {
-    const res = await getWallStatus()
-    cameras.value = res.data.cameras || []
+    const data = await getWallStatus()
+    cameras.value = data.cameras || []
   } catch {
     // Fallback: empty
   } finally {
@@ -28,29 +40,34 @@ async function fetchWallStatus() {
   }
 }
 
+async function fetchHealth() {
+  try {
+    health.value = await getHealth()
+  } catch { /* silent */ }
+}
+
 useWebSocket({
-  topics: ['wall', 'alerts'],
+  topics: ['wall', 'alerts', 'health'],
   onMessage(topic, data) {
     if (topic === 'wall' && data?.cameras) {
-      // Merge wall updates into existing camera data
       for (const update of data.cameras) {
         const cam = cameras.value.find(c => c.camera_id === update.camera_id)
         if (cam) {
           cam.current_score = update.current_score ?? cam.current_score
           cam.score_sparkline = update.score_sparkline ?? cam.score_sparkline
           if (update.active_alert !== undefined) cam.active_alert = update.active_alert
-          if (update.border_state) {
-            // Map border_state to active_alert for UI
-          }
         }
       }
     }
+    if (topic === 'health') {
+      health.value = data
+    }
   },
-  fallbackPoll: fetchWallStatus,
+  fallbackPoll: () => Promise.all([fetchWallStatus(), fetchHealth()]),
   fallbackInterval: 5000,
 })
 
-onMounted(fetchWallStatus)
+onMounted(() => Promise.all([fetchWallStatus(), fetchHealth()]))
 
 const gridStyle = computed(() => {
   if (layout.value === '1x1') return { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' }
@@ -94,8 +111,15 @@ function setLayout(l: typeof layout.value) {
     <!-- Video Wall Area -->
     <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 16px">
       <!-- Toolbar -->
-      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-shrink: 0">
-        <Typography.Title :level="4" style="margin: 0">值班台</Typography.Title>
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid rgba(59, 130, 246, 0.12); flex-shrink: 0">
+        <div style="display: flex; align-items: center; gap: 10px">
+          <span
+            :class="['status-glow', systemStatus !== 'healthy' && 'status-glow--pulse']"
+            :style="{ background: statusColor, boxShadow: `0 0 8px ${statusColor}88` }"
+          />
+          <Typography.Title :level="4" style="margin: 0">值班台</Typography.Title>
+          <Typography.Text v-if="statusLabel" type="secondary" style="font-size: 12px">{{ statusLabel }}</Typography.Text>
+        </div>
         <Space>
           <Tooltip title="1x1">
             <Button
@@ -136,6 +160,9 @@ function setLayout(l: typeof layout.value) {
         </Space>
       </div>
 
+      <!-- Status Strip -->
+      <StatusStrip :health="health" :cameras="cameras" />
+
       <!-- Grid -->
       <div
         :style="{
@@ -167,7 +194,23 @@ function setLayout(l: typeof layout.value) {
 
     <!-- Alert Sidebar -->
     <div style="border-left: 1px solid #1f2937; padding: 16px 12px 16px 0; flex-shrink: 0">
-      <AlertSidebar />
+      <AlertSidebar :health="health" />
     </div>
   </div>
 </template>
+
+<style scoped>
+.status-glow {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-glow--pulse {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+</style>

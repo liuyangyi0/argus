@@ -2,8 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { Statistic, Card } from 'ant-design-vue'
 import { getModelRegistry } from '../../api'
-import ModelRegistry from './ModelRegistry.vue'
-import ReleasePipeline from './ReleasePipeline.vue'
+import ModelTable from './ModelTable.vue'
 import EventLog from './EventLog.vue'
 import BatchInference from './BatchInference.vue'
 
@@ -42,18 +41,15 @@ onMounted(loadAllModels)
       <Statistic title="模型总数" :value="totalModels" />
     </Card>
     <Card size="small" style="flex: 1; text-align: center">
-      <Statistic title="活跃模型" :value="activeModels" value-style="color: #52c41a" />
+      <Statistic title="活跃模型" :value="activeModels" :value-style="{ color: '#52c41a' }" />
     </Card>
     <Card size="small" style="flex: 1; text-align: center">
-      <Statistic title="流水线中" :value="pipelineModels" value-style="color: #3b82f6" />
+      <Statistic title="流水线中" :value="pipelineModels" :value-style="{ color: '#3b82f6' }" />
     </Card>
   </div>
 
-  <!-- Model Registry -->
-  <ModelRegistry :models="allModels" @changed="handleModelsChanged" />
-
-  <!-- Release Pipeline -->
-  <ReleasePipeline :cameras="cameras" :models="allModels" @changed="handleModelsChanged" />
+  <!-- Unified Model Table (pipeline steps + table) -->
+  <ModelTable :models="allModels" :cameras="cameras" @changed="handleModelsChanged" />
 
   <!-- Event Log (collapsed) -->
   <div style="margin-bottom: 16px">

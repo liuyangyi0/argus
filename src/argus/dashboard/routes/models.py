@@ -337,25 +337,172 @@ def delete_model(request: Request, version_id: str):
 
     if record.is_active:
         return JSONResponse({"error": "无法删除当前激活的模型"}, status_code=400)
-    if record.stage == ModelStage.PRODUCTION.value:
-        return JSONResponse({"error": "无法删除生产中的模型"}, status_code=400)
 
-    # Delete model files from disk
+    # Delete model files from disk — only if no other model shares the same path
     if record.model_path:
-        import shutil
-        model_dir = Path(record.model_path)
-        if model_dir.exists():
-            if model_dir.is_dir():
-                shutil.rmtree(model_dir, ignore_errors=True)
-            else:
-                model_dir.unlink(missing_ok=True)
-            logger.info("model.files_deleted", path=str(model_dir))
+        other_models = [
+            m for m in registry.list_models()
+            if m.model_path == record.model_path
+            and m.model_version_id != version_id
+        ]
+        if not other_models:
+            import shutil
+            model_dir = Path(record.model_path)
+            if model_dir.exists():
+                if model_dir.is_dir():
+                    shutil.rmtree(model_dir, ignore_errors=True)
+                else:
+                    model_dir.unlink(missing_ok=True)
+                logger.info("model.files_deleted", path=str(model_dir))
 
     # Delete from database
     registry.delete_model(version_id)
     logger.info("model.deleted", model_version_id=version_id)
 
     return JSONResponse({"status": "ok", "deleted": version_id})
+
+
+def _get_trainer(request: Request):
+    """Construct a ModelTrainer from app state config."""
+    from argus.anomaly.baseline import BaselineManager
+    from argus.anomaly.trainer import ModelTrainer
+
+    config = getattr(request.app.state, "config", None)
+    if config is None:
+        return None
+    baselines_dir = str(config.storage.baselines_dir)
+    models_dir = str(Path(config.storage.baselines_dir).parent / "models")
+    exports_dir = str(Path(config.storage.baselines_dir).parent / "exports")
+    bm = BaselineManager(baselines_dir=baselines_dir)
+    return ModelTrainer(
+        baseline_manager=bm,
+        models_dir=models_dir,
+        exports_dir=exports_dir,
+    )
+
+
+def _get_baseline_manager(request: Request):
+    """Get or create a BaselineManager from app state or config."""
+    baseline_mgr = getattr(request.app.state, "baseline_manager", None)
+    if baseline_mgr is not None:
+        return baseline_mgr
+    config = getattr(request.app.state, "config", None)
+    if config:
+        from argus.anomaly.baseline import BaselineManager
+        return BaselineManager(baselines_dir=str(config.storage.baselines_dir))
+    return None
+
+
+@router.post("/{version_id}/reexport")
+async def reexport_model(request: Request, version_id: str):
+    """Re-export model from checkpoint, fitting PostProcessor MinMax.
+
+    Body: { export_format?: str, quantization?: str }
+    """
+    registry = _get_registry(request)
+    if registry is None:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    record = registry.get_by_version_id(version_id)
+    if record is None:
+        return JSONResponse({"error": f"Model not found: {version_id}"}, status_code=404)
+
+    if not record.model_path:
+        return JSONResponse({"error": "模型没有关联的文件路径"}, status_code=400)
+
+    model_dir = Path(record.model_path)
+    if not model_dir.exists():
+        return JSONResponse(
+            {"error": f"模型目录不存在: {record.model_path}"},
+            status_code=404,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    export_format = body.get("export_format", "openvino")
+    quantization = body.get("quantization", "fp16")
+
+    if export_format not in {"openvino", "onnx", "torch"}:
+        return JSONResponse(
+            {"error": f"不支持的导出格式: {export_format}"},
+            status_code=400,
+        )
+    if quantization not in {"fp16", "fp32", "int8"}:
+        return JSONResponse(
+            {"error": f"不支持的量化方式: {quantization}"},
+            status_code=400,
+        )
+
+    trainer = _get_trainer(request)
+    if trainer is None:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    result = await asyncio.to_thread(
+        trainer.reexport_model,
+        model_dir=model_dir,
+        export_format=export_format,
+        quantization=quantization,
+        model_type=record.model_type,
+    )
+
+    if result.get("status") == "error":
+        return JSONResponse({"error": result["error"]}, status_code=500)
+
+    return JSONResponse(result)
+
+
+@router.post("/{version_id}/recalibrate")
+async def recalibrate_model(request: Request, version_id: str):
+    """Re-calibrate score normalization using baseline images.
+
+    Runs conformal calibration + sigmoid recalibration, persists to calibration.json.
+    """
+    registry = _get_registry(request)
+    if registry is None:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+
+    record = registry.get_by_version_id(version_id)
+    if record is None:
+        return JSONResponse({"error": f"Model not found: {version_id}"}, status_code=404)
+
+    if not record.model_path:
+        return JSONResponse({"error": "模型没有关联的文件路径"}, status_code=400)
+
+    model_dir = Path(record.model_path)
+
+    # Extract zone_id from model_path (data/models/{camera_id}/{zone_id})
+    zone_id = model_dir.parts[-1] if len(model_dir.parts) >= 2 else "default"
+
+    baseline_mgr = _get_baseline_manager(request)
+    if baseline_mgr is None:
+        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+
+    baseline_dir = baseline_mgr.get_baseline_dir(record.camera_id, zone_id)
+    if not baseline_dir.is_dir():
+        return JSONResponse(
+            {"error": f"基线目录不存在: {baseline_dir}"},
+            status_code=404,
+        )
+
+    trainer = _get_trainer(request)
+    if trainer is None:
+        return JSONResponse({"error": "配置不可用"}, status_code=503)
+
+    result = await asyncio.to_thread(
+        trainer.recalibrate_model,
+        model_dir=model_dir,
+        baseline_dir=baseline_dir,
+        camera_id=record.camera_id,
+        zone_id=zone_id,
+    )
+
+    if result.get("status") == "error":
+        return JSONResponse({"error": result["error"]}, status_code=500)
+
+    return JSONResponse(result)
 
 
 @router.get("/{version_id}/stage-history")
