@@ -8,6 +8,8 @@ consecutive frames before triggering, which dramatically reduces false positives
 
 from __future__ import annotations
 
+import math
+import random
 import threading
 import time
 from collections import defaultdict
@@ -122,7 +124,9 @@ class AlertGrader:
         self._node_id = node_id
         self._trackers: dict[str, _AnomalyTracker] = defaultdict(_AnomalyTracker)
         self._last_alerts: dict[str, float] = {}  # zone_key -> last alert timestamp
-        self._alert_counter = 0
+        self._last_camera_alerts: dict[str, float] = {}  # camera_id -> last alert timestamp
+        # Random offset avoids ID collisions across process restarts
+        self._alert_counter = random.randint(1000, 9999)
         self._tracker_lock = threading.Lock()
 
         # Load calibrated thresholds if available and enabled
@@ -158,8 +162,6 @@ class AlertGrader:
 
         Returns an Alert if the anomaly passes all filters, None otherwise.
         """
-        import math
-
         now = time.monotonic()
         zone_key = f"{camera_id}:{zone_id}"
 
@@ -203,6 +205,7 @@ class AlertGrader:
             if gap > self._config.temporal.max_gap_seconds:
                 tracker.evidence = 0.0
                 tracker.first_seen = now
+                tracker.last_seen = now
                 tracker.max_score = adjusted_score
 
             tracker.last_seen = now
@@ -212,9 +215,23 @@ class AlertGrader:
             min_overlap = self._config.temporal.min_spatial_overlap
             if min_overlap > 0 and anomaly_map is not None:
                 curr_mask = (anomaly_map > 0.5).astype(np.uint8)
-                if tracker.prev_anomaly_mask is not None and curr_mask.shape == tracker.prev_anomaly_mask.shape:
-                    intersection = np.count_nonzero(curr_mask & tracker.prev_anomaly_mask)
-                    union = np.count_nonzero(curr_mask | tracker.prev_anomaly_mask)
+                if tracker.prev_anomaly_mask is not None:
+                    prev_mask = tracker.prev_anomaly_mask
+                    # Resize to match if anomaly map dimensions changed (e.g. tiling mode switch)
+                    if curr_mask.shape != prev_mask.shape:
+                        import cv2
+                        prev_mask = cv2.resize(
+                            prev_mask, (curr_mask.shape[1], curr_mask.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        logger.debug(
+                            "grader.spatial_resize",
+                            zone=zone_key,
+                            prev_shape=tracker.prev_anomaly_mask.shape,
+                            curr_shape=curr_mask.shape,
+                        )
+                    intersection = np.count_nonzero(curr_mask & prev_mask)
+                    union = np.count_nonzero(curr_mask | prev_mask)
                     iou = intersection / union if union > 0 else 0.0
                     if iou < min_overlap:
                         logger.debug(
@@ -241,22 +258,40 @@ class AlertGrader:
                 )
                 return None
 
-            # Step 4: Check suppression window
+            # Step 4: Check suppression windows (zone-level then camera-level)
             last_alert_time = self._last_alerts.get(zone_key, 0)
             if now - last_alert_time < self._config.suppression.same_zone_window_seconds:
                 logger.debug("grader.suppressed", zone=zone_key, score=round(adjusted_score, 3))
                 return None
 
+            # Camera-level throttle: after the first alert from each zone
+            # passes through, enforce a minimum interval between subsequent
+            # alerts on the same camera (across all zones) to prevent storms.
+            last_camera_alert = self._last_camera_alerts.get(camera_id, 0)
+            cam_window = self._config.suppression.same_camera_window_seconds
+            if now - last_camera_alert < cam_window:
+                # But always allow the very first alert for a zone that has
+                # never fired — ensures every zone gets initial coverage.
+                if zone_key in self._last_alerts:
+                    logger.debug(
+                        "grader.camera_suppressed",
+                        zone=zone_key,
+                        camera=camera_id,
+                        score=round(adjusted_score, 3),
+                    )
+                    return None
+
             # Step 5: Emit alert
             self._alert_counter += 1
             seq = self._alert_counter
             self._last_alerts[zone_key] = now
+            self._last_camera_alerts[camera_id] = now
 
             # Use the max score seen during the confirmation window for severity
             final_severity = self._score_to_severity(tracker.max_score) or severity
 
             # Timestamp-based ID: survives restarts, unique across nodes
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")[:19]
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
             alert = Alert(
                 alert_id=f"ALT-{self._node_id}-{ts}-{seq:04d}",
                 camera_id=camera_id,
@@ -299,6 +334,7 @@ class AlertGrader:
             else:
                 self._trackers.clear()
                 self._last_alerts.clear()
+                self._last_camera_alerts.clear()
 
     @staticmethod
     def _tracker_to_snapshot(tracker: _AnomalyTracker) -> CusumSnapshot | None:

@@ -85,6 +85,27 @@ class AlertDispatcher:
             )
             self._email_thread.start()
 
+    @staticmethod
+    def _alert_to_dict(
+        alert: Alert,
+        snapshot_path: str | None = None,
+        heatmap_path: str | None = None,
+    ) -> dict:
+        """Convert an alert to a dict payload for dispatch channels."""
+        payload = {
+            "alert_id": alert.alert_id,
+            "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
+            "camera_id": alert.camera_id,
+            "zone_id": alert.zone_id,
+            "severity": alert.severity.value,
+            "anomaly_score": round(alert.anomaly_score, 4),
+        }
+        if snapshot_path is not None:
+            payload["snapshot_path"] = snapshot_path
+        if heatmap_path is not None:
+            payload["heatmap_path"] = heatmap_path
+        return payload
+
     def dispatch(self, alert: Alert) -> None:
         """Send an alert to all configured channels."""
         # Check disk space before writing images
@@ -106,20 +127,17 @@ class AlertDispatcher:
         # Channel 2: Webhook (non-blocking, queued to background thread, with circuit breaker DET-009)
         if self._config.webhook.enabled:
             if self._circuit_breaker.allow_request():
-                payload = {
-                    "alert_id": alert.alert_id,
-                    "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
-                    "camera_id": alert.camera_id,
-                    "zone_id": alert.zone_id,
-                    "severity": alert.severity.value,
-                    "anomaly_score": round(alert.anomaly_score, 4),
-                    "snapshot_path": snapshot_path,
-                    "heatmap_path": heatmap_path,
-                }
+                payload = self._alert_to_dict(alert, snapshot_path, heatmap_path)
                 try:
                     self._webhook_queue.put_nowait(payload)
                 except Exception:
-                    logger.warning("dispatch.webhook_queue_full", alert_id=alert.alert_id)
+                    logger.error(
+                        "dispatch.webhook_queue_full",
+                        alert_id=alert.alert_id,
+                        msg="Alert webhook delivery lost — queue overflow",
+                    )
+                    # P6: Persist overflow event so no alert is silently lost
+                    self._record_dispatch_failure(alert, "webhook_queue_overflow")
             else:
                 logger.warning(
                     "dispatch.circuit_open",
@@ -134,31 +152,21 @@ class AlertDispatcher:
             alert_level = severity_order.index(alert.severity.value) if alert.severity.value in severity_order else -1
             min_level = severity_order.index(self._config.email.min_severity.value) if self._config.email.min_severity.value in severity_order else 0
             if alert_level >= min_level:
-                email_data = {
-                    "alert_id": alert.alert_id,
-                    "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
-                    "camera_id": alert.camera_id,
-                    "zone_id": alert.zone_id,
-                    "severity": alert.severity.value,
-                    "anomaly_score": round(alert.anomaly_score, 4),
-                    "snapshot_path": snapshot_path,
-                }
+                email_data = self._alert_to_dict(alert, snapshot_path)
                 try:
                     self._email_queue.put_nowait(email_data)
                 except Exception:
-                    logger.warning("dispatch.email_queue_full", alert_id=alert.alert_id)
+                    logger.error(
+                        "dispatch.email_queue_full",
+                        alert_id=alert.alert_id,
+                        msg="Alert email delivery lost — queue overflow",
+                    )
+                    self._record_dispatch_failure(alert, "email_queue_overflow")
 
         # Channel 4: WebSocket push (real-time dashboard notification)
         if self._on_alert_ws:
             try:
-                self._on_alert_ws("alerts", {
-                    "alert_id": alert.alert_id,
-                    "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
-                    "camera_id": alert.camera_id,
-                    "zone_id": alert.zone_id,
-                    "severity": alert.severity.value,
-                    "anomaly_score": round(alert.anomaly_score, 4),
-                })
+                self._on_alert_ws("alerts", self._alert_to_dict(alert))
             except Exception as e:
                 logger.warning("dispatch.websocket_failed", alert_id=alert.alert_id, error=str(e))
 
@@ -188,59 +196,73 @@ class AlertDispatcher:
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))
 
-    def _webhook_worker(self) -> None:
-        """Background thread that sends webhook HTTP POST requests.
+    def _dispatch_with_retry(
+        self,
+        queue: Queue,
+        send_fn: Callable[[dict], None],
+        channel: str,
+        max_retries: int = 3,
+    ) -> None:
+        """Shared retry loop for background dispatch workers.
 
-        HIGH-01: Uses per-payload retry loop with exponential backoff.
-        Failed payloads retry up to 3 times before being dropped (logged).
-        Thread never dies on exception — wraps entire loop in try/except.
+        Polls the queue, retries each payload up to max_retries with
+        exponential backoff, and logs dropped payloads at ERROR level.
         """
-        logger.info("webhook_worker.started", url=self._config.webhook.url)
-        max_retries = 3
-
         while not self._shutdown.is_set():
             try:
-                payload = self._webhook_queue.get(timeout=5.0)
+                data = queue.get(timeout=5.0)
             except Empty:
                 continue
 
-            # Per-payload retry loop (HIGH-01)
             backoff = 1.0
             for attempt in range(1, max_retries + 1):
                 if self._shutdown.is_set():
                     break
                 try:
-                    if self._http_client is None:
-                        import httpx
-                        self._http_client = httpx.Client(timeout=self._config.webhook.timeout)
-
-                    response = self._http_client.post(self._config.webhook.url, json=payload)
-                    response.raise_for_status()
-                    self._circuit_breaker.record_success()
+                    send_fn(data)
                     logger.debug(
-                        "dispatch.webhook_ok",
-                        alert_id=payload.get("alert_id"),
-                        status=response.status_code,
+                        f"dispatch.{channel}_ok",
+                        alert_id=data.get("alert_id"),
                     )
-                    break  # Success, move to next payload
+                    break
                 except Exception as e:
-                    self._circuit_breaker.record_failure()
                     if attempt >= max_retries:
                         logger.error(
-                            "dispatch.webhook_dropped",
-                            alert_id=payload.get("alert_id"),
+                            f"dispatch.{channel}_dropped",
+                            alert_id=data.get("alert_id"),
                             error=str(e),
                             attempts=attempt,
                         )
                     else:
                         logger.warning(
-                            "dispatch.webhook_retry",
-                            alert_id=payload.get("alert_id"),
+                            f"dispatch.{channel}_retry",
+                            alert_id=data.get("alert_id"),
                             error=str(e),
                             attempt=attempt,
                         )
                         self._shutdown.wait(timeout=min(backoff, 30.0))
                         backoff = min(backoff * 2, 30.0)
+
+    def _webhook_worker(self) -> None:
+        """Background thread that sends webhook HTTP POST requests."""
+        logger.info("webhook_worker.started", url=self._config.webhook.url)
+
+        def send(payload: dict) -> None:
+            if self._http_client is None:
+                import httpx
+                self._http_client = httpx.Client(timeout=self._config.webhook.timeout)
+            response = self._http_client.post(self._config.webhook.url, json=payload)
+            response.raise_for_status()
+            self._circuit_breaker.record_success()
+
+        def send_with_cb(payload: dict) -> None:
+            try:
+                send(payload)
+            except Exception:
+                self._circuit_breaker.record_failure()
+                raise
+
+        self._dispatch_with_retry(self._webhook_queue, send_with_cb, "webhook")
 
     def _email_worker(self) -> None:
         """Background thread that sends email alerts via SMTP.
@@ -255,70 +277,56 @@ class AlertDispatcher:
         email_cfg = self._config.email
         logger.info("email_worker.started", smtp_host=email_cfg.smtp_host, recipients=len(email_cfg.recipients))
 
-        backoff = 1.0
-        while not self._shutdown.is_set():
-            try:
-                data = self._email_queue.get(timeout=5.0)
-            except Empty:
-                continue
+        def send(data: dict) -> None:
+            msg = MIMEMultipart()
+            msg["From"] = email_cfg.from_address
+            msg["To"] = ", ".join(email_cfg.recipients)
+            msg["Subject"] = (
+                f"[Argus] {data['severity'].upper()} Alert - "
+                f"Camera {data['camera_id']} - {data['alert_id']}"
+            )
+            body = (
+                f"Alert ID: {data['alert_id']}\n"
+                f"Severity: {data['severity'].upper()}\n"
+                f"Camera: {data['camera_id']}\n"
+                f"Zone: {data['zone_id']}\n"
+                f"Anomaly Score: {data['anomaly_score']}\n"
+                f"Time: {data['timestamp']}\n"
+            )
+            msg.attach(MIMEText(body, "plain"))
 
-            try:
-                msg = MIMEMultipart()
-                msg["From"] = email_cfg.from_address
-                msg["To"] = ", ".join(email_cfg.recipients)
-                msg["Subject"] = (
-                    f"[Argus] {data['severity'].upper()} Alert - "
-                    f"Camera {data['camera_id']} - {data['alert_id']}"
-                )
+            snapshot_path = data.get("snapshot_path")
+            if snapshot_path:
+                snap = Path(snapshot_path)
+                if snap.exists():
+                    with open(snap, "rb") as f:
+                        img = MIMEImage(f.read(), name=snap.name)
+                        msg.attach(img)
 
-                body = (
-                    f"Alert ID: {data['alert_id']}\n"
-                    f"Severity: {data['severity'].upper()}\n"
-                    f"Camera: {data['camera_id']}\n"
-                    f"Zone: {data['zone_id']}\n"
-                    f"Anomaly Score: {data['anomaly_score']}\n"
-                    f"Time: {data['timestamp']}\n"
-                )
-                msg.attach(MIMEText(body, "plain"))
+            server = smtplib.SMTP(email_cfg.smtp_host, email_cfg.smtp_port, timeout=10)
+            if email_cfg.use_tls:
+                server.starttls()
+            if email_cfg.smtp_username:
+                server.login(email_cfg.smtp_username, email_cfg.smtp_password)
+            server.sendmail(email_cfg.from_address, email_cfg.recipients, msg.as_string())
+            server.quit()
 
-                # Attach snapshot if available
-                snapshot_path = data.get("snapshot_path")
-                if snapshot_path:
-                    from pathlib import Path
+        self._dispatch_with_retry(self._email_queue, send, "email")
 
-                    snap = Path(snapshot_path)
-                    if snap.exists():
-                        with open(snap, "rb") as f:
-                            img = MIMEImage(f.read(), name=snap.name)
-                            msg.attach(img)
+    def _record_dispatch_failure(self, alert: Alert, reason: str) -> None:
+        """Log dispatch failure so no alert is silently lost.
 
-                # Send via SMTP
-                if email_cfg.use_tls:
-                    server = smtplib.SMTP(email_cfg.smtp_host, email_cfg.smtp_port, timeout=10)
-                    server.starttls()
-                else:
-                    server = smtplib.SMTP(email_cfg.smtp_host, email_cfg.smtp_port, timeout=10)
-
-                if email_cfg.smtp_username:
-                    server.login(email_cfg.smtp_username, email_cfg.smtp_password)
-
-                server.sendmail(email_cfg.from_address, email_cfg.recipients, msg.as_string())
-                server.quit()
-
-                logger.debug(
-                    "dispatch.email_ok",
-                    alert_id=data.get("alert_id"),
-                    recipients=len(email_cfg.recipients),
-                )
-            except Exception as e:
-                logger.error(
-                    "dispatch.email_failed",
-                    alert_id=data.get("alert_id"),
-                    error=str(e),
-                )
-                # Exponential backoff, but don't break
-                self._shutdown.wait(timeout=min(backoff, 30.0))
-                backoff = min(backoff * 2, 30.0)
+        The alert is already persisted to DB by _dispatch_database() before
+        queue submission. This records the delivery failure for review.
+        """
+        logger.error(
+            "dispatch.delivery_lost",
+            alert_id=alert.alert_id,
+            camera_id=alert.camera_id,
+            severity=alert.severity.value,
+            reason=reason,
+            msg=f"ALERT DELIVERY FAILED: {alert.alert_id} — {reason}",
+        )
 
     def _save_snapshot(self, alert: Alert) -> str | None:
         """Save the alert snapshot frame to disk with anomaly region annotations (DET-007)."""

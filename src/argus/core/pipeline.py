@@ -221,7 +221,11 @@ class DetectionPipeline:
         )
 
         # Anti-absorption: time-based heartbeat (MED-05)
-        self._heartbeat_seconds = camera_config.mog2.heartbeat_frames / max(camera_config.fps_target, 1)
+        # P2 fix: cap heartbeat to max_gap * 0.8 so CUSUM evidence can accumulate
+        # even in static scenes where MOG2 drops all non-heartbeat frames
+        raw_heartbeat = camera_config.mog2.heartbeat_frames / max(camera_config.fps_target, 1)
+        max_gap = alert_config.temporal.max_gap_seconds
+        self._heartbeat_seconds = min(raw_heartbeat, max_gap * 0.8)
         self._last_heartbeat_time = 0.0
         self._frame_counter = 0
 
@@ -244,6 +248,9 @@ class DetectionPipeline:
 
         # Thread safety for hot-updates
         self._config_lock = threading.Lock()
+
+        # Cached per-zone anomaly masks (invalidated on update_zones)
+        self._zone_mask_cache: dict[tuple[str, int, int], np.ndarray] = {}
 
         # Thread safety for anomaly lock state (HIGH-03)
         self._lock_state_lock = threading.Lock()
@@ -412,7 +419,7 @@ class DetectionPipeline:
         self._anomaly_detector.load()
 
         # Calibrate raw scores if PostProcessor MinMax is broken
-        if getattr(self._anomaly_detector, "_minmax_broken", False):
+        if self._anomaly_detector.get_status().minmax_broken:
             baseline_dir = self._find_baseline_dir(self.camera_config.camera_id)
             self._anomaly_detector.calibrate_raw_scores(baseline_dir)
 
@@ -500,7 +507,8 @@ class DetectionPipeline:
             )
 
         current_mode = self.mode
-        # Save raw frame before zone masking (need copy since zone_mask mutates frame)
+        # Save raw frame reference before zone masking — apply() returns a new
+        # array (cv2.bitwise_and), so the original frame is not mutated.
         with self._latest_raw_frame_lock:
             self._latest_raw_frame = frame
 
@@ -650,6 +658,7 @@ class DetectionPipeline:
         # Runs in parallel with Anomalib as a lightweight safety backup.
         # If Anomalib is unavailable, Simplex becomes the primary detector.
         simplex_detected = False
+        simplex_result = None
         if self._simplex is not None:
             try:
                 t3b = time.monotonic()
@@ -701,6 +710,7 @@ class DetectionPipeline:
                     else:
                         # Only Simplex detected: use as safety fallback
                         # Set a minimum anomaly score so the alert system can grade it
+                        original_anomalib_score = anomaly_result.anomaly_score
                         fallback_score = max(anomaly_result.anomaly_score, 0.6)
                         anomaly_result = AnomalyResult(
                             anomaly_score=fallback_score,
@@ -714,7 +724,7 @@ class DetectionPipeline:
                         logger.info(
                             "pipeline.simplex_safety_detection",
                             camera_id=frame_data.camera_id,
-                            anomalib_score=round(anomaly_result.anomaly_score, 4),
+                            anomalib_score=round(original_anomalib_score, 4),
                             static_regions=len(simplex_result.static_regions),
                             max_static_seconds=round(simplex_result.max_static_seconds, 1),
                         )
@@ -968,7 +978,7 @@ class DetectionPipeline:
             else:
                 prefilter_decision = PrefilterDecision.PASSED
 
-            if self._anomaly_detector._calibration_scores is not None:
+            if self._anomaly_detector.is_calibrated:
                 cal_level = ConformalLevel.INFO
                 thresholds = self._alert_grader._config.severity_thresholds
                 if anomaly_result.anomaly_score >= thresholds.high:
@@ -1020,106 +1030,118 @@ class DetectionPipeline:
 
         # FR-033: Append frame to ring buffer + sparkline
         self._score_sparkline.append(anomaly_result.anomaly_score)
-        if self._alert_ring_buffer is not None:
-            try:
-                # Build CUSUM evidence snapshot for all zones
-                rb_cusum: dict[str, float] = {}
-                for zone_cfg in self.camera_config.zones:
-                    zone_key = f"{frame_data.camera_id}:{zone_cfg.zone_id}"
-                    snap = self._alert_grader.get_cusum_state(zone_key)
-                    if snap is not None:
-                        rb_cusum[zone_key] = snap.evidence
-                if not rb_cusum:
-                    default_key = f"{frame_data.camera_id}:default"
-                    snap = self._alert_grader.get_cusum_state(default_key)
-                    if snap is not None:
-                        rb_cusum[default_key] = snap.evidence
+        self._handle_ring_buffer(
+            frame_data, frame, anomaly_result, detection_result,
+            simplex_result, simplex_detected, alert,
+        )
 
-                # Build YOLO persons list from detection_result
-                rb_persons: list[dict] = []
-                if detection_result is not None and hasattr(detection_result, "persons"):
-                    rb_persons = [
-                        {
-                            "bbox": [int(p.x1), int(p.y1), int(p.x2), int(p.y2)]
-                            if hasattr(p, "x1") else [],
-                            "confidence": getattr(p, "confidence", 0),
-                        }
-                        for p in detection_result.persons
-                    ]
+        return alert
 
-                # §1.3: Store raw anomaly map — JPEG encoding deferred to solidify
-                rb_heatmap_raw: np.ndarray | None = None
-                if anomaly_result.anomaly_map is not None:
-                    try:
-                        amap = anomaly_result.anomaly_map
-                        if len(amap.shape) == 2:
-                            rb_heatmap_raw = (np.clip(amap, 0, 1) * 255).astype(np.uint8)
-                        else:
-                            rb_heatmap_raw = amap.copy() if amap.dtype == np.uint8 else amap
-                    except Exception:
-                        pass
+    def _handle_ring_buffer(
+        self,
+        frame_data: FrameData,
+        frame: np.ndarray,
+        anomaly_result: AnomalyResult,
+        detection_result: ObjectDetectionResult,
+        simplex_result: object | None,
+        simplex_detected: bool,
+        alert: Alert | None,
+    ) -> None:
+        """Ring buffer frame append, post-capture flush, and alert solidify."""
+        if self._alert_ring_buffer is None:
+            return
 
-                # §1.3: Capture all YOLO detections (not just persons)
-                rb_all_boxes: list[dict] | None = None
-                if detection_result is not None and hasattr(detection_result, "objects"):
-                    rb_all_boxes = [
-                        {
-                            "bbox": [int(getattr(o, "x1", 0)), int(getattr(o, "y1", 0)),
-                                     int(getattr(o, "x2", 0)), int(getattr(o, "y2", 0))],
-                            "class": getattr(o, "class_name", ""),
-                            "confidence": round(getattr(o, "confidence", 0), 2),
-                        }
-                        for o in detection_result.objects
-                    ]
+        # Append current frame to ring buffer
+        try:
+            # Build CUSUM evidence snapshot for all zones
+            rb_cusum: dict[str, float] = {}
+            for zone_cfg in self.camera_config.zones:
+                zone_key = f"{frame_data.camera_id}:{zone_cfg.zone_id}"
+                snap = self._alert_grader.get_cusum_state(zone_key)
+                if snap is not None:
+                    rb_cusum[zone_key] = snap.evidence
+            if not rb_cusum:
+                default_key = f"{frame_data.camera_id}:default"
+                snap = self._alert_grader.get_cusum_state(default_key)
+                if snap is not None:
+                    rb_cusum[default_key] = snap.evidence
 
-                frame_snap = FrameSnapshot(
-                    timestamp=time.time(),
-                    frame_jpeg=compress_frame(
-                        frame, quality=self._ring_buffer_jpeg_quality
-                    ),
-                    anomaly_score=anomaly_result.anomaly_score,
-                    simplex_score=getattr(simplex_result, "max_score", None) if simplex_detected else None,
-                    cusum_evidence=rb_cusum,
-                    yolo_persons=rb_persons,
-                    frame_number=frame_data.frame_number,
-                    heatmap_raw=rb_heatmap_raw,
-                    yolo_boxes=rb_all_boxes,
-                )
-                self._alert_ring_buffer.append(frame_snap)
-            except Exception:
-                logger.debug(
-                    "pipeline.ring_buffer_append_failed",
-                    camera_id=frame_data.camera_id,
-                    exc_info=True,
-                )
+            rb_persons: list[dict] = [
+                {
+                    "bbox": [int(p.x1), int(p.y1), int(p.x2), int(p.y2)],
+                    "confidence": p.confidence,
+                }
+                for p in detection_result.persons
+            ]
 
-        # FR-033: Check for expired post-captures and solidify on alert
-        if self._alert_ring_buffer is not None:
-            # Flush any expired post-trigger captures
-            try:
-                for expired_id in self._alert_ring_buffer.check_expired_captures():
-                    post_frames = self._alert_ring_buffer.finish_post_capture(expired_id)
-                    if post_frames and self._recording_store is not None:
-                        self._recording_store.append_post_frames(expired_id, post_frames)
-                        if self._database is not None:
-                            try:
-                                meta = self._recording_store.load_metadata(expired_id)
-                                self._database.update_alert_recording_status(
-                                    expired_id,
-                                    RecordingStatus.COMPLETE.value,
-                                    frame_count=meta["frame_count"] if meta else None,
-                                    end_timestamp=meta["end_timestamp"] if meta else None,
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "pipeline.recording_db_update_failed",
-                                    alert_id=expired_id,
-                                    exc_info=True,
-                                )
-            except Exception:
-                logger.debug("pipeline.post_capture_flush_failed", exc_info=True)
+            # §1.3: Store raw anomaly map — JPEG encoding deferred to solidify
+            rb_heatmap_raw: np.ndarray | None = None
+            if anomaly_result.anomaly_map is not None:
+                try:
+                    amap = anomaly_result.anomaly_map
+                    if len(amap.shape) == 2:
+                        rb_heatmap_raw = (np.clip(amap, 0, 1) * 255).astype(np.uint8)
+                    else:
+                        rb_heatmap_raw = amap.copy() if amap.dtype == np.uint8 else amap
+                except Exception:
+                    pass
 
-        if alert is not None and self._alert_ring_buffer is not None:
+            rb_all_boxes: list[dict] = [
+                {
+                    "bbox": [int(o.x1), int(o.y1), int(o.x2), int(o.y2)],
+                    "class": o.class_name,
+                    "confidence": round(o.confidence, 2),
+                }
+                for o in detection_result.objects
+            ]
+
+            frame_snap = FrameSnapshot(
+                timestamp=time.time(),
+                frame_jpeg=compress_frame(
+                    frame, quality=self._ring_buffer_jpeg_quality
+                ),
+                anomaly_score=anomaly_result.anomaly_score,
+                simplex_score=getattr(simplex_result, "max_score", None) if simplex_detected else None,
+                cusum_evidence=rb_cusum,
+                yolo_persons=rb_persons,
+                frame_number=frame_data.frame_number,
+                heatmap_raw=rb_heatmap_raw,
+                yolo_boxes=rb_all_boxes,
+            )
+            self._alert_ring_buffer.append(frame_snap)
+        except Exception:
+            logger.debug(
+                "pipeline.ring_buffer_append_failed",
+                camera_id=frame_data.camera_id,
+                exc_info=True,
+            )
+
+        # Flush any expired post-trigger captures
+        try:
+            for expired_id in self._alert_ring_buffer.check_expired_captures():
+                post_frames = self._alert_ring_buffer.finish_post_capture(expired_id)
+                if post_frames and self._recording_store is not None:
+                    self._recording_store.append_post_frames(expired_id, post_frames)
+                    if self._database is not None:
+                        try:
+                            meta = self._recording_store.load_metadata(expired_id)
+                            self._database.update_alert_recording_status(
+                                expired_id,
+                                RecordingStatus.COMPLETE.value,
+                                frame_count=meta["frame_count"] if meta else None,
+                                end_timestamp=meta["end_timestamp"] if meta else None,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "pipeline.recording_db_update_failed",
+                                alert_id=expired_id,
+                                exc_info=True,
+                            )
+        except Exception:
+            logger.debug("pipeline.post_capture_flush_failed", exc_info=True)
+
+        # Solidify ring buffer on alert
+        if alert is not None:
             try:
                 # §1.2.2: Detect overlap — if there's a pending post-capture
                 # from a recent alert, link the new alert to it (shared ring buffer)
@@ -1194,8 +1216,6 @@ class DetectionPipeline:
                     alert_id=alert.alert_id,
                     exc_info=True,
                 )
-
-        return alert
 
     def run_once(self) -> Alert | None:
         """Read one frame from the camera and process it."""
@@ -1309,6 +1329,7 @@ class DetectionPipeline:
         with self._config_lock:
             self.camera_config.zones = zones
             self._zone_mask.update_zones(zones)
+            self._zone_mask_cache.clear()
         logger.info("pipeline.zones_updated", camera_id=self.camera_config.camera_id, zones=len(zones))
 
     def update_thresholds(self, anomaly_threshold: float | None = None) -> None:
@@ -1365,7 +1386,13 @@ class DetectionPipeline:
         self, frame_data: FrameData, anomaly_result: AnomalyResult, frame: np.ndarray,
         detection_type: str = "anomaly", detected_objects: list[dict] | None = None,
     ) -> Alert | None:
-        """Evaluate anomaly against all configured include zones."""
+        """Evaluate anomaly against all configured include zones.
+
+        H4 fix: When anomaly_map is available and zones have polygons,
+        compute per-zone score (max within zone region) instead of using
+        the global score for all zones. This prevents zone A's anomaly
+        from causing false CUSUM accumulation in zone B.
+        """
         include_zones = self._zone_mask.get_include_zones()
 
         if not include_zones:
@@ -1386,11 +1413,17 @@ class DetectionPipeline:
         best_alert = None
         best_rank = -1
         for zone in include_zones:
+            zone_score = anomaly_result.anomaly_score
+            if anomaly_result.anomaly_map is not None and zone.polygon:
+                zone_score = self._compute_zone_score(
+                    anomaly_result.anomaly_map, zone.zone_id, zone.polygon, frame.shape
+                )
+
             alert = self._alert_grader.evaluate(
                 camera_id=frame_data.camera_id,
                 zone_id=zone.zone_id,
                 zone_priority=zone.priority,
-                anomaly_score=anomaly_result.anomaly_score,
+                anomaly_score=zone_score,
                 frame_number=frame_data.frame_number,
                 frame=frame,
                 anomaly_map=anomaly_result.anomaly_map,
@@ -1406,6 +1439,39 @@ class DetectionPipeline:
                     best_rank = rank
 
         return best_alert
+
+    def _compute_zone_score(
+        self,
+        anomaly_map: np.ndarray,
+        zone_id: str,
+        polygon: list[tuple[int, int]],
+        frame_shape: tuple,
+    ) -> float:
+        """Compute the max anomaly score within a zone polygon.
+
+        Uses cached masks to avoid repeated cv2.fillPoly on every frame.
+        Cache is invalidated on update_zones().
+        """
+        map_h, map_w = anomaly_map.shape[:2]
+        cache_key = (zone_id, map_h, map_w)
+
+        zone_mask = self._zone_mask_cache.get(cache_key)
+        if zone_mask is None:
+            frame_h, frame_w = frame_shape[:2]
+            scale_x = map_w / frame_w
+            scale_y = map_h / frame_h
+            scaled_pts = np.array(
+                [(int(x * scale_x), int(y * scale_y)) for x, y in polygon],
+                dtype=np.int32,
+            )
+            zone_mask = np.zeros((map_h, map_w), dtype=np.uint8)
+            cv2.fillPoly(zone_mask, [scaled_pts], 255)
+            self._zone_mask_cache[cache_key] = zone_mask
+
+        zone_values = anomaly_map[zone_mask > 0]
+        if zone_values.size == 0:
+            return 0.0
+        return float(zone_values.max())
 
     def _update_lock_state(self, anomaly_result: AnomalyResult) -> None:
         """Update the anomaly region lock based on detection results.
