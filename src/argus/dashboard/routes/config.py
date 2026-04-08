@@ -24,6 +24,13 @@ from argus.dashboard.components import (
     page_header,
     tab_bar,
 )
+from argus.dashboard.api_response import (
+    api_success,
+    api_internal_error,
+    api_not_found,
+    api_unavailable,
+    api_validation_error,
+)
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 from argus.dashboard.model_runtime import find_registered_model_by_path
 
@@ -166,7 +173,7 @@ async def update_detection_params(request: Request):
     config = request.app.state.config
     camera_manager = request.app.state.camera_manager
     if not config or not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     form = await parse_request_form(request)
 
@@ -182,7 +189,7 @@ async def update_detection_params(request: Request):
         if form.get("sev_high"):
             st.high = float(form["sev_high"])
     except (ValueError, Exception) as e:
-        return JSONResponse({"error": f"阈值参数无效: {e}"}, status_code=400)
+        return api_validation_error(f"阈值参数无效: {e}")
 
     # Update temporal
     temp = config.alerts.temporal
@@ -219,8 +226,8 @@ async def update_detection_params(request: Request):
             detail=f"更新检测参数，影响 {updated} 条流水线",
             ip_address=client_ip,
         )
-    return JSONResponse(
-        {"status": "ok", "pipelines_updated": updated},
+    return api_success(
+        {"pipelines_updated": updated},
         headers=htmx_toast_headers("检测参数已更新"),
     )
 
@@ -286,7 +293,7 @@ async def update_notifications(request: Request):
     """Update email/webhook config."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     form = await parse_request_form(request)
 
@@ -319,8 +326,7 @@ async def update_notifications(request: Request):
     if "webhook_timeout" in form:
         webhook.timeout = float(form["webhook_timeout"])
 
-    return JSONResponse(
-        {"status": "ok"},
+    return api_success(
         headers=htmx_toast_headers("通知设置已更新"),
     )
 
@@ -330,15 +336,11 @@ async def test_email(request: Request):
     """Send a test email."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     email = config.alerts.email
     if not email.smtp_host or not email.recipients:
-        return JSONResponse(
-            {"error": "请先配置 SMTP 服务器和收件人"},
-            status_code=400,
-            headers=htmx_toast_headers("请先配置邮件服务器", toast_type="error"),
-        )
+        return api_validation_error("请先配置 SMTP 服务器和收件人")
 
     def _send():
         import smtplib
@@ -359,15 +361,11 @@ async def test_email(request: Request):
 
     try:
         await asyncio.to_thread(_send)
-        return JSONResponse(
-            {"status": "ok"},
+        return api_success(
             headers=htmx_toast_headers("测试邮件已发送"),
         )
     except Exception as e:
-        return JSONResponse(
-            {"error": str(e)},
-            headers=htmx_toast_headers(f"发送失败: {e}", toast_type="error"),
-        )
+        return api_internal_error(str(e))
 
 
 @router.post("/test-webhook")
@@ -375,11 +373,11 @@ async def test_webhook(request: Request):
     """Send a test webhook."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     webhook = config.alerts.webhook
     if not webhook.url:
-        return JSONResponse({"error": "请先配置 Webhook URL"}, status_code=400)
+        return api_validation_error("请先配置 Webhook URL")
 
     def _send():
         import httpx
@@ -395,12 +393,11 @@ async def test_webhook(request: Request):
 
     try:
         await asyncio.to_thread(_send)
-        return JSONResponse(
-            {"status": "ok"},
+        return api_success(
             headers=htmx_toast_headers("Webhook 测试成功"),
         )
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return api_internal_error(str(e))
 
 
 @router.get("/storage", response_class=HTMLResponse)
@@ -467,7 +464,7 @@ def cleanup_data(request: Request):
     db = request.app.state.db
     config = request.app.state.config
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     days = config.storage.alert_retention_days if config else 90
     deleted, paths = db.delete_old_alerts(days=days)
@@ -481,8 +478,8 @@ def cleanup_data(request: Request):
         except Exception:
             pass
 
-    return JSONResponse(
-        {"status": "ok", "deleted": deleted, "files": removed_files},
+    return api_success(
+        {"deleted": deleted, "files": removed_files},
         headers=htmx_toast_headers(f"已清理 {deleted} 条旧告警"),
     )
 
@@ -567,7 +564,7 @@ async def update_thresholds(request: Request, req: ThresholdUpdateRequest):
     """Hot-update detection thresholds without restart."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     updated = 0
     for pipeline in camera_manager._pipelines.values():
@@ -575,7 +572,7 @@ async def update_thresholds(request: Request, req: ThresholdUpdateRequest):
             pipeline.update_thresholds(anomaly_threshold=req.anomaly_threshold)
             updated += 1
 
-    return JSONResponse({"status": "ok", "pipelines_updated": updated})
+    return api_success({"pipelines_updated": updated})
 
 
 @router.post("/reload-model")
@@ -583,25 +580,25 @@ async def reload_model(request: Request, req: ModelReloadRequest):
     """Trigger model hot-reload for a specific camera."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     if req.camera_id not in camera_manager._pipelines:
-        return JSONResponse({"error": f"摄像头 {req.camera_id} 不存在"}, status_code=404)
+        return api_not_found(f"摄像头 {req.camera_id} 不存在")
 
     # Sanitize model path
     allowed_roots = [Path("data/models").resolve(), Path("data/exports").resolve()]
     try:
         model_path = Path(req.model_path).resolve()
         if not any(str(model_path).startswith(str(root)) for root in allowed_roots):
-            return JSONResponse({"error": "模型路径必须在 data/models/ 或 data/exports/ 下"}, status_code=400)
+            return api_validation_error("模型路径必须在 data/models/ 或 data/exports/ 下")
         if not model_path.exists():
-            return JSONResponse({"error": f"模型文件不存在: {req.model_path}"}, status_code=404)
+            return api_not_found(f"模型文件不存在: {req.model_path}")
     except (ValueError, OSError):
-        return JSONResponse({"error": "模型路径无效"}, status_code=400)
+        return api_validation_error("模型路径无效")
 
     resolved_runtime_model = resolve_runtime_model_path(model_path, req.camera_id)
     if resolved_runtime_model is None:
-        return JSONResponse({"error": "未找到可部署的模型文件 (.xml/.pt)"}, status_code=404)
+        return api_not_found("未找到可部署的模型文件 (.xml/.pt)")
 
     registry_record = find_registered_model_by_path(
         request,
@@ -614,7 +611,7 @@ async def reload_model(request: Request, req: ModelReloadRequest):
         str(resolved_runtime_model),
         version_tag=version_tag,
     )
-    return JSONResponse({"status": "ok" if success else "failed", "camera_id": req.camera_id})
+    return api_success({"result": "ok" if success else "failed", "camera_id": req.camera_id})
 
 
 @router.post("/clear-lock/{camera_id}")
@@ -622,11 +619,11 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
     """Clear the anomaly region lock for a camera."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     pipeline = camera_manager._pipelines.get(camera_id)
     if not pipeline:
-        return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
+        return api_not_found(f"摄像头 {camera_id} 不存在")
 
     pipeline.clear_anomaly_lock()
     audit = getattr(request.app.state, "audit_logger", None)
@@ -650,12 +647,12 @@ async def restart_camera(request: Request, camera_id: str):
     """Stop and restart a camera pipeline."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     await asyncio.to_thread(camera_manager.stop_camera, camera_id)
     success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
-    return JSONResponse(
-        {"status": "ok" if success else "failed"},
+    return api_success(
+        {"result": "ok" if success else "failed"},
         headers=htmx_toast_headers("摄像头已重启"),
     )
 
@@ -666,13 +663,13 @@ def reload_config(request: Request):
     config_path = getattr(request.app.state, "config_path", None)
     camera_manager = request.app.state.camera_manager
     if not config_path or not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     try:
         from argus.config.loader import load_config as _load_config
         new_config = _load_config(config_path)
     except Exception as e:
-        return JSONResponse({"error": f"加载配置失败: {e}"}, status_code=400)
+        return api_validation_error(f"加载配置失败: {e}")
 
     updated = 0
     for cam_cfg in new_config.cameras:
@@ -686,8 +683,8 @@ def reload_config(request: Request):
 
     request.app.state.config = new_config
 
-    return JSONResponse(
-        {"status": "ok", "pipelines_updated": updated},
+    return api_success(
+        {"pipelines_updated": updated},
         headers=htmx_toast_headers("配置已重新加载"),
     )
 
@@ -698,16 +695,15 @@ def save_config(request: Request):
     config = request.app.state.config
     config_path = getattr(request.app.state, "config_path", None)
     if not config or not config_path:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     try:
         from argus.config.loader import save_config as _save
         _save(config, config_path)
     except Exception as e:
-        return JSONResponse({"error": f"保存失败: {e}"}, status_code=500)
+        return api_internal_error(f"保存失败: {e}")
 
-    return JSONResponse(
-        {"status": "ok"},
+    return api_success(
         headers=htmx_toast_headers("配置已保存到文件"),
     )
 
@@ -719,7 +715,7 @@ async def get_audio_alerts(request: Request):
     """Return current audio alert settings per severity."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
     dashboard_cfg = getattr(config, "dashboard", None)
     if dashboard_cfg is None:
         from argus.config.schema import DashboardConfig
@@ -728,7 +724,7 @@ async def get_audio_alerts(request: Request):
     if audio_cfg is None:
         from argus.config.schema import AudioAlertConfig
         audio_cfg = AudioAlertConfig()
-    return JSONResponse(audio_cfg.model_dump())
+    return api_success(audio_cfg.model_dump())
 
 
 @router.put("/audio-alerts")
@@ -740,7 +736,7 @@ async def update_audio_alerts(request: Request):
     """
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     data = await request.json()
 
@@ -748,10 +744,10 @@ async def update_audio_alerts(request: Request):
     try:
         new_audio_cfg = AudioAlertConfig(**data)
     except Exception as e:
-        return JSONResponse({"error": f"无效配置: {e}"}, status_code=400)
+        return api_validation_error(f"无效配置: {e}")
 
     dashboard_cfg = getattr(config, "dashboard", None)
     if dashboard_cfg is not None:
         dashboard_cfg.audio_alerts = new_audio_cfg
 
-    return JSONResponse({"status": "ok", "audio_alerts": new_audio_cfg.model_dump()})
+    return api_success({"audio_alerts": new_audio_cfg.model_dump()})

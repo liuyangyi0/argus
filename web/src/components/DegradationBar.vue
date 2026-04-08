@@ -23,9 +23,9 @@ const expanded = ref(false)
 async function fetchSummary() {
   try {
     const res = await getDegradationSummary()
-    events.value = res.data.events || []
-    activeCount.value = res.data.active_count || 0
-    maxLevel.value = res.data.max_level
+    events.value = res.events || []
+    activeCount.value = res.active_count || 0
+    maxLevel.value = res.max_level
   } catch { /* silent */ }
 }
 

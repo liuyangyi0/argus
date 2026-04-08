@@ -158,8 +158,11 @@ class TestAlertReplayRoundtrip:
         buf = AlertFrameBuffer(fps=5, pre_seconds=5, post_seconds=3)
         store = AlertRecordingStore(archive_dir=str(tmp_path / "recordings"))
 
-        # Use timestamps far in the past so deadlines are always expired
-        base_ts = time.time() - 120
+        # Use recent timestamps — orphan cleanup checks real time.time(),
+        # so past timestamps would be cleaned before we access them.
+        # All 25 frames span 25*0.2 = 5s; trigger is at frame 24 = base+4.8s.
+        # We need trigger_ts < now so finish_post_capture deadline is expired.
+        base_ts = time.time() - 8  # 8 seconds ago (within max_age = 2*(5+3) = 16s)
         for i in range(25):
             snap = _make_snapshot(
                 ts=base_ts + i * 0.2,

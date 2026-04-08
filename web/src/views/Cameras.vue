@@ -27,9 +27,9 @@ watch(() => addForm.value.protocol, async (proto) => {
     usbLoading.value = true
     try {
       const res = await getUsbDevices()
-      usbDevices.value = res.data
-      if (res.data.length > 0) {
-        addForm.value.source = String(res.data[0].index)
+      usbDevices.value = res
+      if (res.length > 0) {
+        addForm.value.source = String(res[0].index)
       }
     } catch { usbDevices.value = [] }
     finally { usbLoading.value = false }
@@ -39,7 +39,7 @@ watch(() => addForm.value.protocol, async (proto) => {
 async function fetchData() {
   try {
     const res = await getCameras()
-    cameras.value = res.data.cameras || []
+    cameras.value = res.cameras || []
   } catch {
     // Network error or timeout — keep existing data
   } finally {

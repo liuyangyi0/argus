@@ -7,7 +7,13 @@ degradation events displayed in the 48px global bar.
 from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse
+
+from argus.dashboard.api_response import (
+    api_success,
+    api_not_found,
+    api_unavailable,
+    api_validation_error,
+)
 
 router = APIRouter()
 
@@ -27,8 +33,8 @@ def active_degradations(request: Request):
     """
     manager = _get_degradation_manager(request)
     if manager is None:
-        return JSONResponse([])
-    return JSONResponse(manager.get_active())
+        return api_success({"items": []})
+    return api_success({"items": manager.get_active()})
 
 
 @router.get("/history")
@@ -43,8 +49,8 @@ def degradation_history(
     """
     manager = _get_degradation_manager(request)
     if manager is None:
-        return JSONResponse([])
-    return JSONResponse(manager.get_history(days=days))
+        return api_success({"items": []})
+    return api_success({"items": manager.get_history(days=days)})
 
 
 @router.get("/summary")
@@ -55,11 +61,11 @@ def degradation_summary(request: Request):
     """
     manager = _get_degradation_manager(request)
     if manager is None:
-        return JSONResponse({"active_count": 0, "max_level": None, "events": []})
+        return api_success({"active_count": 0, "max_level": None, "events": []})
 
     active = manager.get_active()
     max_level = manager.max_active_level
-    return JSONResponse({
+    return api_success({
         "active_count": len(active),
         "max_level": max_level.value if max_level else None,
         "events": active[:3],  # Bar shows max 3, rest collapse to "+N"

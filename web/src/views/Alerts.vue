@@ -21,8 +21,8 @@ async function fetchData() {
     if (filters.value.camera_id) params.camera_id = filters.value.camera_id
     if (filters.value.severity) params.severity = filters.value.severity
     const [a, c] = await Promise.all([getAlerts(params), getCameras()])
-    alerts.value = a.data
-    cameras.value = c.data.cameras || []
+    alerts.value = a.alerts
+    cameras.value = c.cameras || []
   } finally {
     loading.value = false
   }

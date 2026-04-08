@@ -9,6 +9,14 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from argus.dashboard.api_response import (
+    api_conflict,
+    api_internal_error,
+    api_not_found,
+    api_success,
+    api_unavailable,
+    api_validation_error,
+)
 from argus.dashboard.model_runtime import (
     activate_model_version,
     get_registry,
@@ -63,10 +71,10 @@ async def list_models(request: Request, camera_id: str | None = None):
     """List all registered models, optionally filtered by camera_id."""
     registry = _get_registry(request)
     if registry is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     models = registry.list_models(camera_id=camera_id)
-    return JSONResponse({
+    return api_success({
         "models": [m.to_dict() for m in models],
         "total": len(models),
     })
@@ -76,7 +84,7 @@ async def list_models(request: Request, camera_id: str | None = None):
 async def activate_model(request: Request, version_id: str):
     """Activate a specific model version."""
     if _get_registry(request) is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     try:
         triggered_by = "dashboard"
@@ -92,14 +100,13 @@ async def activate_model(request: Request, version_id: str):
             version_id,
             triggered_by=triggered_by,
         )
-        return JSONResponse({
-            "status": "ok",
+        return api_success({
             "activated": record.model_version_id,
             "camera_id": record.camera_id,
             "runtime_synced": runtime_synced,
         })
     except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=404)
+        return api_not_found(str(e))
 
 
 @router.post("/{version_id}/rollback")
@@ -111,7 +118,7 @@ async def rollback_model(request: Request, version_id: str):
     """
     registry = _get_registry(request)
     if registry is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     # Look up the camera_id from the version_id
     models = registry.list_models()
@@ -122,7 +129,7 @@ async def rollback_model(request: Request, version_id: str):
             break
 
     if camera_id is None:
-        return JSONResponse({"error": f"Model version not found: {version_id}"}, status_code=404)
+        return api_not_found(f"模型版本不存在: {version_id}")
 
     previous, runtime_synced = rollback_camera_model(
         request,
@@ -130,13 +137,9 @@ async def rollback_model(request: Request, version_id: str):
         triggered_by="dashboard",
     )
     if previous is None:
-        return JSONResponse(
-            {"error": "No previous model to rollback to"},
-            status_code=404,
-        )
+        return api_not_found("没有可回滚的历史模型")
 
-    return JSONResponse({
-        "status": "ok",
+    return api_success({
         "activated": previous.model_version_id,
         "camera_id": camera_id,
         "runtime_synced": runtime_synced,
@@ -191,40 +194,31 @@ async def batch_inference(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        return api_validation_error("无效的JSON请求")
 
     camera_id = body.get("camera_id")
     image_paths = body.get("image_paths", [])
 
     if not camera_id:
-        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+        return api_validation_error("camera_id is required")
     if not image_paths:
-        return JSONResponse({"error": "image_paths must be a non-empty list"}, status_code=400)
+        return api_validation_error("image_paths must be a non-empty list")
     if len(image_paths) > MAX_BATCH_SIZE:
-        return JSONResponse(
-            {"error": f"Maximum {MAX_BATCH_SIZE} images per batch"},
-            status_code=400,
-        )
+        return api_validation_error(f"Maximum {MAX_BATCH_SIZE} images per batch")
 
     # Get the camera's anomaly detector via public API
     camera_manager = getattr(request.app.state, "camera_manager", None)
     if camera_manager is None:
-        return JSONResponse({"error": "Camera manager not available"}, status_code=503)
+        return api_unavailable("相机管理器不可用")
 
     det_status = camera_manager.get_detector_status(camera_id)
     if det_status is None:
-        return JSONResponse(
-            {"error": f"Camera '{camera_id}' not running or not found"},
-            status_code=404,
-        )
+        return api_not_found(f"相机 '{camera_id}' 未运行或不存在")
 
     pipeline = camera_manager._pipelines.get(camera_id)
     detector = getattr(pipeline, "_anomaly_detector", None) if pipeline else None
     if detector is None:
-        return JSONResponse(
-            {"error": f"No anomaly detector available for camera '{camera_id}'"},
-            status_code=503,
-        )
+        return api_unavailable(f"相机 '{camera_id}' 的异常检测器不可用")
 
     results, scored = await asyncio.to_thread(
         _run_batch_inference, image_paths, detector,
@@ -237,7 +231,7 @@ async def batch_inference(request: Request):
         scored=scored,
     )
 
-    return JSONResponse({
+    return api_success({
         "results": results,
         "total": len(image_paths),
         "scored": scored,
@@ -255,20 +249,17 @@ async def promote_model(request: Request, version_id: str):
     """
     pipeline = _get_release_pipeline(request)
     if pipeline is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        return api_validation_error("无效的JSON请求")
 
     target_stage = body.get("target_stage")
     triggered_by = body.get("triggered_by")
     if not target_stage or not triggered_by:
-        return JSONResponse(
-            {"error": "target_stage and triggered_by are required"},
-            status_code=400,
-        )
+        return api_validation_error("target_stage and triggered_by are required")
 
     try:
         record = pipeline.transition(
@@ -278,8 +269,7 @@ async def promote_model(request: Request, version_id: str):
             reason=body.get("reason"),
             canary_camera_id=body.get("canary_camera_id"),
         )
-        return JSONResponse({
-            "status": "ok",
+        return api_success({
             "model": record.to_dict(),
             "runtime_synced": (
                 sync_active_camera_model(request, record.camera_id)
@@ -288,9 +278,9 @@ async def promote_model(request: Request, version_id: str):
             ),
         })
     except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return api_validation_error(str(e))
     except StageTransitionError as e:
-        return JSONResponse({"error": str(e)}, status_code=409)
+        return api_conflict(str(e))
 
 
 @router.post("/{version_id}/retire")
@@ -298,7 +288,7 @@ async def retire_model(request: Request, version_id: str):
     """Retire a model (any stage → retired)."""
     pipeline = _get_release_pipeline(request)
     if pipeline is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     try:
         body = await request.json()
@@ -314,14 +304,13 @@ async def retire_model(request: Request, version_id: str):
             triggered_by=triggered_by,
             reason=body.get("reason", "manual retirement"),
         )
-        return JSONResponse({
-            "status": "ok",
+        return api_success({
             "model": record.to_dict(),
         })
     except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=404)
+        return api_not_found(str(e))
     except StageTransitionError as e:
-        return JSONResponse({"error": str(e)}, status_code=409)
+        return api_conflict(str(e))
 
 
 @router.delete("/{version_id}")
@@ -329,14 +318,14 @@ def delete_model(request: Request, version_id: str):
     """Delete a model version (only non-active, non-production models)."""
     registry = _get_registry(request)
     if registry is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     record = registry.get_by_version_id(version_id)
     if record is None:
-        return JSONResponse({"error": f"Model not found: {version_id}"}, status_code=404)
+        return api_not_found(f"模型不存在: {version_id}")
 
     if record.is_active:
-        return JSONResponse({"error": "无法删除当前激活的模型"}, status_code=400)
+        return api_validation_error("无法删除当前激活的模型")
 
     # Delete model files from disk — only if no other model shares the same path
     if record.model_path:
@@ -359,7 +348,7 @@ def delete_model(request: Request, version_id: str):
     registry.delete_model(version_id)
     logger.info("model.deleted", model_version_id=version_id)
 
-    return JSONResponse({"status": "ok", "deleted": version_id})
+    return api_success({"deleted": version_id})
 
 
 def _get_trainer(request: Request):
@@ -401,21 +390,18 @@ async def reexport_model(request: Request, version_id: str):
     """
     registry = _get_registry(request)
     if registry is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     record = registry.get_by_version_id(version_id)
     if record is None:
-        return JSONResponse({"error": f"Model not found: {version_id}"}, status_code=404)
+        return api_not_found(f"模型不存在: {version_id}")
 
     if not record.model_path:
-        return JSONResponse({"error": "模型没有关联的文件路径"}, status_code=400)
+        return api_validation_error("模型没有关联的文件路径")
 
     model_dir = Path(record.model_path)
     if not model_dir.exists():
-        return JSONResponse(
-            {"error": f"模型目录不存在: {record.model_path}"},
-            status_code=404,
-        )
+        return api_not_found(f"模型目录不存在: {record.model_path}")
 
     try:
         body = await request.json()
@@ -426,19 +412,13 @@ async def reexport_model(request: Request, version_id: str):
     quantization = body.get("quantization", "fp16")
 
     if export_format not in {"openvino", "onnx", "torch"}:
-        return JSONResponse(
-            {"error": f"不支持的导出格式: {export_format}"},
-            status_code=400,
-        )
+        return api_validation_error(f"不支持的导出格式: {export_format}")
     if quantization not in {"fp16", "fp32", "int8"}:
-        return JSONResponse(
-            {"error": f"不支持的量化方式: {quantization}"},
-            status_code=400,
-        )
+        return api_validation_error(f"不支持的量化方式: {quantization}")
 
     trainer = _get_trainer(request)
     if trainer is None:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     result = await asyncio.to_thread(
         trainer.reexport_model,
@@ -449,9 +429,9 @@ async def reexport_model(request: Request, version_id: str):
     )
 
     if result.get("status") == "error":
-        return JSONResponse({"error": result["error"]}, status_code=500)
+        return api_internal_error(result["error"])
 
-    return JSONResponse(result)
+    return api_success(result)
 
 
 @router.post("/{version_id}/recalibrate")
@@ -462,14 +442,14 @@ async def recalibrate_model(request: Request, version_id: str):
     """
     registry = _get_registry(request)
     if registry is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     record = registry.get_by_version_id(version_id)
     if record is None:
-        return JSONResponse({"error": f"Model not found: {version_id}"}, status_code=404)
+        return api_not_found(f"模型不存在: {version_id}")
 
     if not record.model_path:
-        return JSONResponse({"error": "模型没有关联的文件路径"}, status_code=400)
+        return api_validation_error("模型没有关联的文件路径")
 
     model_dir = Path(record.model_path)
 
@@ -478,18 +458,15 @@ async def recalibrate_model(request: Request, version_id: str):
 
     baseline_mgr = _get_baseline_manager(request)
     if baseline_mgr is None:
-        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+        return api_unavailable("基线管理器不可用")
 
     baseline_dir = baseline_mgr.get_baseline_dir(record.camera_id, zone_id)
     if not baseline_dir.is_dir():
-        return JSONResponse(
-            {"error": f"基线目录不存在: {baseline_dir}"},
-            status_code=404,
-        )
+        return api_not_found(f"基线目录不存在: {baseline_dir}")
 
     trainer = _get_trainer(request)
     if trainer is None:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     result = await asyncio.to_thread(
         trainer.recalibrate_model,
@@ -500,9 +477,9 @@ async def recalibrate_model(request: Request, version_id: str):
     )
 
     if result.get("status") == "error":
-        return JSONResponse({"error": result["error"]}, status_code=500)
+        return api_internal_error(result["error"])
 
-    return JSONResponse(result)
+    return api_success(result)
 
 
 @router.get("/{version_id}/stage-history")
@@ -510,10 +487,10 @@ async def stage_history(request: Request, version_id: str):
     """Get version event history for a specific model."""
     registry = _get_registry(request)
     if registry is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     events = registry.get_version_events(model_version_id=version_id)
-    return JSONResponse({
+    return api_success({
         "events": [e.to_dict() for e in events],
         "total": len(events),
     })
@@ -528,10 +505,10 @@ async def list_version_events(
     """Query global version transition events."""
     registry = _get_registry(request)
     if registry is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     events = registry.get_version_events(camera_id=camera_id, limit=limit)
-    return JSONResponse({
+    return api_success({
         "events": [e.to_dict() for e in events],
         "total": len(events),
     })
@@ -547,14 +524,14 @@ async def shadow_report(
     """Get shadow inference comparison report."""
     pipeline = _get_release_pipeline(request)
     if pipeline is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     stats = pipeline.get_shadow_stats(
         shadow_version_id=version_id,
         camera_id=camera_id,
         days=days,
     )
-    return JSONResponse(stats)
+    return api_success(stats)
 
 
 # ── Backbone management endpoints ──
@@ -566,7 +543,7 @@ async def backbone_status(request: Request):
     from argus.anomaly.backbone_manager import BackboneManager
 
     manager = BackboneManager.get_instance()
-    return JSONResponse({
+    return api_success({
         "version": manager.version,
         "loaded": manager.is_loaded,
     })
@@ -585,28 +562,21 @@ async def backbone_upgrade(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        return api_validation_error("无效的JSON请求")
 
     backbone_path = body.get("backbone_path")
     version = body.get("version")
     triggered_by = body.get("triggered_by", "system")
 
     if not backbone_path or not version:
-        return JSONResponse(
-            {"error": "backbone_path and version are required"},
-            status_code=400,
-        )
+        return api_validation_error("backbone_path and version are required")
 
     manager = BackboneManager.get_instance()
     success = await asyncio.to_thread(manager.upgrade, Path(backbone_path), version)
 
     if success:
-        return JSONResponse({
-            "status": "ok",
+        return api_success({
             "version": version,
         })
     else:
-        return JSONResponse(
-            {"error": "Backbone upgrade failed"},
-            status_code=500,
-        )
+        return api_internal_error("Backbone升级失败")

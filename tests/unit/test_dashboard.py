@@ -349,7 +349,8 @@ class TestBaselineForms:
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["baselines"] == [{
+        assert payload["code"] == 0
+        assert payload["data"]["baselines"] == [{
             "camera_id": "cam_01",
             "version": "v001",
             "image_count": 1,
@@ -718,8 +719,10 @@ class TestModelPublishRoutes:
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["activated"] == version_id
-        assert payload["runtime_synced"] is True
+        assert payload["code"] == 0
+        data = payload["data"]
+        assert data["activated"] == version_id
+        assert data["runtime_synced"] is True
         # _resolve_model_file resolves the directory to the actual model file
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
@@ -760,7 +763,8 @@ class TestModelPublishRoutes:
         )
 
         assert response.status_code == 200
-        assert response.json()["status"] == "ok"
+        assert response.json()["code"] == 0
+        assert response.json()["data"]["result"] == "ok"
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
             str(model_path.resolve()),
@@ -814,7 +818,8 @@ class TestModelPublishRoutes:
         )
 
         assert response.status_code == 200
-        assert response.json()["status"] == "ok"
+        assert response.json()["code"] == 0
+        assert response.json()["data"]["result"] == "ok"
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
             str(exported_model),
@@ -855,7 +860,7 @@ class TestModelPublishRoutes:
         )
 
         assert response.status_code == 404
-        assert response.json()["error"] == "未找到可部署的模型文件 (.xml/.pt)"
+        assert response.json()["msg"] == "未找到可部署的模型文件 (.xml/.pt)"
         camera_manager.reload_model.assert_not_called()
 
     def test_baseline_deploy_resolves_checkpoint_to_exported_torch(
@@ -905,8 +910,8 @@ class TestModelPublishRoutes:
         )
 
         assert response.status_code == 200
-        assert response.json()["status"] == "ok"
-        assert response.json()["model_version_id"] == version_id
+        assert response.json()["code"] == 0
+        assert response.json()["data"]["model_version_id"] == version_id
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
             str(exported_model),
@@ -959,8 +964,10 @@ class TestModelPublishRoutes:
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["model"]["stage"] == "production"
-        assert payload["runtime_synced"] is True
+        assert payload["code"] == 0
+        data = payload["data"]
+        assert data["model"]["stage"] == "production"
+        assert data["runtime_synced"] is True
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
             str(model_dir / "model.xml"),

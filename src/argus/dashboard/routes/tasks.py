@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from argus.dashboard.api_response import api_success, api_unavailable, api_validation_error
 from argus.dashboard.components import empty_state, progress_bar
 from argus.dashboard.tasks import TaskStatus
 
@@ -47,10 +48,10 @@ def tasks_list_json(request: Request):
     """JSON API: active tasks with progress."""
     task_manager = getattr(request.app.state, "task_manager", None)
     if not task_manager:
-        return JSONResponse({"tasks": []})
+        return api_success({"tasks": []})
 
     tasks = task_manager.get_active_tasks()
-    return JSONResponse({"tasks": [
+    return api_success({"tasks": [
         {
             "task_id": t.task_id,
             "task_type": t.task_type,
@@ -84,11 +85,11 @@ async def dismiss_task(request: Request, task_id: str):
     """Dismiss a completed/failed task."""
     task_manager = getattr(request.app.state, "task_manager", None)
     if not task_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     if task_manager.dismiss(task_id):
         return HTMLResponse("")
-    return JSONResponse({"error": "无法清除运行中的任务"}, status_code=400)
+    return api_validation_error("无法清除运行中的任务")
 
 
 def _render_task_card(task) -> str:

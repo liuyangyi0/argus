@@ -15,7 +15,7 @@ const allModels = ref<any[]>([])
 async function loadAllModels() {
   try {
     const res = await getModelRegistry()
-    allModels.value = res.data.models || []
+    allModels.value = res.models || []
   } catch (e) {
     console.error('Failed to load models', e)
   }

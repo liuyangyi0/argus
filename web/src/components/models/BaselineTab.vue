@@ -74,7 +74,7 @@ async function loadBaselines() {
   baselinesLoading.value = true
   try {
     const res = await getBaselines()
-    baselines.value = res.data.baselines || []
+    baselines.value = res.baselines || []
   } catch (e) {
     console.error('Failed to load baselines', e)
   } finally {
@@ -86,7 +86,7 @@ async function loadBaselineVersions(cameraId: string) {
   versionsLoading.value = true
   try {
     const res = await getBaselineVersions({ camera_id: cameraId })
-    baselineVersions.value = res.data.versions || []
+    baselineVersions.value = res.versions || []
   } catch (e) {
     console.error('Failed to load baseline versions', e)
     baselineVersions.value = []
@@ -99,7 +99,7 @@ async function loadCameraGroups() {
   groupsLoading.value = true
   try {
     const res = await getCameraGroups()
-    cameraGroups.value = res.data.groups || []
+    cameraGroups.value = res.groups || []
   } catch (e) {
     console.error('Failed to load camera groups', e)
   } finally {
@@ -244,7 +244,7 @@ function handleMergeGroup(groupId: string) {
       mergingGroup.value = groupId
       try {
         const res = await mergeGroupBaseline({ group_id: groupId })
-        message.success(`组基线合并完成: ${res.data.version}, ${res.data.image_count} 张图片`)
+        message.success(`组基线合并完成: ${res.version}, ${res.image_count} 张图片`)
         loadCameraGroups()
       } catch (e: any) {
         message.error(e.response?.data?.error || '合并失败')
@@ -265,7 +265,7 @@ function handleMergeFP(cameraId: string) {
       mergingFP.value = cameraId
       try {
         const res = await mergeFalsePositives({ camera_id: cameraId })
-        message.success(`误报合并完成: ${res.data.version}, 新增 ${res.data.fp_included} 张误报帧`)
+        message.success(`误报合并完成: ${res.version}, 新增 ${res.fp_included} 张误报帧`)
         loadBaselines()
       } catch (e: any) {
         message.error(e.response?.data?.error || '合并失败')
@@ -371,7 +371,7 @@ async function handleOptimize(record: any) {
       zone_id: 'default',
       target_ratio: 0.2,
     })
-    const { total, keep, move } = preview.data
+    const { total, keep, move } = preview
     optimizingBaseline.value = null
 
     Modal.confirm({
@@ -387,8 +387,7 @@ async function handleOptimize(record: any) {
             zone_id: 'default',
             target_ratio: 0.2,
           })
-          const data = res.data
-          message.success(`优化完成: 保留 ${data.selected} 张, 移除 ${data.moved} 张`)
+          message.success(`优化完成: 保留 ${res.selected} 张, 移除 ${res.moved} 张`)
           loadBaselines()
         } catch (e: any) {
           message.error(e.response?.data?.error || '优化失败')

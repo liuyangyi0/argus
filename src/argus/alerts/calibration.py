@@ -26,6 +26,7 @@ class CalibrationResult:
     high_threshold: float
     n_calibration_samples: int
     target_fprs: dict[str, float]
+    actual_fprs: dict[str, float] | None = None
 
 
 class ConformalCalibrator:
@@ -92,6 +93,11 @@ class ConformalCalibrator:
             if thresholds[ordered[i]] <= thresholds[ordered[i - 1]]:
                 thresholds[ordered[i]] = thresholds[ordered[i - 1]] + min_step
 
+        # Compute actual FPR for each (possibly adjusted) threshold
+        actual_fprs = {}
+        for level in ordered:
+            actual_fprs[level] = float(np.sum(scores > thresholds[level]) / n)
+
         result = CalibrationResult(
             info_threshold=thresholds["info"],
             low_threshold=thresholds["low"],
@@ -99,12 +105,14 @@ class ConformalCalibrator:
             high_threshold=thresholds["high"],
             n_calibration_samples=n,
             target_fprs=target_fprs,
+            actual_fprs=actual_fprs,
         )
 
         logger.info(
             "calibration.complete",
             n_samples=n,
             thresholds={k: round(v, 4) for k, v in thresholds.items()},
+            actual_fprs={k: round(v, 6) for k, v in actual_fprs.items()},
         )
         return result
 
@@ -126,6 +134,7 @@ class ConformalCalibrator:
             "high": result.high_threshold,
             "n_samples": result.n_calibration_samples,
             "target_fprs": result.target_fprs,
+            "actual_fprs": result.actual_fprs,
         }
         if sorted_scores is not None:
             data["sorted_scores"] = [round(float(s), 6) for s in sorted_scores]

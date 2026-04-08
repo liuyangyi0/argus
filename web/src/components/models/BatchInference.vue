@@ -30,8 +30,8 @@ async function handleBatchInference() {
   batchResults.value = []
   try {
     const res = await batchInference(batchCameraId.value, paths)
-    batchResults.value = res.data.results || []
-    message.success(`完成推理: ${res.data.scored}/${res.data.total} 张图片`)
+    batchResults.value = res.results || []
+    message.success(`完成推理: ${res.scored}/${res.total} 张图片`)
   } catch (e: any) {
     message.error(e.response?.data?.error || '批量推理失败')
   } finally {

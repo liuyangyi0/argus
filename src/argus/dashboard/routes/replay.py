@@ -12,7 +12,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+
+from argus.dashboard.api_response import (
+    api_success,
+    api_not_found,
+    api_unavailable,
+    api_validation_error,
+)
 
 router = APIRouter()
 
@@ -36,13 +43,13 @@ def replay_metadata(request: Request, alert_id: str):
     """
     store = _get_recording_store(request)
     if store is None:
-        return JSONResponse({"error": "Recording store not configured"}, status_code=503)
+        return api_unavailable("录像存储未配置")
 
     metadata = store.load_metadata(alert_id)
     if metadata is None:
-        return JSONResponse({"error": "Recording not found"}, status_code=404)
+        return api_not_found("录像不存在")
 
-    return JSONResponse(metadata)
+    return api_success(metadata)
 
 
 @router.get("/{alert_id}/signals")
@@ -55,11 +62,11 @@ def replay_signals(request: Request, alert_id: str):
     """
     store = _get_recording_store(request)
     if store is None:
-        return JSONResponse({"error": "Recording store not configured"}, status_code=503)
+        return api_unavailable("录像存储未配置")
 
     signals = store.load_signals(alert_id)
     if signals is None:
-        return JSONResponse({"error": "Recording not found"}, status_code=404)
+        return api_not_found("录像不存在")
 
     # Enrich with operator actions from alert workflow history
     db = _get_db(request)
@@ -80,7 +87,7 @@ def replay_signals(request: Request, alert_id: str):
     key_frames = _compute_key_frames(signals)
     signals["key_frames"] = key_frames
 
-    return JSONResponse(signals)
+    return api_success(signals)
 
 
 @router.get("/{alert_id}/frame/{index}")
@@ -180,12 +187,12 @@ def replay_reference(
     """
     store = _get_recording_store(request)
     if store is None:
-        return JSONResponse({"available": False, "frame_base64": None, "source_date": ""})
+        return api_success({"available": False, "frame_base64": None, "source_date": ""})
 
     # Get the alert's metadata to find camera_id and trigger time
     metadata = store.load_metadata(alert_id)
     if metadata is None:
-        return JSONResponse({"available": False, "frame_base64": None, "source_date": ""})
+        return api_success({"available": False, "frame_base64": None, "source_date": ""})
 
     camera_id = metadata["camera_id"]
     trigger_ts = metadata["trigger_timestamp"]
@@ -196,7 +203,7 @@ def replay_reference(
         try:
             ref_date = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except ValueError:
-            return JSONResponse({"error": "Invalid date format, use YYYY-MM-DD"}, status_code=400)
+            return api_validation_error("日期格式无效，请使用 YYYY-MM-DD")
     else:
         ref_date = trigger_dt - timedelta(days=1)
 
@@ -211,7 +218,7 @@ def replay_reference(
     # Search for recordings from the same camera on the reference date
     archive_dir = store.archive_dir / ref_date_str / camera_id
     if not archive_dir.exists():
-        return JSONResponse({
+        return api_success({
             "available": False,
             "frame_base64": None,
             "source_date": ref_date_str,
@@ -242,13 +249,13 @@ def replay_reference(
             continue
 
     if best_frame is not None:
-        return JSONResponse({
+        return api_success({
             "available": True,
             "frame_base64": base64.b64encode(best_frame).decode("ascii"),
             "source_date": ref_date_str,
         })
 
-    return JSONResponse({
+    return api_success({
         "available": False,
         "frame_base64": None,
         "source_date": ref_date_str,
@@ -263,16 +270,16 @@ async def pin_frame(request: Request, alert_id: str):
     """
     store = _get_recording_store(request)
     if store is None:
-        return JSONResponse({"error": "Recording store not configured"}, status_code=503)
+        return api_unavailable("录像存储未配置")
 
     body = await request.json()
     index = body.get("index", 0)
     label = body.get("label", "")
 
     if not store.pin_frame(alert_id, index, label):
-        return JSONResponse({"error": "Recording not found"}, status_code=404)
+        return api_not_found("录像不存在")
 
-    return JSONResponse({"success": True})
+    return api_success({"success": True})
 
 
 def _compute_key_frames(signals: dict) -> list[dict]:

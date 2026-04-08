@@ -12,7 +12,7 @@ async function loadVersionEvents() {
   eventsLoading.value = true
   try {
     const res = await getVersionEvents({ limit: 50 })
-    versionEvents.value = res.data.events || []
+    versionEvents.value = res.events || []
   } catch (e) {
     console.error('Failed to load version events', e)
   } finally {

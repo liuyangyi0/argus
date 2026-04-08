@@ -8,7 +8,7 @@ const backbones = ref<any[]>([])
 async function loadBackbones() {
   try {
     const res = await getBackbones()
-    backbones.value = res.data.backbones || []
+    backbones.value = res.backbones || []
   } catch (e) {
     console.error(e)
   }
