@@ -55,7 +55,7 @@ def activate_model_version(
     if registry is None:
         raise ValueError("Database not available")
 
-    registry.activate(version_id, triggered_by=triggered_by)
+    registry.activate(version_id, triggered_by=triggered_by, allow_bypass=True)
     record = registry.get_by_version_id(version_id)
     if record is None:
         raise ValueError(f"Model version not found: {version_id}")

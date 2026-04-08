@@ -21,8 +21,9 @@ from argus.storage.models import (
 
 logger = structlog.get_logger()
 
-# Valid stage transitions (from_stage -> set of allowed to_stages)
-_VALID_TRANSITIONS: dict[str, set[str]] = {
+# Valid stage transitions (from_stage -> set of allowed to_stages).
+# Canonical definition — ModelRegistry imports this to avoid duplication.
+VALID_TRANSITIONS: dict[str, set[str]] = {
     ModelStage.CANDIDATE.value: {ModelStage.SHADOW.value, ModelStage.RETIRED.value},
     ModelStage.SHADOW.value: {
         ModelStage.CANARY.value,
@@ -119,7 +120,9 @@ class ReleasePipeline:
             if target_stage == ModelStage.CANARY.value:
                 record.canary_camera_id = canary_camera_id
             elif target_stage == ModelStage.PRODUCTION.value:
-                self._retire_current_production(session, record.camera_id, model_version_id)
+                self._retire_current_production(
+                    session, record.camera_id, model_version_id, triggered_by,
+                )
                 record.is_active = True
                 record.canary_camera_id = None
             elif target_stage == ModelStage.RETIRED.value:
@@ -233,7 +236,7 @@ class ReleasePipeline:
 
     def _validate_transition(self, current_stage: str, target_stage: str) -> None:
         """Check if the transition is in the allowed set."""
-        allowed = _VALID_TRANSITIONS.get(current_stage, set())
+        allowed = VALID_TRANSITIONS.get(current_stage, set())
         if target_stage not in allowed:
             raise StageTransitionError(
                 f"Invalid transition: {current_stage} → {target_stage}. "
@@ -273,7 +276,10 @@ class ReleasePipeline:
 
     @staticmethod
     def _retire_current_production(
-        session: Session, camera_id: str, exclude_version_id: str
+        session: Session,
+        camera_id: str,
+        exclude_version_id: str,
+        triggered_by: str = "system",
     ) -> None:
         """Retire existing production models for this camera (except the one being promoted)."""
         production_models = (
@@ -285,3 +291,12 @@ class ReleasePipeline:
         for model in production_models:
             model.stage = ModelStage.RETIRED.value
             model.is_active = False
+            session.add(ModelVersionEvent(
+                camera_id=camera_id,
+                from_version=model.model_version_id,
+                to_version=model.model_version_id,
+                from_stage=ModelStage.PRODUCTION.value,
+                to_stage=ModelStage.RETIRED.value,
+                triggered_by=triggered_by,
+                reason=f"Replaced by {exclude_version_id}",
+            ))

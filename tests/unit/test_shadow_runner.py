@@ -175,8 +175,8 @@ class TestErrorHandling:
             session_factory=session_factory,
             sample_rate=1,
         )
-        # Force load failure
-        r._load_failed = True
+        # Force load failure (exhaust all retries)
+        r._load_failures = r._max_load_retries
 
         for _ in range(5):
             r.run_shadow(_blank_frame())
