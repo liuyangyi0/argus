@@ -11,6 +11,7 @@ camera processing thread during HTTP timeouts.
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
@@ -54,6 +55,9 @@ class AlertDispatcher:
         self._alerts_dir.mkdir(parents=True, exist_ok=True)
         self._http_client = None
         self._shutdown = threading.Event()
+        # M3: Cache disk space check to avoid frequent syscalls
+        self._disk_space_ok: bool = True
+        self._disk_space_checked_at: float = 0.0
 
         # DET-009: Circuit breaker for webhook dispatch
         cb_config = CircuitBreakerConfig(
@@ -63,6 +67,15 @@ class AlertDispatcher:
         self._circuit_breaker = CircuitBreaker(cb_config)
 
         # HIGH-13: Non-daemon threads so queued alerts are not discarded on shutdown
+        # Background database dispatch thread — keeps DB writes off the pipeline thread
+        self._db_queue: Queue = Queue(maxsize=200)
+        self._db_thread = threading.Thread(
+            target=self._db_worker,
+            name="argus-db",
+            daemon=False,
+        )
+        self._db_thread.start()
+
         # Background webhook dispatch thread
         self._webhook_queue: Queue = Queue(maxsize=100)
         self._webhook_thread: threading.Thread | None = None
@@ -121,8 +134,22 @@ class AlertDispatcher:
             snapshot_path = self._save_snapshot(alert)
             heatmap_path = self._save_heatmap(alert)
 
-        # Channel 1: Database (always active)
-        self._dispatch_database(alert, snapshot_path, heatmap_path)
+        # Channel 1: Database (non-blocking, queued to background thread)
+        db_data = {
+            "alert": alert,
+            "snapshot_path": snapshot_path,
+            "heatmap_path": heatmap_path,
+        }
+        try:
+            self._db_queue.put_nowait(db_data)
+        except Exception:
+            logger.error(
+                "dispatch.db_queue_full",
+                alert_id=alert.alert_id,
+                msg="Alert DB persistence lost — queue overflow, attempting sync fallback",
+            )
+            # Fallback: synchronous write so the alert is never silently lost
+            self._dispatch_database(alert, snapshot_path, heatmap_path)
 
         # Channel 2: Webhook (non-blocking, queued to background thread, with circuit breaker DET-009)
         if self._config.webhook.enabled:
@@ -242,6 +269,18 @@ class AlertDispatcher:
                         )
                         self._shutdown.wait(timeout=min(backoff, 30.0))
                         backoff = min(backoff * 2, 30.0)
+
+    def _db_worker(self) -> None:
+        """Background thread that persists alerts to the database."""
+        logger.info("db_worker.started")
+        while not self._shutdown.is_set():
+            try:
+                data = self._db_queue.get(timeout=5.0)
+            except Empty:
+                continue
+            self._dispatch_database(
+                data["alert"], data["snapshot_path"], data["heatmap_path"],
+            )
 
     def _webhook_worker(self) -> None:
         """Background thread that sends webhook HTTP POST requests."""
@@ -406,24 +445,36 @@ class AlertDispatcher:
         """Check if enough disk space is available for alert images.
 
         Returns True if at least min_free_mb megabytes are available.
+        Results are cached for 30 seconds to avoid frequent syscalls.
         """
         import shutil
+
+        now = time.monotonic()
+        if now - self._disk_space_checked_at < 30.0:
+            return self._disk_space_ok
 
         try:
             usage = shutil.disk_usage(self._alerts_dir)
             free_mb = usage.free / (1024 * 1024)
-            if free_mb < min_free_mb:
+            self._disk_space_ok = free_mb >= min_free_mb
+            self._disk_space_checked_at = now
+            if not self._disk_space_ok:
                 logger.warning(
                     "dispatch.low_disk_space",
                     free_mb=round(free_mb, 1),
                     threshold_mb=min_free_mb,
                     path=str(self._alerts_dir),
                 )
-                return False
-            return True
+            return self._disk_space_ok
         except OSError as e:
             logger.error("dispatch.disk_check_failed", error=str(e))
             return True  # Fail-open: allow save if check itself fails
+
+    def flush_db_queue(self, timeout: float = 5.0) -> None:
+        """Block until the DB dispatch queue is empty. Used for testing."""
+        deadline = time.monotonic() + timeout
+        while self._db_queue.qsize() > 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
 
     def get_circuit_breaker_status(self) -> dict:
         """Get circuit breaker status for dashboard display (DET-009)."""
@@ -437,12 +488,17 @@ class AlertDispatcher:
         """
         logger.info(
             "dispatcher.closing",
+            db_pending=self._db_queue.qsize(),
             webhook_pending=self._webhook_queue.qsize(),
             email_pending=self._email_queue.qsize(),
         )
         self._shutdown.set()
 
         # Wait for threads to finish processing remaining items
+        if self._db_thread.is_alive():
+            self._db_thread.join(timeout=10.0)
+            if self._db_thread.is_alive():
+                logger.warning("dispatcher.db_drain_timeout")
         if self._webhook_thread and self._webhook_thread.is_alive():
             self._webhook_thread.join(timeout=10.0)
             if self._webhook_thread.is_alive():
@@ -453,11 +509,13 @@ class AlertDispatcher:
                 logger.warning("dispatcher.email_drain_timeout")
 
         # Log any items still in queues after drain
+        remaining_db = self._db_queue.qsize()
         remaining_webhook = self._webhook_queue.qsize()
         remaining_email = self._email_queue.qsize()
-        if remaining_webhook > 0 or remaining_email > 0:
+        if remaining_db > 0 or remaining_webhook > 0 or remaining_email > 0:
             logger.error(
                 "dispatcher.alerts_lost_on_shutdown",
+                db_remaining=remaining_db,
                 webhook_remaining=remaining_webhook,
                 email_remaining=remaining_email,
             )

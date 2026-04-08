@@ -132,6 +132,24 @@ class CameraInferenceRunner:
         else:
             self._consecutive_failures = 0
 
+        # Track segmenter failures → transition to DEGRADED_SEGMENTER
+        seg_failures = self._pipeline.segmenter_consecutive_failures
+        if seg_failures >= self._max_consecutive_failures:
+            if self._degradation.state not in (
+                DegradationState.DEGRADED_SEGMENTER,
+                DegradationState.BACKBONE_FAILED,
+                DegradationState.RESTARTING,
+            ):
+                self._degradation.transition(
+                    DegradationState.DEGRADED_SEGMENTER,
+                    f"{seg_failures} consecutive segmentation failures",
+                )
+        elif seg_failures == 0 and self._degradation.state == DegradationState.DEGRADED_SEGMENTER:
+            self._degradation.transition(
+                DegradationState.NOMINAL,
+                "segmenter recovered",
+            )
+
         # Submit audit record for non-NORMAL frames
         last_record = self._pipeline.last_inference_record
         if last_record is not None and self._record_store is not None:

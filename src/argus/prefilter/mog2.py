@@ -97,6 +97,9 @@ class MOG2PreFilter:
 
         # MED-02: Validate phase correlation result (can return NaN/Inf on edge cases)
         if not (np.isfinite(dx) and np.isfinite(dy)):
+            # Reset _prev_gray so the next frame re-initializes cleanly
+            # instead of using stale reference that produced invalid correlation
+            self._prev_gray = None
             return frame
 
         # Only compensate small vibration; large shifts are real motion

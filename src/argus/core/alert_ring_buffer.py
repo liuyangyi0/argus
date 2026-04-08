@@ -133,6 +133,21 @@ class AlertFrameBuffer:
         """Append a frame snapshot (called from pipeline thread, every frame)."""
         with self._lock:
             self._frames.append(snapshot)
+            # Auto-clean orphaned pending captures that exceed max age (2× post_seconds)
+            if self._pending_captures:
+                now = time.time()
+                max_age = 2 * (self._pre_seconds + self._post_seconds)
+                orphaned = [
+                    aid for aid, pc in self._pending_captures.items()
+                    if now - pc.trigger_timestamp > max_age
+                ]
+                for aid in orphaned:
+                    self._pending_captures.pop(aid, None)
+                    logger.warning(
+                        "ring_buffer.orphan_capture_cleaned",
+                        alert_id=aid,
+                        msg="Pending post-capture exceeded max age, cleaned up",
+                    )
 
     def solidify(
         self,

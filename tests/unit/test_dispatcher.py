@@ -24,7 +24,9 @@ def db(tmp_path):
 @pytest.fixture
 def dispatcher(db, tmp_path):
     config = AlertConfig()
-    return AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+    d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+    yield d
+    d.close()
 
 
 def make_alert(
@@ -52,6 +54,7 @@ class TestAlertDispatcher:
         """Dispatching an alert should persist it in the database."""
         alert = make_alert()
         dispatcher.dispatch(alert)
+        dispatcher.flush_db_queue()
 
         alerts = db.get_alerts()
         assert len(alerts) == 1
@@ -79,6 +82,7 @@ class TestAlertDispatcher:
         """Should work fine without snapshot or heatmap."""
         alert = make_alert()
         dispatcher.dispatch(alert)
+        dispatcher.flush_db_queue()
 
         alerts = db.get_alerts()
         assert len(alerts) == 1
@@ -90,5 +94,6 @@ class TestAlertDispatcher:
         for i in range(5):
             alert = make_alert(alert_id=f"ALT-{i:06d}")
             dispatcher.dispatch(alert)
+        dispatcher.flush_db_queue()
 
         assert db.get_alert_count() == 5
