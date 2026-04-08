@@ -1,6 +1,6 @@
 """Three-state circuit breaker for alert dispatch (DET-009).
 
-Prevents cascading failures when webhook/email endpoints are down.
+Prevents cascading failures when the webhook endpoint is down.
 When too many consecutive failures occur, the circuit opens and
 dispatch is skipped (alerts still saved to DB). After a recovery
 timeout, one test request is allowed (half-open). If it succeeds,

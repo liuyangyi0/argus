@@ -169,12 +169,17 @@ class TestAlertDeduplication:
         assert len(alerts) == 1
 
     def test_different_zones_independent(self):
-        """Alerts from different zones are independent."""
+        """Alerts from different zones are independent when camera window allows."""
         config = _make_fast_config(
             temporal=TemporalConfirmation(
                 evidence_lambda=0.8,
                 evidence_threshold=0.5,
                 min_spatial_overlap=0.0,
+            ),
+            # Minimal camera window so zones can fire independently
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=60.0,
+                same_camera_window_seconds=5.0,
             ),
         )
         grader = AlertGrader(config)
@@ -191,6 +196,7 @@ class TestAlertDeduplication:
                 )
                 if result is not None:
                     alerts.append(result)
+            grader.reset_camera_suppression("cam1")
 
         # Each zone should produce exactly one alert
         zone_ids = {a.zone_id for a in alerts}

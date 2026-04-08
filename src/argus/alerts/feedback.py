@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +53,7 @@ class FeedbackManager:
         self._baselines_dir = Path(baselines_dir)
         self._alerts_dir = Path(alerts_dir)
         self._config = config or FeedbackConfig()
+        self._file_lock = threading.Lock()
 
     # ── Core feedback submission ──
 
@@ -78,6 +80,15 @@ class FeedbackManager:
 
         Returns the created FeedbackRecord.
         """
+        # Validate snapshot path exists if provided
+        if snapshot_path and not Path(snapshot_path).exists():
+            logger.warning(
+                "feedback.snapshot_missing",
+                alert_id=alert_id,
+                path=snapshot_path,
+            )
+            snapshot_path = None  # Clear broken path before persisting
+
         record = FeedbackRecord(
             feedback_id=str(uuid.uuid4()),
             alert_id=alert_id,
@@ -226,63 +237,6 @@ class FeedbackManager:
             )
         return copied
 
-    # ── Legacy compatibility ──
-
-    def export_false_positives(
-        self,
-        camera_id: str,
-        zone_id: str = "default",
-    ) -> int:
-        """Export false positive snapshots to the baseline directory.
-
-        Copies FP-marked alert snapshots into the camera's baseline
-        folder so they're included in the next training cycle.
-
-        Returns the number of images exported.
-        """
-        # Get all FP alerts for this camera
-        alerts = self._db.get_alerts(camera_id=camera_id, limit=500)
-        fp_alerts = [a for a in alerts if a.false_positive and a.snapshot_path]
-
-        if not fp_alerts:
-            logger.info("feedback.no_fp", camera_id=camera_id)
-            return 0
-
-        # Create output directory
-        fp_dir = self._baselines_dir / camera_id / zone_id / "false_positives"
-        fp_dir.mkdir(parents=True, exist_ok=True)
-
-        exported = 0
-        for alert in fp_alerts:
-            src = Path(alert.snapshot_path)
-            if src.exists():
-                dst = fp_dir / f"fp_{alert.alert_id}.jpg"
-                if not dst.exists():
-                    shutil.copy2(src, dst)
-                    # Write metadata sidecar
-                    meta = {
-                        "alert_id": alert.alert_id,
-                        "operator": alert.acknowledged_by or "unknown",
-                        "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
-                        "camera_id": camera_id,
-                        "zone_id": zone_id,
-                        "category": "false_positive",
-                        "anomaly_score": alert.anomaly_score,
-                        "severity": alert.severity,
-                        "notes": alert.notes,
-                    }
-                    meta_path = dst.with_suffix(".meta.json")
-                    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
-                    exported += 1
-
-        logger.info(
-            "feedback.exported",
-            camera_id=camera_id,
-            exported=exported,
-            total_fp=len(fp_alerts),
-        )
-        return exported
-
     def merge_fp_into_baseline(
         self,
         camera_id: str,
@@ -416,6 +370,28 @@ class FeedbackManager:
 
     # ── Internal helpers ──
 
+    def _copy_snapshot_with_meta(
+        self, src: Path, dst: Path, meta: dict, log_event: str, feedback_id: str,
+    ) -> None:
+        """Copy a snapshot file and write a metadata sidecar atomically.
+
+        Uses a temp file for the copy to minimize lock hold time — the lock
+        only guards the exists-check and atomic rename.
+        """
+        tmp = dst.with_suffix(".tmp")
+        shutil.copy2(src, tmp)
+        meta_path = dst.with_suffix(".meta.json")
+        meta_text = json.dumps(meta, indent=2, ensure_ascii=False)
+
+        with self._file_lock:
+            if dst.exists():
+                tmp.unlink(missing_ok=True)
+                return
+            tmp.rename(dst)
+            meta_path.write_text(meta_text)
+
+        logger.debug(log_event, feedback_id=feedback_id, dst=str(dst))
+
     def _copy_to_baseline(self, record: FeedbackRecord) -> None:
         """Copy FP snapshot to camera's baseline false_positives directory."""
         if not record.snapshot_path:
@@ -433,10 +409,9 @@ class FeedbackManager:
         fp_dir.mkdir(parents=True, exist_ok=True)
 
         dst = fp_dir / f"fp_{record.feedback_id[:16]}{src.suffix}"
-        if not dst.exists():
-            shutil.copy2(src, dst)
-            # Write metadata sidecar
-            meta = {
+        self._copy_snapshot_with_meta(
+            src, dst,
+            meta={
                 "feedback_id": record.feedback_id,
                 "alert_id": record.alert_id,
                 "category": record.category,
@@ -445,14 +420,10 @@ class FeedbackManager:
                 "zone_id": record.zone_id,
                 "model_version": record.model_version_at_time,
                 "submitted_by": record.submitted_by,
-            }
-            meta_path = dst.with_suffix(".meta.json")
-            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
-            logger.debug(
-                "feedback.fp_to_baseline",
-                feedback_id=record.feedback_id,
-                dst=str(dst),
-            )
+            },
+            log_event="feedback.fp_to_baseline",
+            feedback_id=record.feedback_id,
+        )
 
     def _copy_to_validation(self, record: FeedbackRecord) -> None:
         """Copy confirmed anomaly snapshot to validation directory."""
@@ -466,20 +437,16 @@ class FeedbackManager:
         val_dir.mkdir(parents=True, exist_ok=True)
 
         dst = val_dir / f"confirmed_{record.feedback_id[:16]}{src.suffix}"
-        if not dst.exists():
-            shutil.copy2(src, dst)
-            meta = {
+        self._copy_snapshot_with_meta(
+            src, dst,
+            meta={
                 "feedback_id": record.feedback_id,
                 "alert_id": record.alert_id,
                 "anomaly_score": record.anomaly_score,
                 "camera_id": record.camera_id,
                 "zone_id": record.zone_id,
                 "model_version": record.model_version_at_time,
-            }
-            meta_path = dst.with_suffix(".meta.json")
-            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
-            logger.debug(
-                "feedback.confirmed_to_validation",
-                feedback_id=record.feedback_id,
-                dst=str(dst),
-            )
+            },
+            log_event="feedback.confirmed_to_validation",
+            feedback_id=record.feedback_id,
+        )

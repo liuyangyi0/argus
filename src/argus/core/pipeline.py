@@ -340,6 +340,9 @@ class DetectionPipeline:
             self._drift_reference_scores: list[float] = []
             self._drift_reference_size = drift_cfg.reference_window
             self._drift_reference_ready = False
+            self._drift_reference_start_time: float = 0.0
+            # Max 10 minutes to collect reference; use partial data if timeout
+            self._drift_reference_timeout = 600.0
             self._drift_cooldown_seconds = drift_cfg.cooldown_minutes * 60
             self._drift_last_alert_time = 0.0
         else:
@@ -1632,20 +1635,40 @@ class DetectionPipeline:
         """
         if not self._drift_reference_ready:
             # Still collecting reference distribution
+            now = time.monotonic()
+            if self._drift_reference_start_time == 0.0:
+                self._drift_reference_start_time = now
+
             self._drift_reference_scores.append(score)
-            if len(self._drift_reference_scores) >= self._drift_reference_size:
+            collected = len(self._drift_reference_scores)
+            timed_out = (now - self._drift_reference_start_time) >= self._drift_reference_timeout
+            enough = collected >= self._drift_reference_size
+
+            # Use partial reference if timeout and have at least 100 samples
+            if enough or (timed_out and collected >= 100):
                 ref = np.array(self._drift_reference_scores)
                 self._drift_detector.set_reference(ref)
                 self._drift_reference_ready = True
                 logger.info(
                     "drift.reference_ready",
                     camera_id=camera_id,
-                    samples=len(self._drift_reference_scores),
+                    samples=collected,
+                    target=self._drift_reference_size,
+                    timed_out=timed_out,
                     mean=round(float(ref.mean()), 4),
                     std=round(float(ref.std()), 4),
                 )
-                # Clear the list to free memory
                 self._drift_reference_scores.clear()
+            elif timed_out:
+                # Not enough samples even after timeout — reset and retry
+                logger.warning(
+                    "drift.reference_timeout_insufficient",
+                    camera_id=camera_id,
+                    samples=collected,
+                    required=100,
+                )
+                self._drift_reference_scores.clear()
+                self._drift_reference_start_time = 0.0
             return
 
         # Reference is ready — feed score to detector

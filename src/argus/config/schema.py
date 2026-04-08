@@ -500,18 +500,6 @@ class WebhookConfig(BaseModel):
     timeout: float = Field(default=5.0, ge=1.0, le=30.0)
 
 
-class EmailConfig(BaseModel):
-    enabled: bool = False
-    min_severity: AlertSeverity = AlertSeverity.HIGH
-    smtp_host: str = ""
-    smtp_port: int = Field(default=587, ge=1, le=65535)
-    smtp_username: str = ""
-    smtp_password: str = ""
-    from_address: str = "argus@plant.local"
-    use_tls: bool = True
-    recipients: list[str] = Field(default_factory=list)
-
-
 class CalibrationConfig(BaseModel):
     """Conformal prediction score calibration."""
 
@@ -537,7 +525,6 @@ class AlertConfig(BaseModel):
         default_factory=lambda: {"critical": 1.2, "standard": 1.0, "low_priority": 0.8}
     )
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
-    email: EmailConfig = Field(default_factory=EmailConfig)
     circuit_breaker_threshold: int = Field(default=5, ge=1, le=50)
     circuit_breaker_timeout: float = Field(default=60.0, ge=10.0, le=600.0)
 
