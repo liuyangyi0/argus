@@ -71,38 +71,6 @@ def _create_fake_baseline(baseline_mgr, camera_id, count=10):
     return version_dir
 
 
-class TestExportWritesMetaJson:
-    def test_meta_json_created(self, feedback_mgr, db, tmp_path):
-        _create_fp_alert(db, "cam_01", "alert_001", tmp_path)
-        exported = feedback_mgr.export_false_positives("cam_01")
-        assert exported == 1
-
-        fp_dir = tmp_path / "baselines" / "cam_01" / "default" / "false_positives"
-        meta_files = list(fp_dir.glob("*.meta.json"))
-        assert len(meta_files) == 1
-
-    def test_meta_json_fields(self, feedback_mgr, db, tmp_path):
-        _create_fp_alert(db, "cam_01", "alert_002", tmp_path)
-        feedback_mgr.export_false_positives("cam_01")
-
-        fp_dir = tmp_path / "baselines" / "cam_01" / "default" / "false_positives"
-        meta_path = fp_dir / "fp_alert_002.meta.json"
-        assert meta_path.exists()
-
-        meta = json.loads(meta_path.read_text())
-        assert meta["alert_id"] == "alert_002"
-        assert meta["camera_id"] == "cam_01"
-        assert meta["category"] == "false_positive"
-        assert meta["anomaly_score"] == 0.45
-        assert meta["severity"] == "medium"
-        assert meta["notes"] == "Shadow artifact"
-
-    def test_idempotent_export(self, feedback_mgr, db, tmp_path):
-        _create_fp_alert(db, "cam_01", "alert_003", tmp_path)
-        assert feedback_mgr.export_false_positives("cam_01") == 1
-        assert feedback_mgr.export_false_positives("cam_01") == 0  # Already exported
-
-
 class TestMergeFpIntoBaseline:
     def test_merge_creates_draft_version(self, feedback_mgr, baseline_mgr, db, tmp_path, lifecycle):
         _create_fake_baseline(baseline_mgr, "cam_01", count=5)

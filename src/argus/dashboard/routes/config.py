@@ -239,35 +239,7 @@ async def notifications_tab(request: Request):
     if not config:
         return HTMLResponse(empty_state("配置不可用"))
 
-    email = config.alerts.email
     webhook = config.alerts.webhook
-
-    email_html = f"""
-    <div class="card">
-        <h3>邮件告警</h3>
-        <form hx-post="/api/config/notifications" hx-swap="none">
-            <div class="form-row">
-                {form_select("启用", "email_enabled", [("true","启用"),("false","禁用")], str(email.enabled).lower())}
-                {form_select("最低严重度", "email_min_severity", [("info","提示"),("low","低"),("medium","中"),("high","高")], email.min_severity.value)}
-            </div>
-            <div class="form-row">
-                {form_group("SMTP 服务器", "smtp_host", email.smtp_host, placeholder="mail.plant.local")}
-                {form_group("SMTP 端口", "smtp_port", str(email.smtp_port), "number")}
-            </div>
-            <div class="form-row">
-                {form_group("用户名", "smtp_username", email.smtp_username, hint="留空表示不需要认证")}
-                {form_group("密码", "smtp_password", email.smtp_password, "password")}
-            </div>
-            <div class="form-row">
-                {form_group("发件人地址", "email_from", email.from_address)}
-                {form_group("收件人", "email_recipients", ", ".join(email.recipients), hint="多个地址用逗号分隔")}
-            </div>
-            <div class="form-actions">
-                <button type="submit" class="btn btn-primary">保存邮件设置</button>
-                <button type="button" class="btn btn-ghost" hx-post="/api/config/test-email" hx-swap="none">发送测试邮件</button>
-            </div>
-        </form>
-    </div>"""
 
     webhook_html = f"""
     <div class="card">
@@ -285,7 +257,7 @@ async def notifications_tab(request: Request):
         </form>
     </div>"""
 
-    return HTMLResponse(email_html + webhook_html)
+    return HTMLResponse(webhook_html)
 
 
 @router.post("/notifications")
@@ -296,26 +268,6 @@ async def update_notifications(request: Request):
         return api_unavailable("不可用")
 
     form = await parse_request_form(request)
-
-    # Email settings
-    email = config.alerts.email
-    if "email_enabled" in form:
-        email.enabled = form["email_enabled"] == "true"
-    if "smtp_host" in form:
-        email.smtp_host = form["smtp_host"]
-    if "smtp_port" in form:
-        email.smtp_port = int(form["smtp_port"])
-    if "smtp_username" in form:
-        email.smtp_username = form["smtp_username"]
-    if "smtp_password" in form:
-        email.smtp_password = form["smtp_password"]
-    if "email_from" in form:
-        email.from_address = form["email_from"]
-    if "email_recipients" in form:
-        email.recipients = [r.strip() for r in form["email_recipients"].split(",") if r.strip()]
-    if "email_min_severity" in form:
-        from argus.config.schema import AlertSeverity
-        email.min_severity = AlertSeverity(form["email_min_severity"])
 
     # Webhook settings
     webhook = config.alerts.webhook
@@ -331,41 +283,6 @@ async def update_notifications(request: Request):
     )
 
 
-@router.post("/test-email")
-async def test_email(request: Request):
-    """Send a test email."""
-    config = request.app.state.config
-    if not config:
-        return api_unavailable("不可用")
-
-    email = config.alerts.email
-    if not email.smtp_host or not email.recipients:
-        return api_validation_error("请先配置 SMTP 服务器和收件人")
-
-    def _send():
-        import smtplib
-        from email.mime.text import MIMEText
-
-        msg = MIMEText("这是 Argus 系统发送的测试邮件。如果您收到此邮件，说明邮件告警配置正确。", "plain", "utf-8")
-        msg["Subject"] = "[Argus] 测试邮件"
-        msg["From"] = email.from_address
-        msg["To"] = ", ".join(email.recipients)
-
-        server = smtplib.SMTP(email.smtp_host, email.smtp_port, timeout=10)
-        if email.use_tls:
-            server.starttls()
-        if email.smtp_username:
-            server.login(email.smtp_username, email.smtp_password)
-        server.sendmail(email.from_address, email.recipients, msg.as_string())
-        server.quit()
-
-    try:
-        await asyncio.to_thread(_send)
-        return api_success(
-            headers=htmx_toast_headers("测试邮件已发送"),
-        )
-    except Exception as e:
-        return api_internal_error(str(e))
 
 
 @router.post("/test-webhook")

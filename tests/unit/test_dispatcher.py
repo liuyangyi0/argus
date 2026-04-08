@@ -8,7 +8,7 @@ import pytest
 
 from argus.alerts.dispatcher import AlertDispatcher
 from argus.alerts.grader import Alert
-from argus.config.schema import AlertConfig, AlertSeverity, EmailConfig, WebhookConfig
+from argus.config.schema import AlertConfig, AlertSeverity, WebhookConfig
 from argus.storage.database import Database
 
 
@@ -187,93 +187,6 @@ class TestWebhookDispatch:
             time.sleep(3.0)  # Allow time for retry with backoff
 
             assert mock_client.post.call_count == 2
-        finally:
-            d.close()
-
-
-class TestEmailDispatch:
-    """Tests for the email dispatch channel."""
-
-    def test_email_severity_filter_blocks_low(self, db, tmp_path):
-        """Email with min_severity=HIGH should not send LOW alerts."""
-        config = AlertConfig(
-            email=EmailConfig(
-                enabled=True,
-                min_severity=AlertSeverity.HIGH,
-                smtp_host="localhost",
-                recipients=["admin@plant.local"],
-            ),
-        )
-        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
-        try:
-            alert = make_alert(severity=AlertSeverity.LOW)
-            d.dispatch(alert)
-            time.sleep(0.2)
-
-            # Email queue should be empty because severity is below threshold
-            assert d._email_queue.qsize() == 0
-        finally:
-            d.close()
-
-    def test_email_severity_filter_allows_high(self, db, tmp_path):
-        """Email with min_severity=MEDIUM should send HIGH alerts."""
-        from unittest.mock import MagicMock, patch
-
-        config = AlertConfig(
-            email=EmailConfig(
-                enabled=True,
-                min_severity=AlertSeverity.MEDIUM,
-                smtp_host="localhost",
-                smtp_port=25,
-                use_tls=False,
-                recipients=["admin@plant.local"],
-            ),
-        )
-        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
-        try:
-            with patch("smtplib.SMTP") as MockSMTP:
-                mock_server = MagicMock()
-                MockSMTP.return_value = mock_server
-
-                alert = make_alert(severity=AlertSeverity.HIGH)
-                d.dispatch(alert)
-                time.sleep(1.0)
-
-                # HIGH >= MEDIUM, so email should have been sent
-                MockSMTP.assert_called_once()
-                mock_server.sendmail.assert_called_once()
-        finally:
-            d.close()
-
-    def test_email_sends_via_smtp(self, db, tmp_path):
-        """Email worker should compose and send via SMTP."""
-        from unittest.mock import MagicMock, patch
-
-        config = AlertConfig(
-            email=EmailConfig(
-                enabled=True,
-                min_severity=AlertSeverity.LOW,
-                smtp_host="localhost",
-                smtp_port=25,
-                use_tls=False,
-                recipients=["admin@plant.local"],
-            ),
-        )
-        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
-        try:
-            alert = make_alert(severity=AlertSeverity.HIGH)
-
-            with patch("smtplib.SMTP") as MockSMTP:
-                mock_server = MagicMock()
-                MockSMTP.return_value = mock_server
-
-                d.dispatch(alert)
-                time.sleep(1.0)
-
-                MockSMTP.assert_called_once_with("localhost", 25, timeout=10)
-                mock_server.sendmail.assert_called_once()
-                send_args = mock_server.sendmail.call_args
-                assert send_args[0][1] == ["admin@plant.local"]
         finally:
             d.close()
 

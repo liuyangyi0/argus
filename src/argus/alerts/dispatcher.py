@@ -1,7 +1,7 @@
 """Multi-channel alert dispatcher.
 
 Routes graded alerts to multiple destinations: database persistence,
-webhook (HTTP POST), and console output. Each channel operates independently
+webhook (HTTP POST), and WebSocket push. Each channel operates independently
 so a failure in one channel doesn't block others.
 
 Webhook dispatch runs in a background thread to avoid blocking the
@@ -35,7 +35,7 @@ class AlertDispatcher:
     Channels:
     - Database: Always active, persists all alerts to SQLite
     - Webhook: HTTP POST to configured URL (e.g., plant DCS), runs in background thread
-    - Console: Colored terminal output for monitoring
+    - WebSocket: Real-time dashboard push
 
     Each alert's snapshot and heatmap are saved to disk before
     dispatching to ensure the images are available for review.
@@ -87,22 +87,12 @@ class AlertDispatcher:
             )
             self._webhook_thread.start()
 
-        # Background email dispatch thread
-        self._email_queue: Queue = Queue(maxsize=100)
-        self._email_thread: threading.Thread | None = None
-        if self._config.email.enabled and self._config.email.recipients:
-            self._email_thread = threading.Thread(
-                target=self._email_worker,
-                name="argus-email",
-                daemon=False,
-            )
-            self._email_thread.start()
-
     @staticmethod
     def _alert_to_dict(
         alert: Alert,
         snapshot_path: str | None = None,
         heatmap_path: str | None = None,
+        evidence_unavailable: bool = False,
     ) -> dict:
         """Convert an alert to a dict payload for dispatch channels."""
         payload = {
@@ -117,10 +107,14 @@ class AlertDispatcher:
             payload["snapshot_path"] = snapshot_path
         if heatmap_path is not None:
             payload["heatmap_path"] = heatmap_path
+        if evidence_unavailable:
+            payload["evidence_unavailable"] = True
         return payload
 
     def dispatch(self, alert: Alert) -> None:
         """Send an alert to all configured channels."""
+        evidence_unavailable = False
+
         # Check disk space before writing images
         if not self._check_disk_space():
             logger.error(
@@ -130,15 +124,19 @@ class AlertDispatcher:
             )
             snapshot_path = None
             heatmap_path = None
+            evidence_unavailable = True
         else:
             snapshot_path = self._save_snapshot(alert)
             heatmap_path = self._save_heatmap(alert)
+            if alert.snapshot is not None and snapshot_path is None:
+                evidence_unavailable = True
 
         # Channel 1: Database (non-blocking, queued to background thread)
         db_data = {
             "alert": alert,
             "snapshot_path": snapshot_path,
             "heatmap_path": heatmap_path,
+            "evidence_unavailable": evidence_unavailable,
         }
         try:
             self._db_queue.put_nowait(db_data)
@@ -154,7 +152,9 @@ class AlertDispatcher:
         # Channel 2: Webhook (non-blocking, queued to background thread, with circuit breaker DET-009)
         if self._config.webhook.enabled:
             if self._circuit_breaker.allow_request():
-                payload = self._alert_to_dict(alert, snapshot_path, heatmap_path)
+                payload = self._alert_to_dict(
+                    alert, snapshot_path, heatmap_path, evidence_unavailable,
+                )
                 try:
                     self._webhook_queue.put_nowait(payload)
                 except Exception:
@@ -172,28 +172,13 @@ class AlertDispatcher:
                     msg="Circuit breaker open, webhook skipped",
                 )
 
-        # Channel 3: Email (non-blocking, queued to background thread)
-        if self._config.email.enabled and self._config.email.recipients:
-            # Respect min_severity filter
-            severity_order = ["info", "low", "medium", "high"]
-            alert_level = severity_order.index(alert.severity.value) if alert.severity.value in severity_order else -1
-            min_level = severity_order.index(self._config.email.min_severity.value) if self._config.email.min_severity.value in severity_order else 3
-            if alert_level >= min_level:
-                email_data = self._alert_to_dict(alert, snapshot_path)
-                try:
-                    self._email_queue.put_nowait(email_data)
-                except Exception:
-                    logger.error(
-                        "dispatch.email_queue_full",
-                        alert_id=alert.alert_id,
-                        msg="Alert email delivery lost — queue overflow",
-                    )
-                    self._record_dispatch_failure(alert, "email_queue_overflow")
-
-        # Channel 4: WebSocket push (real-time dashboard notification)
+        # Channel 3: WebSocket push (real-time dashboard notification)
         if self._on_alert_ws:
             try:
-                self._on_alert_ws("alerts", self._alert_to_dict(alert))
+                self._on_alert_ws(
+                    "alerts",
+                    self._alert_to_dict(alert, evidence_unavailable=evidence_unavailable),
+                )
             except Exception as e:
                 logger.warning("dispatch.websocket_failed", alert_id=alert.alert_id, error=str(e))
 
@@ -302,55 +287,6 @@ class AlertDispatcher:
                 raise
 
         self._dispatch_with_retry(self._webhook_queue, send_with_cb, "webhook")
-
-    def _email_worker(self) -> None:
-        """Background thread that sends email alerts via SMTP.
-
-        Supports both TLS and plain SMTP (common in plant internal networks).
-        """
-        import smtplib
-        from email.mime.image import MIMEImage
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-
-        email_cfg = self._config.email
-        logger.info("email_worker.started", smtp_host=email_cfg.smtp_host, recipients=len(email_cfg.recipients))
-
-        def send(data: dict) -> None:
-            msg = MIMEMultipart()
-            msg["From"] = email_cfg.from_address
-            msg["To"] = ", ".join(email_cfg.recipients)
-            msg["Subject"] = (
-                f"[Argus] {data['severity'].upper()} Alert - "
-                f"Camera {data['camera_id']} - {data['alert_id']}"
-            )
-            body = (
-                f"Alert ID: {data['alert_id']}\n"
-                f"Severity: {data['severity'].upper()}\n"
-                f"Camera: {data['camera_id']}\n"
-                f"Zone: {data['zone_id']}\n"
-                f"Anomaly Score: {data['anomaly_score']}\n"
-                f"Time: {data['timestamp']}\n"
-            )
-            msg.attach(MIMEText(body, "plain"))
-
-            snapshot_path = data.get("snapshot_path")
-            if snapshot_path:
-                snap = Path(snapshot_path)
-                if snap.exists():
-                    with open(snap, "rb") as f:
-                        img = MIMEImage(f.read(), name=snap.name)
-                        msg.attach(img)
-
-            server = smtplib.SMTP(email_cfg.smtp_host, email_cfg.smtp_port, timeout=10)
-            if email_cfg.use_tls:
-                server.starttls()
-            if email_cfg.smtp_username:
-                server.login(email_cfg.smtp_username, email_cfg.smtp_password)
-            server.sendmail(email_cfg.from_address, email_cfg.recipients, msg.as_string())
-            server.quit()
-
-        self._dispatch_with_retry(self._email_queue, send, "email")
 
     def _record_dispatch_failure(self, alert: Alert, reason: str) -> None:
         """Log dispatch failure so no alert is silently lost.
@@ -490,7 +426,6 @@ class AlertDispatcher:
             "dispatcher.closing",
             db_pending=self._db_queue.qsize(),
             webhook_pending=self._webhook_queue.qsize(),
-            email_pending=self._email_queue.qsize(),
         )
         self._shutdown.set()
 
@@ -503,21 +438,15 @@ class AlertDispatcher:
             self._webhook_thread.join(timeout=10.0)
             if self._webhook_thread.is_alive():
                 logger.warning("dispatcher.webhook_drain_timeout")
-        if self._email_thread and self._email_thread.is_alive():
-            self._email_thread.join(timeout=10.0)
-            if self._email_thread.is_alive():
-                logger.warning("dispatcher.email_drain_timeout")
 
         # Log any items still in queues after drain
         remaining_db = self._db_queue.qsize()
         remaining_webhook = self._webhook_queue.qsize()
-        remaining_email = self._email_queue.qsize()
-        if remaining_db > 0 or remaining_webhook > 0 or remaining_email > 0:
+        if remaining_db > 0 or remaining_webhook > 0:
             logger.error(
                 "dispatcher.alerts_lost_on_shutdown",
                 db_remaining=remaining_db,
                 webhook_remaining=remaining_webhook,
-                email_remaining=remaining_email,
             )
 
         if self._http_client:

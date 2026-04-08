@@ -226,16 +226,6 @@ alerts:
     enabled: false
     url: ''
     timeout: 5.0
-  email:
-    enabled: false
-    min_severity: high
-    smtp_host: mail.plant.local
-    smtp_port: 587
-    smtp_username: ''
-    smtp_password: ''
-    from_address: argus@plant.local
-    use_tls: true
-    recipients: []
   circuit_breaker_threshold: 5
   circuit_breaker_timeout: 60.0
 auth:

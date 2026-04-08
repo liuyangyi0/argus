@@ -273,22 +273,19 @@ class AlertGrader:
                 logger.debug("grader.suppressed", zone=zone_key, score=round(adjusted_score, 3))
                 return None
 
-            # Camera-level throttle: after the first alert from each zone
-            # passes through, enforce a minimum interval between subsequent
+            # Camera-level throttle: enforce a minimum interval between
             # alerts on the same camera (across all zones) to prevent storms.
+            # Applied uniformly to all zones — no first-zone exemptions.
             last_camera_alert = self._last_camera_alerts.get(camera_id, 0)
             cam_window = self._config.suppression.same_camera_window_seconds
             if now - last_camera_alert < cam_window:
-                # But always allow the very first alert for a zone that has
-                # never fired — ensures every zone gets initial coverage.
-                if zone_key in self._last_alerts:
-                    logger.debug(
-                        "grader.camera_suppressed",
-                        zone=zone_key,
-                        camera=camera_id,
-                        score=round(adjusted_score, 3),
-                    )
-                    return None
+                logger.debug(
+                    "grader.camera_suppressed",
+                    zone=zone_key,
+                    camera=camera_id,
+                    score=round(adjusted_score, 3),
+                )
+                return None
 
             # Step 5: Emit alert
             self._alert_counter += 1
@@ -345,6 +342,11 @@ class AlertGrader:
                 self._trackers.clear()
                 self._last_alerts.clear()
                 self._last_camera_alerts.clear()
+
+    def reset_camera_suppression(self, camera_id: str) -> None:
+        """Reset camera-level suppression timestamp without clearing zone state."""
+        with self._tracker_lock:
+            self._last_camera_alerts.pop(camera_id, None)
 
     @staticmethod
     def _tracker_to_snapshot(tracker: _AnomalyTracker) -> CusumSnapshot | None:
