@@ -1,184 +1,175 @@
-# Argus — 核电站异物视觉检测系统
+# Argus — 视觉异常检测系统
 
-Nuclear Power Plant Foreign Object Exclusion (FOE) Visual Detection System
+基于固定摄像头与深度学习的智能视觉异常检测系统，实现 7×24 小时不间断监控。
 
-## 项目背景
+## 项目简介
 
-核电站关键区域（反应堆厂房、安全壳内、管廊等）严禁出现异物（墙皮脱落、保温层掉落、遗留工具、杂物等）。本系统通过固定摄像头实时监控，利用深度学习异常检测算法自动发现异常并分级报警。
+Argus 通过实时视频流分析，自动检测监控区域内出现的异常物体或场景变化（遗留物品、结构损伤、环境异常等），并进行四级分级报警与多通道推送。系统采用边缘部署架构，单节点支持 2-4 路摄像头，支持 CPU-only 推理与内网离线环境。
+
+**核心特性：**
+- **少样本异常检测** — 仅需少量"正常"图像即可训练，无需异常样本标注（Dinomaly2 最少 8 张）
+- **双通道安全架构** — 深度学习（Anomalib）+ 传统 CV（Simplex 帧差）并行运行，单通道故障不影响检测
+- **多阶段检测管线** — 区域掩码 → MOG2 预筛 → YOLO 人员过滤 → 双通道异常检测 → CUSUM 时序确认 → 分级报警
+- **全链路可观测** — 告警回放取证、降级检测、模型漂移监控、审计日志
+- **模型全生命周期** — 基线采集 → 训练 → 影子部署 → 金丝雀 → 生产上线，完整 MLOps 流程
 
 ## 系统架构
 
 ```
-摄像头(RTSP/USB) → 帧队列
+摄像头(RTSP/USB/File) → CameraManager（线程池）
     │
     ▼
-[Stage 0] 区域掩码 ── exclude 区域像素置零
+[Stage 0] ZoneMask ── include/exclude 多边形区域掩码
     │
     ▼
-[Stage 1] MOG2 预筛 ── 无变化 → 跳过（心跳每30s强制全帧检测）
-    │ 有变化 / 心跳 / 异常锁定
+[Stage 1] MOG2 预筛 ── 无变化 → 跳过（心跳强制全帧 + 异常锁定旁路）
+    │ 有变化
     ▼
-[Stage 2] YOLO 人员过滤 ── 遮罩/跳过人员区域
+[Stage 2] YOLO 多类目标检测 ── 人员遮罩/跳帧 + BoT-SORT 追踪
     │
     ▼
-[Stage 3] Anomalib 异常检测 → 异常分数 + 热力图
+[Stage 3] 双通道并行检测
+    ├── Anomalib（Dinomaly2/PatchCore/EfficientAD）→ 异常分数 + 热力图
+    └── Simplex 安全通道（帧差 + 静态参考）→ 独立分数
+    │ 融合
+    ▼
+[Stage 4] OVD 分类（YOLO-World，可选）+ SAM 2 分割（可选）
     │
     ▼
-[报警分级] 分数阈值 + 时间窗滤波(连续3帧) + 去重
+[后处理] AnomalyPostprocess + TemporalTracker + DriftDetector(KS)
     │
-    ├→ Dashboard (http://localhost:8080)
-    ├→ Webhook (HTTP POST)
-    ├→ SQLite 持久化
-    └→ 快照 + 热力图保存
+    ▼
+[报警] AlertGrader（自适应阈值 + CUSUM 证据累积 + 去重抑制）
+    │
+    ▼
+AlertDispatcher → SQLite + Webhook + 邮件 + WebSocket 实时推送
 ```
 
 ## 快速开始
 
 ```bash
-# 1. 创建虚拟环境
-python -m venv .venv
-source .venv/Scripts/activate  # Windows
-# source .venv/bin/activate    # Linux/Mac
-
-# 2. 安装依赖
+# 安装（Python 3.11+）
 pip install -e ".[dev]"
 
-# 3. 运行（Dashboard 自动在 :8080 启动）
+# 运行（Dashboard 自动在 :8080 启动）
 python -m argus --config configs/default.yaml
 
-# 4. 运行测试
-python -m pytest tests/unit/ -v
+# 运行测试
+python -m pytest tests/ -v
 ```
 
-## 核心功能清单
+## 功能概览
 
-### 已实现
+### 检测管线
 
-| # | 功能 | 模块 | 状态 |
-|---|------|------|------|
-| **检测管线** | | | |
-| 1 | 多协议摄像头采集（RTSP/USB/文件） | `capture/camera.py` | ✅ |
-| 2 | 断线自动重连（指数退避） | `capture/camera.py` | ✅ |
-| 3 | 帧读取超时（5s，防冻结流卡死） | `capture/camera.py` | ✅ |
-| 4 | 帧率看门狗（30s 无帧自动重连） | `capture/manager.py` | ✅ |
-| 5 | MOG2 背景减除预筛（节约~80%算力） | `prefilter/mog2.py` | ✅ |
-| 6 | 辐射椒盐噪声中值滤波 | `prefilter/mog2.py` | ✅ |
-| 7 | YOLO 人员检测过滤（遮罩/跳帧模式） | `person/detector.py` | ✅ |
-| 8 | YOLO 不可用时优雅降级（不崩溃） | `person/detector.py` | ✅ |
-| 9 | Anomalib 异常检测（PatchCore/EfficientAD） | `anomaly/detector.py` | ✅ |
-| 10 | 冷启动 SSIM 回退（无模型可用时） | `anomaly/detector.py` | ✅ |
-| 11 | 模型热更新（原子替换，不中断推理） | `anomaly/detector.py` | ✅ |
-| **防背景吸收** | | | |
-| 12 | 心跳全帧检测（每30s跳过MOG2强制检测） | `core/pipeline.py` | ✅ |
-| 13 | 异常状态锁定（高置信度异常持续监控） | `core/pipeline.py` | ✅ |
-| **区域管理** | | | |
-| 14 | include/exclude 多边形区域掩码 | `core/zone_mask.py` | ✅ |
-| 15 | 区域热更新（不重启管线） | `core/zone_mask.py` | ✅ |
-| 16 | 多区域独立检测和报警 | `core/pipeline.py` | ✅ |
-| **报警系统** | | | |
-| 17 | 四级报警分级（INFO/LOW/MEDIUM/HIGH） | `alerts/grader.py` | ✅ |
-| 18 | 时间窗滤波（连续N帧确认，降低误报） | `alerts/grader.py` | ✅ |
-| 19 | 重复报警抑制（同区域去重） | `alerts/grader.py` | ✅ |
-| 20 | 区域优先级乘数（关键区域放大分数） | `alerts/grader.py` | ✅ |
-| 21 | 报警 debug 日志（帮助调试报警逻辑） | `alerts/grader.py` | ✅ |
-| 22 | 多通道分发（数据库 + Webhook） | `alerts/dispatcher.py` | ✅ |
-| 23 | 快照和热力图自动保存 | `alerts/dispatcher.py` | ✅ |
-| **多摄像头** | | | |
-| 24 | 线程池管理（每摄像头独立线程） | `capture/manager.py` | ✅ |
-| 25 | 独立启停单个摄像头 | `capture/manager.py` | ✅ |
-| **数据持久化** | | | |
-| 26 | SQLite + WAL 模式 | `storage/database.py` | ✅ |
-| 27 | 写入重试（3次，防瞬态失败丢数据） | `storage/database.py` | ✅ |
-| 28 | 报警确认/标记误报 | `storage/database.py` | ✅ |
-| 29 | 分页查询 + 多条件过滤 | `storage/database.py` | ✅ |
-| **误报反馈** | | | |
-| 30 | 误报标记导出到基线目录 | `alerts/feedback.py` | ✅ |
-| 31 | 误报率统计 | `alerts/feedback.py` | ✅ |
-| **基线管理** | | | |
-| 32 | 版本化基线存储（v001, v002...） | `anomaly/baseline.py` | ✅ |
-| 33 | 基线采集脚本 | `scripts/capture_baseline.py` | ✅ |
-| 34 | 旧版本自动清理 | `anomaly/baseline.py` | ✅ |
-| **模型训练** | | | |
-| 35 | Anomalib 训练脚本（PatchCore/EfficientAD） | `scripts/train_model.py` | ✅ |
-| 36 | 模型导出脚本（OpenVINO/ONNX） | `scripts/export_model.py` | ✅ |
-| 37 | 训练编排（验证→训练→导出） | `anomaly/trainer.py` | ✅ |
-| **Dashboard 仪表盘** | | | |
-| 38 | 系统概览（指标卡片 + 摄像头网格 + 最近报警） | `dashboard/routes/system.py` | ✅ |
-| 39 | 摄像头状态（帧数、跳过率、延迟、报警数） | `dashboard/routes/cameras.py` | ✅ |
-| 40 | 报警列表（分页 + 严重级别筛选） | `dashboard/routes/alerts.py` | ✅ |
-| 41 | 一键确认/标记误报 | `dashboard/routes/alerts.py` | ✅ |
-| 42 | JSON API（供外部集成） | `dashboard/routes/alerts.py` | ✅ |
-| 43 | 区域编辑器（Canvas 画多边形，即时生效） | `dashboard/routes/zones.py` | ✅ |
-| 44 | 配置控制台（阈值调整、摄像头重启、清除锁定） | `dashboard/routes/config.py` | ✅ |
-| 45 | HTMX 自动刷新（3-5s 轮询） | `dashboard/app.py` | ✅ |
-| **系统监控** | | | |
-| 46 | 健康状态（HEALTHY/DEGRADED/UNHEALTHY） | `core/health.py` | ✅ |
-| 47 | 定时任务调度（APScheduler） | `core/scheduler.py` | ✅ |
-| **部署** | | | |
-| 48 | Docker 多阶段构建 | `Dockerfile` | ✅ |
-| 49 | docker-compose（数据卷持久化、资源限制） | `docker-compose.yml` | ✅ |
-| 50 | Pydantic 类型安全配置 + YAML | `config/schema.py` | ✅ |
-| **测试** | | | |
-| 51 | 83 个单元测试（全绿） | `tests/unit/` | ✅ |
+| 功能 | 说明 |
+|------|------|
+| 多协议摄像头采集 | RTSP / USB / 视频文件，断线自动重连（指数退避） |
+| MOG2 背景减除预筛 | 节约 ~80% 算力，含噪声抑制与相位相关防抖 |
+| YOLO 多类目标检测 | YOLO11n 80 类 COCO + BoT-SORT 追踪，人员遮罩/跳帧 |
+| Anomalib 异常检测 | Dinomaly2 / PatchCore / EfficientAD，SSIM 冷启动回退 |
+| Simplex 安全通道 | 纯 OpenCV 帧差检测器，与 ML 通道并行，安全兜底 |
+| 防背景吸收 | 心跳全帧检测 + 异常状态锁定，防止 MOG2 学习吞帧 |
+| OVD 开放词汇分类 | YOLO-World 对异常区域分类（可选） |
+| SAM 2 实例分割 | 异常区域精细分割（可选） |
 
-### 未实现（Phase 5 / 后续）
+### 报警系统
 
-| # | 功能 | 说明 |
-|---|------|------|
-| 1 | Modbus/OPC-UA 接口 | 对接电厂 DCS 系统，需现场调试 |
-| 2 | 多节点聚合 | 中央服务器聚合多个边缘节点，需 PostgreSQL |
-| 3 | AnomalyDINO 零样本模式 | 需 anomalib >= 2.0，零标注即可检测 |
-| 4 | WebSocket 实时视频流 | Dashboard 实时画面（当前是截图刷新） |
-| 5 | 邮件/SMS 通知 | SMTP 集成 |
-| 6 | 审计日志 | 合规记录（谁在什么时间做了什么操作） |
-| 7 | Prometheus 指标导出 | 推理延迟、误报率趋势等可观测性 |
-| 8 | 自动基线定时采集 | 定时从摄像头采集新基线 |
-| 9 | 相位相关图像对齐 | 消除相机微震动影响 |
+| 功能 | 说明 |
+|------|------|
+| 四级分级报警 | INFO / LOW / MEDIUM / HIGH，区域优先级乘数 |
+| CUSUM 时序确认 | 软证据累积替代硬性连续帧计数，降低误报 |
+| 自适应阈值 | 基于滑动窗口分数分布动态调整 |
+| 多通道分发 | SQLite + Webhook + 邮件 + WebSocket，含断路器 |
+| 告警工作流 | NEW → ACKNOWLEDGED → INVESTIGATING → RESOLVED → CLOSED |
+| 告警回放取证 | 环形缓冲区录制（前 60s + 后 30s），多轨信号时间线 |
+
+### 模型管理
+
+| 功能 | 说明 |
+|------|------|
+| 基线生命周期 | 版本化存储，质量过滤，激活/退役 |
+| 模型训练 | 训练前验证 → 训练 → 质量报告 → A/B 对比 → 导出 |
+| 发布管线 | shadow（≥3 天）→ canary（≥7 天）→ production |
+| DINOv2 骨干训练 | 共享骨干 SSL 微调，升级后自动触发下游重训练 |
+| INT8 量化 | NNCF PTQ 量化导出，降低推理延迟 |
+| Conformal 校准 | 分布无关的 FPR 保证 |
+
+### Dashboard 仪表盘
+
+Vue 3 + Ant Design Vue SPA，暗色主题，WebSocket 实时更新。
+
+| 页面 | 说明 |
+|------|------|
+| 系统总览 | 状态卡片、摄像头网格、最近告警 |
+| 摄像头管理 | 添加/启停/统计，go2rtc 视频流 + MJPEG 回退 |
+| 告警中心 | 筛选/批量操作/CSV 导出/工作流状态/音频告警 |
+| 回放取证 | 多轨时间线、逐帧检视、信号历史、参考帧对比 |
+| 模型管理 | 基线管理/训练/模型列表/批量推理/骨干网络/事件日志 |
+| 降级监控 | 全局降级条、降级事件历史、影响评估 |
+| 检测调试 | 帧级诊断、灵敏度预览、学习模式 |
+| 系统设置 | 阈值调整、通知配置、存储维护 |
+| 用户/审计/报表/备份 | RBAC 权限、操作审计、统计报表、数据库备份恢复 |
+
+### 系统监控
+
+| 功能 | 说明 |
+|------|------|
+| 摄像头健康 | 画面冻结、镜头污染、位移、闪光干扰、漂移检测 |
+| 降级检测 | 5 种降级场景自动识别，状态机追踪 |
+| KS 漂移监控 | 异常分数分布偏移检测 |
+| 跨摄像头关联 | 多视角异常时空关联，提升置信度 |
 
 ## 项目结构
 
 ```
-argus/
-├── pyproject.toml             # 项目依赖
-├── configs/default.yaml       # 默认配置
-├── Dockerfile                 # 容器化部署
-├── docker-compose.yml         # 一键部署
-├── src/argus/
-│   ├── __main__.py            # CLI 入口
-│   ├── config/                # Pydantic 配置系统
-│   ├── capture/               # 摄像头采集 + 多摄像头管理
-│   ├── prefilter/             # MOG2 背景减除 + 去噪
-│   ├── person/                # YOLO 人员检测
-│   ├── anomaly/               # Anomalib 异常检测 + 基线 + 训练
-│   ├── core/                  # 管线编排 + 区域掩码 + 健康监控
-│   ├── alerts/                # 报警分级 + 分发 + 误报反馈
-│   ├── storage/               # 数据库 ORM
-│   └── dashboard/             # FastAPI + HTMX 仪表盘
-├── scripts/                   # 基线采集、模型训练、模拟工具
-├── tests/unit/                # 83 个单元测试
-└── data/                      # 运行时数据（git-ignored）
+src/argus/                   # 后端（103 个 Python 模块，12 个子包）
+├── config/                  # Pydantic 配置系统
+├── capture/                 # 摄像头采集 + 基线采集 + 帧采样
+├── prefilter/               # MOG2 背景减除 + Simplex 安全通道
+├── person/                  # YOLO 多类目标检测
+├── anomaly/                 # 异常检测 + 基线 + 训练 + 骨干 + 影子部署
+├── core/                    # 管线编排 + 区域掩码 + 健康 + 降级 + 环形缓冲
+├── alerts/                  # 报警分级 + 分发 + 反馈 + 校准
+├── storage/                 # SQLite ORM（14 模型）+ 模型注册 + 发布管线
+├── streaming/               # go2rtc 流媒体代理（WebRTC/MSE/HLS）
+├── contracts/               # 数据契约验证
+├── validation/              # 合成异常 + Recall 评估
+└── dashboard/               # FastAPI + 17 个路由模块
+
+web/                         # 前端（Vue 3 + Ant Design Vue，32 个文件）
+├── components/              # 7 通用组件 + 10 模型管理子组件
+├── composables/             # WebSocket / go2rtc / 模型状态
+└── views/                   # 6 页面（总览/摄像头/告警/模型/系统/详情）
+
+tests/                       # 935 个测试函数，72 个测试文件
+configs/default.yaml         # 默认配置
+scripts/                     # 基线采集、模型训练、导出、模拟工具
 ```
 
 ## 技术栈
 
-| 层 | 技术 |
-|----|------|
-| 预筛 | OpenCV MOG2 + 中值滤波 |
-| 人员过滤 | Ultralytics YOLO11n |
-| 异常检测 | Anomalib PatchCore / EfficientAD |
-| 推理加速 | OpenVINO / ONNX Runtime |
-| Web | FastAPI + HTMX + Alpine.js |
-| 数据库 | SQLAlchemy + SQLite (WAL) |
-| 配置 | Pydantic + YAML |
-| 容器化 | Docker + docker-compose |
-| 测试 | pytest |
+| 层 | 技术 | 版本 |
+|----|------|------|
+| 视频采集 | OpenCV | >= 4.10 |
+| 目标检测 | Ultralytics YOLO11n + BoT-SORT | >= 8.3 |
+| 异常检测 | Anomalib（Dinomaly2/PatchCore/EfficientAD），DINOv2 backbone | >= 2.0 |
+| 推理加速 | OpenVINO | >= 2024.0 |
+| Web 框架 | FastAPI + WebSocket | >= 0.115 |
+| 前端 | Vue 3 + Ant Design Vue + Vite | Vue 3.5 |
+| 视频流 | go2rtc（WebRTC/MSE/HLS/MJPEG） | 内置 |
+| 数据库 | SQLAlchemy + SQLite（WAL） | >= 2.0 |
+| 配置 | Pydantic v2 + YAML | >= 2.0 |
+| 日志 | structlog（JSON + 控制台） | >= 24.0 |
+| 容器化 | Docker + docker-compose | - |
+| 语言 | Python 3.11+ / TypeScript | - |
 
 ## 配置示例
 
 ```yaml
 cameras:
   - camera_id: cam_01
-    name: "反应堆厂房北侧"
+    name: "厂房北侧监控"
     source: "rtsp://192.168.1.100:554/stream1"
     protocol: rtsp
     fps_target: 5
@@ -195,4 +186,22 @@ cameras:
     mog2:
       denoise: true
       heartbeat_frames: 150
+    simplex:
+      enabled: true
+      diff_threshold: 30
 ```
+
+## 部署
+
+```bash
+# Docker 一键部署
+docker-compose up -d
+
+# 资源需求：4 CPU / 4GB RAM
+# Dashboard: http://localhost:8080
+# 健康检查: GET /api/system/health
+```
+
+## 许可证
+
+MIT
