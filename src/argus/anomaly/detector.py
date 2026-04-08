@@ -42,6 +42,7 @@ class DetectorStatus:
     ssim_calibrated: bool
     ssim_noise_floor: float | None
     is_quantized: bool = False  # True when the loaded model contains INT8 ops
+    minmax_broken: bool = False  # True when PostProcessor MinMax is not fit (sigmoid fallback)
 
 
 class AnomalibDetector:
@@ -320,26 +321,9 @@ class AnomalibDetector:
             # Convert BGR to RGB for anomalib
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
-            prediction = self._engine.predict(rgb)
-
-            # Extract score — Anomalib 2.x returns Tensors, not numpy
-            raw_score = prediction.pred_score
-            if hasattr(raw_score, "item"):
-                anomaly_score = float(raw_score.squeeze().item())
-            else:
-                anomaly_score = float(raw_score)
-
-            if not np.isfinite(anomaly_score):
-                logger.error(
-                    "anomaly.nan_score",
-                    raw_score=str(prediction.pred_score),
-                    msg="Model returned NaN/Inf score, treating as normal",
-                )
-                return self._safe_result()
-
             # When PostProcessor MinMax is not fit, the normalized score is
-            # always 1.0 (useless). Fall back to the raw model score and
-            # apply sigmoid normalization to map it to 0-1.
+            # always 1.0 (useless). Use the raw inner model score directly
+            # to avoid running inference twice.
             if self._minmax_broken:
                 import torch
                 model = self._engine.model
@@ -351,6 +335,25 @@ class AnomalibDetector:
                 if not np.isfinite(raw_val):
                     return self._safe_result()
                 anomaly_score = self._normalize_raw_score(raw_val)
+                # Use anomaly_map from inner output if available
+                prediction = raw_out
+            else:
+                prediction = self._engine.predict(rgb)
+
+                # Extract score — Anomalib 2.x returns Tensors, not numpy
+                raw_score = prediction.pred_score
+                if hasattr(raw_score, "item"):
+                    anomaly_score = float(raw_score.squeeze().item())
+                else:
+                    anomaly_score = float(raw_score)
+
+                if not np.isfinite(anomaly_score):
+                    logger.error(
+                        "anomaly.nan_score",
+                        raw_score=str(prediction.pred_score),
+                        msg="Model returned NaN/Inf score, treating as normal",
+                    )
+                    return self._safe_result()
 
             # Clamp to valid range
             anomaly_score = max(0.0, min(anomaly_score, 1.0))
@@ -533,6 +536,7 @@ class AnomalibDetector:
             ssim_calibrated=calibrated,
             ssim_noise_floor=self._ssim_noise_floor,
             is_quantized=is_quantized,
+            minmax_broken=self._minmax_broken,
         )
 
     def _detect_quantization(self) -> bool:
@@ -713,6 +717,11 @@ class AnomalibDetector:
     def is_loaded(self) -> bool:
         return self._loaded
 
+    @property
+    def is_calibrated(self) -> bool:
+        """Whether conformal calibration data is loaded."""
+        return self._calibration_scores is not None
+
 
 @dataclass
 class _TileInfo:
@@ -753,6 +762,10 @@ class MultiScaleDetector:
     @property
     def is_loaded(self) -> bool:
         return self._base.is_loaded
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self._base.is_calibrated
 
     def load(self) -> bool:
         return self._base.load()
