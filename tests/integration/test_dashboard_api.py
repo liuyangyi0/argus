@@ -80,13 +80,16 @@ class TestHealthEndpoint:
         """GET /api/system/health returns valid JSON with status."""
         resp = client.get("/api/system/health")
         assert resp.status_code == 200
-        data = resp.json()
+        body = resp.json()
+        assert body["code"] == 0
+        data = body["data"]
         assert "status" in data
         assert "cameras" in data
 
     def test_health_camera_info(self, client):
         """Health endpoint includes camera status."""
-        data = client.get("/api/system/health").json()
+        body = client.get("/api/system/health").json()
+        data = body["data"]
         assert len(data["cameras"]) == 1
         cam = data["cameras"][0]
         assert cam["camera_id"] == "cam_01"
@@ -113,35 +116,38 @@ class TestAlertsCRUD:
         """GET /api/alerts/json returns empty list when no alerts exist."""
         resp = client.get("/api/alerts/json")
         assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 0
+        body = resp.json()
+        assert body["code"] == 0
+        alerts = body["data"]["alerts"]
+        assert isinstance(alerts, list)
+        assert len(alerts) == 0
 
     def test_alerts_json_with_data(self, client, db):
         """GET /api/alerts/json returns alerts after seeding."""
         self._seed_alert(db)
         resp = client.get("/api/alerts/json")
         assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) >= 1
-        assert data[0]["alert_id"] == "test-alert-001"
-        assert data[0]["severity"] == "medium"
+        body = resp.json()
+        alerts = body["data"]["alerts"]
+        assert len(alerts) >= 1
+        assert alerts[0]["alert_id"] == "test-alert-001"
+        assert alerts[0]["severity"] == "medium"
 
     def test_alerts_filter_by_camera(self, client, db):
         """GET /api/alerts/json?camera_id=cam_01 filters correctly."""
         self._seed_alert(db, "alert-cam01")
         resp = client.get("/api/alerts/json?camera_id=cam_01")
         assert resp.status_code == 200
-        data = resp.json()
-        assert all(a["camera_id"] == "cam_01" for a in data)
+        alerts = resp.json()["data"]["alerts"]
+        assert all(a["camera_id"] == "cam_01" for a in alerts)
 
     def test_alerts_filter_by_severity(self, client, db):
         """GET /api/alerts/json?severity=medium filters correctly."""
         self._seed_alert(db, "alert-med")
         resp = client.get("/api/alerts/json?severity=medium")
         assert resp.status_code == 200
-        data = resp.json()
-        assert all(a["severity"] == "medium" for a in data)
+        alerts = resp.json()["data"]["alerts"]
+        assert all(a["severity"] == "medium" for a in alerts)
 
     def test_acknowledge_alert(self, client, db):
         """POST /api/alerts/{id}/acknowledge marks the alert."""
@@ -424,7 +430,7 @@ class TestDashboardFeatureChain:
         ]
         detail_resp = client.get("/api/cameras/json")
         assert detail_resp.status_code == 200
-        assert detail_resp.json()["cameras"][0]["camera_id"] == "cam_01"
+        assert detail_resp.json()["data"]["cameras"][0]["camera_id"] == "cam_01"
 
         capture_resp = client.post(
             "/api/baseline/job",

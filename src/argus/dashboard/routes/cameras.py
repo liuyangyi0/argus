@@ -11,6 +11,14 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from argus.dashboard.api_response import (
+    api_conflict,
+    api_internal_error,
+    api_not_found,
+    api_success,
+    api_unavailable,
+    api_validation_error,
+)
 from argus.dashboard.components import (
     empty_state,
     page_header,
@@ -414,7 +422,7 @@ async def add_camera(request: Request):
     camera_manager = request.app.state.camera_manager
     config = request.app.state.config
     if not camera_manager or not config:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     form = await parse_request_form(request)
     camera_id = form.get("camera_id", "").strip()
@@ -425,7 +433,7 @@ async def add_camera(request: Request):
     resolution_str = form.get("resolution", "1920,1080")
 
     if not camera_id or not name or not source:
-        return JSONResponse({"error": "请填写所有必填字段"}, status_code=400)
+        return api_validation_error("请填写所有必填字段")
 
     manager_cameras = getattr(camera_manager, "_cameras", None)
 
@@ -435,7 +443,7 @@ async def add_camera(request: Request):
         existing_ids.update(c.camera_id for c in manager_cameras)
 
     if camera_id in existing_ids:
-        return JSONResponse({"error": f"摄像头 {camera_id} 已存在"}, status_code=400)
+        return api_conflict(f"摄像头 {camera_id} 已存在")
 
     # Parse resolution
     try:
@@ -473,12 +481,12 @@ async def add_camera(request: Request):
         if camera_manager is not None and hasattr(camera_manager, "remove_camera_config"):
             camera_manager.remove_camera_config(camera_id)
         logger.exception("camera.add_failed", camera_id=camera_id)
-        return JSONResponse({"error": "摄像头配置保存失败"}, status_code=500)
+        return api_internal_error("摄像头配置保存失败")
 
     # Note: camera is added to config but not started. User must click "start".
     logger.info("camera.added", camera_id=camera_id, source=source)
 
-    return JSONResponse({"status": "ok", "camera_id": camera_id})
+    return api_success({"camera_id": camera_id})
 
 
 @router.post("/{camera_id}/start")
@@ -486,15 +494,12 @@ async def start_camera(request: Request, camera_id: str):
     """Start a stopped camera."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
     if success:
-        return JSONResponse(
-            {"status": "ok"},
-            headers=htmx_toast_headers("摄像头已启动"),
-        )
-    return JSONResponse({"error": "启动失败"}, status_code=500)
+        return api_success({}, headers=htmx_toast_headers("摄像头已启动"))
+    return api_internal_error("启动失败")
 
 
 @router.post("/{camera_id}/stop")
@@ -502,13 +507,10 @@ async def stop_camera(request: Request, camera_id: str):
     """Stop a running camera."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("不可用")
 
     await asyncio.to_thread(camera_manager.stop_camera, camera_id)
-    return JSONResponse(
-        {"status": "ok"},
-        headers=htmx_toast_headers("摄像头已停止"),
-    )
+    return api_success({}, headers=htmx_toast_headers("摄像头已停止"))
 
 
 @router.get("/usb-devices")
@@ -548,7 +550,7 @@ async def usb_devices(request: Request):
         return results
 
     devices = await asyncio.to_thread(_probe)
-    return JSONResponse(devices)
+    return api_success({"devices": devices})
 
 
 @router.get("/json")
@@ -556,9 +558,9 @@ def cameras_json(request: Request):
     """JSON API for camera status."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"cameras": []})
+        return api_success({"cameras": []})
 
-    return JSONResponse({"cameras": [
+    return api_success({"cameras": [
         {
             "camera_id": s.camera_id,
             "name": s.name,
@@ -582,7 +584,7 @@ def camera_detail_json(request: Request, camera_id: str):
     camera_manager = request.app.state.camera_manager
     camera_config = _find_camera_config(request, camera_id)
     if camera_config is None:
-        return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
+        return api_not_found(f"摄像头 {camera_id} 不存在")
 
     status = None
     if camera_manager is not None:
@@ -610,7 +612,7 @@ def camera_detail_json(request: Request, camera_id: str):
     # Lifecycle stages for pipeline stepper
     stages = _get_lifecycle_stages(request, camera_id, cam_status=status)
 
-    return JSONResponse({
+    return api_success({
         "camera_id": camera_id,
         "name": camera_config.name,
         "connected": status.connected if status is not None else False,
@@ -643,13 +645,13 @@ def camera_runner_snapshot(request: Request, camera_id: str):
     """Get the inference runner state snapshot for a camera (5.1)."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "Camera manager not running"}, status_code=503)
+        return api_unavailable("摄像头管理器未运行")
 
     snapshot = camera_manager.get_runner_snapshot(camera_id)
     if snapshot is None:
-        return JSONResponse({"error": f"Camera {camera_id} not found"}, status_code=404)
+        return api_not_found(f"摄像头 {camera_id} 不存在")
 
-    return JSONResponse({
+    return api_success({
         "camera_id": snapshot.camera_id,
         "model_ref": snapshot.model_ref,
         "health_status": snapshot.health_status,
@@ -794,7 +796,7 @@ async def wall_status(request: Request):
     """
     camera_manager = request.app.state.camera_manager
     if camera_manager is None:
-        return JSONResponse({"cameras": []})
+        return api_success({"cameras": []})
 
     db = getattr(request.app.state, "database", None)
     health_monitor = getattr(request.app.state, "health_monitor", None)
@@ -857,4 +859,4 @@ async def wall_status(request: Request):
         return cameras
 
     cameras = await asyncio.to_thread(_build_wall_data)
-    return JSONResponse({"cameras": cameras})
+    return api_success({"cameras": cameras})

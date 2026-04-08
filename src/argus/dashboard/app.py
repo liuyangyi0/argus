@@ -121,6 +121,9 @@ def create_app(
     if task_manager is not None and getattr(task_manager, "_on_change", None) is None:
         task_manager._on_change = ws_manager.broadcast
 
+    if health_monitor is not None and getattr(health_monitor, "_on_change", None) is None:
+        health_monitor._on_change = ws_manager.broadcast
+
     # Feedback manager for the feedback queue (Section 6)
     if database:
         from argus.alerts.feedback import FeedbackManager

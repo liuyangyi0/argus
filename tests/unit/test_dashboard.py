@@ -79,10 +79,12 @@ class TestDashboardPages:
 
 class TestHealthAPI:
     def test_health_endpoint(self, client):
-        """Health endpoint should return JSON."""
+        """Health endpoint should return JSON envelope."""
         response = client.get("/api/system/health")
         assert response.status_code == 200
-        data = response.json()
+        body = response.json()
+        assert body["code"] == 0
+        data = body["data"]
         assert "status" in data
         assert "cameras" in data
         assert len(data["cameras"]) == 1
@@ -166,7 +168,9 @@ class TestCameraForms:
         response = client.get("/api/cameras/wall/status")
 
         assert response.status_code == 200
-        data = response.json()
+        body = response.json()
+        assert body["code"] == 0
+        data = body["data"]
         assert data["cameras"][0]["camera_id"] == "cam_02"
         assert data["cameras"][0]["degradation"] == "rtsp_broken"
 
@@ -522,8 +526,10 @@ class TestCameraJsonAPI:
         response = client.get("/api/cameras/json")
 
         assert response.status_code == 200
-        data = response.json()
-        assert list(data.keys()) == ["cameras"]
+        body = response.json()
+        assert body["code"] == 0
+        data = body["data"]
+        assert "cameras" in data
         assert data["cameras"][0]["camera_id"] == "cam_01"
         assert data["cameras"][0]["stats"]["frames_captured"] == 12
 
@@ -589,7 +595,9 @@ class TestCameraJsonAPI:
         response = client.get("/api/cameras/cam_01/detail/json")
 
         assert response.status_code == 200
-        data = response.json()
+        body = response.json()
+        assert body["code"] == 0
+        data = body["data"]
         assert data["camera_id"] == "cam_01"
         assert data["config"]["source"] == "rtsp://example/stream"
         assert data["runtime"]["pipeline_mode"] == "learning"
@@ -1147,15 +1155,17 @@ class TestAlertsAPI:
         assert "已标记误报" in response.text
 
     def test_alerts_json_api(self, client, db):
-        """JSON API should return structured data."""
+        """JSON API should return structured envelope with alerts list."""
         now = datetime.now(tz=timezone.utc)
         db.save_alert("ALT-001", now, "cam_01", "z1", "high", 0.96)
 
         response = client.get("/api/alerts/json")
         assert response.status_code == 200
-        data = response.json()
-        assert len(data) == 1
-        assert data[0]["alert_id"] == "ALT-001"
+        body = response.json()
+        assert body["code"] == 0
+        alerts = body["data"]["alerts"]
+        assert len(alerts) == 1
+        assert alerts[0]["alert_id"] == "ALT-001"
 
     def test_alerts_list_shows_thumbnail_column(self, client, db):
         """Alert list should include a snapshot thumbnail column header."""

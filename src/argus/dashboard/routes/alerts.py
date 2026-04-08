@@ -11,6 +11,16 @@ import numpy as np
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from argus.dashboard.api_response import (
+    ErrorCode,
+    api_error,
+    api_forbidden,
+    api_internal_error,
+    api_not_found,
+    api_success,
+    api_unavailable,
+    api_validation_error,
+)
 from argus.dashboard.components import empty_state, page_header, status_badge
 from argus.dashboard.forms import parse_request_form
 
@@ -474,7 +484,7 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     """
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     # Accept both JSON and form data
     content_type = request.headers.get("content-type", "")
@@ -501,45 +511,39 @@ async def alert_workflow_transition(request: Request, alert_id: str):
         "false_positive", "uncertain",
     }
     if new_status not in valid_statuses:
-        return JSONResponse({"error": f"无效状态: {new_status}"}, status_code=400)
+        return api_validation_error(f"无效状态: {new_status}")
 
     # Fetch alert to check severity
     alert = db.get_alert(alert_id)
     if alert is None:
-        return JSONResponse({"error": "告警不存在"}, status_code=404)
+        return api_not_found("告警不存在")
 
     severity = alert.severity
     quick_actions = {"acknowledged", "false_positive"}
 
     # UX v2 §5.1: Severity-based handling enforcement
     if severity == "high" and new_status in quick_actions and not from_detail_view:
-        return JSONResponse({
-            "success": False,
-            "severity": severity,
-            "handling_policy": "detail_required",
-            "require_confirmation": False,
-            "require_detail_view": True,
-            "next_actions": ["investigate"],
-            "message": "HIGH 级告警必须进入详情页处理",
-        }, status_code=403)
+        return api_forbidden("HIGH 级告警必须进入详情页处理")
 
     if severity == "medium" and new_status in quick_actions and not confirmed:
-        return JSONResponse({
-            "success": False,
-            "severity": severity,
-            "handling_policy": "confirm",
-            "require_confirmation": True,
-            "require_detail_view": False,
-            "next_actions": ["acknowledged", "false_positive", "investigating"],
-            "message": "MEDIUM 级告警需要确认后处理",
-        }, status_code=400)
+        return api_error(
+            ErrorCode.VALIDATION_ERROR,
+            "MEDIUM 级告警需要确认后处理",
+            status_code=400,
+            data={
+                "severity": severity,
+                "handling_policy": "confirm",
+                "require_confirmation": True,
+                "next_actions": ["acknowledged", "false_positive", "investigating"],
+            },
+        )
 
     # Execute the transition
     success = db.update_alert_workflow(
         alert_id, new_status, notes=notes or None, assigned_to=assigned_to or None,
     )
     if not success:
-        return JSONResponse({"error": "状态转换失败"}, status_code=500)
+        return api_internal_error("状态转换失败")
 
     # Submit to feedback queue if applicable
     _submit_workflow_feedback(request, alert_id, new_status, category, notes)
@@ -559,8 +563,7 @@ async def alert_workflow_transition(request: Request, alert_id: str):
 
     # Return JSON response for API consumers
     if "json" in content_type:
-        return JSONResponse({
-            "success": True,
+        return api_success({
             "severity": severity,
             "handling_policy": handling_policy,
             "require_confirmation": severity == "medium",
@@ -579,7 +582,7 @@ async def bulk_acknowledge(request: Request):
     """Bulk acknowledge alerts."""
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     data = await request.json()
     alert_ids = data.get("alert_ids", [])
@@ -601,7 +604,7 @@ async def bulk_acknowledge(request: Request):
             ip_address=client_ip,
         )
 
-    return JSONResponse({"status": "ok", "count": count, "message": f"已确认 {count} 条告警"})
+    return api_success({"count": count, "message": f"已确认 {count} 条告警"})
 
 
 @router.post("/bulk-false-positive")
@@ -609,7 +612,7 @@ async def bulk_false_positive(request: Request):
     """Bulk mark alerts as false positive."""
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     data = await request.json()
     alert_ids = data.get("alert_ids", [])
@@ -631,7 +634,7 @@ async def bulk_false_positive(request: Request):
             ip_address=client_ip,
         )
 
-    return JSONResponse({"status": "ok", "count": count, "message": f"已标记 {count} 条为误报"})
+    return api_success({"count": count, "message": f"已标记 {count} 条为误报"})
 
 
 # ── CSV Export ──
@@ -645,7 +648,7 @@ def export_csv(
     """Export alerts as CSV file."""
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     alerts = db.get_alerts(camera_id=camera_id, severity=severity, limit=10000)
 
@@ -859,7 +862,7 @@ def alerts_json(
     """JSON API for alerts (for external integrations)."""
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     alerts = db.get_alerts(camera_id=camera_id, severity=severity, limit=limit)
 
@@ -876,4 +879,4 @@ def alerts_json(
         d["has_recording"] = rec is not None
         d["recording_status"] = rec.status if rec else None
         result.append(d)
-    return result
+    return api_success({"alerts": result})

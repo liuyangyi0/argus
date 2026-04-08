@@ -711,6 +711,11 @@ class CameraManager:
                         with self._bp_lock:
                             self._pending_frames[camera_id] = max(0, self._pending_frames.get(camera_id, 0) - 1)
 
+                    # Yield CPU when no frame was produced (camera disconnected,
+                    # reconnecting, or stream exhausted) to prevent busy-spin.
+                    if alert is None and pipeline.stats.frames_captured == self._last_frame_counts.get(camera_id, 0):
+                        self._stop_event.wait(0.05)
+
                     # C3: Feed anomaly map to cross-camera correlator
                     if self._correlator is not None:
                         anomaly_map = pipeline.get_latest_anomaly_map()
