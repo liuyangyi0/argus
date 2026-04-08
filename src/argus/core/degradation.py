@@ -107,41 +107,45 @@ class DegradationStateMachine:
         self._audit_logger = audit_logger
         self._state = DegradationState.NOMINAL
         self._events: deque[DegradationEvent] = deque(maxlen=max_events)
+        self._lock = threading.Lock()
 
     @property
     def state(self) -> DegradationState:
-        return self._state
+        with self._lock:
+            return self._state
 
     def transition(self, to: DegradationState, reason: str) -> bool:
         """Attempt a state transition.
 
         Returns True if the transition was valid and applied, False otherwise.
+        Thread-safe: protected by internal lock.
         """
-        from_state = self._state
+        with self._lock:
+            from_state = self._state
 
-        if to == from_state:
-            return True  # no-op, already in target state
+            if to == from_state:
+                return True  # no-op, already in target state
 
-        valid_targets = _VALID_TRANSITIONS.get(from_state, set())
-        if to not in valid_targets:
-            logger.error(
-                "degradation.invalid_transition",
-                camera_id=self._camera_id,
-                from_state=from_state.value,
-                to_state=to.value,
+            valid_targets = _VALID_TRANSITIONS.get(from_state, set())
+            if to not in valid_targets:
+                logger.error(
+                    "degradation.invalid_transition",
+                    camera_id=self._camera_id,
+                    from_state=from_state.value,
+                    to_state=to.value,
+                    reason=reason,
+                )
+                return False
+
+            self._state = to
+            event = DegradationEvent(
+                timestamp=time.time(),
+                from_state=from_state,
+                to_state=to,
                 reason=reason,
+                camera_id=self._camera_id,
             )
-            return False
-
-        self._state = to
-        event = DegradationEvent(
-            timestamp=time.time(),
-            from_state=from_state,
-            to_state=to,
-            reason=reason,
-            camera_id=self._camera_id,
-        )
-        self._events.append(event)
+            self._events.append(event)
 
         logger.warning(
             "degradation.transition",
@@ -170,7 +174,8 @@ class DegradationStateMachine:
 
     def get_recent_events(self, n: int = 20) -> list[DegradationEvent]:
         """Return the most recent N degradation events."""
-        events = list(self._events)
+        with self._lock:
+            events = list(self._events)
         return events[-n:] if len(events) > n else events
 
     def reset(self) -> None:

@@ -299,6 +299,7 @@ class DetectionPipeline:
         # 5.1/5.2: Per-frame inference tracking for CameraInferenceRunner
         self._last_inference_record: InferenceRecord | None = None
         self._last_detection_failed: bool = False
+        self._segmenter_consecutive_failures: int = 0
 
         # Drift monitoring: KS test on anomaly score distribution
         drift_cfg = camera_config.drift
@@ -709,9 +710,10 @@ class DetectionPipeline:
                         )
                     else:
                         # Only Simplex detected: use as safety fallback
-                        # Set a minimum anomaly score so the alert system can grade it
+                        # Guarantee minimum score of 0.6 AND boost existing score by at least 0.05
+                        # so Simplex detection always changes the outcome meaningfully
                         original_anomalib_score = anomaly_result.anomaly_score
-                        fallback_score = max(anomaly_result.anomaly_score, 0.6)
+                        fallback_score = max(anomaly_result.anomaly_score + 0.05, 0.6)
                         anomaly_result = AnomalyResult(
                             anomaly_score=fallback_score,
                             anomaly_map=anomaly_result.anomaly_map,
@@ -901,6 +903,7 @@ class DetectionPipeline:
                         },
                     ))
 
+                    self._segmenter_consecutive_failures = 0
                     if seg_result.num_objects > 0:
                         alert.segmentation_count = seg_result.num_objects
                         alert.segmentation_total_area_px = seg_result.total_area_px
@@ -921,11 +924,13 @@ class DetectionPipeline:
                         )
             except Exception as e:
                 # Segmentation failure must never block the pipeline
+                self._segmenter_consecutive_failures += 1
                 logger.warning(
                     "pipeline.segmenter_error",
                     camera_id=frame_data.camera_id,
                     error=str(e),
                     error_type=type(e).__name__,
+                    consecutive_failures=self._segmenter_consecutive_failures,
                 )
 
         self._update_latency(start)
@@ -1288,6 +1293,11 @@ class DetectionPipeline:
     def last_detection_failed(self) -> bool:
         """Whether the last anomaly detection call failed."""
         return self._last_detection_failed
+
+    @property
+    def segmenter_consecutive_failures(self) -> int:
+        """Number of consecutive segmentation failures."""
+        return self._segmenter_consecutive_failures
 
     def get_cusum_states(self) -> dict[str, CusumSnapshot]:
         """Return CUSUM evidence snapshots for all active zones."""

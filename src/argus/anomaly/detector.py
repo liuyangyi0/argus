@@ -79,6 +79,7 @@ class AnomalibDetector:
         self._ssim_baseline_count = 0
         self._ssim_noise_floor: float | None = None
         self._reload_lock = threading.Lock()
+        self._ssim_lock = threading.Lock()  # protects SSIM baseline calibration state
         self._minmax_broken = False  # True when PostProcessor MinMax is not fit
 
     def load(self) -> bool:
@@ -427,50 +428,53 @@ class AnomalibDetector:
         gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
         # Phase 1: Collect baseline frames (first N frames → build avg + noise model)
-        baseline_count = getattr(self, "_ssim_baseline_count", 0)
-        BASELINE_FRAMES = self._ssim_baseline_frames
+        # Lock protects calibration state (_ssim_baseline_acc, _ssim_frame_diffs, etc.)
+        # to prevent race conditions during concurrent SSIM predictions.
+        with self._ssim_lock:
+            baseline_count = self._ssim_baseline_count
+            BASELINE_FRAMES = self._ssim_baseline_frames
 
-        if baseline_count == 0:
-            self._ssim_baseline_acc = gray.copy()
-            self._ssim_baseline_count = 1
-            self._ssim_noise_floor = 0.0
-            self._ssim_frame_diffs = []
-            logger.info("anomaly.ssim_calibrating", msg="Collecting baseline frames...")
-            return AnomalyResult(
-                anomaly_score=0.0, anomaly_map=None, is_anomalous=False,
-                threshold=self.threshold, detection_failed=False,
-            )
-
-        if baseline_count < BASELINE_FRAMES:
-            # Track frame-to-frame differences to learn noise level
-            prev = self._ssim_baseline_acc / baseline_count
-            diff_to_prev = cv2.absdiff(gray, prev)
-            diff_blurred = cv2.GaussianBlur(diff_to_prev, (11, 11), 0) / 255.0
-            noise_sample = float(cv2.blur(diff_blurred, (16, 16)).max())
-            self._ssim_frame_diffs.append(noise_sample)
-
-            # Accumulate for average baseline
-            self._ssim_baseline_acc += gray
-            self._ssim_baseline_count += 1
-
-            if baseline_count == BASELINE_FRAMES - 1:
-                # Finalize baseline and noise floor
-                self._ssim_baseline = (self._ssim_baseline_acc / self._ssim_baseline_count).astype(np.float32)
-                # Noise floor = IQR-based estimation (robust to outliers from early motion)
-                diffs = np.array(self._ssim_frame_diffs)
-                q25, q75 = float(np.percentile(diffs, 25)), float(np.percentile(diffs, 75))
-                iqr = q75 - q25
-                self._ssim_noise_floor = q75 + 1.5 * iqr if iqr > 0 else float(np.median(diffs)) * 1.5
-                logger.info(
-                    "anomaly.ssim_calibrated",
-                    baseline_frames=self._ssim_baseline_count,
-                    noise_floor=round(self._ssim_noise_floor, 4),
-                    diffs=str([round(d, 4) for d in self._ssim_frame_diffs]),
+            if baseline_count == 0:
+                self._ssim_baseline_acc = gray.copy()
+                self._ssim_baseline_count = 1
+                self._ssim_noise_floor = 0.0
+                self._ssim_frame_diffs = []
+                logger.info("anomaly.ssim_calibrating", msg="Collecting baseline frames...")
+                return AnomalyResult(
+                    anomaly_score=0.0, anomaly_map=None, is_anomalous=False,
+                    threshold=self.threshold, detection_failed=False,
                 )
-            return AnomalyResult(
-                anomaly_score=0.0, anomaly_map=None, is_anomalous=False,
-                threshold=self.threshold, detection_failed=False,
-            )
+
+            if baseline_count < BASELINE_FRAMES:
+                # Track frame-to-frame differences to learn noise level
+                prev = self._ssim_baseline_acc / baseline_count
+                diff_to_prev = cv2.absdiff(gray, prev)
+                diff_blurred = cv2.GaussianBlur(diff_to_prev, (11, 11), 0) / 255.0
+                noise_sample = float(cv2.blur(diff_blurred, (16, 16)).max())
+                self._ssim_frame_diffs.append(noise_sample)
+
+                # Accumulate for average baseline
+                self._ssim_baseline_acc += gray
+                self._ssim_baseline_count += 1
+
+                if baseline_count == BASELINE_FRAMES - 1:
+                    # Finalize baseline and noise floor
+                    self._ssim_baseline = (self._ssim_baseline_acc / self._ssim_baseline_count).astype(np.float32)
+                    # Noise floor = IQR-based estimation (robust to outliers from early motion)
+                    diffs = np.array(self._ssim_frame_diffs)
+                    q25, q75 = float(np.percentile(diffs, 25)), float(np.percentile(diffs, 75))
+                    iqr = q75 - q25
+                    self._ssim_noise_floor = q75 + 1.5 * iqr if iqr > 0 else float(np.median(diffs)) * 1.5
+                    logger.info(
+                        "anomaly.ssim_calibrated",
+                        baseline_frames=self._ssim_baseline_count,
+                        noise_floor=round(self._ssim_noise_floor, 4),
+                        diffs=str([round(d, 4) for d in self._ssim_frame_diffs]),
+                    )
+                return AnomalyResult(
+                    anomaly_score=0.0, anomaly_map=None, is_anomalous=False,
+                    threshold=self.threshold, detection_failed=False,
+                )
 
         # Phase 2: Detection — compare against learned baseline
         diff = cv2.absdiff(gray, self._ssim_baseline)

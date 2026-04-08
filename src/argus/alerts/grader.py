@@ -224,6 +224,8 @@ class AlertGrader:
                             prev_mask, (curr_mask.shape[1], curr_mask.shape[0]),
                             interpolation=cv2.INTER_NEAREST,
                         )
+                        # Update tracker to avoid repeated resize on subsequent frames
+                        tracker.prev_anomaly_mask = prev_mask
                         logger.debug(
                             "grader.spatial_resize",
                             zone=zone_key,
@@ -290,10 +292,11 @@ class AlertGrader:
             # Use the max score seen during the confirmation window for severity
             final_severity = self._score_to_severity(tracker.max_score) or severity
 
-            # Timestamp-based ID: survives restarts, unique across nodes
+            # Timestamp-based ID with random suffix for collision resistance
             ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
+            rnd = random.randint(0, 0xFFFF)
             alert = Alert(
-                alert_id=f"ALT-{self._node_id}-{ts}-{seq:04d}",
+                alert_id=f"ALT-{self._node_id}-{ts}-{seq:04d}-{rnd:04x}",
                 camera_id=camera_id,
                 zone_id=zone_id,
                 severity=final_severity,
@@ -391,3 +394,72 @@ class AlertGrader:
         if stale_keys:
             logger.debug("grader.pruned_trackers", count=len(stale_keys), keys=stale_keys)
         return len(stale_keys)
+
+    def save_evidence_state(self, path: Path) -> None:
+        """Persist CUSUM evidence to disk for crash recovery.
+
+        Only saves zones with meaningful evidence (> 0.01) to avoid
+        noise. Restoring stale evidence after restart lets the grader
+        resume accumulation instead of starting cold.
+        """
+        import json
+
+        with self._tracker_lock:
+            state = {}
+            for zone_key, tracker in self._trackers.items():
+                if tracker.evidence > 0.01:
+                    state[zone_key] = {
+                        "evidence": round(tracker.evidence, 6),
+                        "first_seen": tracker.first_seen,
+                        "last_seen": tracker.last_seen,
+                        "max_score": round(tracker.max_score, 6),
+                    }
+
+        if not state:
+            return
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, indent=2))
+            logger.debug("grader.evidence_saved", zones=len(state))
+        except Exception as e:
+            logger.warning("grader.evidence_save_failed", error=str(e))
+
+    def load_evidence_state(self, path: Path) -> int:
+        """Restore persisted CUSUM evidence from disk.
+
+        Returns the number of zones restored. Skips entries older than
+        max_gap_seconds to avoid triggering on stale evidence.
+        """
+        import json
+
+        if not path.exists():
+            return 0
+
+        try:
+            state = json.loads(path.read_text())
+        except Exception as e:
+            logger.warning("grader.evidence_load_failed", error=str(e))
+            return 0
+
+        now = time.time()
+        max_gap = self._config.temporal.max_gap_seconds
+        restored = 0
+
+        with self._tracker_lock:
+            for zone_key, data in state.items():
+                # Skip stale evidence that exceeds the temporal gap threshold
+                if now - data["last_seen"] > max_gap:
+                    continue
+                tracker = _AnomalyTracker(
+                    evidence=data["evidence"],
+                    first_seen=data["first_seen"],
+                    last_seen=data["last_seen"],
+                    max_score=data["max_score"],
+                )
+                self._trackers[zone_key] = tracker
+                restored += 1
+
+        if restored:
+            logger.info("grader.evidence_restored", zones=restored)
+        return restored

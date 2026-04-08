@@ -83,10 +83,14 @@ class ConformalCalibrator:
             thresholds[level] = float(scores[quantile_idx])
 
         # Ensure strict ordering: info < low < medium < high
+        # Adaptive step: use 1% of score range or 0.01, whichever is larger,
+        # to handle dense score distributions where +0.01 may be insufficient
+        score_range = float(scores[-1] - scores[0]) if n > 1 else 1.0
+        min_step = max(0.01, score_range * 0.01)
         ordered = ["info", "low", "medium", "high"]
         for i in range(1, len(ordered)):
             if thresholds[ordered[i]] <= thresholds[ordered[i - 1]]:
-                thresholds[ordered[i]] = thresholds[ordered[i - 1]] + 0.01
+                thresholds[ordered[i]] = thresholds[ordered[i - 1]] + min_step
 
         result = CalibrationResult(
             info_threshold=thresholds["info"],

@@ -121,7 +121,8 @@ class DriftDetector:
         cdf_b = np.searchsorted(b_sorted, all_values, side="right") / len(b)
         ks_stat = float(np.max(np.abs(cdf_a - cdf_b)))
 
-        # Approximate p-value using asymptotic formula
+        # Approximate p-value using asymptotic formula (Kolmogorov distribution)
+        # 10 terms gives good accuracy for lam up to ~4.0
         n = len(a) * len(b) / (len(a) + len(b))
         lam = (np.sqrt(n) + 0.12 + 0.11 / np.sqrt(n)) * ks_stat
         if lam < 0.001:
@@ -129,7 +130,7 @@ class DriftDetector:
         else:
             p_value = 2 * sum(
                 (-1) ** (k - 1) * np.exp(-2 * k * k * lam * lam)
-                for k in range(1, 6)
+                for k in range(1, 11)
             )
             p_value = max(0.0, min(1.0, p_value))
 
