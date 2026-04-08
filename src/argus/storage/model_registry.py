@@ -17,6 +17,7 @@ import structlog
 from sqlalchemy.orm import Session
 
 from argus.storage.models import ModelRecord, ModelStage, ModelVersionEvent
+from argus.storage.release_pipeline import VALID_TRANSITIONS
 
 logger = structlog.get_logger()
 
@@ -108,29 +109,13 @@ class ModelRegistry:
                 .first()
             )
 
-    # Valid stage transitions — must match release_pipeline._VALID_TRANSITIONS
-    _VALID_TRANSITIONS: dict[str, set[str]] = {
-        ModelStage.CANDIDATE.value: {ModelStage.SHADOW.value, ModelStage.RETIRED.value},
-        ModelStage.SHADOW.value: {
-            ModelStage.CANARY.value,
-            ModelStage.CANDIDATE.value,
-            ModelStage.RETIRED.value,
-        },
-        ModelStage.CANARY.value: {
-            ModelStage.PRODUCTION.value,
-            ModelStage.SHADOW.value,
-            ModelStage.RETIRED.value,
-        },
-        ModelStage.PRODUCTION.value: {ModelStage.RETIRED.value},
-        ModelStage.RETIRED.value: set(),  # terminal state
-    }
-
     def promote(
         self,
         model_version_id: str,
         target_stage: str,
         triggered_by: str,
         reason: str | None = None,
+        canary_camera_id: str | None = None,
     ) -> ModelRecord:
         """Promote a model to the next stage in the release pipeline.
 
@@ -144,6 +129,7 @@ class ModelRegistry:
             target_stage: Target stage (must be a valid ModelStage value).
             triggered_by: Who initiated the promotion (required, non-empty).
             reason: Optional reason for the transition.
+            canary_camera_id: Required when target_stage is "canary".
 
         Returns:
             The updated ModelRecord.
@@ -159,6 +145,9 @@ class ModelRegistry:
         if target_stage not in valid_stages:
             raise ValueError(f"Invalid target stage: {target_stage}")
 
+        if target_stage == ModelStage.CANARY.value and not canary_camera_id:
+            raise ValueError("canary_camera_id is required for canary stage")
+
         with self._session_factory() as session:
             record = (
                 session.query(ModelRecord)
@@ -169,7 +158,7 @@ class ModelRegistry:
                 raise ValueError(f"Model version not found: {model_version_id}")
 
             current_stage = record.stage
-            allowed = self._VALID_TRANSITIONS.get(current_stage, set())
+            allowed = VALID_TRANSITIONS.get(current_stage, set())
             if target_stage not in allowed:
                 raise ValueError(
                     f"Invalid transition: {current_stage} → {target_stage}. "
@@ -206,6 +195,11 @@ class ModelRegistry:
 
             record.stage = target_stage
 
+            if target_stage == ModelStage.CANARY.value:
+                record.canary_camera_id = canary_camera_id
+            elif target_stage in (ModelStage.PRODUCTION.value, ModelStage.RETIRED.value):
+                record.canary_camera_id = None
+
             # Record promotion event
             session.add(ModelVersionEvent(
                 camera_id=record.camera_id,
@@ -228,10 +222,19 @@ class ModelRegistry:
         )
         return record
 
-    def activate(self, model_version_id: str, triggered_by: str = "system") -> None:
+    def activate(
+        self,
+        model_version_id: str,
+        triggered_by: str = "system",
+        allow_bypass: bool = False,
+    ) -> None:
         """Set a model as active (deactivates others for same camera).
 
         Also sets stage to production and records a version event.
+
+        By default, only models already at PRODUCTION or RETIRED stage can be
+        activated (for rollback / reactivation). Set ``allow_bypass=True`` to
+        skip this check (e.g. scheduler auto-deploy after retraining).
         """
         with self._session_factory() as session:
             record = (
@@ -241,6 +244,16 @@ class ModelRegistry:
             )
             if record is None:
                 raise ValueError(f"Model version not found: {model_version_id}")
+
+            if not allow_bypass and record.stage not in (
+                ModelStage.PRODUCTION.value,
+                ModelStage.RETIRED.value,
+            ):
+                raise ValueError(
+                    f"Cannot activate model at stage '{record.stage}'. "
+                    f"Use the release pipeline to promote through "
+                    f"shadow → canary → production first."
+                )
 
             # Find current active model for version event
             current = (
@@ -331,16 +344,27 @@ class ModelRegistry:
                         .first()
                     )
 
-            # Fallback: find most recent non-current model that was ever in production
+            # Fallback: find most recent non-current model that was previously
+            # in production (via version events), excluding candidate/retired models
+            # that were never deployed.
             if previous is None:
-                candidates = (
-                    session.query(ModelRecord)
-                    .filter_by(camera_id=camera_id)
-                    .filter(ModelRecord.model_version_id != (current.model_version_id if current else ""))
-                    .order_by(ModelRecord.created_at.desc())
+                exclude_id = current.model_version_id if current else ""
+                prev_prod_events = (
+                    session.query(ModelVersionEvent)
+                    .filter_by(camera_id=camera_id, from_stage=ModelStage.PRODUCTION.value)
+                    .filter(ModelVersionEvent.from_version != exclude_id)
+                    .order_by(ModelVersionEvent.timestamp.desc())
                     .all()
                 )
-                previous = candidates[0] if candidates else None
+                for evt in prev_prod_events:
+                    candidate = (
+                        session.query(ModelRecord)
+                        .filter_by(model_version_id=evt.from_version)
+                        .first()
+                    )
+                    if candidate is not None:
+                        previous = candidate
+                        break
 
             if previous is None:
                 logger.warning("model_registry.rollback_no_previous", camera_id=camera_id)
@@ -399,14 +423,15 @@ class ModelRegistry:
 
     @staticmethod
     def _compute_dir_hash(path: Path) -> str:
-        """Compute SHA256 hash of all files in a directory."""
+        """Compute SHA256 hash of all files in a directory (chunked to avoid OOM)."""
         h = hashlib.sha256()
-        if path.is_file():
-            h.update(path.read_bytes())
-        elif path.is_dir():
-            for f in sorted(path.rglob("*")):
-                if f.is_file():
-                    h.update(f.read_bytes())
+        files = [path] if path.is_file() else sorted(path.rglob("*")) if path.is_dir() else []
+        for f in files:
+            if not f.is_file():
+                continue
+            with open(f, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
         return h.hexdigest()[:16]
 
     @staticmethod

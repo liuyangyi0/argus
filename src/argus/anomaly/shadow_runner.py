@@ -46,14 +46,24 @@ class ShadowRunner:
         self._lock = threading.Lock()
         self._pending_logs: list[ShadowInferenceLog] = []
         self._detector = None  # Lazy-loaded
-        self._load_failed = False
+        self._load_failures = 0
+        self._max_load_retries = 3
+        self._retry_cooldown_frames = 500  # frames between retries
+        self._frames_since_last_failure = 0
 
     def _ensure_loaded(self) -> bool:
-        """Lazy-load the shadow model on first use."""
+        """Lazy-load the shadow model on first use, with limited retries."""
         if self._detector is not None:
             return True
-        if self._load_failed:
+        if self._load_failures >= self._max_load_retries:
             return False
+
+        # Cooldown: wait N frames between retries after first failure
+        if self._load_failures > 0:
+            self._frames_since_last_failure += 1
+            if self._frames_since_last_failure < self._retry_cooldown_frames:
+                return False
+            self._frames_since_last_failure = 0
 
         try:
             from argus.anomaly.detector import AnomalibDetector
@@ -69,8 +79,14 @@ class ShadowRunner:
             )
             return True
         except Exception as e:
-            self._load_failed = True
-            logger.error("shadow_runner.load_failed", error=str(e))
+            self._load_failures += 1
+            self._frames_since_last_failure = 0
+            logger.error(
+                "shadow_runner.load_failed",
+                error=str(e),
+                attempt=self._load_failures,
+                max_retries=self._max_load_retries,
+            )
             return False
 
     def run_shadow(

@@ -121,15 +121,10 @@ async def rollback_model(request: Request, version_id: str):
         return api_unavailable("数据库不可用")
 
     # Look up the camera_id from the version_id
-    models = registry.list_models()
-    camera_id = None
-    for m in models:
-        if m.model_version_id == version_id:
-            camera_id = m.camera_id
-            break
-
-    if camera_id is None:
+    record = registry.get_by_version_id(version_id)
+    if record is None:
         return api_not_found(f"模型版本不存在: {version_id}")
+    camera_id = record.camera_id
 
     previous, runtime_synced = rollback_camera_model(
         request,
@@ -326,6 +321,11 @@ def delete_model(request: Request, version_id: str):
 
     if record.is_active:
         return api_validation_error("无法删除当前激活的模型")
+
+    if record.stage in (ModelStage.SHADOW.value, ModelStage.CANARY.value, ModelStage.PRODUCTION.value):
+        return api_validation_error(
+            f"无法删除处于 {record.stage} 阶段的模型，请先退役"
+        )
 
     # Delete model files from disk — only if no other model shares the same path
     if record.model_path:

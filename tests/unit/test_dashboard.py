@@ -1049,7 +1049,7 @@ class TestCameraManagerModelRouting:
 
         registry = ModelRegistry(session_factory=db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
-        registry.activate(version_id)
+        registry.activate(version_id, allow_bypass=True)
 
         cam_config = CameraConfig(
             camera_id="cam_01",

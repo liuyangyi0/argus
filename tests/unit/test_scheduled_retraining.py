@@ -187,7 +187,7 @@ class TestCreateRetrainingTask:
         callback()
 
         registry.register.assert_called_once()
-        registry.activate.assert_called_once_with("cam_01-patchcore-20260406-001")
+        registry.activate.assert_called_once_with("cam_01-patchcore-20260406-001", allow_bypass=True)
 
     def test_skip_deploy_on_bad_grade(self):
         from argus.core.scheduler import create_retraining_task

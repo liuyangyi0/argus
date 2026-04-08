@@ -39,7 +39,7 @@ def baseline_dir(tmp_path):
 class TestModelRegistry:
 
     def test_register_and_activate_model(self, registry, model_dir, baseline_dir):
-        """Register a model and activate it."""
+        """Register a model and activate it (with allow_bypass for fresh models)."""
         vid = registry.register(
             model_path=model_dir,
             baseline_dir=baseline_dir,
@@ -49,11 +49,17 @@ class TestModelRegistry:
         )
         assert vid.startswith("cam_01-patchcore-")
 
-        registry.activate(vid)
+        registry.activate(vid, allow_bypass=True)
         active = registry.get_active("cam_01")
         assert active is not None
         assert active.model_version_id == vid
         assert active.is_active is True
+
+    def test_activate_rejects_non_production_model(self, registry, model_dir, baseline_dir):
+        """activate() should reject candidate models without allow_bypass."""
+        vid = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        with pytest.raises(ValueError, match="Cannot activate model at stage"):
+            registry.activate(vid)
 
     def test_alert_carries_model_version(self):
         """Alert dataclass should have model_version_id field."""
@@ -98,10 +104,10 @@ class TestModelRegistry:
         (m2 / "model.xml").write_text("v2")
 
         vid1 = registry.register(m1, baseline_dir, "cam_01", "patchcore")
-        registry.activate(vid1)
+        registry.activate(vid1, allow_bypass=True)
 
         vid2 = registry.register(m2, baseline_dir, "cam_01", "patchcore")
-        registry.activate(vid2)
+        registry.activate(vid2, allow_bypass=True)
 
         # Current active should be vid2
         active = registry.get_active("cam_01")
@@ -118,7 +124,7 @@ class TestModelRegistry:
     def test_rollback_no_previous(self, registry, model_dir, baseline_dir):
         """Rollback with only one model should return None."""
         vid = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
-        registry.activate(vid)
+        registry.activate(vid, allow_bypass=True)
 
         result = registry.rollback("cam_01")
         assert result is None
@@ -164,7 +170,7 @@ class TestPromoteStateMachine:
         assert rec.is_active is False
 
         # shadow → canary
-        rec = registry.promote(vid, "canary", triggered_by="engineer_a")
+        rec = registry.promote(vid, "canary", triggered_by="engineer_a", canary_camera_id="cam_01")
         assert rec.stage == "canary"
 
         # canary → production
@@ -187,7 +193,7 @@ class TestPromoteStateMachine:
         """Cannot skip from candidate directly to canary."""
         vid = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
         with pytest.raises(ValueError, match="Invalid transition"):
-            registry.promote(vid, "canary", triggered_by="engineer")
+            registry.promote(vid, "canary", triggered_by="engineer", canary_camera_id="cam_01")
 
     def test_retired_is_terminal(self, registry, model_dir, baseline_dir):
         """Cannot promote from retired state."""
@@ -214,12 +220,12 @@ class TestPromoteStateMachine:
         vid1 = registry.register(m1, baseline_dir, "cam_01", "patchcore")
         # Put vid1 into production
         registry.promote(vid1, "shadow", triggered_by="eng")
-        registry.promote(vid1, "canary", triggered_by="eng")
+        registry.promote(vid1, "canary", triggered_by="eng", canary_camera_id="cam_01")
         registry.promote(vid1, "production", triggered_by="eng")
 
         vid2 = registry.register(m2, baseline_dir, "cam_01", "patchcore")
         registry.promote(vid2, "shadow", triggered_by="eng")
-        registry.promote(vid2, "canary", triggered_by="eng")
+        registry.promote(vid2, "canary", triggered_by="eng", canary_camera_id="cam_01")
         registry.promote(vid2, "production", triggered_by="eng")
 
         # vid1 should now be retired
@@ -236,9 +242,11 @@ class TestPromoteStateMachine:
         """is_active should only be True when stage is production."""
         vid = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
 
-        for stage in ["shadow", "canary"]:
-            rec = registry.promote(vid, stage, triggered_by="eng")
-            assert rec.is_active is False
+        rec = registry.promote(vid, "shadow", triggered_by="eng")
+        assert rec.is_active is False
+
+        rec = registry.promote(vid, "canary", triggered_by="eng", canary_camera_id="cam_01")
+        assert rec.is_active is False
 
         rec = registry.promote(vid, "production", triggered_by="eng")
         assert rec.is_active is True
@@ -250,7 +258,7 @@ class TestPromoteStateMachine:
         """Canary can be demoted back to shadow."""
         vid = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
         registry.promote(vid, "shadow", triggered_by="eng")
-        registry.promote(vid, "canary", triggered_by="eng")
+        registry.promote(vid, "canary", triggered_by="eng", canary_camera_id="cam_01")
         rec = registry.promote(vid, "shadow", triggered_by="eng", reason="regression found")
         assert rec.stage == "shadow"
 
@@ -258,7 +266,7 @@ class TestPromoteStateMachine:
         """Each promotion should create a ModelVersionEvent."""
         vid = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
         registry.promote(vid, "shadow", triggered_by="eng")
-        registry.promote(vid, "canary", triggered_by="eng")
+        registry.promote(vid, "canary", triggered_by="eng", canary_camera_id="cam_01")
 
         events = registry.get_version_events(model_version_id=vid)
         assert len(events) >= 2

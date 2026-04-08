@@ -388,7 +388,7 @@ def create_retraining_task(
                             image_count=current_count,
                             quality_grade=grade,
                         )
-                        model_registry.activate(version_id)
+                        model_registry.activate(version_id, allow_bypass=True)
                         logger.info(
                             "retraining.auto_deployed",
                             camera_id=camera_id,
