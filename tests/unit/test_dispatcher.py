@@ -8,7 +8,7 @@ import pytest
 
 from argus.alerts.dispatcher import AlertDispatcher
 from argus.alerts.grader import Alert
-from argus.config.schema import AlertConfig, AlertSeverity
+from argus.config.schema import AlertConfig, AlertSeverity, EmailConfig, WebhookConfig
 from argus.storage.database import Database
 
 
@@ -97,3 +97,233 @@ class TestAlertDispatcher:
         dispatcher.flush_db_queue()
 
         assert db.get_alert_count() == 5
+
+
+class TestWebhookDispatch:
+    """Tests for the webhook dispatch channel."""
+
+    def test_webhook_posts_to_url(self, db, tmp_path):
+        """Webhook should POST alert payload to configured URL."""
+        from unittest.mock import MagicMock, patch
+
+        config = AlertConfig(
+            webhook=WebhookConfig(enabled=True, url="http://localhost:9999/alerts"),
+        )
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            # Ensure circuit breaker is closed
+            d._circuit_breaker.record_success()
+
+            alert = make_alert()
+
+            mock_client = MagicMock()
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_client.post.return_value = mock_response
+            d._http_client = mock_client
+
+            d.dispatch(alert)
+            time.sleep(1.0)
+
+            mock_client.post.assert_called_once()
+            call_args = mock_client.post.call_args
+            assert call_args[0][0] == "http://localhost:9999/alerts"
+            payload = call_args[1]["json"]
+            assert payload["alert_id"] == "ALT-000001"
+            assert payload["severity"] == "medium"
+        finally:
+            d.close()
+
+    def test_webhook_circuit_breaker_blocks_after_failures(self, db, tmp_path):
+        """Circuit breaker should open after consecutive failures."""
+        from unittest.mock import MagicMock
+
+        config = AlertConfig(
+            webhook=WebhookConfig(enabled=True, url="http://localhost:9999/alerts"),
+            circuit_breaker_threshold=2,
+            circuit_breaker_timeout=60.0,
+        )
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            # Record enough failures to open the circuit breaker
+            for _ in range(3):
+                d._circuit_breaker.record_failure()
+
+            assert not d._circuit_breaker.allow_request()
+
+            alert = make_alert()
+            d.dispatch(alert)
+            time.sleep(0.2)
+
+            # Webhook queue should be empty since CB blocked the request
+            assert d._webhook_queue.qsize() == 0
+        finally:
+            d.close()
+
+    def test_webhook_retry_on_failure(self, db, tmp_path):
+        """Webhook should retry with backoff on transient failure."""
+        from unittest.mock import MagicMock
+
+        config = AlertConfig(
+            webhook=WebhookConfig(enabled=True, url="http://localhost:9999/alerts"),
+        )
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            mock_client = MagicMock()
+            # First call raises, second succeeds
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_client.post.side_effect = [
+                ConnectionError("timeout"),
+                mock_response,
+            ]
+            d._http_client = mock_client
+
+            # Reset circuit breaker to ensure clean state
+            d._circuit_breaker.record_success()
+
+            alert = make_alert()
+            d.dispatch(alert)
+            time.sleep(3.0)  # Allow time for retry with backoff
+
+            assert mock_client.post.call_count == 2
+        finally:
+            d.close()
+
+
+class TestEmailDispatch:
+    """Tests for the email dispatch channel."""
+
+    def test_email_severity_filter_blocks_low(self, db, tmp_path):
+        """Email with min_severity=HIGH should not send LOW alerts."""
+        config = AlertConfig(
+            email=EmailConfig(
+                enabled=True,
+                min_severity=AlertSeverity.HIGH,
+                smtp_host="localhost",
+                recipients=["admin@plant.local"],
+            ),
+        )
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            alert = make_alert(severity=AlertSeverity.LOW)
+            d.dispatch(alert)
+            time.sleep(0.2)
+
+            # Email queue should be empty because severity is below threshold
+            assert d._email_queue.qsize() == 0
+        finally:
+            d.close()
+
+    def test_email_severity_filter_allows_high(self, db, tmp_path):
+        """Email with min_severity=MEDIUM should send HIGH alerts."""
+        from unittest.mock import MagicMock, patch
+
+        config = AlertConfig(
+            email=EmailConfig(
+                enabled=True,
+                min_severity=AlertSeverity.MEDIUM,
+                smtp_host="localhost",
+                smtp_port=25,
+                use_tls=False,
+                recipients=["admin@plant.local"],
+            ),
+        )
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            with patch("smtplib.SMTP") as MockSMTP:
+                mock_server = MagicMock()
+                MockSMTP.return_value = mock_server
+
+                alert = make_alert(severity=AlertSeverity.HIGH)
+                d.dispatch(alert)
+                time.sleep(1.0)
+
+                # HIGH >= MEDIUM, so email should have been sent
+                MockSMTP.assert_called_once()
+                mock_server.sendmail.assert_called_once()
+        finally:
+            d.close()
+
+    def test_email_sends_via_smtp(self, db, tmp_path):
+        """Email worker should compose and send via SMTP."""
+        from unittest.mock import MagicMock, patch
+
+        config = AlertConfig(
+            email=EmailConfig(
+                enabled=True,
+                min_severity=AlertSeverity.LOW,
+                smtp_host="localhost",
+                smtp_port=25,
+                use_tls=False,
+                recipients=["admin@plant.local"],
+            ),
+        )
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            alert = make_alert(severity=AlertSeverity.HIGH)
+
+            with patch("smtplib.SMTP") as MockSMTP:
+                mock_server = MagicMock()
+                MockSMTP.return_value = mock_server
+
+                d.dispatch(alert)
+                time.sleep(1.0)
+
+                MockSMTP.assert_called_once_with("localhost", 25, timeout=10)
+                mock_server.sendmail.assert_called_once()
+                send_args = mock_server.sendmail.call_args
+                assert send_args[0][1] == ["admin@plant.local"]
+        finally:
+            d.close()
+
+
+class TestDiskSpaceCheck:
+    """Tests for disk space safety checks."""
+
+    def test_fail_closed_on_check_error(self, db, tmp_path):
+        """Disk check failure should fail-closed (skip image save)."""
+        from unittest.mock import patch
+
+        config = AlertConfig()
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            # Force cache expiry
+            d._disk_space_checked_at = 0.0
+
+            with patch("shutil.disk_usage", side_effect=OSError("Permission denied")):
+                result = d._check_disk_space()
+
+            assert result is False  # fail-closed
+        finally:
+            d.close()
+
+    def test_low_disk_space_skips_images(self, db, tmp_path):
+        """When disk space is low, images should be skipped but DB record persisted."""
+        from unittest.mock import patch, MagicMock
+        from collections import namedtuple
+
+        DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
+
+        config = AlertConfig()
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            d._disk_space_checked_at = 0.0
+
+            with patch("shutil.disk_usage", return_value=DiskUsage(
+                total=100 * 1024 * 1024,
+                used=99 * 1024 * 1024,
+                free=1 * 1024 * 1024,  # 1 MB < 500 MB threshold
+            )):
+                alert = make_alert(with_snapshot=True, with_heatmap=True)
+                d.dispatch(alert)
+                d.flush_db_queue()
+
+            # DB record should exist
+            alerts = db.get_alerts()
+            assert len(alerts) == 1
+            # But no images saved
+            jpg_files = list((tmp_path / "alerts").rglob("*.jpg"))
+            assert len(jpg_files) == 0
+        finally:
+            d.close()

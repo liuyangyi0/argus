@@ -8,6 +8,14 @@ from datetime import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from argus.dashboard.api_response import (
+    api_conflict,
+    api_forbidden,
+    api_not_found,
+    api_success,
+    api_unavailable,
+    api_validation_error,
+)
 from argus.dashboard.auth import hash_password, require_role
 from argus.dashboard.components import empty_state, page_header
 from argus.dashboard.forms import parse_request_form
@@ -40,25 +48,25 @@ def _user_to_dict(u) -> dict:
 async def users_json(request: Request):
     """JSON API: list all users (admin only)."""
     if not require_role(request, "admin"):
-        return JSONResponse({"error": "权限不足"}, status_code=403)
+        return api_forbidden("权限不足")
 
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     users = db.get_all_users()
-    return JSONResponse({"users": [_user_to_dict(u) for u in users]})
+    return api_success({"users": [_user_to_dict(u) for u in users]})
 
 
 @router.post("/json")
 async def create_user_json(request: Request):
     """JSON API: create a new user (admin only)."""
     if not require_role(request, "admin"):
-        return JSONResponse({"error": "权限不足"}, status_code=403)
+        return api_forbidden("权限不足")
 
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     body = await request.json()
     username = str(body.get("username", "")).strip()
@@ -67,54 +75,52 @@ async def create_user_json(request: Request):
     role = str(body.get("role", "viewer"))
 
     if not username or not password:
-        return JSONResponse({"error": "用户名和密码不能为空"}, status_code=400)
+        return api_validation_error("用户名和密码不能为空")
     if role not in ("admin", "operator", "viewer"):
-        return JSONResponse({"error": "角色无效"}, status_code=400)
+        return api_validation_error("角色无效")
     if len(password) < 6:
-        return JSONResponse({"error": "密码至少6位"}, status_code=400)
+        return api_validation_error("密码至少6位")
 
     if db.get_user(username) is not None:
-        return JSONResponse({"error": f"用户 {username} 已存在"}, status_code=400)
+        return api_conflict(f"用户 {username} 已存在")
 
     db.create_user(username, hash_password(password), role, display_name)
-    return JSONResponse({"success": True, "username": username, "message": "User created"})
+    return api_success({"username": username})
 
 
 @router.delete("/{username}/json")
 async def delete_user_json(request: Request, username: str):
     """JSON API: delete a user (admin only)."""
     if not require_role(request, "admin"):
-        return JSONResponse({"error": "权限不足"}, status_code=403)
+        return api_forbidden("权限不足")
 
     db = request.app.state.db
     current_user = getattr(request.state, "user", {})
     if username == current_user.get("username"):
-        return JSONResponse({"error": "不能删除当前登录用户"}, status_code=400)
+        return api_validation_error("不能删除当前登录用户")
 
     if db.get_user(username) is None:
-        return JSONResponse({"error": "用户不存在"}, status_code=404)
+        return api_not_found("用户不存在")
 
     db.delete_user(username)
-    return JSONResponse({"success": True, "message": "User deleted"})
+    return api_success({"username": username})
 
 
 @router.post("/{username}/toggle-active/json")
 async def toggle_active_json(request: Request, username: str):
     """JSON API: toggle user active status (admin only)."""
     if not require_role(request, "admin"):
-        return JSONResponse({"error": "权限不足"}, status_code=403)
+        return api_forbidden("权限不足")
 
     db = request.app.state.db
     user = db.get_user(username)
     if user is None:
-        return JSONResponse({"error": "用户不存在"}, status_code=404)
+        return api_not_found("用户不存在")
 
     db.update_user(username, active=not user.active)
-    return JSONResponse({
-        "success": True,
+    return api_success({
         "username": username,
         "active": not user.active,
-        "message": f"User {'deactivated' if user.active else 'activated'}",
     })
 
 
@@ -247,11 +253,11 @@ async def users_page(request: Request):
 async def create_user(request: Request):
     """Create a new user (admin only). Returns updated table body HTML."""
     if not require_role(request, "admin"):
-        return JSONResponse({"error": "权限不足"}, status_code=403)
+        return api_forbidden("权限不足")
 
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     form = await parse_request_form(request)
     username = str(form.get("username", "")).strip()
@@ -260,14 +266,14 @@ async def create_user(request: Request):
     role = str(form.get("role", "viewer"))
 
     if not username or not password:
-        return JSONResponse({"error": "用户名和密码不能为空"}, status_code=400)
+        return api_validation_error("用户名和密码不能为空")
     if role not in ("admin", "operator", "viewer"):
-        return JSONResponse({"error": "角色无效"}, status_code=400)
+        return api_validation_error("角色无效")
     if len(password) < 6:
-        return JSONResponse({"error": "密码至少6位"}, status_code=400)
+        return api_validation_error("密码至少6位")
 
     if db.get_user(username) is not None:
-        return JSONResponse({"error": f"用户 {username} 已存在"}, status_code=400)
+        return api_conflict(f"用户 {username} 已存在")
 
     db.create_user(username, hash_password(password), role, display_name)
     return _users_table_rows_response(db)
@@ -277,12 +283,12 @@ async def create_user(request: Request):
 async def delete_user(request: Request, username: str):
     """Delete a user (admin only). Returns updated table body HTML."""
     if not require_role(request, "admin"):
-        return JSONResponse({"error": "权限不足"}, status_code=403)
+        return api_forbidden("权限不足")
 
     db = request.app.state.db
     current_user = getattr(request.state, "user", {})
     if username == current_user.get("username"):
-        return JSONResponse({"error": "不能删除当前登录用户"}, status_code=400)
+        return api_validation_error("不能删除当前登录用户")
 
     db.delete_user(username)
     return _users_table_rows_response(db)
@@ -292,12 +298,12 @@ async def delete_user(request: Request, username: str):
 async def toggle_active(request: Request, username: str):
     """Toggle user active status (admin only). Returns updated table body HTML."""
     if not require_role(request, "admin"):
-        return JSONResponse({"error": "权限不足"}, status_code=403)
+        return api_forbidden("权限不足")
 
     db = request.app.state.db
     user = db.get_user(username)
     if user is None:
-        return JSONResponse({"error": "用户不存在"}, status_code=404)
+        return api_not_found("用户不存在")
 
     db.update_user(username, active=not user.active)
     return _users_table_rows_response(db)

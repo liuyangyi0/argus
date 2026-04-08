@@ -128,6 +128,8 @@ class AlertGrader:
         # Random offset avoids ID collisions across process restarts
         self._alert_counter = random.randint(1000, 9999)
         self._tracker_lock = threading.Lock()
+        self._eval_count = 0
+        self._prune_interval = 1000  # auto-prune every N evaluations
 
         # Load calibrated thresholds if available and enabled
         if calibration_path and self._config.calibration.enabled:
@@ -164,6 +166,11 @@ class AlertGrader:
         """
         now = time.monotonic()
         zone_key = f"{camera_id}:{zone_id}"
+
+        # Auto-prune stale trackers periodically to prevent memory growth
+        self._eval_count += 1
+        if self._eval_count % self._prune_interval == 0:
+            self.prune_stale_trackers()
 
         # Defense-in-depth: reject NaN/Inf scores
         if not math.isfinite(anomaly_score):

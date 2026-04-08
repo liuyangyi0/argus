@@ -48,7 +48,7 @@ const audioLoading = ref(false)
 async function fetchHealth() {
   try {
     const res = await getHealth()
-    health.value = res.data
+    health.value = res
   } catch (e) {
     console.error(e)
   }
@@ -70,7 +70,7 @@ async function loadUsers() {
   usersLoading.value = true
   try {
     const res = await apiGetUsers()
-    users.value = res.data.users
+    users.value = res.users
   } catch (e) {
     console.error(e)
     message.error('加载用户列表失败')
@@ -125,9 +125,9 @@ async function loadAudit() {
       user: auditFilters.user || undefined,
       action: auditFilters.action || undefined,
     })
-    auditEntries.value = res.data.entries
-    auditTotal.value = res.data.total
-    const uniqueUsers = new Set<string>(res.data.entries.map((e: any) => e.user).filter(Boolean))
+    auditEntries.value = res.entries
+    auditTotal.value = res.total
+    const uniqueUsers = new Set<string>(res.entries.map((e: any) => e.user).filter(Boolean))
     auditUserOptions.value = Array.from(uniqueUsers).sort()
   } catch (e) {
     console.error(e)
@@ -174,7 +174,7 @@ async function loadDegradation() {
   degradationLoading.value = true
   try {
     const res = await getDegradationHistory(degradationDays.value)
-    degradationEvents.value = res.data || []
+    degradationEvents.value = res || []
   } catch { /* silent */ }
   finally { degradationLoading.value = false }
 }
@@ -183,7 +183,7 @@ async function loadAudioConfig() {
   audioLoading.value = true
   try {
     const res = await getAudioAlerts()
-    audioConfig.value = res.data
+    audioConfig.value = res
   } catch { /* silent */ }
   finally { audioLoading.value = false }
 }

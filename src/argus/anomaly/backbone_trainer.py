@@ -49,12 +49,16 @@ class _BaselineImageDataset(Dataset):
     def __len__(self) -> int:
         return len(self._paths)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int) -> torch.Tensor | None:
         path = self._paths[idx]
         img = cv2.imread(str(path))
         if img is None:
-            # Return a random noise image as fallback
-            return torch.randn(3, self._size, self._size)
+            logger.warning(
+                "backbone_dataset.imread_failed",
+                path=str(path),
+                idx=idx,
+            )
+            return None  # filtered by collate_fn
 
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (self._size, self._size))
@@ -92,6 +96,7 @@ def _collect_baseline_images(
     camera_ids: list[str],
     baselines_dir: Path,
     max_per_camera: int = 5000,
+    max_total: int = 50000,
 ) -> list[Path]:
     """Collect baseline images from all cameras for pooled training."""
     all_paths: list[Path] = []
@@ -104,6 +109,15 @@ def _collect_baseline_images(
             list(cam_dir.rglob("*.png")) + list(cam_dir.rglob("*.jpg"))
         )
         all_paths.extend(images[:max_per_camera])
+
+    # Enforce total image cap to prevent OOM
+    if len(all_paths) > max_total:
+        logger.warning(
+            "backbone_trainer.images_capped",
+            collected=len(all_paths),
+            max_total=max_total,
+        )
+        all_paths = all_paths[:max_total]
 
     logger.info(
         "backbone_trainer.images_collected",
@@ -204,13 +218,40 @@ class BackboneTrainer:
 
         # Create dataset and dataloader
         dataset = _BaselineImageDataset(image_paths, image_size=image_size)
+
+        def _skip_none_collate(batch: list[torch.Tensor | None]) -> torch.Tensor | None:
+            """Filter out None entries (failed reads) and stack the rest."""
+            valid = [t for t in batch if t is not None]
+            if not valid:
+                return None
+            return torch.stack(valid)
+
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=2,
             drop_last=True,
+            collate_fn=_skip_none_collate,
         )
+
+        # Abort if corruption rate exceeds 10%
+        corrupt_count = sum(1 for t in (dataset[i] for i in range(len(dataset))) if t is None)
+        if corrupt_count > 0:
+            corrupt_rate = corrupt_count / len(dataset)
+            logger.warning(
+                "backbone_trainer.corrupt_images",
+                corrupt=corrupt_count,
+                total=len(dataset),
+                rate=f"{corrupt_rate:.1%}",
+            )
+            if corrupt_rate > 0.10:
+                return BackboneTrainingResult(
+                    success=False,
+                    error=f"图像损坏率过高: {corrupt_count}/{len(dataset)} ({corrupt_rate:.1%} > 10%)",
+                    total_images=len(image_paths),
+                    duration_seconds=time.monotonic() - start,
+                )
 
         # Optimizer: only fine-tune last few transformer blocks + SSL head
         # Freeze early layers for efficiency
@@ -241,6 +282,8 @@ class BackboneTrainer:
             n_batches = 0
 
             for batch in dataloader:
+                if batch is None:
+                    continue  # entire batch was corrupt — skip
                 # Create two augmented views (simple: horizontal flip)
                 view1 = batch
                 view2 = torch.flip(batch, dims=[3])  # Horizontal flip

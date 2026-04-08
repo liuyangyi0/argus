@@ -12,7 +12,13 @@ so the frontend can degrade gracefully.
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+
+from argus.dashboard.api_response import (
+    api_success,
+    api_not_found,
+    api_unavailable,
+    api_validation_error,
+)
 
 router = APIRouter()
 
@@ -44,7 +50,7 @@ def stream_info(request: Request, camera_id: str):
         ws_scheme = "wss" if request.url.scheme == "https" else "ws"
         ws_base = f"{ws_scheme}://{request.headers.get('host', '').split(':')[0] or '127.0.0.1'}:{go2rtc.api_port}"
 
-        return JSONResponse({
+        return api_success({
             "camera_id": camera_id,
             "go2rtc": True,
             "webrtc_ws": f"{ws_base}/api/ws?src={camera_id}",
@@ -55,7 +61,7 @@ def stream_info(request: Request, camera_id: str):
             "fallback": f"/api/cameras/{camera_id}/stream",
         })
 
-    return JSONResponse({
+    return api_success({
         "camera_id": camera_id,
         "go2rtc": False,
         "fallback": f"/api/cameras/{camera_id}/stream",
@@ -67,14 +73,14 @@ def streams_list(request: Request):
     """List all registered streams in go2rtc."""
     go2rtc = _get_go2rtc(request)
     if go2rtc is None or not go2rtc.running:
-        return JSONResponse({"go2rtc": False, "streams": {}})
+        return api_success({"go2rtc": False, "streams": {}})
 
     try:
         streams = go2rtc.list_streams()
     except Exception:
-        return JSONResponse({"go2rtc": False, "streams": {}})
+        return api_success({"go2rtc": False, "streams": {}})
 
-    return JSONResponse({"go2rtc": True, "streams": streams})
+    return api_success({"go2rtc": True, "streams": streams})
 
 
 @router.post("/{camera_id}/register")
@@ -82,21 +88,20 @@ def register_stream(request: Request, camera_id: str):
     """Dynamically register a camera stream with go2rtc."""
     go2rtc = _get_go2rtc(request)
     if go2rtc is None or not go2rtc.running:
-        return JSONResponse({"error": "go2rtc is not running"}, status_code=503)
+        return api_unavailable("go2rtc 未运行")
 
     camera_manager = getattr(request.app.state, "camera_manager", None)
     if not camera_manager:
-        return JSONResponse({"error": "Camera manager not available"}, status_code=503)
+        return api_unavailable("摄像头管理器不可用")
 
     cam_config = camera_manager.get_camera_config(camera_id)
     if cam_config is None:
-        return JSONResponse({"error": f"Camera {camera_id} not found"}, status_code=404)
+        return api_not_found(f"摄像头 {camera_id} 不存在")
 
     if getattr(cam_config, "protocol", "rtsp") != "rtsp":
-        return JSONResponse(
-            {"error": f"Camera {camera_id} uses protocol '{cam_config.protocol}', not RTSP"},
-            status_code=400,
+        return api_validation_error(
+            f"摄像头 {camera_id} 使用协议 '{cam_config.protocol}'，非 RTSP"
         )
 
     go2rtc.add_stream(camera_id, cam_config.source)
-    return JSONResponse({"status": "ok", "camera_id": camera_id})
+    return api_success({"status": "ok", "camera_id": camera_id})

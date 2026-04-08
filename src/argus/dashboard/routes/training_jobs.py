@@ -15,6 +15,14 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from argus.dashboard.api_response import (
+    api_conflict,
+    api_success,
+    api_internal_error,
+    api_not_found,
+    api_unavailable,
+    api_validation_error,
+)
 from argus.storage.models import (
     AuditLog,
     TrainingJobRecord,
@@ -52,11 +60,10 @@ def _get_pending_job(db, job_id: str):
     """Fetch a job and validate it's pending confirmation. Returns (job, error_response)."""
     job = db.get_training_job(job_id)
     if job is None:
-        return None, JSONResponse({"error": f"Job not found: {job_id}"}, status_code=404)
+        return None, api_not_found(f"任务不存在: {job_id}")
     if job.status != TrainingJobStatus.PENDING_CONFIRMATION.value:
-        return None, JSONResponse(
-            {"error": f"Job is not pending confirmation (status={job.status})"},
-            status_code=400,
+        return None, api_validation_error(
+            f"任务不在待确认状态 (status={job.status})",
         )
     return job, None
 
@@ -72,13 +79,13 @@ async def list_training_jobs(
     """List training jobs with optional filters."""
     db = _get_db(request)
     if db is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     jobs = db.list_training_jobs(
         status=status, job_type=job_type, camera_id=camera_id, limit=min(limit, 200),
     )
     pending_count = db.count_pending_jobs()
-    return JSONResponse({
+    return api_success({
         "jobs": [j.to_dict() for j in jobs],
         "total": len(jobs),
         "pending_count": pending_count,
@@ -90,11 +97,11 @@ async def get_training_job(request: Request, job_id: str):
     """Get training job detail."""
     db = _get_db(request)
     if db is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     job = db.get_training_job(job_id)
     if job is None:
-        return JSONResponse({"error": f"Job not found: {job_id}"}, status_code=404)
+        return api_not_found(f"任务不存在: {job_id}")
 
     data = job.to_dict()
     for field in ("hyperparameters", "metrics", "validation_report"):
@@ -103,7 +110,7 @@ async def get_training_job(request: Request, job_id: str):
                 data[field] = json.loads(data[field])
             except (json.JSONDecodeError, TypeError):
                 pass
-    return JSONResponse(data)
+    return api_success(data)
 
 
 @router.post("/")
@@ -122,35 +129,32 @@ async def create_training_job(request: Request):
     """
     db = _get_db(request)
     if db is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        return api_validation_error("无效的JSON请求")
 
     valid_types = {t.value for t in TrainingJobType}
     job_type = body.get("job_type")
     if job_type not in valid_types:
-        return JSONResponse(
-            {"error": f"job_type must be one of {valid_types}"},
-            status_code=400,
+        return api_validation_error(
+            f"job_type 必须是 {valid_types} 之一",
         )
 
     camera_id = body.get("camera_id")
     if job_type == TrainingJobType.ANOMALY_HEAD.value and not camera_id:
-        return JSONResponse(
-            {"error": "camera_id is required for anomaly_head jobs"},
-            status_code=400,
+        return api_validation_error(
+            "anomaly_head 类型任务需要指定 camera_id",
         )
 
     # Validate camera_id exists in config
     if camera_id:
         config = getattr(request.app.state, "config", None)
         if config and not any(c.camera_id == camera_id for c in config.cameras):
-            return JSONResponse(
-                {"error": f"Camera '{camera_id}' not found in configuration"},
-                status_code=400,
+            return api_validation_error(
+                f"摄像头 '{camera_id}' 在配置中不存在",
             )
 
     hyperparams = body.get("hyperparameters")
@@ -185,7 +189,7 @@ async def create_training_job(request: Request):
         camera_id=camera_id,
     )
 
-    return JSONResponse({"status": "ok", "job_id": job_id}, status_code=201)
+    return api_success({"job_id": job_id}, status_code=201)
 
 
 @router.post("/{job_id}/confirm")
@@ -193,7 +197,7 @@ async def confirm_training_job(request: Request, job_id: str):
     """Human confirms a pending training job (writes audit log)."""
     db = _get_db(request)
     if db is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     job, err = _get_pending_job(db, job_id)
     if err:
@@ -215,10 +219,7 @@ async def confirm_training_job(request: Request, job_id: str):
         confirmed_at=now,
     )
     if updated is False:
-        return JSONResponse(
-            {"error": "Job was already confirmed or status changed"},
-            status_code=409,
-        )
+        return api_conflict("任务已确认或状态已变更")
 
     _write_audit(
         db, confirmed_by, "training_job.confirm", job_id,
@@ -226,7 +227,7 @@ async def confirm_training_job(request: Request, job_id: str):
     )
 
     logger.info("training_job.confirmed", job_id=job_id, confirmed_by=confirmed_by)
-    return JSONResponse({"status": "ok", "job_id": job_id, "new_status": "queued"})
+    return api_success({"job_id": job_id, "new_status": "queued"})
 
 
 @router.post("/{job_id}/reject")
@@ -234,7 +235,7 @@ async def reject_training_job(request: Request, job_id: str):
     """Human rejects a pending training job."""
     db = _get_db(request)
     if db is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     job, err = _get_pending_job(db, job_id)
     if err:
@@ -260,7 +261,7 @@ async def reject_training_job(request: Request, job_id: str):
     )
 
     logger.info("training_job.rejected", job_id=job_id, rejected_by=rejected_by)
-    return JSONResponse({"status": "ok", "job_id": job_id, "new_status": "rejected"})
+    return api_success({"job_id": job_id, "new_status": "rejected"})
 
 
 @router.get("/backbones/json")
@@ -268,13 +269,13 @@ async def list_backbones(request: Request):
     """List backbone versions."""
     db = _get_db(request)
     if db is None:
-        return JSONResponse({"error": "Database not available"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     backbones = db.list_backbones()
     active_id = next(
         (b.backbone_version_id for b in backbones if b.is_active), None,
     )
-    return JSONResponse({
+    return api_success({
         "backbones": [b.to_dict() for b in backbones],
         "active_version_id": active_id,
         "total": len(backbones),

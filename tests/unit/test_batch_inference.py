@@ -101,7 +101,9 @@ class TestBatchInferenceEndpoint:
             response = await batch_inference(request)
 
         assert response.status_code == 200
-        data = json.loads(response.body)
+        body = json.loads(response.body)
+        assert body["code"] == 0
+        data = body["data"]
         assert data["total"] == 1
         assert data["scored"] == 1
         assert data["results"][0]["score"] == 0.7
@@ -127,7 +129,9 @@ class TestBatchInferenceEndpoint:
         )
         response = await batch_inference(request)
 
-        data = json.loads(response.body)
+        body = json.loads(response.body)
+        assert body["code"] == 0
+        data = body["data"]
         assert data["total"] == 1
         assert data["scored"] == 0
         assert "error" in data["results"][0]

@@ -70,20 +70,46 @@ def _severity_rank(severity) -> int:
     return _SEVERITY_ORDER.get(severity.value, 0)
 
 
-@dataclass
 class PipelineStats:
-    """Runtime statistics for the pipeline."""
+    """Runtime statistics for the pipeline.
 
-    frames_captured: int = 0
-    frames_skipped_no_change: int = 0
-    frames_skipped_person: int = 0
-    frames_analyzed: int = 0
-    frames_heartbeat: int = 0
-    frames_dropped_backpressure: int = 0
-    anomalies_detected: int = 0
-    alerts_emitted: int = 0
-    avg_latency_ms: float = 0.0
-    _latency_sum: float = 0.0
+    Thread-safe: all increments and reads go through a lock to prevent
+    torn reads when the dashboard snapshots stats from a different thread.
+    """
+
+    __slots__ = (
+        "_lock", "frames_captured", "frames_skipped_no_change",
+        "frames_skipped_person", "frames_analyzed", "frames_heartbeat",
+        "frames_dropped_backpressure", "anomalies_detected",
+        "alerts_emitted", "avg_latency_ms", "_latency_sum",
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.frames_captured: int = 0
+        self.frames_skipped_no_change: int = 0
+        self.frames_skipped_person: int = 0
+        self.frames_analyzed: int = 0
+        self.frames_heartbeat: int = 0
+        self.frames_dropped_backpressure: int = 0
+        self.anomalies_detected: int = 0
+        self.alerts_emitted: int = 0
+        self.avg_latency_ms: float = 0.0
+        self._latency_sum: float = 0.0
+
+    def snapshot(self) -> dict:
+        """Return a consistent point-in-time copy of all counters."""
+        with self._lock:
+            return {
+                "captured": self.frames_captured,
+                "skipped_no_change": self.frames_skipped_no_change,
+                "skipped_person": self.frames_skipped_person,
+                "analyzed": self.frames_analyzed,
+                "heartbeats": self.frames_heartbeat,
+                "anomalies": self.anomalies_detected,
+                "alerts": self.alerts_emitted,
+                "avg_latency_ms": round(self.avg_latency_ms, 1),
+            }
 
 
 class DetectionPipeline:
@@ -1380,16 +1406,7 @@ class DetectionPipeline:
         logger.info(
             "pipeline.shutdown",
             camera_id=self.camera_config.camera_id,
-            stats={
-                "captured": self.stats.frames_captured,
-                "skipped_no_change": self.stats.frames_skipped_no_change,
-                "skipped_person": self.stats.frames_skipped_person,
-                "analyzed": self.stats.frames_analyzed,
-                "heartbeats": self.stats.frames_heartbeat,
-                "anomalies": self.stats.anomalies_detected,
-                "alerts": self.stats.alerts_emitted,
-                "avg_latency_ms": round(self.stats.avg_latency_ms, 1),
-            },
+            stats=self.stats.snapshot(),
         )
 
     def _evaluate_zones(
@@ -1531,9 +1548,10 @@ class DetectionPipeline:
 
     def _update_latency(self, start: float) -> None:
         elapsed_ms = (time.monotonic() - start) * 1000
-        n = self.stats.frames_analyzed
-        self.stats._latency_sum += elapsed_ms
-        self.stats.avg_latency_ms = self.stats._latency_sum / n if n > 0 else 0
+        with self.stats._lock:
+            self.stats._latency_sum += elapsed_ms
+            n = self.stats.frames_analyzed
+            self.stats.avg_latency_ms = self.stats._latency_sum / n if n > 0 else 0
 
     # --- D1: Classifier helpers ----------------------------------------------
 

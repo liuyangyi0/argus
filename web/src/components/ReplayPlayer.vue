@@ -96,12 +96,12 @@ async function loadReference(date?: string) {
     const params: any = {}
     if (date) params.date = date
     const res = await getReplayReference(props.alertId, params)
-    if (res.data.available && res.data.frame_base64) {
-      referenceFrame.value = `data:image/jpeg;base64,${res.data.frame_base64}`
+    if (res.available && res.frame_base64) {
+      referenceFrame.value = `data:image/jpeg;base64,${res.frame_base64}`
     } else {
       referenceFrame.value = null
     }
-    referenceDate.value = res.data.source_date || ''
+    referenceDate.value = res.source_date || ''
   } catch {
     referenceFrame.value = null
   } finally {

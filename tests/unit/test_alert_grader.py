@@ -362,3 +362,89 @@ class TestCUSUMEvidence:
         # With alternating 0.6/0.0, evidence grows slowly due to decay on zero frames
         # May or may not trigger in 20 frames depending on exact math
         # The key test is that it doesn't crash and evidence mechanics work
+
+
+class TestGraderConcurrency:
+    """Thread-safety tests for AlertGrader under concurrent evaluation."""
+
+    def test_concurrent_evaluate_no_crash(self):
+        """Multiple threads evaluating the same grader should not crash."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        config = make_config()
+        grader = AlertGrader(config)
+        errors = []
+
+        def worker(thread_id):
+            try:
+                for i in range(50):
+                    grader.evaluate(
+                        camera_id=f"cam{thread_id % 3}",
+                        zone_id=f"z{thread_id % 2}",
+                        zone_priority=ZonePriority.STANDARD,
+                        anomaly_score=0.5 + (i % 10) * 0.05,
+                        frame_number=i,
+                    )
+            except Exception as e:
+                errors.append(e)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(worker, tid) for tid in range(8)]
+            for f in as_completed(futures):
+                f.result()  # re-raise if any exception
+
+        assert len(errors) == 0
+
+    def test_concurrent_prune_no_crash(self):
+        """Pruning while evaluating should not corrupt tracker state."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        config = make_config()
+        grader = AlertGrader(config)
+
+        def evaluator():
+            for i in range(100):
+                grader.evaluate(
+                    camera_id="cam1", zone_id="z1",
+                    zone_priority=ZonePriority.STANDARD,
+                    anomaly_score=0.6, frame_number=i,
+                )
+
+        def pruner():
+            for _ in range(20):
+                grader.prune_stale_trackers(max_age_seconds=0.001)
+                time.sleep(0.001)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(evaluator),
+                pool.submit(evaluator),
+                pool.submit(pruner),
+                pool.submit(pruner),
+            ]
+            for f in as_completed(futures):
+                f.result()
+
+    def test_auto_prune_triggers(self):
+        """Auto-prune should fire after _prune_interval evaluations."""
+        config = make_config()
+        grader = AlertGrader(config)
+        grader._prune_interval = 10  # trigger prune every 10 evals
+
+        # Create some trackers that will become stale
+        grader._trackers["cam_old:z_old"] = _AnomalyTracker(
+            evidence=0.5,
+            first_seen=time.monotonic() - 7200,
+            last_seen=time.monotonic() - 7200,
+        )
+
+        # Run 10 evaluations to trigger auto-prune
+        for i in range(10):
+            grader.evaluate(
+                camera_id="cam1", zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.3, frame_number=i,
+            )
+
+        # Stale tracker should have been pruned (last_seen 2h ago > 1h default)
+        assert "cam_old:z_old" not in grader._trackers

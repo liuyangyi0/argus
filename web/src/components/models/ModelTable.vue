@@ -91,7 +91,7 @@ function handleRollback(record: any) {
     async onOk() {
       try {
         const res = await rollbackModel(record.model_version_id)
-        message.success(`已回滚到 ${res.data.activated}`)
+        message.success(`已回滚到 ${res.activated}`)
         emit('changed')
       } catch (e: any) {
         message.error(e.response?.data?.error || '回滚失败')
@@ -191,7 +191,7 @@ async function handleViewShadowReport(record: any) {
   shadowReport.value = null
   try {
     const res = await getShadowReport(record.model_version_id, { days: 7 })
-    shadowReport.value = res.data
+    shadowReport.value = res
   } catch (e: any) {
     message.error(e.response?.data?.error || '获取影子报告失败')
   } finally {
@@ -205,7 +205,7 @@ async function handleViewStageHistory(record: any) {
   stageHistory.value = []
   try {
     const res = await getStageHistory(record.model_version_id)
-    stageHistory.value = res.data.events || []
+    stageHistory.value = res.events || []
   } catch (e: any) {
     message.error(e.response?.data?.error || '获取历史失败')
   } finally {
@@ -251,7 +251,7 @@ function handleRecalibrate(record: any) {
       recalibrateLoading.value = record.model_version_id
       try {
         const res = await recalibrateModel(record.model_version_id)
-        const n = res.data.n_samples
+        const n = res.n_samples
         message.success(`重新校准成功 (${n} 个样本)`)
         emit('changed')
       } catch (e: any) {

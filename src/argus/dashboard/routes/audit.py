@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from argus.dashboard.api_response import api_paginated, api_unavailable
 from argus.dashboard.components import empty_state, page_header
 
 router = APIRouter()
@@ -54,7 +55,7 @@ async def audit_json(
     """JSON API: paginated audit log entries with optional filters."""
     audit = getattr(request.app.state, "audit_logger", None)
     if not audit:
-        return JSONResponse({"error": "审计日志不可用"}, status_code=503)
+        return api_unavailable("审计日志不可用")
 
     offset = (page - 1) * page_size
     logs = audit.get_logs(
@@ -62,12 +63,7 @@ async def audit_json(
     )
     total = audit.count_logs(user=user or None, action=action or None)
 
-    return JSONResponse({
-        "entries": [_audit_entry_to_dict(e) for e in logs],
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-    })
+    return api_paginated("entries", [_audit_entry_to_dict(e) for e in logs], total, page, page_size)
 
 
 # ── HTML endpoint (legacy HTMX) ──

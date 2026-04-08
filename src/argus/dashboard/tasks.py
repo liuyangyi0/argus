@@ -177,8 +177,8 @@ class TaskManager:
         """Pause a running task. The task must check pause_event in its loop."""
         task = self._tasks.get(task_id)
         if task and task.status == TaskStatus.RUNNING:
-            task.pause_event.clear()
             with self._lock:
+                task.pause_event.clear()
                 task.status = TaskStatus.PAUSED
                 task.message = "已暂停"
             self._notify_task_change(task)
@@ -193,7 +193,7 @@ class TaskManager:
             with self._lock:
                 task.status = TaskStatus.RUNNING
                 task.message = "已恢复"
-            task.pause_event.set()
+                task.pause_event.set()
             self._notify_task_change(task)
             logger.info("task.resumed", task_id=task_id)
             return True

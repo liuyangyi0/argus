@@ -29,7 +29,7 @@ async function loadHistory() {
   historyLoading.value = true
   try {
     const res = await getTrainingHistory()
-    trainingHistory.value = res.data.records || []
+    trainingHistory.value = res.records || []
   } catch (e) {
     console.error('Failed to load training history', e)
   } finally {
@@ -58,7 +58,7 @@ async function handleCompare() {
       old_record_id: compareForm.value.old_record_id,
       new_record_id: compareForm.value.new_record_id,
     })
-    compareResult.value = res.data
+    compareResult.value = res
   } catch (e: any) {
     message.error(e.response?.data?.error || '对比失败')
   } finally {

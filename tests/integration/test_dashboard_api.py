@@ -342,11 +342,11 @@ class TestDashboardFeatureChain:
             },
         )
         assert submit_resp.status_code == 200
-        task_id = submit_resp.json()["task_id"]
+        task_id = submit_resp.json()["data"]["task_id"]
 
         tasks_resp = client.get("/api/tasks/json")
         assert tasks_resp.status_code == 200
-        tasks = tasks_resp.json()["tasks"]
+        tasks = tasks_resp.json()["data"]["tasks"]
         task = next((item for item in tasks if item["task_id"] == task_id), None)
         assert task is not None
         assert task["task_type"] == "baseline_capture"
@@ -355,7 +355,7 @@ class TestDashboardFeatureChain:
         deadline = time.time() + 1.0
         final_task = task
         while time.time() < deadline:
-            final_task = client.get("/api/tasks/json").json()["tasks"][0]
+            final_task = client.get("/api/tasks/json").json()["data"]["tasks"][0]
             if final_task["status"] == "complete":
                 break
             time.sleep(0.02)
@@ -455,22 +455,22 @@ class TestDashboardFeatureChain:
             },
         )
         assert create_job_resp.status_code == 201
-        job_id = create_job_resp.json()["job_id"]
+        job_id = create_job_resp.json()["data"]["job_id"]
 
         jobs_resp = client.get("/api/training-jobs/json")
         assert jobs_resp.status_code == 200
-        assert jobs_resp.json()["pending_count"] == 1
+        assert jobs_resp.json()["data"]["pending_count"] == 1
 
         confirm_resp = client.post(
             f"/api/training-jobs/{job_id}/confirm",
             json={"confirmed_by": "operator"},
         )
         assert confirm_resp.status_code == 200
-        assert confirm_resp.json()["new_status"] == "queued"
+        assert confirm_resp.json()["data"]["new_status"] == "queued"
 
         detail_job_resp = client.get(f"/api/training-jobs/{job_id}")
         assert detail_job_resp.status_code == 200
-        assert detail_job_resp.json()["status"] == "queued"
+        assert detail_job_resp.json()["data"]["status"] == "queued"
 
         model_dir = tmp_path / "model"
         model_dir.mkdir()
@@ -484,7 +484,7 @@ class TestDashboardFeatureChain:
 
         publish_resp = client.post(f"/api/models/{version_id}/activate")
         assert publish_resp.status_code == 200
-        assert publish_resp.json()["runtime_synced"] is True
+        assert publish_resp.json()["data"]["runtime_synced"] is True
         camera_manager.reload_model.assert_called_with(
             "cam_01",
             str(model_dir / "model.xml"),
@@ -543,8 +543,10 @@ class TestDashboardFeatureChain:
 
         assert resp.status_code == 200
         payload = resp.json()
-        assert payload["model"]["stage"] == "production"
-        assert payload["runtime_synced"] is True
+        assert payload["code"] == 0
+        data = payload["data"]
+        assert data["model"]["stage"] == "production"
+        assert data["runtime_synced"] is True
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
             str(model_dir / "model.xml"),

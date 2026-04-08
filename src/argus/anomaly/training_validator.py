@@ -422,16 +422,21 @@ class TrainingValidator:
 
             # Re-score each alert's snapshot
             original_detections = len(alerts)
+            skipped_missing = 0
+            skipped_unreadable = 0
+            skipped_error = 0
             new_detections = 0
             replay_scores = []
 
             for alert in alerts:
                 if not alert.snapshot_path or not Path(alert.snapshot_path).exists():
+                    skipped_missing += 1
                     original_detections -= 1
                     continue
 
                 frame = cv2.imread(str(alert.snapshot_path))
                 if frame is None:
+                    skipped_unreadable += 1
                     original_detections -= 1
                     continue
 
@@ -442,15 +447,36 @@ class TrainingValidator:
                     if score >= threshold:
                         new_detections += 1
                 except Exception:
+                    skipped_error += 1
                     original_detections -= 1
                     continue
 
+            total_skipped = skipped_missing + skipped_unreadable + skipped_error
+            if total_skipped > 0:
+                logger.warning(
+                    "validation.replay_skipped_alerts",
+                    skipped_missing=skipped_missing,
+                    skipped_unreadable=skipped_unreadable,
+                    skipped_error=skipped_error,
+                    effective_alerts=original_detections,
+                    total_alerts=len(alerts),
+                )
+
+            # Require minimum effective sample size for statistical validity
+            min_effective = 5
             if original_detections == 0:
                 return StepResult(
                     name="historical_replay",
                     passed=True,
                     skipped=True,
                     skip_reason="No valid historical alert snapshots found",
+                )
+            if 0 < original_detections < min_effective:
+                return StepResult(
+                    name="historical_replay",
+                    passed=True,
+                    skipped=True,
+                    skip_reason=f"Insufficient valid snapshots: {original_detections} < {min_effective}",
                 )
 
             new_detection_rate = new_detections / original_detections

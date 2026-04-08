@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from argus.dashboard.routes.baseline import CaptureStats
+from argus.capture.quality import CaptureStats
 from argus.storage.database import Database
 from argus.storage.models import TrainingRecord
 
@@ -156,51 +156,44 @@ class TestTrainingRecord:
 
 
 class TestCaptureStats:
-    def test_retention_rate_calculated(self):
-        """CaptureStats calculates retention_rate correctly."""
-        stats = CaptureStats(
-            total_frames=100,
-            captured_frames=85,
-            filtered_frames=15,
-        )
-        assert stats.retention_rate == pytest.approx(0.85)
+    def test_accepted_and_rejected_counts(self):
+        """CaptureStats tracks accepted and rejected frame counts."""
+        stats = CaptureStats(total_grabbed=100, accepted=85, rejected_blur=10, rejected_exposure=5)
+        assert stats.total_grabbed == 100
+        assert stats.accepted == 85
+        assert stats.total_rejected == 15
 
-    def test_retention_rate_zero_total(self):
-        """CaptureStats handles zero total frames without division error."""
-        stats = CaptureStats(
-            total_frames=0,
-            captured_frames=0,
-            filtered_frames=0,
-        )
-        assert stats.retention_rate == 0.0
+    def test_zero_total_grabbed(self):
+        """CaptureStats handles zero total frames."""
+        stats = CaptureStats()
+        assert stats.total_grabbed == 0
+        assert stats.accepted == 0
+        assert stats.total_rejected == 0
 
-    def test_retention_rate_perfect(self):
-        """CaptureStats with all frames captured has 1.0 retention."""
-        stats = CaptureStats(
-            total_frames=50,
-            captured_frames=50,
-            filtered_frames=0,
-        )
-        assert stats.retention_rate == pytest.approx(1.0)
+    def test_perfect_acceptance(self):
+        """CaptureStats with all frames accepted."""
+        stats = CaptureStats(total_grabbed=50, accepted=50)
+        assert stats.total_rejected == 0
 
-    def test_filter_reasons_stored(self):
-        """CaptureStats stores filter reasons correctly."""
+    def test_rejection_reasons_tracked(self):
+        """CaptureStats tracks individual rejection reasons."""
         stats = CaptureStats(
-            total_frames=100,
-            captured_frames=90,
-            filtered_frames=10,
-            filter_reasons={"blur": 5, "exposure": 3, "no_frame": 2},
+            total_grabbed=100,
+            accepted=90,
+            rejected_blur=5,
+            rejected_exposure=3,
+            rejected_duplicate=2,
         )
-        assert stats.filter_reasons["blur"] == 5
-        assert stats.filter_reasons["exposure"] == 3
-        assert sum(stats.filter_reasons.values()) == 10
+        assert stats.rejected_blur == 5
+        assert stats.rejected_exposure == 3
+        assert stats.rejected_duplicate == 2
+        assert stats.total_rejected == 10
 
     def test_brightness_range(self):
-        """CaptureStats stores brightness range."""
+        """CaptureStats computes brightness range from values."""
         stats = CaptureStats(
-            total_frames=100,
-            captured_frames=100,
-            filtered_frames=0,
-            brightness_range=(45.2, 180.7),
+            total_grabbed=100,
+            accepted=100,
+            brightness_values=[45.2, 120.0, 180.7],
         )
-        assert stats.brightness_range == (45.2, 180.7)
+        assert stats.brightness_range() == (45.2, 180.7)

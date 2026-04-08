@@ -241,6 +241,15 @@ class AnomalyConfig(BaseModel):
         default=7, ge=0, le=90,
         description="Minimum days in canary stage before promotion to production",
     )
+    # Backbone training resource limits
+    backbone_max_per_camera: int = Field(
+        default=5000, ge=100, le=20000,
+        description="Maximum baseline images per camera for backbone SSL training",
+    )
+    backbone_max_total_images: int = Field(
+        default=50000, ge=1000, le=200000,
+        description="Maximum total images across all cameras for backbone training",
+    )
 
 
 class ClassifierConfig(BaseModel):
@@ -457,7 +466,11 @@ class SeverityThresholds(BaseModel):
 class TemporalConfirmation(BaseModel):
     """Require anomaly persistence before alerting."""
 
-    min_consecutive_frames: int = Field(default=3, ge=1, le=30)
+    min_consecutive_frames: int = Field(
+        default=3, ge=1, le=30,
+        description="DEPRECATED: Not enforced by AlertGrader. "
+        "Use evidence_threshold to control alert sensitivity instead.",
+    )
     max_gap_seconds: float = Field(default=10.0, ge=1.0, le=120.0)
     min_spatial_overlap: float = Field(
         default=0.3, ge=0.0, le=1.0,

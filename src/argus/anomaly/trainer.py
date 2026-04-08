@@ -383,13 +383,16 @@ class ModelTrainer:
 
         # Export
         export_path_str = None
+        actual_export_format = export_format
+        actual_quantization = quantization
         if export_format:
             self._status = TrainingStatus.EXPORTING
             quant_label = f" + {quantization}" if quantization != "fp32" else ""
             _progress(70, f"正在导出 {export_format}{quant_label} 格式...")
             try:
                 export_path_str = str(self._exports_dir / camera_id / zone_id)
-                self._export_model(
+                Path(export_path_str).mkdir(parents=True, exist_ok=True)
+                export_result = self._export_model(
                     engine=engine,
                     model=model,
                     export_format=export_format,
@@ -398,6 +401,20 @@ class ModelTrainer:
                     val_dir=val_dir,
                     calibration_images=calibration_images,
                 )
+                actual_export_format = export_result["actual_format"]
+                actual_quantization = export_result["actual_quantization"]
+                if actual_export_format != export_format:
+                    logger.warning(
+                        "training.export_format_changed",
+                        requested=export_format,
+                        actual=actual_export_format,
+                    )
+                if actual_quantization != quantization:
+                    logger.warning(
+                        "training.quantization_changed",
+                        requested=quantization,
+                        actual=actual_quantization,
+                    )
             except Exception as e:
                 logger.error("training.export_failed", error=str(e))
 
@@ -480,8 +497,8 @@ class ModelTrainer:
                     model_type=model_type,
                     training_params={
                         "image_size": image_size,
-                        "export_format": export_format,
-                        "quantization": quantization,
+                        "export_format": actual_export_format,
+                        "quantization": actual_quantization,
                         "train_count": train_count,
                         "val_count": val_count,
                         "quality_grade": quality_report.grade,
@@ -549,7 +566,14 @@ class ModelTrainer:
         # Cleanup split directory
         split_dir = output_dir / "_split"
         if split_dir.exists():
-            shutil.rmtree(split_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(split_dir)
+            except OSError as e:
+                logger.warning(
+                    "trainer.split_cleanup_failed",
+                    path=str(split_dir),
+                    error=str(e),
+                )
 
         return result
 
@@ -1084,6 +1108,24 @@ class ModelTrainer:
             except ImportError:
                 logger.warning("trainer.callbacks_unavailable", msg="EarlyStopping/ModelCheckpoint not available")
 
+        # H-1: Add a timer callback to enforce training timeout
+        try:
+            from datetime import timedelta as _td
+
+            from lightning.pytorch.callbacks import Timer
+
+            # Multi-epoch models get 2h, single-epoch feature extractors get 30min
+            timeout_seconds = 7200 if max_epochs > 1 else 1800
+            timer = Timer(duration=_td(seconds=timeout_seconds))
+            callbacks.append(timer)
+            logger.info(
+                "trainer.timeout_set",
+                timeout_seconds=timeout_seconds,
+                max_epochs=max_epochs,
+            )
+        except ImportError:
+            logger.warning("trainer.timer_unavailable", msg="Lightning Timer callback not available")
+
         engine = Engine(
             default_root_dir=str(output_dir),
             max_epochs=max_epochs,
@@ -1109,7 +1151,7 @@ class ModelTrainer:
         quantization: str = "fp16",
         val_dir: Path | None = None,
         calibration_images: int = 100,
-    ) -> None:
+    ) -> dict[str, str]:
         """Export trained model to an optimized inference format.
 
         CRIT-02/HIGH-12: Use correct Anomalib 2.x export API (export_mode parameter).
@@ -1117,6 +1159,10 @@ class ModelTrainer:
         If quantization == "int8" and export_format == "openvino", runs NNCF
         post-training quantization on the exported FP model using validation
         images as calibration data.
+
+        Returns:
+            dict with ``actual_format`` and ``actual_quantization`` reflecting
+            what was actually produced (may differ from request on fallback).
         """
         actual_format = export_format
         export_kwargs = {}
@@ -1150,23 +1196,42 @@ class ModelTrainer:
         logger.info("training.exported", format=actual_format, path=export_path)
 
         # INT8 post-training quantization (B2)
-        if quantization == "int8" and export_format == "openvino":
-            ModelTrainer._quantize_int8(
+        actual_quantization = quantization
+        if quantization == "int8" and actual_format == "openvino":
+            int8_ok = ModelTrainer._quantize_int8(
                 export_path=Path(export_path),
                 val_dir=val_dir,
                 calibration_images=calibration_images,
             )
+            if not int8_ok:
+                actual_quantization = "fp32"
+                logger.warning(
+                    "training.quantization_downgraded",
+                    requested="int8",
+                    actual="fp32",
+                )
+        elif quantization == "int8" and actual_format != "openvino":
+            # INT8 only supported with OpenVINO; record actual state
+            actual_quantization = "fp32"
+
+        return {
+            "actual_format": actual_format,
+            "actual_quantization": actual_quantization,
+        }
 
     @staticmethod
     def _quantize_int8(
         export_path: Path,
         val_dir: Path | None = None,
         calibration_images: int = 100,
-    ) -> None:
+    ) -> bool:
         """Apply INT8 post-training quantization to an exported OpenVINO model.
 
         Uses NNCF's quantize() with calibration data from validation images.
         Falls back gracefully if nncf is not installed.
+
+        Returns:
+            True if quantization succeeded, False otherwise.
         """
         try:
             import nncf
@@ -1175,7 +1240,7 @@ class ModelTrainer:
                 "training.int8_skipped",
                 reason="nncf not installed — run: pip install argus[quantize]",
             )
-            return
+            return False
 
         try:
             import openvino as ov
@@ -1184,13 +1249,13 @@ class ModelTrainer:
                 "training.int8_skipped",
                 reason="openvino not installed",
             )
-            return
+            return False
 
         # Find the exported .xml model file
         xml_files = sorted(export_path.rglob("*.xml"))
         if not xml_files:
             logger.warning("training.int8_skipped", reason="No .xml model found in export path")
-            return
+            return False
 
         model_xml = xml_files[0]
         logger.info("training.int8_quantizing", model=str(model_xml))
@@ -1212,7 +1277,7 @@ class ModelTrainer:
                     "training.int8_skipped",
                     reason="No calibration images available",
                 )
-                return
+                return False
 
             # Run NNCF post-training quantization
             quantized_model = nncf.quantize(
@@ -1233,6 +1298,7 @@ class ModelTrainer:
                 original_size_mb=round(model_bin.stat().st_size / 1024 / 1024, 1)
                 if model_bin.exists() else None,
             )
+            return True
 
         except Exception as e:
             logger.error("training.int8_failed", error=str(e))
@@ -1240,6 +1306,7 @@ class ModelTrainer:
                 "training.int8_fallback",
                 msg="Keeping FP model — INT8 quantization failed",
             )
+            return False
 
     # ── Re-export & Re-calibrate ──
 

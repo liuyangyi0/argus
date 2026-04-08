@@ -15,6 +15,15 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from argus.dashboard.api_response import (
+    api_conflict,
+    api_forbidden,
+    api_internal_error,
+    api_not_found,
+    api_success,
+    api_unavailable,
+    api_validation_error,
+)
 from argus.capture.baseline_job import run_baseline_capture_job, BaselineCaptureJobConfig
 from argus.config.schema import BaselineCaptureConfig
 from argus.core.model_discovery import resolve_runtime_model_path
@@ -279,11 +288,11 @@ def baseline_list_json(request: Request):
     """JSON API: list baselines by camera with version info."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     baselines_dir = Path(config.storage.baselines_dir)
     if not baselines_dir.exists():
-        return JSONResponse({"baselines": []})
+        return api_success({"baselines": []})
 
     baselines = []
     for cam_dir in sorted(baselines_dir.iterdir()):
@@ -309,7 +318,7 @@ def baseline_list_json(request: Request):
                 "state": version_state,
             })
 
-    return JSONResponse({"baselines": baselines})
+    return api_success({"baselines": baselines})
 
 
 @router.get("/models/json")
@@ -317,11 +326,11 @@ async def models_list_json(request: Request):
     """JSON API: list trained models found in data/models/."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     models_dir = Path(config.storage.models_dir)
     if not models_dir.exists():
-        return JSONResponse({"models": []})
+        return api_success({"models": []})
 
     result = []
     for cam_dir in sorted(models_dir.iterdir()):
@@ -345,7 +354,7 @@ async def models_list_json(request: Request):
                     "model_path": rel_path,
                 })
 
-    return JSONResponse({"models": result})
+    return api_success({"models": result})
 
 
 @router.delete("/models/by-path")
@@ -353,20 +362,20 @@ async def delete_model_by_path(request: Request):
     """Delete a trained model file by its path (for filesystem-only models)."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     body = await request.json()
     model_path = body.get("model_path")
     if not model_path:
-        return JSONResponse({"error": "model_path is required"}, status_code=400)
+        return api_validation_error("model_path is required")
 
     target = Path(model_path).resolve()
     models_dir = Path(config.storage.models_dir).resolve()
     if not str(target).startswith(str(models_dir)):
-        return JSONResponse({"error": "路径不在模型目录下"}, status_code=403)
+        return api_forbidden("路径不在模型目录下")
 
     if not target.exists():
-        return JSONResponse({"error": f"文件不存在: {model_path}"}, status_code=404)
+        return api_not_found(f"文件不存在: {model_path}")
 
     if target.is_dir():
         shutil.rmtree(target, ignore_errors=True)
@@ -374,7 +383,7 @@ async def delete_model_by_path(request: Request):
         target.unlink(missing_ok=True)
     logger.info("model.file_deleted", path=model_path)
 
-    return JSONResponse({"status": "ok", "deleted": model_path})
+    return api_success({"deleted": model_path})
 
 
 @router.get("/training-history/json")
@@ -382,11 +391,11 @@ async def training_history_json(request: Request):
     """JSON API: training history with quality grades."""
     database = getattr(request.app.state, "database", None)
     if not database:
-        return JSONResponse({"records": []})
+        return api_success({"records": []})
 
     camera_id = request.query_params.get("camera_id")
     records = database.get_training_history(camera_id=camera_id, limit=50)
-    return JSONResponse({"records": [r.to_dict() for r in records]})
+    return api_success({"records": [r.to_dict() for r in records]})
 
 
 @router.get("/{camera_id}/images", response_class=HTMLResponse)
@@ -524,7 +533,7 @@ def delete_baseline_image(request: Request, camera_id: str, filename: str):
     """Delete a single baseline image."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     version = request.query_params.get("version", "default")
     baselines_dir = Path(config.storage.baselines_dir)
@@ -571,23 +580,23 @@ async def delete_baseline_version(request: Request):
         user = request.query_params.get("user", user)
 
     if not camera_id or not version:
-        return JSONResponse({"error": "camera_id and version are required"}, status_code=400)
+        return api_validation_error("camera_id and version are required")
 
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     baselines_dir = Path(config.storage.baselines_dir)
     base_dir = _camera_baseline_root(baselines_dir, camera_id, zone_id)
     version_dir = _resolve_baseline_version_dir(baselines_dir, camera_id, version, zone_id)
     if not version_dir.exists() or not version_dir.is_dir():
-        return JSONResponse({"error": "基线版本不存在"}, status_code=404)
+        return api_not_found("基线版本不存在")
 
     lifecycle = _get_lifecycle(request)
     if lifecycle is not None:
         version_record = lifecycle.get_version(camera_id, zone_id, version)
         if version_record is not None and version_record.state == "active":
-            return JSONResponse({"error": "生产中的基线版本不能直接删除，请先退役"}, status_code=400)
+            return api_validation_error("生产中的基线版本不能直接删除，请先退役")
 
     await asyncio.to_thread(shutil.rmtree, version_dir)
     _reset_current_marker_after_delete(base_dir, version)
@@ -603,7 +612,7 @@ async def delete_baseline_version(request: Request):
         version=version,
         user=user,
     )
-    return JSONResponse({"status": "ok", "camera_id": camera_id, "version": version})
+    return api_success({"camera_id": camera_id, "version": version})
 
 
 @router.post("/version/delete")
@@ -700,7 +709,7 @@ async def start_training(request: Request):
     config = request.app.state.config
 
     if not task_manager or not config:
-        return JSONResponse({"error": "服务不可用"}, status_code=503)
+        return api_unavailable("服务不可用")
 
     form = await parse_request_form(request)
     camera_id = form.get("camera_id", "")
@@ -711,7 +720,7 @@ async def start_training(request: Request):
     skip_validation = form.get("skip_baseline_validation", "").lower() in ("true", "1", "yes")
 
     if not camera_id:
-        return JSONResponse({"error": "请选择摄像头"}, status_code=400)
+        return api_validation_error("请选择摄像头")
 
     # Validate quantization value
     if quantization not in ("fp32", "fp16", "int8"):
@@ -752,7 +761,7 @@ async def start_training(request: Request):
             skip_baseline_validation=skip_validation,
         )
     except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return api_validation_error(str(e))
 
     return HTMLResponse(
         '<div hx-get="/api/baseline/train" hx-trigger="load" hx-swap="innerHTML"></div>',
@@ -824,29 +833,29 @@ async def deploy_model(request: Request):
     """Deploy a trained model to a camera (hot-reload)."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "不可用"}, status_code=503)
+        return api_unavailable("服务不可用")
 
     data = await request.json()
     camera_id = data.get("camera_id", "")
     model_path = data.get("model_path", "")
 
     if not camera_id or not model_path:
-        return JSONResponse({"error": "缺少参数"}, status_code=400)
+        return api_validation_error("缺少参数")
 
     # Path safety
     allowed_roots = [Path("data/models").resolve(), Path("data/exports").resolve()]
     resolved = Path(model_path).resolve()
     if not any(str(resolved).startswith(str(root)) for root in allowed_roots):
-        return JSONResponse({"error": "模型路径无效"}, status_code=400)
+        return api_validation_error("模型路径无效")
     if not resolved.exists():
-        return JSONResponse({"error": "模型文件不存在"}, status_code=404)
+        return api_not_found("模型文件不存在")
 
     if camera_id not in camera_manager._pipelines:
-        return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
+        return api_not_found(f"摄像头 {camera_id} 不存在")
 
     resolved_runtime_model = resolve_runtime_model_path(resolved, camera_id)
     if resolved_runtime_model is None:
-        return JSONResponse({"error": "模型目录中未找到可部署的模型文件 (.xml/.pt)"}, status_code=404)
+        return api_not_found("模型目录中未找到可部署的模型文件 (.xml/.pt)")
     resolved = resolved_runtime_model
     logger.info("deploy.resolved_model_file", path=str(resolved))
 
@@ -882,14 +891,13 @@ async def deploy_model(request: Request):
                 detail=model_path,
                 ip_address=client_ip,
             )
-        return JSONResponse(
+        return api_success(
             {
-                "status": "ok",
                 "model_version_id": registry_record.model_version_id if registry_record else None,
             },
             headers=htmx_toast_headers("模型已部署"),
         )
-    return JSONResponse({"error": "模型部署失败"}, status_code=500)
+    return api_internal_error("模型部署失败")
 
 
 # ── Advanced Baseline Capture Job Endpoints ──
@@ -903,14 +911,14 @@ async def start_capture_job(request: Request):
     task_manager = app.state.task_manager
     config = app.state.config
     if not camera_manager or not task_manager or not config:
-        return JSONResponse({"error": "服务不可用"}, status_code=503)
+        return api_unavailable("服务不可用")
 
     form = await parse_request_form(request)
     camera_id = form.get("camera_id", "")
     session_label = form.get("session_label", "daytime")
 
     if not camera_id:
-        return JSONResponse({"error": "请选择摄像头"}, status_code=400)
+        return api_validation_error("请选择摄像头")
 
     if "count" in form or "interval" in form:
         target_frames = int(form.get("count", 100))
@@ -974,9 +982,9 @@ async def start_capture_job(request: Request):
             task_info.pause_event = pause_ev
             task_info.abort_event = abort_ev
     except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=409)
+        return api_conflict(str(e))
 
-    return JSONResponse({"task_id": task_id, "status": "submitted"})
+    return api_success({"task_id": task_id})
 
 
 @router.post("/capture")
@@ -990,8 +998,8 @@ async def pause_capture_job(task_id: str, request: Request):
     """Pause a running baseline capture job."""
     task_manager = request.app.state.task_manager
     if task_manager.pause_task(task_id):
-        return JSONResponse({"task_id": task_id, "status": "paused"})
-    return JSONResponse({"error": "Task not found or not running"}, status_code=404)
+        return api_success({"task_id": task_id, "status": "paused"})
+    return api_not_found("任务不存在或未在运行")
 
 
 @router.post("/job/{task_id}/resume")
@@ -999,8 +1007,8 @@ async def resume_capture_job(task_id: str, request: Request):
     """Resume a paused baseline capture job."""
     task_manager = request.app.state.task_manager
     if task_manager.resume_task(task_id):
-        return JSONResponse({"task_id": task_id, "status": "resumed"})
-    return JSONResponse({"error": "Task not found or not paused"}, status_code=404)
+        return api_success({"task_id": task_id, "status": "resumed"})
+    return api_not_found("任务不存在或未暂停")
 
 
 @router.post("/job/{task_id}/abort")
@@ -1008,8 +1016,8 @@ async def abort_capture_job(task_id: str, request: Request):
     """Abort a running or paused baseline capture job."""
     task_manager = request.app.state.task_manager
     if task_manager.abort_task(task_id):
-        return JSONResponse({"task_id": task_id, "status": "aborting"})
-    return JSONResponse({"error": "Task not found or not active"}, status_code=404)
+        return api_success({"task_id": task_id, "status": "aborting"})
+    return api_not_found("任务不存在或未激活")
 
 
 @router.get("/job/{task_id}")
@@ -1018,8 +1026,8 @@ async def get_capture_job_status(task_id: str, request: Request):
     task_manager = request.app.state.task_manager
     task = task_manager.get_task(task_id)
     if task is None:
-        return JSONResponse({"error": "Task not found"}, status_code=404)
-    return JSONResponse({
+        return api_not_found("任务不存在")
+    return api_success({
         "task_id": task.task_id,
         "task_type": task.task_type,
         "camera_id": task.camera_id,
@@ -1282,30 +1290,30 @@ async def compare_models_route(request: Request):
     """Compare two trained models (TRN-008)."""
     database = getattr(request.app.state, "database", None)
     if not database:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     data = await request.json()
     old_record_id = data.get("old_record_id")
     new_record_id = data.get("new_record_id")
 
     if not old_record_id or not new_record_id:
-        return JSONResponse({"error": "缺少参数"}, status_code=400)
+        return api_validation_error("缺少参数")
 
     old_record = database.get_training_record(int(old_record_id))
     new_record = database.get_training_record(int(new_record_id))
 
     if not old_record or not new_record:
-        return JSONResponse({"error": "训练记录不存在"}, status_code=404)
+        return api_not_found("训练记录不存在")
 
     if not old_record.model_path or not new_record.model_path:
-        return JSONResponse({"error": "模型路径不存在"}, status_code=400)
+        return api_validation_error("模型路径不存在")
 
     # Find a validation set (prefer new record's baseline)
     config = request.app.state.config
     baselines_dir = Path(config.storage.baselines_dir)
     val_dir = baselines_dir / new_record.camera_id / new_record.zone_id
     if not val_dir.exists():
-        return JSONResponse({"error": "验证集目录不存在"}, status_code=400)
+        return api_validation_error("验证集目录不存在")
 
     try:
         from argus.anomaly.baseline import BaselineManager
@@ -1319,12 +1327,12 @@ async def compare_models_route(request: Request):
         new_model = trainer._find_best_model_file(Path(new_record.model_path))
 
         if not old_model or not new_model:
-            return JSONResponse({"error": "无法找到模型文件"}, status_code=400)
+            return api_validation_error("无法找到模型文件")
 
         result = trainer.compare_models(old_model, new_model, val_dir)
-        return JSONResponse(result)
+        return api_success(result)
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return api_internal_error(str(e))
 
 
 
@@ -1521,11 +1529,11 @@ async def optimize_preview(
 ):
     """Preview how many images would be kept/moved by optimization."""
     if not camera_id:
-        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+        return api_validation_error("camera_id is required")
 
     baseline_mgr = _get_baseline_manager(request)
     if baseline_mgr is None:
-        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+        return api_unavailable("基线管理器不可用")
 
     baseline_dir = baseline_mgr.get_baseline_dir(camera_id, zone_id)
     all_images = sorted(
@@ -1533,11 +1541,11 @@ async def optimize_preview(
     )
     total = len(all_images)
     if total == 0:
-        return JSONResponse({"total": 0, "keep": 0, "move": 0})
+        return api_success({"total": 0, "keep": 0, "move": 0})
 
     target_count = max(30, int(total * target_ratio))
     keep = min(target_count, total)
-    return JSONResponse({"total": total, "keep": keep, "move": total - keep})
+    return api_success({"total": total, "keep": keep, "move": total - keep})
 
 
 @router.post("/optimize/json")
@@ -1557,18 +1565,18 @@ async def optimize_baseline_json(request: Request):
     target_ratio = float(data.get("target_ratio", 0.2))
 
     if not camera_id:
-        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+        return api_validation_error("camera_id is required")
 
     baseline_mgr = _get_baseline_manager(request)
     if baseline_mgr is None:
-        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+        return api_unavailable("基线管理器不可用")
 
     baseline_dir = baseline_mgr.get_baseline_dir(camera_id, zone_id)
     all_images = sorted(
         list(baseline_dir.glob("*.png")) + list(baseline_dir.glob("*.jpg"))
     )
     if not all_images:
-        return JSONResponse({"error": "未找到基线图片"}, status_code=404)
+        return api_not_found("未找到基线图片")
 
     target_count = max(30, int(len(all_images) * target_ratio))
     selected = baseline_mgr.diversity_select(baseline_dir, target_count)
@@ -1604,7 +1612,7 @@ async def optimize_baseline_json(request: Request):
             ip_address=client_ip,
         )
 
-    return JSONResponse({
+    return api_success({
         "selected": len(selected),
         "moved": moved,
         "backup_dir": str(backup_dir),
@@ -1619,7 +1627,7 @@ async def camera_groups_json(request: Request):
     """JSON API: list configured camera groups with baseline status."""
     config = request.app.state.config
     if not config:
-        return JSONResponse({"groups": []})
+        return api_success({"groups": []})
 
     groups = []
     baseline_mgr = _get_baseline_manager(request)
@@ -1642,7 +1650,7 @@ async def camera_groups_json(request: Request):
             "image_count": image_count,
             "current_version": current_version,
         })
-    return JSONResponse({"groups": groups})
+    return api_success({"groups": groups})
 
 
 @router.post("/groups/merge")
@@ -1654,22 +1662,22 @@ async def merge_group_baseline(request: Request):
     target_count = data.get("target_count")
 
     if not group_id:
-        return JSONResponse({"error": "group_id is required"}, status_code=400)
+        return api_validation_error("group_id is required")
 
     config = request.app.state.config
     if not config:
-        return JSONResponse({"error": "配置不可用"}, status_code=503)
+        return api_unavailable("配置不可用")
 
     group_cfg = next(
         (g for g in getattr(config, "camera_groups", []) if g.group_id == group_id),
         None,
     )
     if group_cfg is None:
-        return JSONResponse({"error": f"Group {group_id} not found"}, status_code=404)
+        return api_not_found(f"分组 {group_id} 不存在")
 
     baseline_mgr = _get_baseline_manager(request)
     if baseline_mgr is None:
-        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+        return api_unavailable("基线管理器不可用")
 
     version_dir = baseline_mgr.merge_camera_baselines(
         group_id=group_id,
@@ -1683,8 +1691,7 @@ async def merge_group_baseline(request: Request):
         + len(list(version_dir.glob("*.jpg")))
     )
 
-    return JSONResponse({
-        "status": "ok",
+    return api_success({
         "group_id": group_id,
         "version": version_dir.name,
         "image_count": image_count,
@@ -1703,15 +1710,15 @@ async def merge_false_positives(request: Request):
     max_fp_images = data.get("max_fp_images")
 
     if not camera_id:
-        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+        return api_validation_error("camera_id is required")
 
     feedback_mgr = getattr(request.app.state, "feedback_manager", None)
     if feedback_mgr is None:
-        return JSONResponse({"error": "反馈���理器未初始化"}, status_code=503)
+        return api_unavailable("反馈管理器未初始化")
 
     baseline_mgr = _get_baseline_manager(request)
     if baseline_mgr is None:
-        return JSONResponse({"error": "基线管理器不可用"}, status_code=503)
+        return api_unavailable("基线管理器不可用")
 
     result = feedback_mgr.merge_fp_into_baseline(
         camera_id=camera_id,
@@ -1721,9 +1728,9 @@ async def merge_false_positives(request: Request):
     )
 
     if "error" in result:
-        return JSONResponse(result, status_code=400)
+        return api_validation_error(result["error"])
 
-    return JSONResponse({"status": "ok", **result})
+    return api_success(result)
 
 
 # ── Baseline Lifecycle Endpoints ──
@@ -1740,14 +1747,14 @@ async def baseline_versions_json(request: Request):
     camera_id = request.query_params.get("camera_id", "")
     zone_id = request.query_params.get("zone_id", "default")
     if not camera_id:
-        return JSONResponse({"error": "camera_id is required"}, status_code=400)
+        return api_validation_error("camera_id is required")
 
     lifecycle = _get_lifecycle(request)
     if lifecycle is None:
-        return JSONResponse({"error": "生命周期管理器未初始化"}, status_code=503)
+        return api_unavailable("生命周期管理器未初始化")
 
     versions = lifecycle.get_versions(camera_id, zone_id)
-    return JSONResponse({"versions": [v.to_dict() for v in versions]})
+    return api_success({"versions": [v.to_dict() for v in versions]})
 
 
 @router.post("/verify")
@@ -1761,13 +1768,11 @@ async def verify_baseline(request: Request):
     verified_by_secondary = data.get("verified_by_secondary")
 
     if not camera_id or not version or not verified_by:
-        return JSONResponse(
-            {"error": "camera_id, version, verified_by are required"}, status_code=400
-        )
+        return api_validation_error("camera_id, version, verified_by are required")
 
     lifecycle = _get_lifecycle(request)
     if lifecycle is None:
-        return JSONResponse({"error": "生命周期管理器未初始化"}, status_code=503)
+        return api_unavailable("生命周期管理器未初始化")
 
     try:
         client_ip = request.client.host if request.client else ""
@@ -1777,9 +1782,9 @@ async def verify_baseline(request: Request):
             verified_by_secondary=verified_by_secondary,
             ip_address=client_ip,
         )
-        return JSONResponse({"status": "ok", "version": record.to_dict()})
+        return api_success({"version": record.to_dict()})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return api_validation_error(str(e))
 
 
 @router.post("/activate-baseline")
@@ -1792,22 +1797,20 @@ async def activate_baseline(request: Request):
     user = data.get("user", "operator")
 
     if not camera_id or not version:
-        return JSONResponse(
-            {"error": "camera_id and version are required"}, status_code=400
-        )
+        return api_validation_error("camera_id and version are required")
 
     lifecycle = _get_lifecycle(request)
     if lifecycle is None:
-        return JSONResponse({"error": "生命周期管理器未初始化"}, status_code=503)
+        return api_unavailable("生命周期管理器未初始化")
 
     try:
         client_ip = request.client.host if request.client else ""
         record = lifecycle.activate(
             camera_id, zone_id, version, user=user, ip_address=client_ip,
         )
-        return JSONResponse({"status": "ok", "version": record.to_dict()})
+        return api_success({"version": record.to_dict()})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return api_validation_error(str(e))
 
 
 @router.post("/retire")
@@ -1821,13 +1824,11 @@ async def retire_baseline(request: Request):
     reason = data.get("reason", "")
 
     if not camera_id or not version:
-        return JSONResponse(
-            {"error": "camera_id and version are required"}, status_code=400
-        )
+        return api_validation_error("camera_id and version are required")
 
     lifecycle = _get_lifecycle(request)
     if lifecycle is None:
-        return JSONResponse({"error": "生命周期管理器未初始化"}, status_code=503)
+        return api_unavailable("生命周期管理器未初始化")
 
     try:
         client_ip = request.client.host if request.client else ""
@@ -1835,6 +1836,6 @@ async def retire_baseline(request: Request):
             camera_id, zone_id, version,
             user=user, reason=reason, ip_address=client_ip,
         )
-        return JSONResponse({"status": "ok", "version": record.to_dict()})
+        return api_success({"version": record.to_dict()})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return api_validation_error(str(e))

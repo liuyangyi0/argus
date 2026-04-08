@@ -130,7 +130,7 @@ export function useModelState() {
   async function loadCameras() {
     try {
       const res = await getCameras()
-      cameras.value = res.data.cameras || []
+      cameras.value = res.cameras || []
     } catch (e) {
       console.error('Failed to load cameras', e)
     }
@@ -139,7 +139,7 @@ export function useModelState() {
   async function loadTasks() {
     try {
       const res = await getTasks()
-      tasks.value = res.data.tasks || []
+      tasks.value = res.tasks || []
     } catch (e) {
       console.error('Failed to load tasks', e)
     }

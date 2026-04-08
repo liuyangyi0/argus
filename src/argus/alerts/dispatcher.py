@@ -177,7 +177,7 @@ class AlertDispatcher:
             # Respect min_severity filter
             severity_order = ["info", "low", "medium", "high"]
             alert_level = severity_order.index(alert.severity.value) if alert.severity.value in severity_order else -1
-            min_level = severity_order.index(self._config.email.min_severity.value) if self._config.email.min_severity.value in severity_order else 0
+            min_level = severity_order.index(self._config.email.min_severity.value) if self._config.email.min_severity.value in severity_order else 3
             if alert_level >= min_level:
                 email_data = self._alert_to_dict(alert, snapshot_path)
                 try:
@@ -468,7 +468,7 @@ class AlertDispatcher:
             return self._disk_space_ok
         except OSError as e:
             logger.error("dispatch.disk_check_failed", error=str(e))
-            return True  # Fail-open: allow save if check itself fails
+            return False  # Fail-closed: skip image save if check fails (DB record still written)
 
     def flush_db_queue(self, timeout: float = 5.0) -> None:
         """Block until the DB dispatch queue is empty. Used for testing."""

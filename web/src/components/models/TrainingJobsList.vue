@@ -36,8 +36,8 @@ async function loadJobs() {
     if (filterStatus.value) params.status = filterStatus.value
     if (filterJobType.value) params.job_type = filterJobType.value
     const res = await getTrainingJobs(params)
-    jobs.value = res.data.jobs || []
-    emit('update:pendingCount', res.data.pending_count || 0)
+    jobs.value = res.jobs || []
+    emit('update:pendingCount', res.pending_count || 0)
   } catch (e) {
     console.error(e)
   } finally {
@@ -48,7 +48,7 @@ async function loadJobs() {
 async function showDetail(jobId: string) {
   try {
     const res = await getTrainingJob(jobId)
-    detailJob.value = res.data
+    detailJob.value = res
     detailDrawer.value = true
   } catch (e) {
     message.error('加载详情失败')
