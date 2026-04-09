@@ -27,8 +27,7 @@ from typing import TYPE_CHECKING
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from argus.config.schema import AuthConfig
 from argus.dashboard.forms import parse_request_form
@@ -172,10 +171,19 @@ def get_denied_response(request: Request, permission: str) -> dict:
     }
 
 
-# ── Auth Middleware ──
+# ── Auth Middleware (pure ASGI) ──
+#
+# IMPORTANT: These middleware classes are implemented as pure ASGI middleware
+# instead of Starlette's BaseHTTPMiddleware.  BaseHTTPMiddleware buffers the
+# entire body of StreamingResponse through an internal asyncio queue, which
+# blocks the event loop for long-lived MJPEG streams and prevents other
+# requests from being processed.
+#
+# See: https://github.com/encode/starlette/discussions/1729
+#      https://github.com/encode/starlette/issues/1012
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    """Session + API-token authentication middleware.
+class AuthMiddleware:
+    """Session + API-token authentication middleware (pure ASGI).
 
     Checks in order:
     1. Session cookie (browser users)
@@ -192,7 +200,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         session_secret: str,
         database: Database | None = None,
     ):
-        super().__init__(app)
+        self.app = app
         self._enabled = config.enabled
         self._token_hash = (
             hashlib.sha256(config.api_token.encode()).hexdigest()
@@ -202,21 +210,33 @@ class AuthMiddleware(BaseHTTPMiddleware):
         self._max_age = config.session_timeout_minutes * 60
         self._database = database
 
-    async def dispatch(self, request: Request, call_next) -> Response:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        # WebSocket connections are authenticated separately in the WS
+        # endpoint handler (via verify_ws_token), not here.
+        if scope["type"] == "websocket":
+            if not self._enabled:
+                scope.setdefault("state", {})["user"] = {"username": "system", "role": "admin"}
+            await self.app(scope, receive, send)
+            return
+
+        # HTTP requests
+        request = Request(scope)
+
         if not self._enabled:
-            # Auth disabled: set a default admin user so role checks still work
             request.state.user = {"username": "system", "role": "admin"}
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         path = request.url.path
 
-        # Static files are always public
-        if path.startswith("/static/"):
-            return await call_next(request)
-
-        # Public paths
-        if path in _PUBLIC_PATHS:
-            return await call_next(request)
+        # Static files and public paths bypass auth
+        if path.startswith("/static/") or path in _PUBLIC_PATHS:
+            await self.app(scope, receive, send)
+            return
 
         # Try session cookie first
         session_token = request.cookies.get(_SESSION_COOKIE)
@@ -224,13 +244,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
             user_info = verify_session_token(session_token, self._secret, self._max_age)
             if user_info:
                 request.state.user = user_info
-                return await call_next(request)
+                await self.app(scope, receive, send)
+                return
 
         # Try X-API-Token header (legacy)
         api_token = request.headers.get("x-api-token", "")
         if api_token and self._verify_api_token(api_token):
             request.state.user = {"username": "api", "role": "admin"}
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         # Try HTTP Basic Auth (legacy)
         if not api_token:
@@ -242,7 +264,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     _, _, token = decoded.partition(":")
                     if token and self._verify_api_token(token):
                         request.state.user = {"username": "api", "role": "admin"}
-                        return await call_next(request)
+                        await self.app(scope, receive, send)
+                        return
                 except Exception:
                     pass
 
@@ -252,13 +275,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if accepts_html and not is_htmx:
             redirect_url = f"/login?next={request.url.path}"
-            return RedirectResponse(url=redirect_url, status_code=302)
-
-        return JSONResponse(
-            {"error": "Authentication required"},
-            status_code=401,
-            headers={"WWW-Authenticate": 'Bearer realm="Argus"'},
-        )
+            response = RedirectResponse(url=redirect_url, status_code=302)
+        else:
+            response = JSONResponse(
+                {"error": "Authentication required"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="Argus"'},
+            )
+        await response(scope, receive, send)
 
     def _verify_api_token(self, token: str) -> bool:
         """Constant-time token comparison to prevent timing attacks."""
@@ -268,25 +292,31 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return secrets.compare_digest(token_hash, self._token_hash)
 
 
-# ── Rate Limit Middleware ──
+# ── Rate Limit Middleware (pure ASGI) ──
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple in-memory rate limiter for POST endpoints.
+class RateLimitMiddleware:
+    """Simple in-memory rate limiter for POST endpoints (pure ASGI).
 
     Limits requests per IP per minute. Uses a sliding window counter.
     """
 
     def __init__(self, app: ASGIApp, max_requests_per_minute: int = 60):
-        super().__init__(app)
+        self.app = app
         self._max_rpm = max_requests_per_minute
         self._counters: dict[str, list[float]] = defaultdict(list)
 
-    async def dispatch(self, request: Request, call_next) -> Response:
-        # Only rate-limit POST/DELETE
-        if request.method not in ("POST", "DELETE"):
-            return await call_next(request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-        client_ip = request.client.host if request.client else "unknown"
+        method = scope.get("method", "GET")
+        if method not in ("POST", "DELETE"):
+            await self.app(scope, receive, send)
+            return
+
+        client = scope.get("client")
+        client_ip = client[0] if client else "unknown"
         now = time.monotonic()
         window = 60.0
 
@@ -299,14 +329,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         if len(entries) >= self._max_rpm:
             logger.warning("rate_limit.exceeded", client_ip=client_ip, count=len(entries))
-            return JSONResponse(
+            response = JSONResponse(
                 {"error": "Rate limit exceeded"},
                 status_code=429,
                 headers={"Retry-After": "60"},
             )
+            await response(scope, receive, send)
+            return
 
         self._counters[client_ip].append(now)
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
 def verify_token(token: str, config: AuthConfig) -> bool:
@@ -324,16 +356,32 @@ def verify_token(token: str, config: AuthConfig) -> bool:
     return secrets.compare_digest(token_hash, expected_hash)
 
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Adds security headers to all responses."""
+# ── Security Headers Middleware (pure ASGI) ──
 
-    async def dispatch(self, request: Request, call_next) -> Response:
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Cache-Control"] = "no-store"
-        return response
+class SecurityHeadersMiddleware:
+    """Adds security headers to all responses (pure ASGI)."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = dict(message.get("headers", []))
+                extra = [
+                    (b"x-content-type-options", b"nosniff"),
+                    (b"x-frame-options", b"DENY"),
+                    (b"x-xss-protection", b"1; mode=block"),
+                    (b"cache-control", b"no-store"),
+                ]
+                message["headers"] = list(message.get("headers", [])) + extra
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 # ── Login / Logout routes ──
