@@ -296,6 +296,28 @@ class Go2RTCManager:
     # Stream management via REST API
     # ------------------------------------------------------------------
 
+    def register_camera(
+        self, camera_id: str, source: str, protocol: str,
+    ) -> str | None:
+        """Register a camera and return the RTSP re-stream URL.
+
+        Handles protocol dispatch (RTSP pass-through, USB→ffmpeg conversion).
+        Returns the ``rtsp://`` URL that the pipeline should read from,
+        or ``None`` if the protocol is unsupported or registration fails.
+        """
+        if protocol == "rtsp":
+            go2rtc_source = source
+        elif protocol == "usb":
+            go2rtc_source = usb_to_go2rtc_source(source)
+        else:
+            return None
+        try:
+            self.add_stream(camera_id, go2rtc_source)
+        except Exception:
+            logger.warning("go2rtc.register_failed", camera_id=camera_id)
+            return None
+        return f"rtsp://127.0.0.1:{self.rtsp_port}/{camera_id}"
+
     def add_stream(self, name: str, source: str) -> None:
         """Register a new stream source (e.g. RTSP URL).
 
@@ -370,21 +392,11 @@ class Go2RTCManager:
         registered = set(current.keys()) if current else set()
 
         for cam in cameras:
-            protocol = cam.get("protocol", "rtsp")
             cam_id = cam["camera_id"]
-            source = cam["source"]
-
-            if protocol == "rtsp":
-                go2rtc_source = source
-            elif protocol == "usb":
-                go2rtc_source = usb_to_go2rtc_source(source)
-            else:
-                continue
-
-            if cam_id not in registered:
-                self.add_stream(cam_id, go2rtc_source)
-            else:
+            if cam_id in registered:
                 registered.discard(cam_id)
+                continue
+            self.register_camera(cam_id, cam["source"], cam.get("protocol", "rtsp"))
 
         # Remove stale streams that are no longer in the config
         for stale in registered:

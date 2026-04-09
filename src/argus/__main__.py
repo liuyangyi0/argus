@@ -236,31 +236,19 @@ def main():
     _go2rtc = None
     dashboard_cfg = getattr(config, "dashboard", None)
     if dashboard_cfg and dashboard_cfg.go2rtc_enabled:
-        from argus.streaming.go2rtc_manager import Go2RTCManager, usb_to_go2rtc_source
+        from argus.streaming.go2rtc_manager import Go2RTCManager
         _go2rtc = Go2RTCManager(
             api_port=dashboard_cfg.go2rtc_api_port,
             rtsp_port=dashboard_cfg.go2rtc_rtsp_port,
             binary_path=dashboard_cfg.go2rtc_binary,
         )
-        # Build streams: RTSP pass-through + USB via ffmpeg
-        _streams: dict[str, str] = {}
-        for cam in cameras:
-            if cam.protocol == "rtsp":
-                _streams[cam.camera_id] = cam.source
-            elif cam.protocol == "usb":
-                _streams[cam.camera_id] = usb_to_go2rtc_source(cam.source)
         try:
-            _go2rtc.start(_streams)
-            # Redirect USB camera sources to go2rtc RTSP re-stream
+            _go2rtc.start()
             for cam in cameras:
-                if cam.protocol == "usb":
-                    rtsp_url = f"rtsp://127.0.0.1:{dashboard_cfg.go2rtc_rtsp_port}/{cam.camera_id}"
-                    logger.info(
-                        "go2rtc.usb_redirect",
-                        camera_id=cam.camera_id,
-                        original=cam.source,
-                        redirected=rtsp_url,
-                    )
+                rtsp_url = _go2rtc.register_camera(cam.camera_id, cam.source, cam.protocol)
+                if rtsp_url and cam.protocol == "usb":
+                    logger.info("go2rtc.usb_redirect", camera_id=cam.camera_id,
+                                original=cam.source, redirected=rtsp_url)
                     cam.source = rtsp_url
                     cam.protocol = "rtsp"
         except Exception as exc:
