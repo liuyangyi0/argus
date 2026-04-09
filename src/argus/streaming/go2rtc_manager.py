@@ -39,6 +39,21 @@ _HEALTH_POLL_INTERVAL = 0.5  # seconds
 _HEALTH_POLL_TIMEOUT = 10  # seconds
 
 
+def usb_to_go2rtc_source(device_index: str | int) -> str:
+    """Convert a USB camera device index to a go2rtc ffmpeg source URL.
+
+    go2rtc supports USB cameras via its built-in FFmpeg integration:
+      ``ffmpeg:device?video=<index>#video=h264``
+
+    This avoids the legacy MJPEG fallback path (which creates long-lived
+    HTTP connections that exhaust the browser's per-origin connection limit).
+
+    Ref: https://github.com/AlexxIT/go2rtc/issues/159
+    """
+    idx = int(device_index)
+    return f"ffmpeg:device?video={idx}#video=h264"
+
+
 def _find_go2rtc_binary() -> Path | None:
     """Locate the go2rtc binary on the system.
 
@@ -339,7 +354,11 @@ class Go2RTCManager:
     # ------------------------------------------------------------------
 
     def sync_cameras(self, cameras: list[dict[str, Any]]) -> None:
-        """Register all RTSP cameras from the Argus configuration.
+        """Register cameras from the Argus configuration.
+
+        Supports both RTSP and USB cameras. USB cameras are registered
+        using go2rtc's built-in FFmpeg integration to avoid the legacy
+        MJPEG fallback path.
 
         Parameters
         ----------
@@ -352,14 +371,18 @@ class Go2RTCManager:
 
         for cam in cameras:
             protocol = cam.get("protocol", "rtsp")
-            if protocol != "rtsp":
-                continue
-
             cam_id = cam["camera_id"]
             source = cam["source"]
 
+            if protocol == "rtsp":
+                go2rtc_source = source
+            elif protocol == "usb":
+                go2rtc_source = usb_to_go2rtc_source(source)
+            else:
+                continue  # skip unsupported protocols (e.g. file)
+
             if cam_id not in registered:
-                self.add_stream(cam_id, source)
+                self.add_stream(cam_id, go2rtc_source)
             else:
                 registered.discard(cam_id)
 
