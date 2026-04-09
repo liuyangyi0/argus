@@ -88,6 +88,42 @@ def _mjpeg_response(request: Request, grab_fn: Callable[[], bytes | None]) -> Re
 router = APIRouter()
 
 
+def _ensure_go2rtc_stream(request: Request, cam_config) -> None:
+    """Register camera with go2rtc and redirect USB sources to RTSP re-stream.
+
+    For USB cameras this converts the device index to go2rtc's ffmpeg source
+    and rewrites ``cam_config.source`` / ``cam_config.protocol`` so the
+    pipeline reads from go2rtc's RTSP re-stream instead of the device directly.
+
+    Safe to call multiple times — skips if already registered or go2rtc unavailable.
+    """
+    go2rtc = getattr(request.app.state, "go2rtc", None)
+    if go2rtc is None or not go2rtc.running:
+        return
+
+    protocol = getattr(cam_config, "protocol", "rtsp")
+    cam_id = cam_config.camera_id
+
+    # Already redirected (protocol was changed to rtsp by a previous call)
+    if protocol == "rtsp" and cam_config.source.startswith("rtsp://127.0.0.1"):
+        return
+
+    if protocol == "usb":
+        from argus.streaming.go2rtc_manager import usb_to_go2rtc_source
+        go2rtc_source = usb_to_go2rtc_source(cam_config.source)
+        try:
+            go2rtc.add_stream(cam_id, go2rtc_source)
+        except Exception:
+            return
+        cam_config.source = f"rtsp://127.0.0.1:{go2rtc.rtsp_port}/{cam_id}"
+        cam_config.protocol = "rtsp"
+    elif protocol == "rtsp":
+        try:
+            go2rtc.add_stream(cam_id, cam_config.source)
+        except Exception:
+            pass
+
+
 class AddCameraRequest(BaseModel):
     camera_id: str
     name: str
@@ -548,6 +584,11 @@ async def start_camera(request: Request, camera_id: str):
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("不可用")
+
+    # Register with go2rtc and redirect USB → RTSP before pipeline opens the device
+    cam_config = next((c for c in camera_manager._cameras if c.camera_id == camera_id), None)
+    if cam_config:
+        _ensure_go2rtc_stream(request, cam_config)
 
     success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
     if success:
