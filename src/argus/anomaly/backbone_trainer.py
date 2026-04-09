@@ -10,6 +10,7 @@ checkpoint that all per-camera anomaly heads (Level 2) build upon.
 from __future__ import annotations
 
 import hashlib
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,11 +136,19 @@ def _compute_hash(path: Path) -> str:
 
 
 def _compute_dataset_hash(image_paths: list[Path]) -> str:
-    """Compute a deterministic hash of the dataset (based on paths + count)."""
+    """Compute a deterministic hash of the dataset (paths + mtime + count).
+
+    Includes file modification times so that re-captured baselines at the
+    same paths produce a different hash.
+    """
     h = hashlib.sha256()
     h.update(str(len(image_paths)).encode())
     for p in sorted(image_paths)[:100]:  # Sample first 100 for speed
         h.update(str(p).encode())
+        try:
+            h.update(str(p.stat().st_mtime_ns).encode())
+        except OSError:
+            pass
     return h.hexdigest()[:16]
 
 
@@ -226,29 +235,35 @@ class BackboneTrainer:
                 return None
             return torch.stack(valid)
 
+        # Windows spawn-based multiprocessing can cause issues; use 0 workers there
+        num_workers = 0 if sys.platform == "win32" else 2
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=2,
+            num_workers=num_workers,
             drop_last=True,
             collate_fn=_skip_none_collate,
         )
 
-        # Abort if corruption rate exceeds 10%
-        corrupt_count = sum(1 for t in (dataset[i] for i in range(len(dataset))) if t is None)
+        # Abort if corruption rate exceeds 10% (sample-based check to avoid
+        # reading every image twice — DataLoader will read them during training)
+        sample_size = min(200, len(dataset))
+        sample_indices = list(range(sample_size))  # first N images
+        corrupt_count = sum(1 for i in sample_indices if dataset[i] is None)
         if corrupt_count > 0:
-            corrupt_rate = corrupt_count / len(dataset)
+            corrupt_rate = corrupt_count / sample_size
             logger.warning(
                 "backbone_trainer.corrupt_images",
                 corrupt=corrupt_count,
+                sampled=sample_size,
                 total=len(dataset),
                 rate=f"{corrupt_rate:.1%}",
             )
             if corrupt_rate > 0.10:
                 return BackboneTrainingResult(
                     success=False,
-                    error=f"图像损坏率过高: {corrupt_count}/{len(dataset)} ({corrupt_rate:.1%} > 10%)",
+                    error=f"图像损坏率过高: {corrupt_count}/{sample_size} 抽样 ({corrupt_rate:.1%} > 10%)",
                     total_images=len(image_paths),
                     duration_seconds=time.monotonic() - start,
                 )
@@ -307,7 +322,7 @@ class BackboneTrainer:
                 n_batches += 1
                 batch_count += 1
 
-                if batch_count % 10 == 0:
+                if batch_count % 10 == 0 and total_batches > 0:
                     pct = 15 + int(80 * batch_count / total_batches)
                     _progress(pct, f"Epoch {epoch + 1}/{epochs} — loss: {loss.item():.4f}")
 

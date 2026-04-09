@@ -24,6 +24,7 @@ import hmac
 import json
 import shutil
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -141,7 +142,8 @@ class ModelPackager:
             Path to the created package directory.
         """
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        pkg_name = f"{camera_id or 'backbone'}_{model_type or 'ssl'}_{ts}"
+        short_id = uuid.uuid4().hex[:6]
+        pkg_name = f"{camera_id or 'backbone'}_{model_type or 'ssl'}_{ts}_{short_id}"
         pkg_dir = output_dir / pkg_name
         pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -171,7 +173,7 @@ class ModelPackager:
                 "created_at": created_at,
                 **training_params,
             }
-            # Write as YAML if available, else JSON with .yaml extension
+            # Write as YAML if available, else fall back to JSON with matching extension
             try:
                 import yaml
                 (pkg_dir / "config.yaml").write_text(
@@ -179,7 +181,7 @@ class ModelPackager:
                     encoding="utf-8",
                 )
             except ImportError:
-                (pkg_dir / "config.yaml").write_text(
+                (pkg_dir / "config.json").write_text(
                     json.dumps(config_data, indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
@@ -277,10 +279,15 @@ class ModelPackager:
         for line in sums_content.strip().split("\n"):
             if not line.strip():
                 continue
+            # Support both "hash  path" (2 spaces) and "hash *path" (sha256sum binary mode)
             parts = line.split("  ", 1)
             if len(parts) != 2:
+                parts = line.split(" *", 1)
+            if len(parts) != 2:
+                parts = line.split(" ", 1)
+            if len(parts) != 2:
                 continue
-            expected_hash, rel_path = parts
+            expected_hash, rel_path = parts[0].strip(), parts[1].strip()
             file_path = package_dir / rel_path
             if not file_path.exists():
                 logger.error("model_package.verify_failed", reason=f"Missing: {rel_path}")

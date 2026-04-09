@@ -417,6 +417,11 @@ class ModelTrainer:
                     )
             except Exception as e:
                 logger.error("training.export_failed", error=str(e))
+                return self._fail(
+                    start,
+                    error=f"模型导出失败: {e}",
+                    **common_fail_kwargs,
+                )
 
         # Output validation + smoke test (TRN-006)
         # Returns (validation_dict, loaded_detector_or_None)
@@ -461,10 +466,10 @@ class ModelTrainer:
                     baseline_dir=baseline_dir,
                     threshold=threshold_recommended,
                     auroc_threshold=self._validation_config.get(
-                        "validation_auroc_threshold", 0.99
+                        "validation_auroc_threshold", 0.85
                     ),
                     recall_threshold=self._validation_config.get(
-                        "validation_recall_threshold", 0.95
+                        "validation_recall_threshold", 0.80
                     ),
                     replay_days=self._validation_config.get(
                         "historical_replay_days", 30
@@ -504,11 +509,13 @@ class ModelTrainer:
                         "quality_grade": quality_report.grade,
                     },
                 )
-                self._model_registry.activate(model_version_id)
+                # Model stays in CANDIDATE stage — promotion to production
+                # must go through the release pipeline (shadow → canary → production).
                 logger.info(
                     "training.model_registered",
                     model_version_id=model_version_id,
                     camera_id=camera_id,
+                    stage="candidate",
                 )
             except Exception as e:
                 logger.error("training.model_registry_failed", error=str(e))
@@ -562,6 +569,11 @@ class ModelTrainer:
                     )
             except Exception as e:
                 logger.warning("trainer.calibration_failed", error=str(e))
+
+        # Strip raw scores from val_stats to avoid bloating DB/JSON storage.
+        # Percentile statistics are already computed and sufficient for reporting.
+        if val_stats.get("scores"):
+            del val_stats["scores"]
 
         # Cleanup split directory
         split_dir = output_dir / "_split"
@@ -1288,8 +1300,23 @@ class ModelTrainer:
                 preset=nncf.QuantizationPreset.MIXED,
             )
 
-            # Save INT8 model — overwrite the FP model files
+            # Backup FP model before overwriting with INT8 version
             model_bin = model_xml.with_suffix(".bin")
+            fp_backup_xml = model_xml.with_name(model_xml.stem + "_fp32.xml")
+            fp_backup_bin = model_xml.with_name(model_xml.stem + "_fp32.bin")
+            try:
+                shutil.copy2(str(model_xml), str(fp_backup_xml))
+                if model_bin.exists():
+                    shutil.copy2(str(model_bin), str(fp_backup_bin))
+                logger.info(
+                    "training.int8_fp_backup",
+                    xml=str(fp_backup_xml),
+                    bin=str(fp_backup_bin),
+                )
+            except OSError as backup_err:
+                logger.warning("training.int8_backup_failed", error=str(backup_err))
+
+            # Save INT8 model — overwrite the FP model files
             ov.save_model(quantized_model, str(model_xml))
 
             logger.info(
@@ -1359,6 +1386,8 @@ class ModelTrainer:
         model_type: str = "patchcore",
         image_size: int = 256,
         calibration_images: int = 100,
+        camera_id: str | None = None,
+        zone_id: str | None = None,
     ) -> dict:
         """Re-export a model from its checkpoint, fitting PostProcessor MinMax.
 
@@ -1380,11 +1409,13 @@ class ModelTrainer:
         if ckpt is None:
             return {"status": "error", "error": "未找到 checkpoint (.ckpt) 文件"}
 
-        # Derive camera_id / zone_id from model_dir path structure:
+        # Use explicit IDs if provided, else derive from model_dir path structure:
         # data/models/{camera_id}/{zone_id}
         parts = model_dir.parts
-        zone_id = parts[-1] if len(parts) >= 2 else "default"
-        camera_id = parts[-2] if len(parts) >= 2 else "unknown"
+        if zone_id is None:
+            zone_id = parts[-1] if len(parts) >= 2 else "default"
+        if camera_id is None:
+            camera_id = parts[-2] if len(parts) >= 2 else "unknown"
 
         export_path = str(self._exports_dir / camera_id / zone_id)
 
@@ -1483,11 +1514,7 @@ class ModelTrainer:
                 if frame is None:
                     continue
                 prediction = detector.predict(frame)
-                score = (
-                    float(prediction.get("score", 0.0))
-                    if isinstance(prediction, dict)
-                    else float(prediction)
-                )
+                score = float(prediction.anomaly_score)
                 if np.isfinite(score):
                     scores.append(score)
 

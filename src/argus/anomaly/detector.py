@@ -780,6 +780,9 @@ class MultiScaleDetector:
     def hot_reload(self, new_model_path: Path) -> bool:
         return self._base.hot_reload(new_model_path)
 
+    def calibrate_raw_scores(self, baseline_dir: Path | None = None) -> None:
+        return self._base.calibrate_raw_scores(baseline_dir)
+
     def predict(self, frame: np.ndarray) -> AnomalyResult:
         """Run multi-scale detection: tiles + full frame, return best score.
 
