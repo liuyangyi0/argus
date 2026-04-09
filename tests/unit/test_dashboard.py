@@ -153,10 +153,12 @@ class TestCameraForms:
                 camera_id="cam_02",
                 name="Camera 02",
                 connected=False,
+                running=False,
                 model_version_id=None,
-                pipeline=None,
+                stats=None,
             ),
         ]
+        camera_manager._pipelines = {}  # No active pipelines
 
         app = create_app(
             camera_manager=camera_manager,

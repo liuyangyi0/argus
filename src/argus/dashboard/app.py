@@ -81,24 +81,21 @@ def create_app(
 
         await ws_manager.start()
 
-        # Start go2rtc and register cameras (RTSP + USB)
+        # Start go2rtc and register RTSP cameras.
+        # USB cameras are NOT registered here — they are exclusive devices
+        # that cannot be opened by both the pipeline (OpenCV) and go2rtc
+        # (FFmpeg) simultaneously.  USB streams go through the MJPEG fallback.
         if go2rtc is not None:
-            from argus.streaming.go2rtc_manager import usb_to_go2rtc_source
-
             cameras_cfg = getattr(config, "cameras", [])
-            streams: dict[str, str] = {}
+            rtsp_streams: dict[str, str] = {}
             for cam in cameras_cfg:
                 protocol = getattr(cam, "protocol", None) or (cam.get("protocol") if isinstance(cam, dict) else None) or "rtsp"
                 cam_id = getattr(cam, "camera_id", None) or (cam.get("camera_id") if isinstance(cam, dict) else None)
                 source = getattr(cam, "source", None) or (cam.get("source") if isinstance(cam, dict) else None)
-                if not cam_id or not source:
-                    continue
-                if protocol == "rtsp":
-                    streams[cam_id] = source
-                elif protocol == "usb":
-                    streams[cam_id] = usb_to_go2rtc_source(source)
+                if cam_id and source and protocol == "rtsp":
+                    rtsp_streams[cam_id] = source
             try:
-                await asyncio.to_thread(go2rtc.start, streams)
+                await asyncio.to_thread(go2rtc.start, rtsp_streams)
             except (FileNotFoundError, TimeoutError, Exception) as exc:
                 logger.warning(
                     "go2rtc.start_failed",

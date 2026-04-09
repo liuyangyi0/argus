@@ -98,16 +98,10 @@ def register_stream(request: Request, camera_id: str):
     if cam_config is None:
         return api_not_found(f"摄像头 {camera_id} 不存在")
 
-    protocol = getattr(cam_config, "protocol", "rtsp")
-    if protocol == "rtsp":
-        source = cam_config.source
-    elif protocol == "usb":
-        from argus.streaming.go2rtc_manager import usb_to_go2rtc_source
-        source = usb_to_go2rtc_source(cam_config.source)
-    else:
+    if getattr(cam_config, "protocol", "rtsp") != "rtsp":
         return api_validation_error(
-            f"摄像头 {camera_id} 使用协议 '{protocol}'，go2rtc 不支持"
+            f"摄像头 {camera_id} 使用协议 '{cam_config.protocol}'，非 RTSP（USB 摄像头为独占设备，不能同时被 go2rtc 和 pipeline 打开）"
         )
 
-    go2rtc.add_stream(camera_id, source)
+    go2rtc.add_stream(camera_id, cam_config.source)
     return api_success({"status": "ok", "camera_id": camera_id})
