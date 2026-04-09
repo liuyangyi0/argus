@@ -18,6 +18,8 @@ import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive, deleteAlert
 import { formatRelativeTime } from '../utils/time'
 import { useWebSocket } from '../composables/useWebSocket'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
+import AnnotationOverlay from '../components/AnnotationOverlay.vue'
+import ImageCompareSlider from '../components/ImageCompareSlider.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -31,7 +33,8 @@ const filters = ref({ camera_id: '', severity: '' })
 // Detail panel state
 const selectedAlert = ref<any>(null)
 const detailData = ref<any>(null)
-const imageMode = ref<'composite' | 'snapshot' | 'heatmap'>('composite')
+const imageMode = ref<'composite' | 'snapshot' | 'heatmap' | 'compare'>('composite')
+const annotationMode = ref(false)
 
 // Bulk selection
 const selectedRowKeys = ref<string[]>([])
@@ -531,13 +534,43 @@ const columns = computed(() => {
             </div>
           </div>
 
-          <!-- Image display -->
-          <div style="border-radius: 8px; overflow: hidden; background: #000; text-align: center">
+          <!-- Image display: standard view or comparison slider -->
+          <div v-if="imageMode === 'compare'" style="margin-bottom: 12px">
+            <ImageCompareSlider
+              :left-src="`/api/alerts/${selectedAlert.alert_id}/image/snapshot`"
+              :right-src="`/api/alerts/${selectedAlert.alert_id}/image/heatmap`"
+              left-label="原始帧"
+              right-label="热力图"
+              :width="640"
+              :height="480"
+            />
+            <Typography.Text type="secondary" style="font-size: 11px; margin-top: 4px; display: block">
+              按住 Alt 悬停可放大区域
+            </Typography.Text>
+          </div>
+          <div v-else style="border-radius: 8px; overflow: hidden; background: #000; text-align: center; position: relative">
             <img
+              ref="alertImageRef"
               :src="`/api/alerts/${selectedAlert.alert_id}/image/${imageMode}`"
               style="max-width: 100%; max-height: 480px; object-fit: contain"
               :alt="selectedAlert.alert_id"
             />
+            <!-- Canvas annotation overlay (toggled) -->
+            <AnnotationOverlay
+              v-if="annotationMode"
+              :width="640"
+              :height="480"
+              :alert-id="selectedAlert.alert_id"
+              :camera-id="selectedAlert.camera_id"
+            />
+          </div>
+          <div style="display: flex; gap: 6px; margin-top: 6px">
+            <Button size="small" :type="imageMode === 'compare' ? 'primary' : 'default'" @click="imageMode = imageMode === 'compare' ? 'composite' : 'compare'">
+              {{ imageMode === 'compare' ? '返回普通视图' : '对比滑块' }}
+            </Button>
+            <Button size="small" :type="annotationMode ? 'primary' : 'default'" @click="annotationMode = !annotationMode">
+              {{ annotationMode ? '关闭标注' : '标注画框' }}
+            </Button>
           </div>
         </div>
 

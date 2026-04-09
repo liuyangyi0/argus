@@ -6,6 +6,7 @@ import { useModelState } from '../composables/useModelState'
 import BaselineTab from '../components/models/BaselineTab.vue'
 import TrainingTab from '../components/models/TrainingTab.vue'
 import ModelsTab from '../components/models/ModelsTab.vue'
+import ModelComparison from '../components/models/ModelComparison.vue'
 
 const route = useRoute()
 const {
@@ -25,6 +26,7 @@ const {
 // Determine initial tab from query param (supports redirect from /training)
 const initialTab = route.query.tab === 'training' ? 'training'
   : route.query.tab === 'models' ? 'models'
+  : route.query.tab === 'comparison' ? 'comparison'
   : 'baselines'
 const activeTab = ref(initialTab)
 
@@ -64,6 +66,10 @@ onMounted(async () => {
 
       <Tabs.TabPane key="models" tab="模型与发布">
         <ModelsTab :cameras="cameras" />
+      </Tabs.TabPane>
+
+      <Tabs.TabPane key="comparison" tab="A/B 对比">
+        <ModelComparison :cameras="cameras" />
       </Tabs.TabPane>
     </Tabs>
   </div>

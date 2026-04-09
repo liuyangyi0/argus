@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import cv2
+import numpy as np
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -24,7 +31,7 @@ from argus.dashboard.model_runtime import (
     sync_active_camera_model,
 )
 from argus.storage.model_registry import ModelRegistry
-from argus.storage.models import ModelRecord, ModelStage
+from argus.storage.models import ModelRecord, ModelStage, ShadowInferenceLog
 from argus.storage.release_pipeline import (
     ReleasePipeline,
     StageTransitionError,
@@ -36,10 +43,21 @@ router = APIRouter()
 
 MAX_BATCH_SIZE = 100
 
+# Dedicated thread pool for CPU-intensive model inference (not asyncio default pool)
+_AB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ab-compare")
+
 
 def _get_registry(request: Request) -> ModelRegistry | None:
     """Get ModelRegistry from app state, or None if unavailable."""
     return get_registry(request)
+
+
+def _get_session_factory(request: Request):
+    """Get SQLAlchemy session factory from app state, or None."""
+    db = getattr(request.app.state, "database", None) or getattr(request.app.state, "db", None)
+    if db is None:
+        return None
+    return getattr(db, "get_session", None)
 
 
 def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
@@ -534,6 +552,279 @@ async def shadow_report(
         days=days,
     )
     return api_success(stats)
+
+
+# ── A/B Comparison endpoints ──
+
+
+def _query_shadow_logs(session, version_id: str, camera_id: str | None, days: int):
+    """Build a filtered ShadowInferenceLog query (shared by ab-scores/ab-distribution)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    query = (
+        session.query(ShadowInferenceLog)
+        .filter(ShadowInferenceLog.shadow_version_id == version_id)
+        .filter(ShadowInferenceLog.timestamp >= cutoff)
+    )
+    if camera_id:
+        query = query.filter(ShadowInferenceLog.camera_id == camera_id)
+    return query
+
+
+@router.get("/{version_id}/ab-scores")
+async def ab_compare_scores(
+    request: Request,
+    version_id: str,
+    camera_id: str | None = None,
+    days: int = 7,
+    limit: int = 500,
+):
+    """Get time-series shadow vs production scores for A/B comparison chart."""
+    session_factory = _get_session_factory(request)
+    if session_factory is None:
+        return api_unavailable("数据库不可用")
+
+    with session_factory() as session:
+        logs = list(
+            _query_shadow_logs(session, version_id, camera_id, days)
+            .order_by(ShadowInferenceLog.timestamp.desc())
+            .limit(limit)
+            .all()
+        )
+
+    logs.reverse()
+
+    scores = [
+        {
+            "t": log.timestamp.isoformat() if log.timestamp else None,
+            "shadow": round(log.shadow_score, 4),
+            "production": round(log.production_score, 4) if log.production_score is not None else None,
+            "shadow_alert": log.shadow_would_alert,
+            "prod_alert": log.production_alerted,
+        }
+        for log in logs
+    ]
+
+    return api_success({
+        "scores": scores,
+        "total": len(scores),
+        "shadow_version_id": version_id,
+    })
+
+
+@router.get("/{version_id}/ab-distribution")
+async def ab_compare_distribution(
+    request: Request,
+    version_id: str,
+    camera_id: str | None = None,
+    days: int = 7,
+    bins: int = 20,
+):
+    """Get score distribution histograms for shadow vs production."""
+    session_factory = _get_session_factory(request)
+    if session_factory is None:
+        return api_unavailable("数据库不可用")
+
+    with session_factory() as session:
+        # Only fetch the two score columns, not full ORM objects
+        rows = (
+            _query_shadow_logs(session, version_id, camera_id, days)
+            .with_entities(ShadowInferenceLog.shadow_score, ShadowInferenceLog.production_score)
+            .limit(50000)
+            .all()
+        )
+
+    if not rows:
+        return api_success({
+            "bin_edges": [],
+            "shadow_counts": [],
+            "production_counts": [],
+            "total_samples": 0,
+        })
+
+    bin_edges = [round(i / bins, 4) for i in range(bins + 1)]
+    shadow_counts = [0] * bins
+    prod_counts = [0] * bins
+
+    for shadow_score, prod_score in rows:
+        shadow_counts[min(int(shadow_score * bins), bins - 1)] += 1
+        if prod_score is not None:
+            prod_counts[min(int(prod_score * bins), bins - 1)] += 1
+
+    return api_success({
+        "bin_edges": bin_edges,
+        "shadow_counts": shadow_counts,
+        "production_counts": prod_counts,
+        "total_samples": len(rows),
+    })
+
+
+# ── Shadow detector cache (LRU, max 3 entries) ──
+from collections import OrderedDict
+
+_shadow_detector_cache: OrderedDict[str, object] = OrderedDict()
+_shadow_cache_lock = threading.Lock()
+
+
+def _get_or_load_shadow_detector(shadow_model_path: Path, shadow_version_id: str, threshold: float):
+    """Get cached shadow detector or load it. Thread-safe, LRU eviction (max 3)."""
+    with _shadow_cache_lock:
+        cached = _shadow_detector_cache.get(shadow_version_id)
+        if cached is not None:
+            # Move to end for LRU ordering
+            _shadow_detector_cache.move_to_end(shadow_version_id)  # type: ignore[attr-defined]
+            return cached
+
+    from argus.anomaly.detector import AnomalibDetector
+
+    det = AnomalibDetector(model_path=shadow_model_path, threshold=threshold)
+
+    with _shadow_cache_lock:
+        if len(_shadow_detector_cache) >= 3:
+            # Evict least-recently-used (first item)
+            evicted_key, _ = _shadow_detector_cache.popitem(last=False)  # type: ignore[call-arg]
+            logger.debug("ab_compare.cache_evict", evicted=evicted_key)
+        _shadow_detector_cache[shadow_version_id] = det
+
+    logger.info("ab_compare.shadow_loaded", version_id=shadow_version_id)
+    return det
+
+
+def _run_ab_heatmap(
+    frame: np.ndarray,
+    production_detector: object,
+    shadow_model_path: Path,
+    shadow_version_id: str,
+    shadow_threshold: float,
+) -> dict:
+    """Run both models on a frame and produce heatmap images (blocking)."""
+    result: dict = {}
+
+    # --- Production model ---
+    t0 = time.perf_counter()
+    try:
+        prod_pred = production_detector.predict(frame)
+        result["production_score"] = round(float(prod_pred.anomaly_score), 4)
+        result["production_latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+        if prod_pred.anomaly_map is not None:
+            heatmap = _anomaly_map_to_jpeg(prod_pred.anomaly_map, frame.shape[:2])
+            result["production_heatmap"] = base64.b64encode(heatmap).decode()
+        else:
+            result["production_heatmap"] = None
+    except Exception as e:
+        result["production_error"] = str(e)
+
+    # --- Shadow model (cached) ---
+    t1 = time.perf_counter()
+    try:
+        shadow_det = _get_or_load_shadow_detector(
+            shadow_model_path, shadow_version_id, shadow_threshold,
+        )
+        shadow_pred = shadow_det.predict(frame)
+        result["shadow_score"] = round(float(shadow_pred.anomaly_score), 4)
+        result["shadow_latency_ms"] = round((time.perf_counter() - t1) * 1000, 1)
+
+        if shadow_pred.anomaly_map is not None:
+            heatmap = _anomaly_map_to_jpeg(shadow_pred.anomaly_map, frame.shape[:2])
+            result["shadow_heatmap"] = base64.b64encode(heatmap).decode()
+        else:
+            result["shadow_heatmap"] = None
+    except Exception as e:
+        result["shadow_error"] = str(e)
+
+    # --- Original frame thumbnail ---
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    result["original_frame"] = base64.b64encode(buf.tobytes()).decode()
+
+    return result
+
+
+def _anomaly_map_to_jpeg(anomaly_map: np.ndarray, target_hw: tuple[int, int]) -> bytes:
+    """Convert an anomaly map (float or uint8) to a JET-colored JPEG thumbnail."""
+    amap = anomaly_map
+    if amap.ndim == 3:
+        amap = amap[:, :, 0]
+
+    # Normalize to 0-255
+    if amap.dtype != np.uint8:
+        amap = np.clip(amap, 0, 1)
+        amap = (amap * 255).astype(np.uint8)
+
+    # Resize to match frame dimensions
+    h, w = target_hw
+    if amap.shape[:2] != (h, w):
+        amap = cv2.resize(amap, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    colored = cv2.applyColorMap(amap, cv2.COLORMAP_JET)
+    _, buf = cv2.imencode(".jpg", colored, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes()
+
+
+@router.post("/ab-live-compare")
+async def ab_live_compare(request: Request):
+    """Run both production and shadow model on a live camera frame.
+
+    Body: { camera_id: str, shadow_version_id: str }
+    Returns: base64 encoded heatmaps for production and shadow, plus scores.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return api_validation_error("无效的JSON请求")
+
+    camera_id = body.get("camera_id")
+    shadow_version_id = body.get("shadow_version_id")
+
+    if not camera_id or not shadow_version_id:
+        return api_validation_error("camera_id and shadow_version_id are required")
+
+    # Get camera frame
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    if camera_manager is None:
+        return api_unavailable("相机管理器不可用")
+
+    frame = camera_manager.get_latest_frame(camera_id)
+    if frame is None:
+        return api_not_found(f"相机 '{camera_id}' 无可用帧")
+
+    # Get production detector
+    pipeline = camera_manager.get_pipeline(camera_id)
+    production_detector = getattr(pipeline, "_anomaly_detector", None) if pipeline else None
+    if production_detector is None:
+        return api_unavailable(f"相机 '{camera_id}' 的异常检测器不可用")
+
+    # Get shadow model path from registry
+    registry = _get_registry(request)
+    if registry is None:
+        return api_unavailable("数据库不可用")
+
+    shadow_record = registry.get_by_version_id(shadow_version_id)
+    if shadow_record is None:
+        return api_not_found(f"影子模型不存在: {shadow_version_id}")
+    if not shadow_record.model_path:
+        return api_validation_error("影子模型没有关联的文件路径")
+
+    shadow_model_path = Path(shadow_record.model_path)
+    if not shadow_model_path.exists():
+        return api_not_found(f"影子模型文件不存在: {shadow_record.model_path}")
+
+    shadow_threshold = 0.5
+    if shadow_record.calibration_thresholds:
+        import json
+        try:
+            cal = json.loads(shadow_record.calibration_thresholds)
+            shadow_threshold = cal.get("threshold", 0.5)
+        except Exception:
+            pass
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        _AB_EXECUTOR,
+        _run_ab_heatmap, frame, production_detector,
+        shadow_model_path, shadow_version_id, shadow_threshold,
+    )
+
+    return api_success(result)
 
 
 # ── Backbone management endpoints ──

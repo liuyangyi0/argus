@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onActivated, onDeactivated } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 
 defineOptions({ name: 'OverviewPage' })
@@ -10,10 +10,13 @@ import {
   BorderOutlined,
   TableOutlined,
   BellOutlined,
+  VideoCameraOutlined,
 } from '@ant-design/icons-vue'
 import VideoTile, { type CameraTileData } from '../components/VideoTile.vue'
 import AlertSidebar from '../components/AlertSidebar.vue'
 import StatusStrip from '../components/StatusStrip.vue'
+import ScoreTrendPanel from '../components/ScoreTrendPanel.vue'
+import AlertTimeline from '../components/AlertTimeline.vue'
 import { getWallStatus, getHealth } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
@@ -39,13 +42,6 @@ const highAlertCameras = computed(() =>
   cameras.value.filter(c => c.active_alert?.severity === 'high')
 )
 const hasHighAlert = computed(() => highAlertCameras.value.length > 0)
-
-// Last alert time indicator
-const lastAlertTime = computed(() => {
-  const withAlerts = cameras.value.filter(c => c.active_alert)
-  if (withAlerts.length === 0) return null
-  return '活跃中'
-})
 
 async function fetchWallStatus() {
   try {
@@ -125,106 +121,74 @@ function setLayout(l: typeof layout.value) {
   layout.value = l
   if (l !== '1x1' && l !== 'focus') focusCamera.value = null
 }
+
+// Layout button configs for cleaner template
+const layoutButtons = [
+  { key: '1x1' as const, icon: BorderOutlined, tip: '单画面' },
+  { key: '2x2' as const, icon: AppstoreOutlined, tip: '四分屏' },
+  { key: '3x3' as const, icon: TableOutlined, tip: '九分屏' },
+  { key: 'focus' as const, icon: BlockOutlined, tip: '焦点模式' },
+]
 </script>
 
 <template>
-  <div style="display: flex; gap: 0; height: calc(100vh - 72px); margin: -24px; padding: 0">
-    <!-- Video Wall Area -->
-    <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 16px">
+  <div class="overview-root">
+    <!-- Main content area -->
+    <div class="overview-main">
       <!-- High alert banner -->
-      <div
-        v-if="hasHighAlert"
-        style="display: flex; align-items: center; gap: 10px; padding: 8px 16px; margin-bottom: 10px; background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.4); border-radius: 6px"
-      >
-        <BellOutlined style="color: #ef4444; font-size: 16px" />
-        <Typography.Text strong style="color: #ef4444; font-size: 13px">
-          {{ highAlertCameras.length }} 个高级告警需要处理
-        </Typography.Text>
-        <Typography.Text type="secondary" style="font-size: 12px">
-          ({{ highAlertCameras.map(c => c.camera_id).join(', ') }})
-        </Typography.Text>
-        <Button
-          type="primary"
-          danger
-          size="small"
-          style="margin-left: auto"
-          @click="router.push('/alerts?severity=high')"
-        >
-          查看
-        </Button>
+      <div v-if="hasHighAlert" class="high-alert-banner">
+        <div class="high-alert-inner">
+          <div class="high-alert-pulse" />
+          <BellOutlined style="color: #ef4444; font-size: 16px" />
+          <Typography.Text strong style="color: #fca5a5; font-size: 13px">
+            {{ highAlertCameras.length }} 个高级告警需要立即处理
+          </Typography.Text>
+          <Typography.Text type="secondary" style="font-size: 12px; color: #ef444488">
+            {{ highAlertCameras.map(c => c.camera_id).join(', ') }}
+          </Typography.Text>
+          <Button
+            type="primary"
+            danger
+            size="small"
+            style="margin-left: auto"
+            @click="router.push('/alerts?severity=high')"
+          >
+            查看告警
+          </Button>
+        </div>
       </div>
 
       <!-- Toolbar -->
-      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid rgba(59, 130, 246, 0.12); flex-shrink: 0">
-        <div style="display: flex; align-items: center; gap: 10px">
+      <div class="overview-toolbar">
+        <div class="toolbar-left">
           <span
-            :class="['status-glow', systemStatus !== 'healthy' && 'status-glow--pulse']"
-            :style="{ background: statusColor, boxShadow: `0 0 8px ${statusColor}88` }"
+            class="status-glow"
+            :class="{ 'status-glow--pulse': systemStatus !== 'healthy' }"
+            :style="{ background: statusColor, boxShadow: `0 0 10px ${statusColor}88` }"
           />
-          <Typography.Title :level="4" style="margin: 0">值班台</Typography.Title>
-          <Typography.Text v-if="statusLabel" type="secondary" style="font-size: 12px">{{ statusLabel }}</Typography.Text>
-          <!-- Last alert indicator -->
-          <Typography.Text
-            v-if="lastAlertTime"
-            type="secondary"
-            style="font-size: 11px; margin-left: 8px; color: #ef4444"
-          >
-            告警 {{ lastAlertTime }}
-          </Typography.Text>
+          <Typography.Title :level="4" style="margin: 0; color: #e2e8f0">值班台</Typography.Title>
+          <Typography.Text v-if="statusLabel" style="font-size: 12px; color: #6b7280">{{ statusLabel }}</Typography.Text>
         </div>
-        <Space>
-          <Tooltip title="1x1">
+        <div class="toolbar-right">
+          <Tooltip v-for="btn in layoutButtons" :key="btn.key" :title="btn.tip">
             <Button
-              :type="layout === '1x1' ? 'primary' : 'default'"
+              :type="layout === btn.key ? 'primary' : 'text'"
               size="small"
-              @click="setLayout('1x1')"
+              class="layout-btn"
+              :class="{ 'layout-btn--active': layout === btn.key }"
+              @click="setLayout(btn.key)"
             >
-              <template #icon><BorderOutlined /></template>
+              <template #icon><component :is="btn.icon" /></template>
             </Button>
           </Tooltip>
-          <Tooltip title="2x2">
-            <Button
-              :type="layout === '2x2' ? 'primary' : 'default'"
-              size="small"
-              @click="setLayout('2x2')"
-            >
-              <template #icon><AppstoreOutlined /></template>
-            </Button>
-          </Tooltip>
-          <Tooltip title="3x3">
-            <Button
-              :type="layout === '3x3' ? 'primary' : 'default'"
-              size="small"
-              @click="setLayout('3x3')"
-            >
-              <template #icon><TableOutlined /></template>
-            </Button>
-          </Tooltip>
-          <Tooltip title="焦点模式">
-            <Button
-              :type="layout === 'focus' ? 'primary' : 'default'"
-              size="small"
-              @click="setLayout('focus')"
-            >
-              <template #icon><BlockOutlined /></template>
-            </Button>
-          </Tooltip>
-        </Space>
+        </div>
       </div>
 
       <!-- Status Strip -->
       <StatusStrip :health="health" :cameras="cameras" />
 
-      <!-- Grid -->
-      <div
-        :style="{
-          display: 'grid',
-          ...gridStyle,
-          gap: '8px',
-          flex: '1',
-          minHeight: 0,
-        }"
-      >
+      <!-- Video Grid -->
+      <div class="video-grid" :style="gridStyle">
         <VideoTile
           v-for="(cam, idx) in displayCameras"
           :key="cam.camera_id"
@@ -238,32 +202,206 @@ function setLayout(l: typeof layout.value) {
         <div
           v-for="n in Math.max(0, (layout === '2x2' ? 4 : layout === '3x3' ? 9 : 0) - displayCameras.length)"
           :key="'empty-' + n"
-          style="border: 1px dashed #2d2d4a; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #4a5568; font-size: 13px"
+          class="empty-tile"
         >
-          无摄像头
+          <div class="empty-tile-content">
+            <VideoCameraOutlined style="font-size: 24px; color: #2d2d4a" />
+            <span>未配置</span>
+          </div>
         </div>
       </div>
+
+      <!-- Score Trend Panel -->
+      <ScoreTrendPanel :cameras="cameras" />
+
+      <!-- 24h Alert Timeline -->
+      <AlertTimeline @segment-click="(p) => router.push(
+        p.segment.first_alert_id
+          ? `/cameras/${p.camera_id}?replay=${p.segment.first_alert_id}`
+          : `/alerts?camera=${p.camera_id}`
+      )" />
     </div>
 
     <!-- Alert Sidebar -->
-    <div style="border-left: 1px solid #1f2937; padding: 16px 12px 16px 0; flex-shrink: 0">
+    <div class="overview-sidebar">
       <AlertSidebar :health="health" />
     </div>
   </div>
 </template>
 
 <style scoped>
+.overview-root {
+  display: flex;
+  gap: 0;
+  height: calc(100vh - 72px);
+  margin: -24px;
+  padding: 0;
+}
+
+.overview-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 10px;
+}
+
+.overview-sidebar {
+  border-left: 1px solid #1f2937;
+  padding: 16px 12px 16px 0;
+  flex-shrink: 0;
+}
+
+/* High alert banner */
+.high-alert-banner {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+.high-alert-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  position: relative;
+  z-index: 1;
+}
+
+.high-alert-pulse {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(239, 68, 68, 0.05) 50%, transparent 100%);
+  animation: alert-sweep 3s ease-in-out infinite;
+}
+
+@keyframes alert-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Toolbar */
+.overview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+
+.toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.toolbar-right {
+  display: flex;
+  gap: 4px;
+}
+
+.layout-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  transition: all 0.2s;
+}
+
+.layout-btn:not(.layout-btn--active) {
+  color: #6b7280;
+}
+
+.layout-btn:not(.layout-btn--active):hover {
+  background: #1e1e36;
+  color: #e2e8f0;
+}
+
 .status-glow {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   flex-shrink: 0;
 }
+
 .status-glow--pulse {
   animation: pulse-glow 2s ease-in-out infinite;
 }
+
 @keyframes pulse-glow {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
+}
+
+/* Video grid */
+.video-grid {
+  display: grid;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+}
+
+.empty-tile {
+  border: 1px dashed #2d2d4a;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #12121e;
+  transition: border-color 0.3s;
+}
+
+.empty-tile:hover {
+  border-color: #3b82f644;
+}
+
+.empty-tile-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: #2d2d4a;
+  font-size: 12px;
+}
+
+/* ── Mobile responsive ── */
+@media (max-width: 768px) {
+  .overview-root {
+    flex-direction: column;
+    height: auto;
+  }
+  .overview-sidebar {
+    border-left: none;
+    border-top: 1px solid #1f2937;
+    padding: 12px;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+  .overview-main {
+    padding: 10px;
+  }
+  .overview-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .toolbar-right {
+    flex-wrap: wrap;
+  }
+  .video-grid {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: auto !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .overview-main {
+    padding: 8px;
+    gap: 6px;
+  }
+  .layout-btn {
+    width: 28px;
+    height: 28px;
+  }
 }
 </style>

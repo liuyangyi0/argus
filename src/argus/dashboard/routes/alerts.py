@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import io
+from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import cv2
@@ -942,6 +944,143 @@ def _add_fp_snapshot_to_baseline(request: Request, alert_id: str) -> None:
         zone_id=zone_id,
         dest=str(dest),
     )
+
+
+@router.get("/timeline")
+def alerts_timeline(
+    request: Request,
+    date: str = Query(None, description="Date in YYYY-MM-DD format, defaults to today"),
+):
+    """24h timeline: per-camera horizontal bars with alert segments colored by severity.
+
+    Merges adjacent alerts within a 60-second window into segments for clean display.
+    """
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    if date:
+        try:
+            day = datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return api_validation_error("日期格式错误，请使用 YYYY-MM-DD")
+    else:
+        day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    # Fetch alerts for the day using SQL time-range filter
+    from sqlalchemy import select
+    from argus.storage.models import AlertRecord
+
+    with db.get_session() as session:
+        stmt = (
+            select(AlertRecord)
+            .where(AlertRecord.timestamp >= day_start.timestamp())
+            .where(AlertRecord.timestamp < day_end.timestamp())
+            .order_by(AlertRecord.timestamp.asc())
+        )
+        day_alerts = list(session.scalars(stmt).all())
+
+    # Group by camera
+    by_camera: dict[str, list] = defaultdict(list)
+    for a in day_alerts:
+        by_camera[a.camera_id].append(a)
+
+    # Build camera names from app state
+    camera_names: dict[str, str] = {}
+    manager = getattr(request.app.state, "camera_manager", None)
+    if manager and hasattr(manager, "cameras"):
+        for cam_id, pipeline in manager.cameras.items():
+            camera_names[cam_id] = getattr(pipeline, "camera_config", None)
+            if camera_names[cam_id]:
+                camera_names[cam_id] = camera_names[cam_id].name
+            else:
+                camera_names[cam_id] = cam_id
+
+    merge_window = 60  # seconds
+    severity_order = {"high": 3, "medium": 2, "low": 1, "info": 0}
+
+    cameras = []
+    for cam_id, cam_alerts in by_camera.items():
+        cam_alerts.sort(key=lambda a: a.timestamp)
+        segments = []
+        current_seg = None
+
+        for a in cam_alerts:
+            ts = datetime.fromtimestamp(a.timestamp)
+            sev = a.severity.value if hasattr(a.severity, "value") else str(a.severity)
+            aid = a.alert_id
+
+            if current_seg is None:
+                current_seg = {
+                    "start": ts.isoformat(),
+                    "end": (ts + timedelta(seconds=30)).isoformat(),
+                    "severity": sev,
+                    "alert_count": 1,
+                    "first_alert_id": aid,
+                }
+            elif (ts - datetime.fromisoformat(current_seg["end"])).total_seconds() <= merge_window:
+                # Merge: extend end time and use highest severity
+                current_seg["end"] = (ts + timedelta(seconds=30)).isoformat()
+                current_seg["alert_count"] += 1
+                if severity_order.get(sev, 0) > severity_order.get(current_seg["severity"], 0):
+                    current_seg["severity"] = sev
+                    current_seg["first_alert_id"] = aid  # use highest-severity alert
+            else:
+                segments.append(current_seg)
+                current_seg = {
+                    "start": ts.isoformat(),
+                    "end": (ts + timedelta(seconds=30)).isoformat(),
+                    "severity": sev,
+                    "alert_count": 1,
+                    "first_alert_id": aid,
+                }
+
+        if current_seg:
+            segments.append(current_seg)
+
+        cameras.append({
+            "camera_id": cam_id,
+            "name": camera_names.get(cam_id, cam_id),
+            "segments": segments,
+        })
+
+    return api_success({
+        "date": day_start.strftime("%Y-%m-%d"),
+        "cameras": cameras,
+    })
+
+
+@router.post("/{alert_id}/annotations")
+async def save_annotations(request: Request, alert_id: str):
+    """Save operator-drawn annotations (bounding boxes) for an alert frame.
+
+    Used by the Canvas annotation overlay for marking anomalies/false positives.
+    Body: {"annotations": [{"x":int,"y":int,"width":int,"height":int,"label":str}]}
+    """
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    alert = db.get_alert(alert_id)
+    if not alert:
+        return api_not_found("告警不存在")
+
+    body = await request.json()
+    annotations = body.get("annotations", [])
+
+    # Store annotations as JSON in alert metadata directory
+    alerts_dir = Path(request.app.state.config.get("alerts_dir", "data/alerts"))
+    anno_path = alerts_dir / alert_id / "annotations.json"
+    anno_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import json
+    with open(anno_path, "w") as f:
+        json.dump({"alert_id": alert_id, "annotations": annotations}, f)
+
+    return api_success({"alert_id": alert_id, "count": len(annotations)})
 
 
 @router.get("/json")

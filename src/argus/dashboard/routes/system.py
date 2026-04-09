@@ -10,8 +10,9 @@ import shutil
 
 import structlog
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
+from argus.core.metrics import METRICS
 from argus.dashboard.api_response import api_success
 from argus.dashboard.components import (
     page_header,
@@ -355,6 +356,15 @@ async def system_details(request: Request):
             </table>
         </div>
     </div>""")
+
+
+@router.get("/metrics")
+def prometheus_metrics():
+    """Prometheus-compatible metrics endpoint for scraping."""
+    return Response(
+        content=METRICS.generate(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 def _format_uptime(seconds: float) -> str:

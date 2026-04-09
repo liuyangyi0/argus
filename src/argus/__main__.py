@@ -18,7 +18,9 @@ from argus.alerts.grader import Alert
 from argus.capture.manager import CameraManager
 from argus.config.loader import load_config
 from argus.config.schema import AlertSeverity
+from argus.core.event_bus import EventBus
 from argus.core.health import HealthMonitor
+from argus.core.metrics import METRICS
 from argus.core.scheduler import (
     TaskScheduler,
     create_job_processing_task,
@@ -179,6 +181,11 @@ def main():
         print("Error: No cameras configured", file=sys.stderr)
         sys.exit(1)
 
+    METRICS.ensure_initialized()
+    METRICS.app_info.info({"version": "0.2.0", "node_id": config.node_id})
+
+    event_bus = EventBus()
+
     # Initialize subsystems
     db = Database(database_url=config.storage.database_url)
     db.initialize()
@@ -268,6 +275,7 @@ def main():
         record_store=record_store,
         database=db,
         alert_recording_store=alert_recording_store,
+        event_bus=event_bus,
     )
 
     # Graceful shutdown
@@ -382,13 +390,16 @@ def main():
         while running and manager.is_running:
             time.sleep(1.0)
 
-            # Update health for each camera
+            # Update health and Prometheus metrics for each camera
             for status in manager.get_status():
                 health.update_camera(
                     camera_id=status.camera_id,
                     connected=status.connected,
                     frames_captured=status.stats.frames_captured if status.stats else 0,
                     avg_latency_ms=status.stats.avg_latency_ms if status.stats else 0,
+                )
+                METRICS.camera_status.labels(camera_id=status.camera_id).set(
+                    1.0 if status.connected else 0.0,
                 )
 
             # Periodic status in verbose mode

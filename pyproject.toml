@@ -26,6 +26,8 @@ dependencies = [
     "apscheduler>=3.10.0",
     "faiss-cpu>=1.7.0",
     "av>=12.0.0",
+    "prometheus-client>=0.21.0",
+    "sahi>=0.11.0",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +35,8 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
+    "pytest-benchmark>=4.0.0",
+    "hypothesis>=6.100.0",
     "ruff>=0.8.0",
 ]
 quantize = ["nncf>=2.7.0"]
@@ -51,6 +55,13 @@ packages = ["src/argus"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "e2e: marks tests as end-to-end tests (deselect with '-m \"not e2e\"')",
+    "slow: marks tests that take >10s to run",
+    "benchmark: marks performance benchmark tests",
+    "chaos: marks chaos/fault-injection tests",
+]
 
 [tool.ruff]
 target-version = "py311"

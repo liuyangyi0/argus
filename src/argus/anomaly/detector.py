@@ -738,12 +738,16 @@ class _TileInfo:
 
 
 class MultiScaleDetector:
-    """Sliding window multi-scale anomaly detector.
+    """Sliding window multi-scale anomaly detector with pyramid support.
 
     Wraps an AnomalibDetector and runs it on multiple overlapping tiles
     of the input frame, plus once on the full frame. This dramatically
     improves detection of small objects that get lost when a 1920×1080
     frame is squeezed down to 256×256.
+
+    Pyramid mode (default): runs 3 levels (512/768/1024) to capture
+    anomalies at different scales — small foreign objects, medium debris,
+    and large structural changes. NMS merges results across levels.
 
     The final score is the maximum across all tiles and the full frame,
     so a small anomaly in one tile won't be diluted by normal regions.
@@ -757,11 +761,20 @@ class MultiScaleDetector:
         base_detector: AnomalibDetector,
         tile_size: int = 512,
         tile_overlap: float = 0.25,
+        pyramid_mode: bool = False,
+        pyramid_sizes: list[int] | None = None,
     ):
         self._base = base_detector
         self._tile_size = tile_size
+        self._tile_overlap = tile_overlap
         self._stride = max(1, int(tile_size * (1.0 - tile_overlap)))
         self.threshold = base_detector.threshold
+        self._pyramid_mode = pyramid_mode
+        self._pyramid_sizes = pyramid_sizes or [512, 768, 1024]
+        # Pre-compute strides for each pyramid level
+        self._pyramid_strides = [
+            max(1, int(sz * (1.0 - tile_overlap))) for sz in self._pyramid_sizes
+        ]
 
     @property
     def is_loaded(self) -> bool:
@@ -789,6 +802,9 @@ class MultiScaleDetector:
         Falls back to single-scale for SSIM mode (no trained model) since
         SSIM frame-diff works on the full frame and each tile would need
         its own independent calibration.
+
+        Pyramid mode: runs 3 levels (512/768/1024) and merges results,
+        capturing anomalies at different spatial scales.
         """
         if frame is None or frame.size == 0:
             return self._base.predict(frame)
@@ -799,29 +815,53 @@ class MultiScaleDetector:
 
         h, w = frame.shape[:2]
 
-        # If frame is smaller than tile size, just run single-scale
-        if h <= self._tile_size and w <= self._tile_size:
+        # If frame is smaller than smallest tile, just run single-scale
+        min_tile = self._pyramid_sizes[0] if self._pyramid_mode else self._tile_size
+        if h <= min_tile and w <= min_tile:
             return self._base.predict(frame)
 
-        # Generate tile coordinates
-        tiles = self._generate_tiles(h, w)
-
-        # Run detection on each tile
         best_score = 0.0
         best_result: AnomalyResult | None = None
-        tile_results: list[tuple[_TileInfo, AnomalyResult]] = []
+        all_tile_results: list[tuple[_TileInfo, AnomalyResult]] = []
 
-        for tile_info in tiles:
-            crop = frame[
-                tile_info.y : tile_info.y + tile_info.h,
-                tile_info.x : tile_info.x + tile_info.w,
-            ]
-            result = self._base.predict(crop)
-            tile_results.append((tile_info, result))
+        if self._pyramid_mode:
+            # Pyramid: run at each scale level (512/768/1024)
+            for level_idx, (pyr_size, pyr_stride) in enumerate(
+                zip(self._pyramid_sizes, self._pyramid_strides)
+            ):
+                if h <= pyr_size and w <= pyr_size:
+                    continue  # frame too small for this level
+                tiles = self._generate_tiles(h, w, tile_size=pyr_size, stride=pyr_stride)
+                for tile_info in tiles:
+                    crop = frame[
+                        tile_info.y : tile_info.y + tile_info.h,
+                        tile_info.x : tile_info.x + tile_info.w,
+                    ]
+                    result = self._base.predict(crop)
+                    all_tile_results.append((tile_info, result))
+                    if result.anomaly_score > best_score:
+                        best_score = result.anomaly_score
+                        best_result = result
 
-            if result.anomaly_score > best_score:
-                best_score = result.anomaly_score
-                best_result = result
+            logger.debug(
+                "multiscale.pyramid_result",
+                levels=len(self._pyramid_sizes),
+                total_tiles=len(all_tile_results),
+                best_score=round(best_score, 3),
+            )
+        else:
+            # Single tile_size mode (legacy)
+            tiles = self._generate_tiles(h, w)
+            for tile_info in tiles:
+                crop = frame[
+                    tile_info.y : tile_info.y + tile_info.h,
+                    tile_info.x : tile_info.x + tile_info.w,
+                ]
+                result = self._base.predict(crop)
+                all_tile_results.append((tile_info, result))
+                if result.anomaly_score > best_score:
+                    best_score = result.anomaly_score
+                    best_result = result
 
         # Also run full-frame detection (catches large anomalies)
         global_result = self._base.predict(frame)
@@ -833,13 +873,14 @@ class MultiScaleDetector:
             best_result = global_result
 
         # Merge heatmaps from all tiles into full-frame heatmap
-        merged_map = self._merge_heatmaps(h, w, tile_results, global_result)
+        merged_map = self._merge_heatmaps(h, w, all_tile_results, global_result)
 
         logger.debug(
             "multiscale.result",
-            tiles=len(tiles),
+            tiles=len(all_tile_results),
             best_score=round(best_score, 3),
             global_score=round(global_result.anomaly_score, 3),
+            pyramid=self._pyramid_mode,
         )
 
         return AnomalyResult(
@@ -849,38 +890,43 @@ class MultiScaleDetector:
             threshold=self.threshold,
         )
 
-    def _generate_tiles(self, frame_h: int, frame_w: int) -> list[_TileInfo]:
+    def _generate_tiles(
+        self, frame_h: int, frame_w: int,
+        tile_size: int | None = None, stride: int | None = None,
+    ) -> list[_TileInfo]:
         """Generate sliding window tile coordinates covering the frame.
 
         Tiles that would extend beyond the frame edge are clamped so they
         stay within bounds (the last tile in each row/column may overlap
         more with its neighbor).
         """
+        ts = tile_size or self._tile_size
+        st = stride or self._stride
         tiles = []
         y = 0
         while y < frame_h:
-            tile_h = min(self._tile_size, frame_h - y)
+            tile_h = min(ts, frame_h - y)
             # If remaining height is too small, extend tile upward
-            if tile_h < self._tile_size and y > 0:
-                y = max(0, frame_h - self._tile_size)
+            if tile_h < ts and y > 0:
+                y = max(0, frame_h - ts)
                 tile_h = frame_h - y
 
             x = 0
             while x < frame_w:
-                tile_w = min(self._tile_size, frame_w - x)
-                if tile_w < self._tile_size and x > 0:
-                    x = max(0, frame_w - self._tile_size)
+                tile_w = min(ts, frame_w - x)
+                if tile_w < ts and x > 0:
+                    x = max(0, frame_w - ts)
                     tile_w = frame_w - x
 
                 tiles.append(_TileInfo(x=x, y=y, w=tile_w, h=tile_h))
 
                 if x + tile_w >= frame_w:
                     break
-                x += self._stride
+                x += st
 
             if y + tile_h >= frame_h:
                 break
-            y += self._stride
+            y += st
 
         return tiles
 
@@ -927,4 +973,64 @@ class MultiScaleDetector:
             )
             np.maximum(merged, global_map, out=merged)
 
-        return merged if has_any_map else None
+        if not has_any_map:
+            return None
+
+        # NMS: suppress overlapping anomaly peaks across pyramid levels.
+        # Extract connected regions above threshold, suppress lower-scoring
+        # regions that overlap significantly with higher-scoring ones.
+        if self._pyramid_mode:
+            merged = self._nms_suppress(merged)
+
+        return merged
+
+    def _nms_suppress(
+        self, heatmap: np.ndarray, iou_threshold: float = 0.5
+    ) -> np.ndarray:
+        """Non-Maximum Suppression on heatmap anomaly regions.
+
+        Extracts connected components above the detection threshold,
+        computes bounding boxes, and suppresses lower-scoring overlapping
+        regions — keeping only the strongest detection per spatial area.
+        """
+        binary = (heatmap >= self.threshold).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
+
+        if num_labels <= 2:
+            return heatmap  # 0 or 1 region — nothing to suppress
+
+        # Collect regions with their max scores
+        regions: list[tuple[float, int, int, int, int, int]] = []  # (score, label, x, y, w, h)
+        for i in range(1, num_labels):  # skip background (0)
+            x, y, w, h = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP], \
+                stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+            mask = labels[y:y+h, x:x+w] == i
+            region_score = float(heatmap[y:y+h, x:x+w][mask].max())
+            regions.append((region_score, i, x, y, w, h))
+
+        # Sort by score descending
+        regions.sort(key=lambda r: r[0], reverse=True)
+
+        suppressed = set()
+        for idx, (score_a, label_a, x_a, y_a, w_a, h_a) in enumerate(regions):
+            if label_a in suppressed:
+                continue
+            for jdx in range(idx + 1, len(regions)):
+                score_b, label_b, x_b, y_b, w_b, h_b = regions[jdx]
+                if label_b in suppressed:
+                    continue
+                # Compute IoU of bounding boxes
+                ix = max(0, min(x_a + w_a, x_b + w_b) - max(x_a, x_b))
+                iy = max(0, min(y_a + h_a, y_b + h_b) - max(y_a, y_b))
+                intersection = ix * iy
+                union = w_a * h_a + w_b * h_b - intersection
+                iou = intersection / max(union, 1)
+                if iou >= iou_threshold:
+                    suppressed.add(label_b)
+
+        # Zero out suppressed regions
+        if suppressed:
+            for label_id in suppressed:
+                heatmap[labels == label_id] = 0.0
+
+        return heatmap

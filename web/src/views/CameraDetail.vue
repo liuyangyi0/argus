@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { Card, Steps, Tabs, Descriptions, Badge, Button, Typography, Space, Statistic, Row, Col, Empty } from 'ant-design-vue'
 import { ArrowLeftOutlined } from '@ant-design/icons-vue'
 import { getCameraDetail } from '../api'
+import ZoneEditor from '../components/ZoneEditor.vue'
 import { useGo2RTC } from '../composables/useGo2RTC'
 
 const route = useRoute()
@@ -38,6 +39,15 @@ onUnmounted(() => {
 // go2rtc WebRTC/MSE player
 const { videoRef, mjpegRef, status: streamStatus, start: startStream, stop: stopStream } = useGo2RTC(cameraId)
 const mjpegUrl = computed(() => `/api/cameras/${cameraId}/stream`)
+const snapshotUrl = computed(() => `/api/cameras/${cameraId}/snapshot`)
+const zoneEditorData = ref<any[]>(camera.value?.zones || [])
+
+async function saveZones() {
+  try {
+    const { api } = await import('../api/client')
+    await api.post(`/api/zones/${cameraId}/update`, { zones: zoneEditorData.value })
+  } catch { /* handled by global interceptor */ }
+}
 
 const lifecycleStep = computed(() => {
   if (!camera.value) return 0
@@ -217,6 +227,20 @@ const configEntries = computed(() => flattenEntries(camera.value?.config))
             <Empty v-else description="暂无摄像头配置" />
           </Card>
         </Space>
+      </Tabs.TabPane>
+
+      <Tabs.TabPane key="zones" tab="区域编辑">
+        <Card title="检测区域配置" :bordered="false">
+          <ZoneEditor
+            v-model="zoneEditorData"
+            :image-src="snapshotUrl"
+            :width="640"
+            :height="480"
+          />
+          <div style="margin-top: 12px">
+            <Button type="primary" size="small" @click="saveZones">保存区域配置</Button>
+          </div>
+        </Card>
       </Tabs.TabPane>
     </Tabs>
   </div>
