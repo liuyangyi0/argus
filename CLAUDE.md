@@ -88,6 +88,10 @@ class MyMiddleware(BaseHTTPMiddleware):
 
 在 `src/argus/storage/models.py` 中给任何表新增 `mapped_column` 后，**必须** 同时在 `src/argus/storage/database.py` 的 `_auto_migrate()` 方法中添加对应的 `ALTER TABLE ADD COLUMN` 条目，否则已有数据库会触发 `sqlite3.OperationalError: no such column` → HTTP 500。
 
+### ❌ 所有摄像头协议都必须注册到 go2rtc
+
+新增摄像头协议时（如 USB、ONVIF），**必须** 在 `go2rtc_manager.py` 的 `sync_cameras()` 和 `app.py` 的 lifespan 中同步注册。未注册的摄像头会回退到 MJPEG `<img>` 标签，每个占一个 HTTP 长连接（最长 30 分钟），多个摄像头直接吃满浏览器的 6 连接/origin 上限，导致所有后续请求排队超时。使用 `usb_to_go2rtc_source()` 将 USB 设备索引转为 `ffmpeg:device?video=N#video=h264` 格式。
+
 ### ❌ MJPEG 流编码必须使用专用线程池
 
 `cv2.imencode()` 等 CPU 密集操作 **禁止** 使用 `asyncio.to_thread()`（会占满默认线程池），必须使用 `loop.run_in_executor(_STREAM_EXECUTOR, ...)` 指定专用 `ThreadPoolExecutor`，避免阻塞普通 API 请求。见 `src/argus/dashboard/routes/cameras.py` 中的 `_STREAM_EXECUTOR`。
