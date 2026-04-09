@@ -300,6 +300,7 @@ def main():
             config=config,
             config_path=args.config,
             task_manager=task_mgr,
+            go2rtc_instance=_go2rtc,
         )
         app.state.audit_logger = audit_logger
         app.state.recording_store = alert_recording_store  # FR-033: shared with pipelines
