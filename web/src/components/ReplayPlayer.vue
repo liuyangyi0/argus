@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { Button, Space, Tag, Typography, Select } from 'ant-design-vue'
 import {
   StepBackwardOutlined,
@@ -10,7 +10,7 @@ import {
   FastForwardOutlined,
 } from '@ant-design/icons-vue'
 import SignalTrack from './SignalTrack.vue'
-import { getReplayMetadata, getReplaySignals, getReplayFrameUrl, getReplayHeatmapUrl, getReplayReference, pinReplayFrame } from '../api'
+import { getReplayMetadata, getReplaySignals, getReplayVideoUrl, getReplayFrameUrl, getReplayHeatmapUrl, getReplayReference, pinReplayFrame } from '../api'
 
 const props = defineProps<{
   alertId: string
@@ -25,17 +25,19 @@ const speed = ref(1)
 const referenceFrame = ref<string | null>(null)
 const referenceDate = ref('')
 const loadingRef = ref(false)
+const videoEl = ref<HTMLVideoElement | null>(null)
 
 const selectedRefOption = ref('yesterday')
 const clipStart = ref<number | null>(null)
 const clipEnd = ref<number | null>(null)
 
-// §1.3: Overlay toggles
-const showHeatmap = ref(true)  // default on
-const showBoxes = ref(false)   // default off
+const showHeatmap = ref(true)
+const showBoxes = ref(false)
 const hasHeatmaps = computed(() => signals.value?.has_heatmaps || false)
 
-let playTimer: ReturnType<typeof setInterval> | null = null
+const fps = computed(() => metadata.value?.fps || 15)
+const videoUrl = computed(() => getReplayVideoUrl(props.alertId))
+const heatmapUrl = computed(() => getReplayHeatmapUrl(props.alertId, currentIndex.value))
 
 function onRefOptionChange(value: any) {
   selectedRefOption.value = value
@@ -46,7 +48,6 @@ function onRefOptionChange(value: any) {
     }
     return
   }
-  // Compute the reference date based on trigger timestamp
   const triggerTs = metadata.value?.trigger_timestamp
   if (!triggerTs) return
   const trigger = new Date(triggerTs * 1000)
@@ -78,12 +79,14 @@ async function loadData() {
     metadata.value = metaRes.data
     signals.value = sigRes.data
 
-    // Default to trigger frame index (don't auto-play)
-    if (metadata.value?.trigger_frame_index !== undefined) {
+    // After metadata loads, seek video to trigger frame
+    await nextTick()
+    if (videoEl.value && metadata.value?.trigger_frame_index !== undefined) {
+      const triggerTime = metadata.value.trigger_frame_index / fps.value
+      videoEl.value.currentTime = triggerTime
       currentIndex.value = metadata.value.trigger_frame_index
     }
 
-    // Load default reference (yesterday)
     loadReference()
   } catch (e) {
     console.error('Replay load error', e)
@@ -111,49 +114,50 @@ async function loadReference(date?: string) {
 
 onMounted(loadData)
 
-// Playback controls
-function togglePlay() {
-  playing.value = !playing.value
+// Video event handlers
+function onTimeUpdate() {
+  if (!videoEl.value) return
+  const idx = Math.floor(videoEl.value.currentTime * fps.value)
+  const max = (metadata.value?.frame_count || 1) - 1
+  currentIndex.value = Math.min(idx, max)
 }
 
-watch(playing, (isPlaying) => {
-  if (playTimer) {
-    clearInterval(playTimer)
-    playTimer = null
-  }
-  if (isPlaying && metadata.value) {
-    const fps = metadata.value.fps || 5
-    const intervalMs = 1000 / (fps * speed.value)
-    playTimer = setInterval(() => {
-      if (currentIndex.value < (metadata.value?.frame_count || 0) - 1) {
-        currentIndex.value++
-      } else {
-        playing.value = false
-      }
-    }, intervalMs)
-  }
-})
+function onVideoPlay() { playing.value = true }
+function onVideoPause() { playing.value = false }
+function onVideoEnded() { playing.value = false }
 
-watch(speed, () => {
-  if (playing.value) {
-    playing.value = false
-    playing.value = true // restart with new speed
+// Playback controls — delegate to <video> element
+function togglePlay() {
+  if (!videoEl.value) return
+  if (videoEl.value.paused) {
+    videoEl.value.play()
+  } else {
+    videoEl.value.pause()
   }
-})
+}
 
 function stepFrame(delta: number) {
-  playing.value = false
-  const max = (metadata.value?.frame_count || 1) - 1
-  currentIndex.value = Math.max(0, Math.min(max, currentIndex.value + delta))
+  if (!videoEl.value) return
+  videoEl.value.pause()
+  videoEl.value.currentTime = Math.max(0, videoEl.value.currentTime + delta / fps.value)
 }
 
 function seekTo(index: number) {
-  playing.value = false
+  if (!videoEl.value) return
+  videoEl.value.pause()
+  videoEl.value.currentTime = index / fps.value
   currentIndex.value = index
 }
 
 function goToStart() { seekTo(0) }
 function goToEnd() { seekTo((metadata.value?.frame_count || 1) - 1) }
+
+// Speed control — set video.playbackRate
+watch(speed, (s) => {
+  if (videoEl.value) {
+    videoEl.value.playbackRate = s
+  }
+})
 
 // Keyboard shortcuts
 function handleKeydown(e: KeyboardEvent) {
@@ -162,9 +166,9 @@ function handleKeydown(e: KeyboardEvent) {
     case ' ': e.preventDefault(); togglePlay(); break
     case 'ArrowLeft': stepFrame(-1); break
     case 'ArrowRight': stepFrame(1); break
-    case 'k': case 'K': playing.value = false; break
-    case 'j': case 'J': speed.value = Math.max(0.25, speed.value / 2); if (!playing.value) playing.value = true; break
-    case 'l': case 'L': speed.value = Math.min(4, speed.value * 2); if (!playing.value) playing.value = true; break
+    case 'k': case 'K': if (videoEl.value) videoEl.value.pause(); break
+    case 'j': case 'J': speed.value = Math.max(0.25, speed.value / 2); if (videoEl.value?.paused) videoEl.value.play(); break
+    case 'l': case 'L': speed.value = Math.min(4, speed.value * 2); if (videoEl.value?.paused) videoEl.value.play(); break
     case 'Home': goToStart(); break
     case 'End': goToEnd(); break
     case '[': clipStart.value = currentIndex.value; break
@@ -175,14 +179,9 @@ function handleKeydown(e: KeyboardEvent) {
 onMounted(() => window.addEventListener('keydown', handleKeydown))
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
-  if (playTimer) clearInterval(playTimer)
 })
 
 // Computed
-const frameUrl = computed(() => getReplayFrameUrl(props.alertId, currentIndex.value))
-const heatmapUrl = computed(() => getReplayHeatmapUrl(props.alertId, currentIndex.value))
-
-// Current frame's YOLO boxes from signals
 const currentBoxes = computed(() => {
   if (!showBoxes.value || !signals.value?.yolo_boxes) return []
   return signals.value.yolo_boxes[currentIndex.value] || []
@@ -205,7 +204,6 @@ const statusText = computed(() => {
 
 const speeds = [0.25, 0.5, 1, 2, 4]
 
-// §1.2.2: Recording-in-progress computations
 const triggerProgressPct = computed(() => {
   if (!metadata.value) return 50
   const triggerIdx = metadata.value.trigger_frame_index || 0
@@ -237,14 +235,23 @@ async function handlePinFrame() {
       <!-- Main playback window -->
       <div style="flex: 1; min-width: 0">
         <div style="position: relative; background: #000; border-radius: 4px; overflow: hidden; aspect-ratio: 16/9">
-          <img :src="frameUrl" style="width: 100%; height: 100%; object-fit: contain; display: block" />
-          <!-- §1.3: Heatmap overlay (toggle) -->
+          <video
+            ref="videoEl"
+            :src="videoUrl"
+            preload="auto"
+            style="width: 100%; height: 100%; object-fit: contain; display: block"
+            @timeupdate="onTimeUpdate"
+            @play="onVideoPlay"
+            @pause="onVideoPause"
+            @ended="onVideoEnded"
+          />
+          <!-- Heatmap overlay -->
           <img
             v-if="showHeatmap && hasHeatmaps"
             :src="heatmapUrl"
             style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; opacity: 0.4; pointer-events: none; mix-blend-mode: screen"
           />
-          <!-- §1.3: YOLO detection boxes overlay (toggle) -->
+          <!-- YOLO detection boxes overlay -->
           <svg
             v-if="showBoxes && currentBoxes.length > 0"
             style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none"
@@ -269,7 +276,7 @@ async function handlePinFrame() {
           </div>
         </div>
       </div>
-      <!-- Reference window with date selector (§1.3) -->
+      <!-- Reference window with date selector -->
       <div style="width: 240px; flex-shrink: 0">
         <div style="display: flex; align-items: center; gap: 4px; margin-bottom: 4px">
           <Typography.Text type="secondary" style="font-size: 12px; flex-shrink: 0">历史对照</Typography.Text>
@@ -323,7 +330,7 @@ async function handlePinFrame() {
         </Button>
       </Space>
 
-      <!-- §1.3: Overlay toggles -->
+      <!-- Overlay toggles -->
       <Space size="small" style="margin-left: 8px">
         <Button
           size="small"
@@ -349,7 +356,7 @@ async function handlePinFrame() {
       </Typography.Text>
     </div>
 
-    <!-- Timeline scrubber (§1.2.2: recording-in-progress shows dashed incomplete segment) -->
+    <!-- Timeline scrubber -->
     <div style="margin-bottom: 8px; position: relative">
       <input
         type="range"
@@ -362,10 +369,8 @@ async function handlePinFrame() {
       <!-- Recording-in-progress indicator -->
       <div v-if="metadata.status === 'recording'" style="display: flex; align-items: center; justify-content: flex-end; margin-top: 2px">
         <div style="flex: 1; display: flex; align-items: center; gap: 4px">
-          <!-- Trigger point marker -->
           <div :style="{ width: triggerProgressPct + '%' }" />
           <div style="width: 8px; height: 8px; border-radius: 50%; background: #ef4444; flex-shrink: 0" />
-          <!-- Dashed incomplete segment -->
           <div style="flex: 1; height: 2px; border-top: 2px dashed #4a5568" />
         </div>
         <Typography.Text type="secondary" style="font-size: 11px; margin-left: 8px; flex-shrink: 0; color: #ef4444">
@@ -374,7 +379,7 @@ async function handlePinFrame() {
       </div>
     </div>
 
-    <!-- Signal tracks (MEDIUM/HIGH only — LOW shows video + trigger point only per §1.2.3) -->
+    <!-- Signal tracks -->
     <div v-if="signals && metadata.severity !== 'low' && metadata.severity !== 'info'" style="display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px">
       <SignalTrack
         v-if="signals.anomaly_scores"
@@ -413,7 +418,7 @@ async function handlePinFrame() {
         :height="24"
         @seek="seekTo"
       />
-      <!-- Operator action track (§1.3 — 5th track) -->
+      <!-- Operator action track -->
       <div v-if="signals.operator_actions?.length" style="height: 20px; position: relative; background: #1a1a2e; border-radius: 2px; overflow: hidden">
         <Typography.Text type="secondary" style="font-size: 10px; position: absolute; left: 4px; top: 2px">操作员</Typography.Text>
         <div

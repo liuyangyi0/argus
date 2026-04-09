@@ -1205,9 +1205,10 @@ class DetectionPipeline:
                     )
                     # Persist recording to disk and insert DB record
                     rec_path = ""
+                    file_size = 0
                     if self._recording_store is not None:
                         try:
-                            rec_path = self._recording_store.save(recording)
+                            rec_path, file_size = self._recording_store.save(recording)
                             logger.info(
                                 "pipeline.recording_saved",
                                 alert_id=alert.alert_id,
@@ -1231,9 +1232,10 @@ class DetectionPipeline:
                                 trigger_timestamp=recording.trigger_timestamp,
                                 frame_count=len(recording.frames),
                                 fps=recording.fps,
-                                file_size_bytes=sum(len(f.frame_jpeg) for f in recording.frames),
+                                file_size_bytes=file_size,
                                 linked_alert_id=recording.linked_alert_id,
                                 status=recording.status.value,
+                                video_codec="h264",
                             )
                             self._database.save_alert_recording(db_rec)
                         except Exception:

@@ -1,10 +1,11 @@
-"""Tests for AlertRecordingStore disk persistence (FR-033)."""
+"""Tests for AlertRecordingStore disk persistence with H.264 MP4 (FR-033)."""
 
 import json
 import time
-import tempfile
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from argus.core.alert_ring_buffer import (
@@ -15,18 +16,26 @@ from argus.core.alert_ring_buffer import (
 from argus.storage.alert_recording import AlertRecordingStore
 
 
+def _make_jpeg(width: int = 640, height: int = 480, value: int = 128) -> bytes:
+    """Create a valid JPEG frame for testing."""
+    frame = np.full((height, width, 3), value, dtype=np.uint8)
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes()
+
+
 def _make_recording(
     alert_id: str = "ALT-TEST-001",
     camera_id: str = "cam_01",
     severity: str = "medium",
     frame_count: int = 10,
+    status: RecordingStatus = RecordingStatus.RECORDING,
 ) -> SolidifiedRecording:
-    """Create a test recording."""
+    """Create a test recording with valid JPEG frames."""
     ts = time.time()
     frames = [
         FrameSnapshot(
             timestamp=ts - frame_count + i,
-            frame_jpeg=b"\xff\xd8\xff\xe0" + bytes(100),
+            frame_jpeg=_make_jpeg(value=i * 20),
             anomaly_score=0.1 + i * 0.05,
             simplex_score=None,
             cusum_evidence={"cam_01:default": 0.5 + i * 0.1},
@@ -42,7 +51,8 @@ def _make_recording(
         trigger_timestamp=ts,
         trigger_frame_index=frame_count - 1,
         frames=frames,
-        fps=2,
+        fps=15,
+        status=status,
     )
 
 
@@ -50,16 +60,40 @@ class TestAlertRecordingStore:
     def test_save_and_load_metadata(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
         recording = _make_recording()
-        rec_path = store.save(recording)
+        rec_path, file_size = store.save(recording)
 
         assert Path(rec_path).exists()
+        assert file_size > 0
+
         metadata = store.load_metadata("ALT-TEST-001")
         assert metadata is not None
         assert metadata["alert_id"] == "ALT-TEST-001"
         assert metadata["camera_id"] == "cam_01"
         assert metadata["severity"] == "medium"
         assert metadata["frame_count"] == 10
-        assert metadata["fps"] == 2
+        assert metadata["fps"] == 15
+        assert metadata["codec"] == "h264"
+        assert metadata["video_file"] == "pre.mp4"  # status=RECORDING
+
+    def test_save_complete_recording(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording(status=RecordingStatus.COMPLETE)
+        rec_path, _ = store.save(recording)
+
+        metadata = store.load_metadata("ALT-TEST-001")
+        assert metadata["video_file"] == "recording.mp4"
+        assert (Path(rec_path) / "recording.mp4").exists()
+
+    def test_save_creates_mp4(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording()
+        rec_path, _ = store.save(recording)
+
+        rec_dir = Path(rec_path)
+        assert (rec_dir / "pre.mp4").exists()
+        assert not (rec_dir / "frames").exists()  # No JPEG frame dir
+        assert (rec_dir / "signals.json").exists()
+        assert (rec_dir / "metadata.json").exists()
 
     def test_save_and_load_signals(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
@@ -72,7 +106,7 @@ class TestAlertRecordingStore:
         assert len(signals["anomaly_scores"]) == 10
         assert "cam_01:default" in signals["cusum_evidence"]
 
-    def test_load_frame(self, tmp_path):
+    def test_load_frame_from_mp4(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
         recording = _make_recording(frame_count=5)
         store.save(recording)
@@ -80,18 +114,12 @@ class TestAlertRecordingStore:
         frame = store.load_frame("ALT-TEST-001", 0)
         assert frame is not None
         assert isinstance(frame, bytes)
+        assert len(frame) > 100  # Valid JPEG
 
-        # Out of range
-        assert store.load_frame("ALT-TEST-001", 100) is None
-
-    def test_list_frames(self, tmp_path):
-        store = AlertRecordingStore(archive_dir=str(tmp_path))
-        recording = _make_recording(frame_count=5)
-        store.save(recording)
-
-        frames = store.list_frames("ALT-TEST-001")
-        assert len(frames) == 5
-        assert frames[0] == "000000.jpg"
+        # Verify it's a valid JPEG
+        arr = np.frombuffer(frame, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        assert img is not None
 
     def test_has_recording(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
@@ -103,13 +131,13 @@ class TestAlertRecordingStore:
     def test_append_post_frames(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
         recording = _make_recording(frame_count=5)
-        store.save(recording)
+        rec_path, _ = store.save(recording)
 
         ts = time.time()
         post_frames = [
             FrameSnapshot(
                 timestamp=ts + i,
-                frame_jpeg=b"\xff\xd8\xff\xe0" + bytes(50),
+                frame_jpeg=_make_jpeg(value=200 + i * 10),
                 anomaly_score=0.3,
                 simplex_score=None,
                 cusum_evidence={"cam_01:default": 0.8},
@@ -125,6 +153,23 @@ class TestAlertRecordingStore:
         metadata = store.load_metadata("ALT-TEST-001")
         assert metadata["frame_count"] == 8
         assert metadata["status"] == "complete"
+        assert metadata["video_file"] == "recording.mp4"
+
+        # Verify pre.mp4 and post.mp4 are cleaned up
+        rec_dir = Path(rec_path)
+        assert not (rec_dir / "pre.mp4").exists()
+        assert not (rec_dir / "post.mp4").exists()
+        assert (rec_dir / "recording.mp4").exists()
+
+    def test_get_video_path(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording()
+        store.save(recording)
+
+        video_path = store.get_video_path("ALT-TEST-001")
+        assert video_path is not None
+        assert video_path.exists()
+        assert video_path.suffix == ".mp4"
 
     def test_disk_usage(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
@@ -138,4 +183,24 @@ class TestAlertRecordingStore:
         assert store.load_metadata("NOPE") is None
         assert store.load_signals("NOPE") is None
         assert store.load_frame("NOPE", 0) is None
-        assert store.list_frames("NOPE") == []
+
+    def test_cleanup_old(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording()
+        rec_path, _ = store.save(recording)
+
+        # Force the date directory to look old by renaming
+        rec_dir = Path(rec_path)
+        date_dir = rec_dir.parent.parent
+        old_date_dir = date_dir.parent / "2020-01-01"
+        date_dir.rename(old_date_dir)
+
+        archived = store.cleanup_old(max_age_days=1)
+        assert archived == 1
+
+        # Verify video is deleted but trigger frame is preserved
+        old_rec_dir = old_date_dir / "cam_01" / "ALT-TEST-001"
+        assert not (old_rec_dir / "pre.mp4").exists()
+        assert not (old_rec_dir / "recording.mp4").exists()
+        assert (old_rec_dir / "trigger_frame.jpg").exists()
+        assert (old_rec_dir / "signals.json").exists()

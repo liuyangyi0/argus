@@ -1,10 +1,11 @@
 """Disk persistence for solidified alert recordings (FR-033).
 
-Stores alert replay data (JPEG frames + signal timeseries) under:
+Stores alert replay data (H.264 MP4 video + signal timeseries) under:
     {archive_dir}/{date}/{camera_id}/{alert_id}/
-        frames/       JPEG frame sequence
-        signals.json  Timeseries for all 5 replay tracks
-        metadata.json Recording metadata
+        recording.mp4   H.264 video (or pre.mp4 during recording)
+        heatmaps/       JPEG heatmap overlays (optional)
+        signals.json    Timeseries for all 5 replay tracks
+        metadata.json   Recording metadata
 """
 
 from __future__ import annotations
@@ -20,8 +21,20 @@ import numpy as np
 import structlog
 
 from argus.core.alert_ring_buffer import FrameSnapshot, SolidifiedRecording, RecordingStatus
+from argus.core.video_encoder import (
+    Mp4Encoder, concat_mp4, extract_frame_jpeg, jpeg_dimensions, _BYTES_PER_MB,
+)
 
 logger = structlog.get_logger()
+
+
+def _find_video_file(rec_dir: Path) -> Path | None:
+    """Return the active video file in a recording directory, or None."""
+    for name in ("recording.mp4", "pre.mp4"):
+        p = rec_dir / name
+        if p.exists():
+            return p
+    return None
 
 
 def _encode_heatmap_jpeg(heatmap_raw: np.ndarray, quality: int = 60) -> bytes | None:
@@ -35,42 +48,77 @@ def _encode_heatmap_jpeg(heatmap_raw: np.ndarray, quality: int = 60) -> bytes | 
     return buf.tobytes()
 
 
-class AlertRecordingStore:
-    """Manages solidified alert recordings on disk."""
+def _detect_frame_dimensions(frames: list[FrameSnapshot]) -> tuple[int, int]:
+    """Detect (width, height) from the first valid JPEG frame header (no full decode)."""
+    for snap in frames:
+        if snap.frame_jpeg:
+            dims = jpeg_dimensions(snap.frame_jpeg)
+            if dims is not None:
+                return dims
+    return (1280, 720)  # fallback
 
-    def __init__(self, archive_dir: str = "data/recordings"):
+
+class AlertRecordingStore:
+    """Manages solidified alert recordings on disk as H.264 MP4 video."""
+
+    def __init__(
+        self,
+        archive_dir: str = "data/recordings",
+        video_crf: int = 23,
+        video_preset: str = "veryfast",
+    ):
         self._archive_dir = Path(archive_dir)
+        self._video_crf = video_crf
+        self._video_preset = video_preset
         self._path_cache: dict[str, Path] = {}  # alert_id -> rec_dir (O(1) lookup)
 
-    def save(self, recording: SolidifiedRecording) -> str:
-        """Persist a solidified recording to disk.
+    def save(self, recording: SolidifiedRecording) -> tuple[str, int]:
+        """Persist a solidified recording to disk as MP4 video.
 
-        Returns the recording directory path.
+        Returns (recording_dir_path, file_size_bytes).
         """
         date_str = datetime.fromtimestamp(
             recording.trigger_timestamp, tz=timezone.utc
         ).strftime("%Y-%m-%d")
 
         rec_dir = self._archive_dir / date_str / recording.camera_id / recording.alert_id
-        frames_dir = rec_dir / "frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
+        rec_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write frames + optional heatmap overlays (JPEG-encoded at save time)
-        heatmaps_dir = rec_dir / "heatmaps"
+        # Determine video filename based on recording status
+        # pre.mp4 during recording (post-trigger window still collecting)
+        # recording.mp4 when complete
+        is_recording = recording.status == RecordingStatus.RECORDING
+        video_name = "pre.mp4" if is_recording else "recording.mp4"
+        video_path = rec_dir / video_name
+
+        # Detect frame dimensions from actual data
+        width, height = _detect_frame_dimensions(recording.frames)
+
+        # Encode frames to H.264 MP4
+        file_size = 0
+        if recording.frames:
+            encoder = Mp4Encoder(
+                video_path,
+                fps=recording.fps,
+                width=width,
+                height=height,
+                crf=self._video_crf,
+                preset=self._video_preset,
+            )
+            for snap in recording.frames:
+                encoder.write_jpeg_frame(snap.frame_jpeg)
+            file_size = encoder.finalize()
+
+        # Write heatmap overlays as JPEG sequence (sparse, used for Canvas overlay)
         has_heatmaps = any(snap.heatmap_raw is not None for snap in recording.frames)
         if has_heatmaps:
+            heatmaps_dir = rec_dir / "heatmaps"
             heatmaps_dir.mkdir(parents=True, exist_ok=True)
-
-        total_size = 0
-        for i, snap in enumerate(recording.frames):
-            frame_path = frames_dir / f"{i:06d}.jpg"
-            frame_path.write_bytes(snap.frame_jpeg)
-            total_size += len(snap.frame_jpeg)
-            if snap.heatmap_raw is not None and has_heatmaps:
-                heatmap_bytes = _encode_heatmap_jpeg(snap.heatmap_raw)
-                if heatmap_bytes:
-                    (heatmaps_dir / f"{i:06d}.jpg").write_bytes(heatmap_bytes)
-                    total_size += len(heatmap_bytes)
+            for i, snap in enumerate(recording.frames):
+                if snap.heatmap_raw is not None:
+                    heatmap_bytes = _encode_heatmap_jpeg(snap.heatmap_raw)
+                    if heatmap_bytes:
+                        (heatmaps_dir / f"{i:06d}.jpg").write_bytes(heatmap_bytes)
 
         # Build signals timeseries
         signals = self._build_signals(recording.frames)
@@ -91,6 +139,10 @@ class AlertRecordingStore:
             "fps": recording.fps,
             "linked_alert_id": recording.linked_alert_id,
             "status": recording.status.value,
+            "video_file": video_name,
+            "width": width,
+            "height": height,
+            "codec": "h264",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         (rec_dir / "metadata.json").write_text(
@@ -105,44 +157,76 @@ class AlertRecordingStore:
             camera_id=recording.camera_id,
             severity=recording.severity,
             frame_count=len(recording.frames),
-            size_mb=round(total_size / (1024 * 1024), 2),
+            size_mb=round(file_size / _BYTES_PER_MB, 2),
+            video=video_name,
         )
 
-        return str(rec_dir)
+        return str(rec_dir), file_size
 
     def append_post_frames(self, alert_id: str, post_frames: list[FrameSnapshot]) -> bool:
         """Append post-trigger frames to an existing recording.
 
-        Updates frame files, signals, and metadata. Returns True on success.
+        Encodes post_frames as post.mp4, concatenates with pre.mp4 to produce
+        recording.mp4, then cleans up temp files. Returns True on success.
         """
         rec_dir = self._find_recording_dir(alert_id)
         if rec_dir is None:
             logger.warning("alert_recording.append_not_found", alert_id=alert_id)
             return False
 
-        frames_dir = rec_dir / "frames"
         metadata_path = rec_dir / "metadata.json"
         signals_path = rec_dir / "signals.json"
+        pre_path = rec_dir / "pre.mp4"
+        post_path = rec_dir / "post.mp4"
+        final_path = rec_dir / "recording.mp4"
 
-        # Read current metadata
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         existing_count = metadata["frame_count"]
+        width = metadata.get("width", 1280)
+        height = metadata.get("height", 720)
+        fps = metadata.get("fps", 15)
 
-        # Append new frames + heatmaps
+        # Encode post-trigger frames to post.mp4
+        if post_frames:
+            encoder = Mp4Encoder(
+                post_path,
+                fps=fps,
+                width=width,
+                height=height,
+                crf=self._video_crf,
+                preset=self._video_preset,
+            )
+            for snap in post_frames:
+                encoder.write_jpeg_frame(snap.frame_jpeg)
+            encoder.finalize()
+
+        # Concatenate pre.mp4 + post.mp4 -> recording.mp4
+        if pre_path.exists() and post_path.exists():
+            file_size = concat_mp4(
+                pre_path, post_path, final_path,
+                crf=self._video_crf, preset=self._video_preset,
+            )
+            pre_path.unlink()
+            post_path.unlink()
+        elif pre_path.exists():
+            pre_path.rename(final_path)
+            file_size = final_path.stat().st_size
+        else:
+            logger.warning("alert_recording.no_pre_mp4", alert_id=alert_id)
+            return False
+
+        # Append heatmaps (continue numbering from existing_count)
         has_heatmaps = any(snap.heatmap_raw is not None for snap in post_frames)
-        heatmaps_dir = rec_dir / "heatmaps"
         if has_heatmaps:
+            heatmaps_dir = rec_dir / "heatmaps"
             heatmaps_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, snap in enumerate(post_frames):
-            frame_path = frames_dir / f"{existing_count + i:06d}.jpg"
-            frame_path.write_bytes(snap.frame_jpeg)
-            if snap.heatmap_raw is not None and has_heatmaps:
-                heatmap_bytes = _encode_heatmap_jpeg(snap.heatmap_raw)
-                if heatmap_bytes:
-                    (heatmaps_dir / f"{existing_count + i:06d}.jpg").write_bytes(
-                        heatmap_bytes
-                    )
+            for i, snap in enumerate(post_frames):
+                if snap.heatmap_raw is not None:
+                    heatmap_bytes = _encode_heatmap_jpeg(snap.heatmap_raw)
+                    if heatmap_bytes:
+                        (heatmaps_dir / f"{existing_count + i:06d}.jpg").write_bytes(
+                            heatmap_bytes
+                        )
 
         # Update signals
         existing_signals = json.loads(signals_path.read_text(encoding="utf-8"))
@@ -156,12 +240,10 @@ class AlertRecordingStore:
                 post_signals["cusum_evidence"][zone_id]
             )
         existing_signals["yolo_persons"].extend(post_signals["yolo_persons"])
-        # Merge yolo_boxes for overlay toggle
         if "yolo_boxes" in post_signals:
             if "yolo_boxes" not in existing_signals:
                 existing_signals["yolo_boxes"] = []
             existing_signals["yolo_boxes"].extend(post_signals["yolo_boxes"])
-        # Update has_heatmaps flag if post frames have heatmaps
         if has_heatmaps:
             existing_signals["has_heatmaps"] = True
         signals_path.write_text(
@@ -170,8 +252,11 @@ class AlertRecordingStore:
 
         # Update metadata
         metadata["frame_count"] = existing_count + len(post_frames)
-        metadata["end_timestamp"] = post_frames[-1].timestamp if post_frames else metadata["end_timestamp"]
+        metadata["end_timestamp"] = (
+            post_frames[-1].timestamp if post_frames else metadata["end_timestamp"]
+        )
         metadata["status"] = RecordingStatus.COMPLETE.value
+        metadata["video_file"] = "recording.mp4"
         metadata_path.write_text(
             json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
         )
@@ -181,6 +266,7 @@ class AlertRecordingStore:
             alert_id=alert_id,
             new_frames=len(post_frames),
             total_frames=metadata["frame_count"],
+            size_mb=round(file_size / _BYTES_PER_MB, 2),
         )
         return True
 
@@ -205,24 +291,14 @@ class AlertRecordingStore:
         return json.loads(sig_path.read_text(encoding="utf-8"))
 
     def load_frame(self, alert_id: str, index: int) -> bytes | None:
-        """Load a single JPEG frame by index."""
+        """Extract a single JPEG frame by index from the MP4 video."""
         rec_dir = self._find_recording_dir(alert_id)
         if rec_dir is None:
             return None
-        frame_path = rec_dir / "frames" / f"{index:06d}.jpg"
-        if not frame_path.exists():
+        video_path = self._get_video_file(rec_dir)
+        if video_path is None:
             return None
-        return frame_path.read_bytes()
-
-    def list_frames(self, alert_id: str) -> list[str]:
-        """List all frame filenames for an alert."""
-        rec_dir = self._find_recording_dir(alert_id)
-        if rec_dir is None:
-            return []
-        frames_dir = rec_dir / "frames"
-        if not frames_dir.exists():
-            return []
-        return sorted(f.name for f in frames_dir.iterdir() if f.suffix == ".jpg")
+        return extract_frame_jpeg(video_path, index)
 
     def load_heatmap_frame(self, alert_id: str, index: int) -> bytes | None:
         """Load a single heatmap overlay JPEG by index."""
@@ -233,6 +309,13 @@ class AlertRecordingStore:
         if not heatmap_path.exists():
             return None
         return heatmap_path.read_bytes()
+
+    def get_video_path(self, alert_id: str) -> Path | None:
+        """Return the path to the MP4 video file for direct streaming."""
+        rec_dir = self._find_recording_dir(alert_id)
+        if rec_dir is None:
+            return None
+        return self._get_video_file(rec_dir)
 
     @property
     def archive_dir(self) -> Path:
@@ -261,8 +344,8 @@ class AlertRecordingStore:
     def cleanup_old(self, max_age_days: int = 30) -> int:
         """Remove recordings older than max_age_days.
 
-        Recordings older than max_age_days are downsampled: only the trigger
-        frame and signals.json are kept, video frames are deleted.
+        Recordings older than max_age_days are archived: only the trigger
+        frame (extracted from MP4) and signals.json are kept.
 
         Returns the number of recordings archived.
         """
@@ -284,7 +367,6 @@ class AlertRecordingStore:
             except ValueError:
                 continue
 
-            # Archive each recording in this date directory
             for camera_dir in date_dir.iterdir():
                 if not camera_dir.is_dir():
                     continue
@@ -294,7 +376,6 @@ class AlertRecordingStore:
                     self._archive_recording(rec_dir)
                     archived += 1
 
-            # Remove date dir if empty
             if not any(date_dir.iterdir()):
                 date_dir.rmdir()
 
@@ -308,18 +389,17 @@ class AlertRecordingStore:
             return 0
         return sum(f.stat().st_size for f in self._archive_dir.rglob("*") if f.is_file())
 
-    def _find_recording_dir(self, alert_id: str) -> Path | None:
-        """Find the recording directory for an alert_id.
+    @staticmethod
+    def _get_video_file(rec_dir: Path) -> Path | None:
+        """Return the active video file path (recording.mp4 or pre.mp4)."""
+        return _find_video_file(rec_dir)
 
-        Uses an in-memory cache for O(1) lookups. Falls back to
-        filesystem scan on cache miss (cold start or restart).
-        """
-        # Cache hit
+    def _find_recording_dir(self, alert_id: str) -> Path | None:
+        """Find the recording directory for an alert_id."""
         cached = self._path_cache.get(alert_id)
         if cached is not None and cached.is_dir():
             return cached
 
-        # Filesystem scan fallback
         if not self._archive_dir.exists():
             return None
         for date_dir in sorted(self._archive_dir.iterdir(), reverse=True):
@@ -337,7 +417,6 @@ class AlertRecordingStore:
     @staticmethod
     def _build_signals(frames: list[FrameSnapshot]) -> dict:
         """Build signal timeseries dict from frame snapshots."""
-        # Collect all zone IDs across all frames
         all_zones: set[str] = set()
         for f in frames:
             all_zones.update(f.cusum_evidence.keys())
@@ -358,36 +437,40 @@ class AlertRecordingStore:
                 }
                 for f in frames
             ],
-            # §1.3: Per-frame YOLO detection boxes for overlay toggle
-            "yolo_boxes": [
-                f.yolo_boxes or [] for f in frames
-            ],
+            "yolo_boxes": [f.yolo_boxes or [] for f in frames],
             "has_heatmaps": any(f.heatmap_raw is not None for f in frames),
         }
         return signals
 
     @staticmethod
     def _archive_recording(rec_dir: Path) -> None:
-        """Downsample a recording for archival: keep trigger frame + signals only."""
+        """Downsample a recording for archival: extract trigger frame, delete video."""
         meta_path = rec_dir / "metadata.json"
         if not meta_path.exists():
             return
 
         metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         trigger_idx = metadata.get("trigger_frame_index", 0)
-        frames_dir = rec_dir / "frames"
 
-        # Keep only the trigger frame
-        if frames_dir.exists():
-            trigger_file = frames_dir / f"{trigger_idx:06d}.jpg"
-            trigger_bytes = trigger_file.read_bytes() if trigger_file.exists() else None
-            shutil.rmtree(frames_dir)
-            if trigger_bytes is not None:
-                frames_dir.mkdir()
-                (frames_dir / f"{trigger_idx:06d}.jpg").write_bytes(trigger_bytes)
+        # Extract trigger frame from video before deleting
+        video_path = _find_video_file(rec_dir)
+        trigger_jpeg = None
+        if video_path is not None:
+            trigger_jpeg = extract_frame_jpeg(video_path, trigger_idx)
+            video_path.unlink()
+
+        # Save trigger frame as standalone JPEG
+        if trigger_jpeg:
+            (rec_dir / "trigger_frame.jpg").write_bytes(trigger_jpeg)
+
+        # Remove heatmaps directory
+        heatmaps_dir = rec_dir / "heatmaps"
+        if heatmaps_dir.exists():
+            shutil.rmtree(heatmaps_dir)
 
         # Update metadata
         metadata["status"] = RecordingStatus.ARCHIVED.value
+        metadata["video_file"] = None
         meta_path.write_text(
             json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
         )

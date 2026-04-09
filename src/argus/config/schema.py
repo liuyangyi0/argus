@@ -360,6 +360,15 @@ class RingBufferConfig(BaseModel):
         default=85, ge=60, le=95,
         description="JPEG compression quality for buffered frames",
     )
+    video_crf: int = Field(
+        default=23, ge=18, le=28,
+        description="H.264 CRF quality (lower = better quality, larger files)",
+    )
+    video_preset: str = Field(
+        default="veryfast",
+        pattern=r"^(ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow)$",
+        description="libx264 encoding preset (ultrafast/veryfast/fast/medium/slow)",
+    )
     max_recording_age_days: int = Field(
         default=30, ge=7, le=90,
         description="Days to keep full recordings before archiving to trigger-frame-only",

@@ -1,7 +1,7 @@
 """Alert replay API for multi-track timeline playback (UX v2 §1.3).
 
 Provides endpoints to retrieve recording metadata, signal timeseries,
-individual frames, and historical reference frames for alert replay.
+individual frames, MP4 video, and historical reference frames for alert replay.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response
 
 from argus.dashboard.api_response import (
     api_success,
@@ -38,8 +38,7 @@ def _get_db(request: Request):
 def replay_metadata(request: Request, alert_id: str):
     """Return recording metadata for an alert.
 
-    Response: {alert_id, camera_id, severity, start_ts, end_ts, trigger_ts,
-               fps, frame_count, status, linked_alert_id}
+    Response includes video_url for direct MP4 playback.
     """
     store = _get_recording_store(request)
     if store is None:
@@ -48,6 +47,9 @@ def replay_metadata(request: Request, alert_id: str):
     metadata = store.load_metadata(alert_id)
     if metadata is None:
         return api_not_found("录像不存在")
+
+    # Enrich with video URL for frontend
+    metadata["video_url"] = f"/api/replay/{alert_id}/video"
 
     return api_success(metadata)
 
@@ -90,9 +92,33 @@ def replay_signals(request: Request, alert_id: str):
     return api_success(signals)
 
 
+@router.get("/{alert_id}/video")
+def replay_video(request: Request, alert_id: str):
+    """Return the MP4 video file with HTTP Range support for seeking.
+
+    The browser <video> element uses Range requests for efficient playback.
+    """
+    store = _get_recording_store(request)
+    if store is None:
+        return api_unavailable("录像存储未配置")
+
+    video_path = store.get_video_path(alert_id)
+    if video_path is None or not video_path.exists():
+        return api_not_found("视频文件不存在")
+
+    return FileResponse(
+        path=str(video_path),
+        media_type="video/mp4",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @router.get("/{alert_id}/frame/{index}")
 def replay_frame(request: Request, alert_id: str, index: int):
-    """Return a single JPEG frame by index."""
+    """Return a single JPEG frame by index (extracted from MP4).
+
+    Used for heatmap compositing, pin-frame thumbnails, and reference comparison.
+    """
     store = _get_recording_store(request)
     if store is None:
         return Response(status_code=503)
@@ -113,7 +139,7 @@ def replay_frame(request: Request, alert_id: str, index: int):
 
 @router.get("/{alert_id}/heatmap/{index}")
 def replay_heatmap_frame(request: Request, alert_id: str, index: int):
-    """Return a single heatmap overlay JPEG by index (§1.3 overlay toggle)."""
+    """Return a single heatmap overlay JPEG by index."""
     store = _get_recording_store(request)
     if store is None:
         return Response(status_code=503)
@@ -129,47 +155,6 @@ def replay_heatmap_frame(request: Request, alert_id: str, index: int):
         content=heatmap_bytes,
         media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=3600"},
-    )
-
-
-@router.get("/{alert_id}/frames")
-async def replay_frames_stream(
-    request: Request,
-    alert_id: str,
-    start: int = Query(default=0, ge=0),
-    end: int = Query(default=50, ge=0),
-):
-    """Stream a range of frames as multipart MJPEG.
-
-    Used for batch playback. Max 200 frames per request.
-    """
-    store = _get_recording_store(request)
-    if store is None:
-        return Response(status_code=503)
-
-    # Clamp range
-    end = min(end, start + 200)
-    frame_list = store.list_frames(alert_id)
-    if not frame_list:
-        return Response(status_code=404)
-
-    end = min(end, len(frame_list))
-
-    def generate():
-        for i in range(start, end):
-            frame_bytes = store.load_frame(alert_id, i)
-            if frame_bytes is None:
-                continue
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n"
-                b"\r\n" + frame_bytes + b"\r\n"
-            )
-
-    return StreamingResponse(
-        generate(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
@@ -237,14 +222,23 @@ def replay_reference(
             continue
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            # Find the trigger frame from this recording
             dist = abs(meta["trigger_timestamp"] - ref_ts)
             if dist < best_distance:
                 trigger_idx = meta.get("trigger_frame_index", 0)
-                frame_path = rec_dir / "frames" / f"{trigger_idx:06d}.jpg"
-                if frame_path.exists():
-                    best_frame = frame_path.read_bytes()
+                # Check archived trigger frame first, then extract from video
+                trigger_frame_path = rec_dir / "trigger_frame.jpg"
+                if trigger_frame_path.exists():
+                    best_frame = trigger_frame_path.read_bytes()
                     best_distance = dist
+                else:
+                    from argus.storage.alert_recording import _find_video_file
+                    video_path = _find_video_file(rec_dir)
+                    if video_path is not None:
+                        from argus.core.video_encoder import extract_frame_jpeg
+                        frame_data = extract_frame_jpeg(video_path, trigger_idx)
+                        if frame_data:
+                            best_frame = frame_data
+                            best_distance = dist
         except (json.JSONDecodeError, KeyError):
             continue
 
@@ -311,7 +305,6 @@ def _compute_key_frames(signals: dict) -> list[dict]:
     # 2. Evidence threshold: find where CUSUM evidence is highest
     cusum = signals.get("cusum_evidence", {})
     if cusum:
-        # Use the first zone's evidence
         first_zone = next(iter(cusum.values()), [])
         if first_zone:
             max_evidence_idx = 0
