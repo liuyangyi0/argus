@@ -33,3 +33,11 @@ export const getBackboneStatus = () => api.get('/models/backbone/status').then(u
 // ── Batch Inference ──
 export const batchInference = (cameraId: string, imagePaths: string[]) =>
   api.post('/models/batch-inference', { camera_id: cameraId, image_paths: imagePaths }).then(u)
+
+// ── A/B Comparison ──
+export const getABScores = (versionId: string, params?: { camera_id?: string; days?: number; limit?: number }) =>
+  api.get(`/models/${versionId}/ab-scores`, { params }).then(u)
+export const getABDistribution = (versionId: string, params?: { camera_id?: string; days?: number; bins?: number }) =>
+  api.get(`/models/${versionId}/ab-distribution`, { params }).then(u)
+export const runABLiveCompare = (cameraId: string, shadowVersionId: string) =>
+  api.post('/models/ab-live-compare', { camera_id: cameraId, shadow_version_id: shadowVersionId }, { timeout: 60000 }).then(u)

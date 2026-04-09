@@ -13,3 +13,45 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #555; }
+
+/* ── CSS Variables for theme-aware components ── */
+:root, .dark-theme {
+  --argus-card-bg: linear-gradient(135deg, #1a1a2e 0%, #16162a 100%);
+  --argus-border: #2d2d4a;
+  --argus-text: #e2e8f0;
+  --argus-text-muted: #6b7280;
+  --argus-surface: #12121e;
+}
+.light-theme {
+  --argus-card-bg: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+  --argus-border: #e5e7eb;
+  --argus-text: #111827;
+  --argus-text-muted: #6b7280;
+  --argus-surface: #f1f5f9;
+}
+
+/* ── Light theme overrides ── */
+.light-theme body,
+.light-theme #app { background: #f1f5f9; }
+.light-theme ::-webkit-scrollbar-thumb { background: #cbd5e1; }
+.light-theme ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ── Mobile responsive globals ── */
+@media (max-width: 768px) {
+  /* Ant Design tables: horizontal scroll */
+  .ant-table-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .ant-table { min-width: 600px; }
+
+  /* Touch-friendly buttons */
+  .ant-btn { min-height: 36px; }
+
+  /* Sidebar overlay on mobile */
+  .ant-layout-sider-collapsed { position: absolute !important; z-index: 100; }
+
+  /* Cards: full width */
+  .ant-card { margin-bottom: 8px; }
+}
+
+@media (max-width: 480px) {
+  .ant-layout-content { padding: 8px !important; }
+}

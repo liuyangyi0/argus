@@ -110,6 +110,18 @@ class PersonFilterConfig(BaseModel):
         default=False,
         description="Enable BoT-SORT tracking for persistent object IDs across frames.",
     )
+    sahi_enabled: bool = Field(
+        default=False,
+        description="Enable SAHI sliced inference for small/distant object detection",
+    )
+    sahi_slice_size: int = Field(
+        default=640, ge=320, le=1920,
+        description="SAHI slice width/height in pixels",
+    )
+    sahi_overlap_ratio: float = Field(
+        default=0.25, ge=0.0, le=0.5,
+        description="Overlap ratio between adjacent slices for SAHI",
+    )
 
 
 class CaptureQualityConfig(BaseModel):
@@ -164,11 +176,20 @@ class AnomalyConfig(BaseModel):
     )
     tile_size: int = Field(
         default=512, ge=256, le=1920,
-        description="Tile size in pixels for sliding window (256-1920)",
+        description="Tile size in pixels for sliding window (256-1920). Ignored when pyramid_mode is enabled.",
     )
     tile_overlap: float = Field(
         default=0.25, ge=0.0, le=0.5,
         description="Overlap ratio between adjacent tiles (0.0-0.5)",
+    )
+    pyramid_mode: bool = Field(
+        default=True,
+        description="Use 3-level pyramid (512/768/1024) instead of single tile_size. "
+        "Captures anomalies at different scales — small, medium, and large.",
+    )
+    pyramid_sizes: list[int] = Field(
+        default=[512, 768, 1024],
+        description="Tile sizes for pyramid levels (smallest to largest)",
     )
     # Dinomaly2 parameters (only used when model_type="dinomaly2")
     dinomaly_backbone: str = Field(
@@ -386,12 +407,32 @@ class LowLightConfig(BaseModel):
     pipeline skips the MOG2 pre-filter (which would otherwise discard the
     frame as "no change") and shortens the heartbeat interval so that
     temporal evidence can accumulate and trigger alerts.
+
+    CLAHE (Contrast Limited Adaptive Histogram Equalization) enhances
+    low-light frames before anomaly detection, improving feature visibility
+    at <1ms per frame cost.
     """
 
     enabled: bool = Field(default=True, description="Enable automatic low-light MOG2 bypass")
     brightness_threshold: float = Field(
         default=40.0, ge=5.0, le=128.0,
         description="Mean grayscale brightness below which low-light mode activates",
+    )
+    clahe_enabled: bool = Field(
+        default=True,
+        description="Apply CLAHE preprocessing on low-light frames before anomaly detection",
+    )
+    clahe_clip_limit: float = Field(
+        default=3.0, ge=1.0, le=10.0,
+        description="CLAHE contrast clip limit (higher = more contrast, more noise)",
+    )
+    clahe_grid_size: int = Field(
+        default=8, ge=2, le=16,
+        description="CLAHE tile grid size (NxN tiles for local histogram equalization)",
+    )
+    brightness_jump_threshold: float = Field(
+        default=30.0, ge=5.0, le=100.0,
+        description="Brightness change between frames to freeze MOG2 learning rate",
     )
 
 

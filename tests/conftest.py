@@ -10,6 +10,7 @@ from argus.config.schema import (
     MOG2Config,
     PersonFilterConfig,
 )
+from argus.core.event_bus import EventBus
 
 
 @pytest.fixture
@@ -65,3 +66,17 @@ def camera_config():
 def alert_config():
     """A test alert config."""
     return AlertConfig()
+
+
+@pytest.fixture
+def event_bus():
+    """A fresh EventBus instance, cleared after test."""
+    bus = EventBus()
+    yield bus
+    bus.clear()
+
+
+@pytest.fixture
+def frame_sequence(blank_frame, noisy_frame):
+    """A sequence of 10 frames alternating blank and noisy."""
+    return [blank_frame if i % 2 == 0 else noisy_frame for i in range(10)]

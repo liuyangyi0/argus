@@ -101,6 +101,7 @@ class YOLOObjectDetector:
     - Multi-class COCO detection (configurable class list)
     - BoT-SORT object tracking (persistent track IDs across frames)
     - Gaussian blur masking for person regions (DET-011)
+    - SAHI sliced inference for small/distant object detection
     - Graceful degradation if YOLO unavailable
     """
 
@@ -113,6 +114,9 @@ class YOLOObjectDetector:
         shared_model: Any | None = None,
         classes_to_detect: list[int] | None = None,
         enable_tracking: bool = False,
+        sahi_enabled: bool = False,
+        sahi_slice_size: int = 640,
+        sahi_overlap_ratio: float = 0.25,
     ):
         self.confidence = confidence
         self.skip_frame_on_person = skip_frame_on_person
@@ -123,6 +127,10 @@ class YOLOObjectDetector:
         self._model_name = model_name
         self._shared_model = shared_model
         self._available: bool | None = None  # None = not yet attempted
+        self._sahi_enabled = sahi_enabled
+        self._sahi_slice_size = sahi_slice_size
+        self._sahi_overlap_ratio = sahi_overlap_ratio
+        self._sahi_model = None  # lazy-loaded AutoDetectionModel
 
     def _ensure_model(self):
         """Lazy-load the YOLO model on first use. Degrades gracefully on failure."""
@@ -148,53 +156,101 @@ class YOLOObjectDetector:
                 msg="Person filtering OFFLINE — all frames will be analyzed unfiltered",
             )
 
+    def _detect_sahi(self, frame: np.ndarray) -> list[ObjectDetection]:
+        """Run SAHI sliced inference for small/distant object detection."""
+        try:
+            from sahi import AutoDetectionModel
+            from sahi.predict import get_sliced_prediction
+
+            if self._sahi_model is None:
+                self._sahi_model = AutoDetectionModel.from_pretrained(
+                    model_type="ultralytics",
+                    model=self._model,
+                    confidence_threshold=self.confidence,
+                )
+                logger.info("yolo.sahi_initialized", slice_size=self._sahi_slice_size)
+
+            result = get_sliced_prediction(
+                image=frame,
+                detection_model=self._sahi_model,
+                slice_height=self._sahi_slice_size,
+                slice_width=self._sahi_slice_size,
+                overlap_height_ratio=self._sahi_overlap_ratio,
+                overlap_width_ratio=self._sahi_overlap_ratio,
+                verbose=0,
+            )
+
+            objects: list[ObjectDetection] = []
+            for pred in result.object_prediction_list:
+                bbox = pred.bbox
+                class_id = pred.category.id
+                if class_id not in self.classes_to_detect:
+                    continue
+                class_name = COCO_CLASS_NAMES.get(class_id, f"class_{class_id}")
+                objects.append(ObjectDetection(
+                    x1=int(bbox.minx), y1=int(bbox.miny),
+                    x2=int(bbox.maxx), y2=int(bbox.maxy),
+                    confidence=pred.score.value,
+                    class_id=class_id,
+                    class_name=class_name,
+                ))
+            return objects
+        except Exception as e:
+            logger.warning("yolo.sahi_error", error=str(e), error_type=type(e).__name__)
+            return []
+
     def detect(self, frame: np.ndarray) -> ObjectDetectionResult:
         """Detect objects in the frame.
 
         Returns empty result if YOLO is unavailable (graceful degradation).
+        Uses SAHI sliced inference when enabled for small object detection.
         """
         self._ensure_model()
 
         if not self._available:
             return PersonFilterResult(persons=[], has_persons=False, filter_available=False)
 
-        # YOLO-002: Use tracking if enabled, otherwise standard predict
-        if self.enable_tracking:
-            results = self._model.track(
-                frame,
-                classes=self.classes_to_detect,
-                conf=self.confidence,
-                persist=True,
-                verbose=False,
-            )
+        # SAHI sliced inference for small/distant objects
+        if self._sahi_enabled:
+            objects = self._detect_sahi(frame)
         else:
-            results = self._model.predict(
-                frame,
-                classes=self.classes_to_detect,
-                conf=self.confidence,
-                verbose=False,
-            )
+            # YOLO-002: Use tracking if enabled, otherwise standard predict
+            if self.enable_tracking:
+                results = self._model.track(
+                    frame,
+                    classes=self.classes_to_detect,
+                    conf=self.confidence,
+                    persist=True,
+                    verbose=False,
+                )
+            else:
+                results = self._model.predict(
+                    frame,
+                    classes=self.classes_to_detect,
+                    conf=self.confidence,
+                    verbose=False,
+                )
 
-        objects: list[ObjectDetection] = []
-        if results and results[0].boxes is not None:
-            for box in results[0].boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                conf = float(box.conf[0])
-                class_id = int(box.cls[0])
-                class_name = COCO_CLASS_NAMES.get(class_id, f"class_{class_id}")
+            objects = []
+            if results and results[0].boxes is not None:
+                for box in results[0].boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    conf = float(box.conf[0])
+                    class_id = int(box.cls[0])
+                    class_name = COCO_CLASS_NAMES.get(class_id, f"class_{class_id}")
 
-                # YOLO-002: Extract track ID if available
-                track_id = None
-                if self.enable_tracking and box.id is not None:
-                    track_id = int(box.id[0])
+                    # YOLO-002: Extract track ID if available
+                    track_id = None
+                    if self.enable_tracking and box.id is not None:
+                        track_id = int(box.id[0])
 
-                objects.append(ObjectDetection(
-                    x1=x1, y1=y1, x2=x2, y2=y2,
-                    confidence=conf,
-                    class_id=class_id,
-                    class_name=class_name,
-                    track_id=track_id,
-                ))
+                    objects.append(ObjectDetection(
+                        x1=x1, y1=y1, x2=x2, y2=y2,
+                        confidence=conf,
+                        class_id=class_id,
+                        class_name=class_name,
+                        track_id=track_id,
+                    ))
 
         # Split into persons vs non-person objects
         persons = [o for o in objects if o.class_id == 0]

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -27,7 +28,19 @@ import structlog
 
 import uuid
 
+# Dedicated thread pool for parallel YOLO+Anomaly inference
+# Separate from default asyncio pool to avoid blocking API requests (see CLAUDE.md)
+_INFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inference")
+
 from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
+from types import MappingProxyType
+
+from argus.core.event_bus import (
+    EventBus,
+    FrameAnalyzed,
+    AlertRaised,
+)
+from argus.core.metrics import METRICS
 from argus.core.alert_ring_buffer import AlertFrameBuffer, FrameSnapshot, RecordingStatus, compress_frame
 from argus.storage.models import AlertRecordingRecord
 from argus.anomaly.detector import AnomalibDetector, AnomalyResult, DetectorStatus
@@ -141,10 +154,12 @@ class DetectionPipeline:
         feedback_manager: object | None = None,
         recording_store: object | None = None,
         database: object | None = None,
+        event_bus: EventBus | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
         self._on_drift = on_drift
+        self._event_bus = event_bus
         self._model_version_id = model_version_id
         self._shadow_runner = shadow_runner
         self._feedback_manager = feedback_manager
@@ -153,6 +168,19 @@ class DetectionPipeline:
         self.stats = PipelineStats()
         self._classifier_config = classifier_config
         self._segmenter_config = segmenter_config
+
+        # Pre-cache Prometheus metric children (avoids per-frame .labels() lock)
+        _cid = camera_config.camera_id
+        self._m_latency = METRICS.inference_latency.labels(camera_id=_cid)
+        self._m_frames = METRICS.frames_processed.labels(camera_id=_cid)
+        self._m_skipped_mog2 = METRICS.frames_skipped.labels(camera_id=_cid, reason="mog2_no_change")
+        _zone_id = camera_config.zones[0].zone_id if camera_config.zones else "default"
+        self._m_anomaly_score = METRICS.anomaly_score.labels(camera_id=_cid, zone_id=_zone_id)
+        # Stage metrics: pre-cache known stages, with fallback for dynamic ones
+        self._m_stages: dict[str, object] = {
+            name: METRICS.pipeline_stage_seconds.labels(camera_id=_cid, stage=name)
+            for name in ("zone_mask", "mog2", "yolo", "anomaly", "simplex")
+        }
 
         # Stage 0: Zone masking
         self._zone_mask = ZoneMaskEngine(
@@ -171,7 +199,7 @@ class DetectionPipeline:
             enable_stabilization=camera_config.mog2.enable_stabilization,
         )
 
-        # Stage 2: Object detection (YOLO-003: multi-class + tracking)
+        # Stage 2: Object detection (YOLO-003: multi-class + tracking + SAHI)
         self._object_detector = YOLOObjectDetector(
             model_name=camera_config.person_filter.model_name,
             confidence=camera_config.person_filter.confidence,
@@ -179,6 +207,9 @@ class DetectionPipeline:
             shared_model=shared_yolo_model,
             classes_to_detect=camera_config.person_filter.classes_to_detect,
             enable_tracking=camera_config.person_filter.enable_tracking,
+            sahi_enabled=camera_config.person_filter.sahi_enabled,
+            sahi_slice_size=camera_config.person_filter.sahi_slice_size,
+            sahi_overlap_ratio=camera_config.person_filter.sahi_overlap_ratio,
         )
 
         # Stage 3: Anomaly detector — auto-discover trained model
@@ -207,12 +238,16 @@ class DetectionPipeline:
                 base_detector=base_detector,
                 tile_size=camera_config.anomaly.tile_size,
                 tile_overlap=camera_config.anomaly.tile_overlap,
+                pyramid_mode=camera_config.anomaly.pyramid_mode,
+                pyramid_sizes=camera_config.anomaly.pyramid_sizes,
             )
             logger.info(
                 "pipeline.multiscale_enabled",
                 camera_id=camera_config.camera_id,
                 tile_size=camera_config.anomaly.tile_size,
                 tile_overlap=camera_config.anomaly.tile_overlap,
+                pyramid_mode=camera_config.anomaly.pyramid_mode,
+                pyramid_sizes=camera_config.anomaly.pyramid_sizes,
             )
         else:
             self._anomaly_detector = base_detector
@@ -261,6 +296,17 @@ class DetectionPipeline:
         self._low_light_threshold = ll_cfg.brightness_threshold
         self._low_light_heartbeat_seconds = alert_config.temporal.max_gap_seconds / 2
         self._was_low_light = False
+        self._prev_brightness: float | None = None
+        self._brightness_jump_threshold = ll_cfg.brightness_jump_threshold
+
+        # CLAHE preprocessing for low-light enhancement (<1ms/frame)
+        self._clahe_enabled = ll_cfg.clahe_enabled and ll_cfg.enabled
+        self._clahe: cv2.CLAHE | None = None
+        if self._clahe_enabled:
+            self._clahe = cv2.createCLAHE(
+                clipLimit=ll_cfg.clahe_clip_limit,
+                tileGridSize=(ll_cfg.clahe_grid_size, ll_cfg.clahe_grid_size),
+            )
 
         # Anti-absorption: anomaly region lock with time-based clearing (HIGH-03)
         self._locked = False
@@ -275,8 +321,9 @@ class DetectionPipeline:
         # Thread safety for hot-updates
         self._config_lock = threading.Lock()
 
-        # Cached per-zone anomaly masks (invalidated on update_zones)
+        # Cached per-zone anomaly masks (invalidated on update_zones, bounded to 64)
         self._zone_mask_cache: dict[tuple[str, int, int], np.ndarray] = {}
+        self._zone_mask_cache_limit = 64
 
         # Thread safety for anomaly lock state (HIGH-03)
         self._lock_state_lock = threading.Lock()
@@ -297,8 +344,8 @@ class DetectionPipeline:
         self._mode = PipelineMode.ACTIVE
         self._mode_lock = threading.Lock()
 
-        # DET-008: Per-frame diagnostics ring buffer
-        self._diagnostics = DiagnosticsBuffer(maxlen=1500, score_maxlen=300)
+        # DET-008: Per-frame diagnostics ring buffer (500 ≈ 100s @ 5 FPS)
+        self._diagnostics = DiagnosticsBuffer(maxlen=500, score_maxlen=300)
 
         # FR-033: Alert ring buffer for replay recordings
         rb_cfg = camera_config.ring_buffer
@@ -555,10 +602,26 @@ class DetectionPipeline:
 
         # Low-light detection: bypass MOG2 when scene is dark
         is_low_light = False
+        brightness_jump = False
         if self._low_light_enabled:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mean_brightness = float(gray.mean())
             is_low_light = mean_brightness < self._low_light_threshold
+
+            # Brightness jump detection: freeze MOG2 on sudden illumination changes
+            if self._prev_brightness is not None:
+                delta = abs(mean_brightness - self._prev_brightness)
+                if delta >= self._brightness_jump_threshold:
+                    brightness_jump = True
+                    logger.info(
+                        "pipeline.brightness_jump",
+                        camera_id=frame_data.camera_id,
+                        delta=round(delta, 1),
+                        prev=round(self._prev_brightness, 1),
+                        current=round(mean_brightness, 1),
+                    )
+            self._prev_brightness = mean_brightness
+
             if is_low_light and not self._was_low_light:
                 logger.warning(
                     "pipeline.low_light_entered",
@@ -572,6 +635,12 @@ class DetectionPipeline:
                     brightness=round(mean_brightness, 1),
                 )
             self._was_low_light = is_low_light
+
+            # CLAHE low-light enhancement: equalize frame before detection stages
+            if is_low_light and self._clahe is not None:
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
+                frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         diag.low_light = is_low_light
 
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
@@ -593,7 +662,8 @@ class DetectionPipeline:
         skip_prefilter = is_heartbeat or is_locked or is_low_light
 
         # DET-006: MAINTENANCE mode freezes MOG2 learning on all frames
-        freeze_mog2 = current_mode == PipelineMode.MAINTENANCE
+        # Also freeze on brightness jumps to prevent background model corruption
+        freeze_mog2 = current_mode == PipelineMode.MAINTENANCE or brightness_jump
 
         mog2_skipped = False
         if not skip_prefilter:
@@ -606,6 +676,7 @@ class DetectionPipeline:
             if not prefilter_result.has_change:
                 self.stats.frames_skipped_no_change += 1
                 mog2_skipped = True
+                self._m_skipped_mog2.inc()
                 diag.stages.append(StageResult(
                     stage_name="mog2",
                     duration_ms=(time.monotonic() - t1) * 1000,
@@ -623,47 +694,79 @@ class DetectionPipeline:
             if is_heartbeat:
                 self.stats.frames_heartbeat += 1
 
-        # Stage 2: Person filter
+        # Stage 2+3: YOLO person filter + Anomaly detection
+        # When skip_frame_on_person=True (nuclear plant default), run both in
+        # parallel via ThreadPoolExecutor to overlap YOLO 15-30ms with Anomalib.
+        # Correctness note: when skip_on_person=True AND YOLO finds no persons,
+        # the frame is never masked (there's nobody to blur), so anomaly running
+        # on the original frame produces the same result as sequential mode.
+        # When skip_frame_on_person=False, person masking produces masked_frame
+        # needed by anomaly, so stages must remain sequential.
         t2 = time.monotonic()
-        detection_result: ObjectDetectionResult = self._object_detector.detect(frame)
+        skip_on_person = self.camera_config.person_filter.skip_frame_on_person
 
-        # HIGH-04: Warn once if person filter is unavailable
-        if not detection_result.filter_available and not self._person_filter_warned:
-            self._person_filter_warned = True
-            logger.warning(
-                "pipeline.person_filter_offline",
-                camera_id=self.camera_config.camera_id,
-                msg="YOLO person filter unavailable — frames will not be filtered for humans",
+        if skip_on_person:
+            # Parallel: submit both to thread pool concurrently
+            yolo_future: Future = _INFERENCE_EXECUTOR.submit(
+                self._object_detector.detect, frame,
             )
+            anomaly_future: Future = _INFERENCE_EXECUTOR.submit(
+                self._anomaly_detector.predict, frame,
+            )
+            detection_result: ObjectDetectionResult = yolo_future.result()
+            t2_yolo_done = time.monotonic()
+            anomaly_result: AnomalyResult = anomaly_future.result()
+            t3_anomaly_done = time.monotonic()
 
-        if detection_result.has_persons and self.camera_config.person_filter.skip_frame_on_person:
-            self.stats.frames_skipped_person += 1
-            # HIGH-03: Still update lock state even when person filter skips
-            self._update_lock_state_time(time.monotonic())
-            return None
+            # HIGH-04: Warn once if person filter is unavailable
+            if not detection_result.filter_available and not self._person_filter_warned:
+                self._person_filter_warned = True
+                logger.warning(
+                    "pipeline.person_filter_offline",
+                    camera_id=self.camera_config.camera_id,
+                    msg="YOLO person filter unavailable — frames will not be filtered for humans",
+                )
+
+            if detection_result.has_persons:
+                self.stats.frames_skipped_person += 1
+                self._update_lock_state_time(time.monotonic())
+                return None
+        else:
+            # Sequential: YOLO first (need masked_frame for person blurring), then anomaly
+            detection_result = self._object_detector.detect(frame)
+            t2_yolo_done = time.monotonic()
+
+            if not detection_result.filter_available and not self._person_filter_warned:
+                self._person_filter_warned = True
+                logger.warning(
+                    "pipeline.person_filter_offline",
+                    camera_id=self.camera_config.camera_id,
+                    msg="YOLO person filter unavailable — frames will not be filtered for humans",
+                )
+
+            # When persons found but skip disabled: use masked_frame with persons blurred
+            analysis_frame = (
+                detection_result.masked_frame if detection_result.masked_frame is not None else frame
+            )
+            anomaly_result = self._anomaly_detector.predict(analysis_frame)
+            t3_anomaly_done = time.monotonic()
 
         diag.stages.append(StageResult(
             stage_name="yolo",
-            duration_ms=(time.monotonic() - t2) * 1000,
+            duration_ms=(t2_yolo_done - t2) * 1000,
             metadata={
                 "person_count": len(detection_result.persons),
                 "object_count": len(detection_result.objects),
                 "classes": [o.class_name for o in detection_result.non_person_objects],
                 "track_ids": [o.track_id for o in detection_result.objects if o.track_id is not None],
+                "parallel": skip_on_person,
             },
         ))
 
-        analysis_frame = (
-            detection_result.masked_frame if detection_result.masked_frame is not None else frame
-        )
-
-        # Stage 3: Anomaly detection
-        t3 = time.monotonic()
-        anomaly_result: AnomalyResult = self._anomaly_detector.predict(analysis_frame)
         self.stats.frames_analyzed += 1
         diag.stages.append(StageResult(
             stage_name="anomaly",
-            duration_ms=(time.monotonic() - t3) * 1000,
+            duration_ms=(t3_anomaly_done - t2) * 1000 if skip_on_person else (t3_anomaly_done - t2_yolo_done) * 1000,
             metadata={"score": round(anomaly_result.anomaly_score, 4)},
         ))
         diag.anomaly_score = anomaly_result.anomaly_score
@@ -989,6 +1092,41 @@ class DetectionPipeline:
         diag.total_duration_ms = (time.monotonic() - start) * 1000
         self._last_detection_failed = anomaly_result.detection_failed
 
+        cam_id = frame_data.camera_id
+
+        # Prometheus metrics (children pre-cached at __init__ to avoid per-frame lock)
+        self._m_latency.observe(diag.total_duration_ms / 1000.0)
+        self._m_frames.inc()
+        for s in diag.stages:
+            m = self._m_stages.get(s.stage_name) or self._m_stages_fallback(s.stage_name)
+            m.observe(s.duration_ms / 1000.0)
+        self._m_anomaly_score.set(anomaly_result.anomaly_score)
+        if alert is not None:
+            METRICS.alerts_total.labels(
+                camera_id=cam_id, severity=alert.severity.value,
+            ).inc()
+
+        # Event bus (skip allocation if no subscribers)
+        if self._event_bus is not None and self._event_bus.has_subscribers(FrameAnalyzed):
+            self._event_bus.publish(FrameAnalyzed(
+                camera_id=cam_id,
+                frame_number=frame_data.frame_number,
+                anomaly_score=anomaly_result.anomaly_score,
+                is_anomalous=anomaly_result.is_anomalous,
+                stage_latencies=MappingProxyType({s.stage_name: s.duration_ms for s in diag.stages}),
+                mog2_skipped=mog2_skipped,
+                person_detected=detection_result.has_persons,
+            ))
+        if self._event_bus is not None and alert is not None and self._event_bus.has_subscribers(AlertRaised):
+            self._event_bus.publish(AlertRaised(
+                alert_id=alert.alert_id,
+                camera_id=cam_id,
+                zone_id=alert.zone_id,
+                severity=alert.severity,
+                anomaly_score=alert.anomaly_score,
+                handling_policy=alert.handling_policy,
+            ))
+
         # 5.2: Build InferenceRecord only for non-NORMAL frames (avoid
         # uuid4/time_ns/dict-comprehension overhead on every frame)
         if alert is not None:
@@ -1276,6 +1414,14 @@ class DetectionPipeline:
             "score_sparkline": [round(s, 3) for s in sparkline],
         }
 
+    def _m_stages_fallback(self, stage_name: str) -> object:
+        """Lazily create and cache a stage metric child for an unexpected stage name."""
+        child = METRICS.pipeline_stage_seconds.labels(
+            camera_id=self.camera_config.camera_id, stage=stage_name,
+        )
+        self._m_stages[stage_name] = child
+        return child
+
     def get_latest_frame(self) -> np.ndarray | None:
         """Get a copy of the latest processed frame for live preview."""
         with self._latest_frame_lock:
@@ -1498,6 +1644,9 @@ class DetectionPipeline:
             )
             zone_mask = np.zeros((map_h, map_w), dtype=np.uint8)
             cv2.fillPoly(zone_mask, [scaled_pts], 255)
+            if len(self._zone_mask_cache) >= self._zone_mask_cache_limit:
+                oldest_key = next(iter(self._zone_mask_cache))
+                del self._zone_mask_cache[oldest_key]
             self._zone_mask_cache[cache_key] = zone_mask
 
         zone_values = anomaly_map[zone_mask > 0]

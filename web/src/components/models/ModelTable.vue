@@ -7,8 +7,9 @@ import {
 import {
   ReloadOutlined, CheckOutlined, RollbackOutlined, DeleteOutlined,
   ExperimentOutlined, HistoryOutlined, LoadingOutlined,
-  DownOutlined, ExportOutlined, AimOutlined,
+  DownOutlined, ExportOutlined, AimOutlined, SwapOutlined,
 } from '@ant-design/icons-vue'
+import { useRouter } from 'vue-router'
 import {
   activateModel, rollbackModel, deleteModel,
   promoteModel, retireModel,
@@ -25,6 +26,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   changed: []
 }>()
+
+const router = useRouter()
 
 // ── State ──
 const activatingModel = ref<string | null>(null)
@@ -265,6 +268,13 @@ function handleRecalibrate(record: any) {
 
 // ── Dropdown menu dispatcher ──
 
+function handleOpenABCompare(record: any) {
+  router.push({
+    path: '/models',
+    query: { tab: 'comparison', camera: record.camera_id, shadow: record.model_version_id },
+  })
+}
+
 function handleMenuClick(record: any, { key }: { key: string }) {
   switch (key) {
     case 'reexport': handleReexport(record); break
@@ -272,6 +282,7 @@ function handleMenuClick(record: any, { key }: { key: string }) {
     case 'retire': handleRetire(record); break
     case 'delete': handleDeleteModel(record); break
     case 'shadow-report': handleViewShadowReport(record); break
+    case 'ab-compare': handleOpenABCompare(record); break
     case 'stage-history': handleViewStageHistory(record); break
   }
 }
@@ -383,8 +394,11 @@ const columns = [
                     <AimOutlined /> 重新校准
                   </Menu.Item>
                   <Menu.Divider />
-                  <Menu.Item v-if="record.stage === 'shadow'" key="shadow-report">
+                  <Menu.Item v-if="record.stage === 'shadow' || record.stage === 'canary'" key="shadow-report">
                     <ExperimentOutlined /> 影子报告
+                  </Menu.Item>
+                  <Menu.Item v-if="record.stage === 'shadow' || record.stage === 'canary'" key="ab-compare">
+                    <SwapOutlined /> A/B 详细对比
                   </Menu.Item>
                   <Menu.Item key="stage-history">
                     <HistoryOutlined /> 阶段历史
