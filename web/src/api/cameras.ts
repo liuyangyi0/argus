@@ -10,6 +10,7 @@ export const startCamera = (id: string) => api.post(`/cameras/${id}/start`).then
 export const stopCamera = (id: string) => api.post(`/cameras/${id}/stop`).then(u)
 export const getUsbDevices = () => api.get('/cameras/usb-devices').then(u)
 export const addCamera = (data: FormData) => api.post('/cameras', data).then(u)
+export const deleteCamera = (id: string) => api.delete(`/cameras/${id}`).then(u)
 
 // ── Streaming (go2rtc) ──
 export const getStreamInfo = (id: string) => api.get(`/streaming/${id}`).then(u)

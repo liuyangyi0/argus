@@ -12,3 +12,6 @@ export const bulkAcknowledge = (ids: string[]) =>
   api.post('/alerts/bulk-acknowledge', { alert_ids: ids }).then(u)
 export const bulkFalsePositive = (ids: string[]) =>
   api.post('/alerts/bulk-false-positive', { alert_ids: ids }).then(u)
+export const deleteAlert = (id: string) => api.delete(`/alerts/${id}`).then(u)
+export const bulkDeleteAlerts = (ids: string[]) =>
+  api.post('/alerts/bulk-delete', { alert_ids: ids }).then(u)

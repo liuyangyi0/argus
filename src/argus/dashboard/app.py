@@ -110,10 +110,13 @@ def create_app(
             go2rtc.close()
         await ws_manager.stop()
 
-        # Shut down thread pools
+        # Shut down thread pools AFTER uvicorn stops accepting requests.
+        # Use wait=True so in-flight tasks finish before the executor is
+        # torn down.  cancel_futures=True (Python 3.9+) cancels queued-but-
+        # not-started futures to avoid blocking on stale work.
         from argus.dashboard.routes.cameras import _STREAM_EXECUTOR
-        _STREAM_EXECUTOR.shutdown(wait=False)
-        _default_executor.shutdown(wait=False)
+        _STREAM_EXECUTOR.shutdown(wait=True, cancel_futures=True)
+        _default_executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(
         title="Argus - 核电站异物检测系统",

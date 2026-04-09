@@ -4,8 +4,8 @@ import { useRouter } from 'vue-router'
 
 defineOptions({ name: 'CamerasPage' })
 import { Table, Badge, Button, Typography, Space, Modal, Form, Input, Select, InputNumber, message } from 'ant-design-vue'
-import { PlusOutlined } from '@ant-design/icons-vue'
-import { getCameras, startCamera, stopCamera, getUsbDevices, addCamera } from '../api'
+import { PlusOutlined, DeleteOutlined } from '@ant-design/icons-vue'
+import { getCameras, startCamera, stopCamera, getUsbDevices, addCamera, deleteCamera } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
 const router = useRouter()
@@ -81,6 +81,25 @@ async function handleStart(id: string) {
 async function handleStop(id: string) {
   await stopCamera(id)
   fetchData()
+}
+
+function handleDelete(id: string) {
+  Modal.confirm({
+    title: '确认删除',
+    content: `确定要删除摄像头 "${id}" 吗？删除后需重新添加。`,
+    okText: '删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        await deleteCamera(id)
+        message.success('摄像头已删除')
+        fetchData()
+      } catch (e: any) {
+        message.error(e.message || '删除失败')
+      }
+    },
+  })
 }
 
 async function handleAddCamera() {
@@ -208,6 +227,9 @@ const columns = [
             </Button>
             <Button size="small" @click="router.push(`/cameras/${record.camera_id}`)">
               详情
+            </Button>
+            <Button size="small" danger @click="handleDelete(record.camera_id)">
+              <template #icon><DeleteOutlined /></template>
             </Button>
           </Space>
         </template>

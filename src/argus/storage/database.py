@@ -258,6 +258,24 @@ class Database:
                 stmt = stmt.where(AlertRecord.severity == severity)
             return session.scalar(stmt) or 0
 
+    def delete_alert(self, alert_id: str) -> tuple[bool, list[str]]:
+        """Delete a single alert by ID. Returns (success, image_paths)."""
+        with self.get_session() as session:
+            record = session.scalar(
+                select(AlertRecord).where(AlertRecord.alert_id == alert_id)
+            )
+            if record is None:
+                return False, []
+            image_paths = []
+            if record.snapshot_path:
+                image_paths.append(record.snapshot_path)
+            if record.heatmap_path:
+                image_paths.append(record.heatmap_path)
+            session.delete(record)
+            session.commit()
+            logger.info("database.alert_deleted", alert_id=alert_id)
+            return True, image_paths
+
     def delete_old_alerts(self, days: int = 90) -> tuple[int, list[str]]:
         """Delete alerts older than N days. Returns (count_deleted, image_paths).
 
