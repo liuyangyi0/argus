@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, watch, ref } from 'vue'
-import { Badge, Typography } from 'ant-design-vue'
+import { Badge, Typography, Tooltip } from 'ant-design-vue'
+import {
+  WarningOutlined,
+  BellOutlined,
+  CheckCircleOutlined,
+} from '@ant-design/icons-vue'
 import Sparkline from './Sparkline.vue'
 import { useGo2RTC } from '../composables/useGo2RTC'
 
@@ -9,6 +14,7 @@ export interface CameraTileData {
   name: string
   status: string
   model_version?: string
+  fps?: number
   current_score: number
   score_sparkline: number[]
   alert_count_today: number
@@ -23,6 +29,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'dblclick', cameraId: string): void
+  (e: 'alert-click', alertId: string): void
 }>()
 
 const borderStyle = computed(() => {
@@ -45,7 +52,7 @@ const statusBadge = computed(() => {
 
 // go2rtc WebRTC/MSE player
 const cameraIdRef = computed(() => props.camera.camera_id)
-const { videoRef, status: streamStatus, start, stop } = useGo2RTC(cameraIdRef)
+const { videoRef, mjpegRef, status: streamStatus, start, stop } = useGo2RTC(cameraIdRef)
 
 // Legacy MJPEG fallback URL
 const mjpegUrl = computed(() => `/api/cameras/${props.camera.camera_id}/stream`)
@@ -55,8 +62,6 @@ const tileRef = ref<HTMLElement | null>(null)
 let observer: IntersectionObserver | null = null
 
 onMounted(() => {
-  // IntersectionObserver is the sole trigger for start/stop —
-  // it fires immediately for visible elements on mount.
   if (tileRef.value) {
     observer = new IntersectionObserver(
       ([entry]) => {
@@ -84,6 +89,13 @@ watch(() => props.camera.status, (newStatus, oldStatus) => {
 onUnmounted(() => {
   observer?.disconnect()
 })
+
+function handleAlertBadgeClick(e: MouseEvent) {
+  e.stopPropagation()
+  if (props.camera.active_alert) {
+    emit('alert-click', props.camera.active_alert.alert_id)
+  }
+}
 </script>
 
 <template>
@@ -100,20 +112,45 @@ onUnmounted(() => {
     }"
     @dblclick="emit('dblclick', camera.camera_id)"
   >
-    <!-- Header -->
-    <div style="display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: #0f0f1a; flex-shrink: 0">
-      <Badge :status="statusBadge" />
+    <!-- Header: 20px status bar -->
+    <div style="display: flex; align-items: center; gap: 6px; padding: 3px 10px; background: #141414; flex-shrink: 0; min-height: 20px">
       <Typography.Text strong style="font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
         {{ camera.name || camera.camera_id }}
       </Typography.Text>
-      <Typography.Text v-if="camera.model_version" type="secondary" style="font-size: 10px">
+      <Typography.Text v-if="camera.model_version" type="secondary" style="font-size: 9px; flex-shrink: 0">
         {{ camera.model_version.slice(0, 8) }}
       </Typography.Text>
+      <!-- Status icons cluster -->
+      <div style="display: flex; align-items: center; gap: 4px; flex-shrink: 0">
+        <!-- Online/offline -->
+        <Tooltip :title="camera.status === 'online' ? '在线' : '离线'">
+          <CheckCircleOutlined
+            v-if="camera.status === 'online'"
+            style="font-size: 12px; color: #22c55e"
+          />
+          <span v-else style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #6b7280" />
+        </Tooltip>
+        <!-- Degradation warning -->
+        <Tooltip v-if="camera.degradation" :title="`降级: ${camera.degradation}`">
+          <WarningOutlined style="font-size: 12px; color: #f59e0b" />
+        </Tooltip>
+        <!-- Active alert -->
+        <Tooltip v-if="camera.active_alert" :title="`活跃告警 (${camera.active_alert.severity})`">
+          <BellOutlined
+            :style="{
+              fontSize: '12px',
+              color: camera.active_alert.severity === 'high' ? '#ef4444' : '#f97316',
+              cursor: 'pointer',
+            }"
+            @click="handleAlertBadgeClick"
+          />
+        </Tooltip>
+      </div>
     </div>
 
     <!-- Video stream -->
     <div style="flex: 1; min-height: 0; position: relative; background: #000">
-      <!-- WebRTC / MSE via go2rtc — always in DOM so videoRef is never null -->
+      <!-- WebRTC / MSE via go2rtc -->
       <video
         ref="videoRef"
         autoplay
@@ -122,8 +159,9 @@ onUnmounted(() => {
         v-show="camera.status === 'online' && (streamStatus === 'playing' || streamStatus === 'connecting')"
         style="width: 100%; height: 100%; object-fit: contain; display: block"
       />
-      <!-- MJPEG fallback when go2rtc is unavailable -->
+      <!-- MJPEG fallback -->
       <img
+        ref="mjpegRef"
         v-if="camera.status === 'online' && streamStatus === 'fallback'"
         :src="mjpegUrl"
         style="width: 100%; height: 100%; object-fit: contain; display: block"
@@ -143,13 +181,34 @@ onUnmounted(() => {
       >
         连接中...
       </div>
+      <!-- FPS label overlay -->
+      <div
+        v-if="camera.status === 'online'"
+        style="position: absolute; top: 4px; right: 4px; background: rgba(0,0,0,0.6); padding: 1px 6px; border-radius: 3px; font-size: 10px; color: #9ca3af; pointer-events: none"
+      >
+        {{ camera.fps || '--' }} FPS
+      </div>
     </div>
 
-    <!-- Footer -->
-    <div style="display: flex; align-items: center; gap: 8px; padding: 4px 10px; background: #0f0f1a; flex-shrink: 0">
-      <Sparkline :data="camera.score_sparkline" :width="80" :height="20" :color="camera.current_score > 0.7 ? '#ef4444' : '#3b82f6'" />
-      <Typography.Text type="secondary" style="font-size: 11px; margin-left: auto">
-        {{ camera.alert_count_today }} 告警
+    <!-- Footer: 28px status bar -->
+    <div style="display: flex; align-items: center; gap: 8px; padding: 4px 10px; background: #0f0f1a; flex-shrink: 0; min-height: 28px">
+      <div style="flex: 1; min-width: 0">
+        <Sparkline
+          :data="camera.score_sparkline"
+          :width="0"
+          :height="22"
+          :color="camera.current_score > 0.7 ? '#ef4444' : '#3b82f6'"
+          style="width: 100%"
+        />
+      </div>
+      <Badge
+        v-if="camera.alert_count_today > 0"
+        :count="camera.alert_count_today"
+        :number-style="{ backgroundColor: '#ef4444', fontSize: '10px', minWidth: '16px', height: '16px', lineHeight: '16px', padding: '0 4px', boxShadow: 'none' }"
+        style="flex-shrink: 0"
+      />
+      <Typography.Text v-else type="secondary" style="font-size: 10px; flex-shrink: 0">
+        0
       </Typography.Text>
     </div>
   </div>

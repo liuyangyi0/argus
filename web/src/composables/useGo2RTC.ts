@@ -17,6 +17,12 @@ const MAX_RETRIES = 3
 const RETRY_BASE_MS = 2000
 const MAX_RECONNECT = 3
 
+// ── Connection budget ──
+// HTTP/1.1 allows ~6 concurrent connections per origin.  Reserve 2 for
+// API requests + WebSocket, leaving at most 4 for live video streams.
+const MAX_CONCURRENT_STREAMS = 4
+let _activeStreamCount = 0
+
 interface StreamInfo {
   camera_id: string
   go2rtc: boolean
@@ -27,6 +33,7 @@ interface StreamInfo {
 
 export function useGo2RTC(cameraId: Ref<string> | string) {
   const videoRef = ref<HTMLVideoElement | null>(null)
+  const mjpegRef = ref<HTMLImageElement | null>(null)
   const status = ref<StreamStatus>('idle')
 
   let pc: RTCPeerConnection | null = null
@@ -238,13 +245,29 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
     })
   }
 
+  let _counted = false  // whether this instance holds a stream budget slot
+
+  function releaseBudget() {
+    if (_counted) {
+      _activeStreamCount = Math.max(0, _activeStreamCount - 1)
+      _counted = false
+    }
+  }
+
   async function start() {
     stop()
+    if (_activeStreamCount >= MAX_CONCURRENT_STREAMS) {
+      console.warn(`[go2rtc] connection budget exhausted (${_activeStreamCount}/${MAX_CONCURRENT_STREAMS})`)
+      status.value = 'error'
+      return
+    }
+    _activeStreamCount++
+    _counted = true
     const thisGen = ++generation
     status.value = 'connecting'
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (thisGen !== generation) return
+      if (thisGen !== generation) return  // stop() was called, budget already released
 
       if (attempt > 0) {
         await new Promise(r => setTimeout(r, RETRY_BASE_MS * Math.pow(2, attempt - 1)))
@@ -255,7 +278,11 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
       if (thisGen !== generation) return
 
       if (!info) {
-        if (attempt === MAX_RETRIES) { status.value = 'error'; return }
+        if (attempt === MAX_RETRIES) {
+          releaseBudget()
+          status.value = 'error'
+          return
+        }
         continue
       }
 
@@ -276,6 +303,9 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
       }
     }
 
+    // Fallback to MJPEG — release budget since MJPEG uses <img> tag, not a
+    // WebRTC/MSE connection tracked by the budget counter.
+    releaseBudget()
     status.value = 'fallback'
   }
 
@@ -320,6 +350,11 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
       videoRef.value.srcObject = null
       videoRef.value.src = ''
     }
+    // Force-close any active MJPEG HTTP connection
+    if (mjpegRef.value) {
+      mjpegRef.value.src = ''
+    }
+    releaseBudget()
     status.value = 'idle'
   }
 
@@ -327,6 +362,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
   return {
     videoRef,
+    mjpegRef,
     status,
     start,
     stop,

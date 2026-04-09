@@ -8,6 +8,7 @@ go2rtc handles camera video streaming (WebRTC/MSE/HLS).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -72,6 +73,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Expand the default asyncio thread pool for non-streaming API requests
+        _default_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=16, thread_name_prefix="api-default",
+        )
+        asyncio.get_running_loop().set_default_executor(_default_executor)
+
         await ws_manager.start()
 
         # Start go2rtc and register RTSP cameras
@@ -98,6 +105,11 @@ def create_app(
         if go2rtc is not None:
             go2rtc.close()
         await ws_manager.stop()
+
+        # Shut down thread pools
+        from argus.dashboard.routes.cameras import _STREAM_EXECUTOR
+        _STREAM_EXECUTOR.shutdown(wait=False)
+        _default_executor.shutdown(wait=False)
 
     app = FastAPI(
         title="Argus - 核电站异物检测系统",
