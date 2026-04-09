@@ -51,6 +51,7 @@ def create_app(
     config: object | None = None,
     config_path: str | None = None,
     task_manager: object | None = None,
+    go2rtc_instance: Go2RTCManager | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
     from argus.anomaly.baseline_lifecycle import BaselineLifecycle
@@ -62,9 +63,9 @@ def create_app(
         max_connections=dashboard_config.websocket_max_connections,
     )
 
-    # go2rtc streaming proxy
-    go2rtc: Go2RTCManager | None = None
-    if dashboard_config.go2rtc_enabled:
+    # go2rtc streaming proxy — reuse instance from __main__ if provided
+    go2rtc: Go2RTCManager | None = go2rtc_instance
+    if go2rtc is None and dashboard_config.go2rtc_enabled:
         go2rtc = Go2RTCManager(
             api_port=dashboard_config.go2rtc_api_port,
             rtsp_port=dashboard_config.go2rtc_rtsp_port,
