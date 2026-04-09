@@ -49,3 +49,45 @@ pip install -e ".[dev]"
 - 框架: pytest + pytest-asyncio（asyncio_mode = "auto"）
 - 已知预存失败: `test_dashboard.py::TestCompositeGeneration::test_generate_composite_missing_file` — ultralytics monkey-patch `cv2.imread` 导致，与业务逻辑无关
 - 运行全量测试约 30 秒
+
+## 踩坑记录
+
+### ❌ 禁止使用 Starlette `BaseHTTPMiddleware`
+
+**绝对不要** 在本项目中使用 `starlette.middleware.base.BaseHTTPMiddleware`。
+
+**原因**: `BaseHTTPMiddleware` 会将 `StreamingResponse`（如 MJPEG 视频流）的每一帧通过内部 asyncio queue 中转，阻塞事件循环直到整个流结束（最长 30 分钟）。多层 `BaseHTTPMiddleware` 叠加后，所有其他 HTTP 请求完全无法处理，导致前端切页后全部请求超时。
+
+**正确做法**: 所有 middleware 必须实现为**纯 ASGI middleware**（`__call__(self, scope, receive, send)`），直接传递 `send`/`receive` 给下游 app，不拦截不缓冲 response body。
+
+**参考**:
+- https://github.com/encode/starlette/discussions/1729
+- https://github.com/encode/starlette/issues/1012
+- 本项目修复提交: `3d1ed38`
+
+```python
+# ✅ 正确: 纯 ASGI middleware
+class MyMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # 在这里做检查、修改 scope 等
+            pass
+        await self.app(scope, receive, send)  # 直接传递, 不缓冲
+
+# ❌ 错误: BaseHTTPMiddleware 会缓冲 StreamingResponse body
+class MyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)  # 内部通过 queue 中转 body
+        return response
+```
+
+### ❌ ORM 新增字段必须同步添加 `_auto_migrate`
+
+在 `src/argus/storage/models.py` 中给任何表新增 `mapped_column` 后，**必须** 同时在 `src/argus/storage/database.py` 的 `_auto_migrate()` 方法中添加对应的 `ALTER TABLE ADD COLUMN` 条目，否则已有数据库会触发 `sqlite3.OperationalError: no such column` → HTTP 500。
+
+### ❌ MJPEG 流编码必须使用专用线程池
+
+`cv2.imencode()` 等 CPU 密集操作 **禁止** 使用 `asyncio.to_thread()`（会占满默认线程池），必须使用 `loop.run_in_executor(_STREAM_EXECUTOR, ...)` 指定专用 `ThreadPoolExecutor`，避免阻塞普通 API 请求。见 `src/argus/dashboard/routes/cameras.py` 中的 `_STREAM_EXECUTOR`。
