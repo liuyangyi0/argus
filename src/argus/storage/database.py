@@ -77,6 +77,10 @@ class Database:
             ("models", "component_type", "VARCHAR(20) DEFAULT 'full'"),
             ("models", "model_path", "VARCHAR(500)"),
             ("models", "canary_camera_id", "VARCHAR(50)"),
+            # Alert recording MP4 migration (d47d70f)
+            ("alert_recordings", "video_codec", "VARCHAR(10) DEFAULT 'h264'"),
+            ("alert_recordings", "width", "INTEGER"),
+            ("alert_recordings", "height", "INTEGER"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
