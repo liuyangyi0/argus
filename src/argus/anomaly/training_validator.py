@@ -185,8 +185,15 @@ class TrainingValidator:
 
         duration = time.monotonic() - start
 
-        # All must pass (skipped counts as pass)
-        all_passed = all(s.passed or s.skipped for s in steps)
+        # All must pass (skipped counts as pass), but at least one must
+        # actually run — if every step was skipped we have no evidence of quality.
+        any_actually_ran = any(not s.skipped for s in steps)
+        all_passed = any_actually_ran and all(s.passed or s.skipped for s in steps)
+        if not any_actually_ran:
+            logger.warning(
+                "training_validator.all_skipped",
+                msg="All validation steps were skipped — marking as NOT passed",
+            )
 
         report = ValidationReport(
             all_passed=all_passed,

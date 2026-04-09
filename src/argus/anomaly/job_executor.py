@@ -36,6 +36,44 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# ── Hyperparameter validation ──
+
+_HYPERPARAMETER_LIMITS: dict[str, dict] = {
+    "epochs": {"type": int, "min": 1, "max": 200},
+    "lr": {"type": float, "min": 1e-8, "max": 1.0},
+    "batch_size": {"type": int, "min": 1, "max": 256},
+    "image_size": {"type": int, "min": 64, "max": 1024},
+    "backbone_type": {"type": str, "allowed": {"dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14"}},
+    "export_format": {"type": str, "allowed": {"openvino", "onnx", "torch"}},
+    "quantization": {"type": str, "allowed": {"fp16", "fp32", "int8"}},
+    "model_type": {"type": str, "allowed": {"patchcore", "efficient_ad", "fastflow", "padim", "dinomaly2"}},
+    "calibration_images": {"type": int, "min": 1, "max": 500},
+}
+
+
+def _validate_hyperparameters(params: dict) -> list[str]:
+    """Validate hyperparameters against known limits. Returns list of errors."""
+    errors: list[str] = []
+    for key, value in params.items():
+        spec = _HYPERPARAMETER_LIMITS.get(key)
+        if spec is None:
+            continue  # unknown params are passed through
+        expected_type = spec["type"]
+        if not isinstance(value, expected_type):
+            # Allow int where float is expected
+            if expected_type is float and isinstance(value, int):
+                pass
+            else:
+                errors.append(f"{key}: expected {expected_type.__name__}, got {type(value).__name__}")
+                continue
+        if "min" in spec and value < spec["min"]:
+            errors.append(f"{key}={value} below minimum {spec['min']}")
+        if "max" in spec and value > spec["max"]:
+            errors.append(f"{key}={value} above maximum {spec['max']}")
+        if "allowed" in spec and value not in spec["allowed"]:
+            errors.append(f"{key}={value!r} not in {spec['allowed']}")
+    return errors
+
 
 class TrainingJobExecutor:
     """Executes queued training jobs end-to-end."""
@@ -61,8 +99,40 @@ class TrainingJobExecutor:
         self._model_packages_dir = model_packages_dir
         self._model_packages_dir.mkdir(parents=True, exist_ok=True)
 
+    def recover_stale_jobs(self, max_running_hours: float = 6.0) -> int:
+        """Recover jobs stuck in RUNNING state (e.g. after process crash).
+
+        Jobs that have been RUNNING for longer than max_running_hours are
+        marked as FAILED with a timeout error.
+        """
+        running_jobs = self._db.list_training_jobs(status=TrainingJobStatus.RUNNING.value)
+        recovered = 0
+        now = datetime.now(timezone.utc)
+        for job in running_jobs:
+            if job.started_at is None:
+                continue
+            elapsed_hours = (now - job.started_at).total_seconds() / 3600
+            if elapsed_hours > max_running_hours:
+                self._db.update_training_job(
+                    job.job_id,
+                    status=TrainingJobStatus.FAILED.value,
+                    error=f"Job timed out after {elapsed_hours:.1f}h (limit: {max_running_hours}h)",
+                    completed_at=now,
+                    duration_seconds=elapsed_hours * 3600,
+                )
+                logger.warning(
+                    "job_executor.stale_job_recovered",
+                    job_id=job.job_id,
+                    elapsed_hours=round(elapsed_hours, 1),
+                )
+                recovered += 1
+        return recovered
+
     def process_queued_jobs(self) -> int:
         """Process all queued training jobs. Returns number processed."""
+        # First, recover any jobs stuck in RUNNING from prior crashes
+        self.recover_stale_jobs()
+
         jobs = self._db.list_training_jobs(status=TrainingJobStatus.QUEUED.value)
         processed = 0
         for job in jobs:
@@ -126,8 +196,11 @@ class TrainingJobExecutor:
         if self._backbone_trainer is None:
             raise RuntimeError("BackboneTrainer not configured")
 
-        # Parse hyperparameters
+        # Parse and validate hyperparameters
         params = json.loads(job.hyperparameters) if job.hyperparameters else {}
+        param_errors = _validate_hyperparameters(params)
+        if param_errors:
+            raise ValueError(f"Invalid hyperparameters: {'; '.join(param_errors)}")
 
         # Get all camera IDs from config (or use all available)
         camera_ids = []
@@ -191,8 +264,11 @@ class TrainingJobExecutor:
         if backbone:
             backbone_checkpoint = backbone.checkpoint_path
 
-        # Parse hyperparameters
+        # Parse and validate hyperparameters
         params = json.loads(job.hyperparameters) if job.hyperparameters else {}
+        param_errors = _validate_hyperparameters(params)
+        if param_errors:
+            raise ValueError(f"Invalid hyperparameters: {'; '.join(param_errors)}")
 
         # Run training (trainer already has validation wired in)
         result = self._trainer.train(

@@ -85,7 +85,7 @@ def create_app(
                     rtsp_streams[cam["camera_id"]] = cam["source"]
             try:
                 await asyncio.to_thread(go2rtc.start, rtsp_streams)
-            except (FileNotFoundError, TimeoutError) as exc:
+            except (FileNotFoundError, TimeoutError, Exception) as exc:
                 logger.warning(
                     "go2rtc.start_failed",
                     error=str(exc),

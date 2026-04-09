@@ -183,7 +183,7 @@ class Go2RTCManager:
                     except Exception:
                         pass
                 time.sleep(0.5)
-        except (httpx.ConnectError, httpx.ReadTimeout):
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException):
             pass  # No stale process — port is free
 
     def start(self, initial_streams: dict[str, str] | None = None) -> None:

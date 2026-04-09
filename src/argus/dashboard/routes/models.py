@@ -167,7 +167,9 @@ def _run_batch_inference(
                 continue
 
             prediction = detector.predict(frame)
-            score = float(prediction.get("score", 0.0)) if isinstance(prediction, dict) else float(prediction)
+            score = float(prediction.anomaly_score) if hasattr(prediction, "anomaly_score") else (
+                float(prediction.get("score", 0.0)) if isinstance(prediction, dict) else float(prediction)
+            )
             entry["score"] = round(score, 4)
             entry["is_anomalous"] = score >= threshold
             scored += 1
