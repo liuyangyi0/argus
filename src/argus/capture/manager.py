@@ -331,6 +331,10 @@ class CameraManager:
                 ))
         return statuses
 
+    def get_pipeline(self, camera_id: str):
+        """Get the DetectionPipeline for a camera, or None."""
+        return self._pipelines.get(camera_id)
+
     def get_latest_frame(self, camera_id: str) -> np.ndarray | None:
         """Get the latest processed frame from a camera for live preview."""
         pipeline = self._pipelines.get(camera_id)

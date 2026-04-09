@@ -91,37 +91,22 @@ router = APIRouter()
 def _ensure_go2rtc_stream(request: Request, cam_config) -> None:
     """Register camera with go2rtc and redirect USB sources to RTSP re-stream.
 
-    For USB cameras this converts the device index to go2rtc's ffmpeg source
-    and rewrites ``cam_config.source`` / ``cam_config.protocol`` so the
-    pipeline reads from go2rtc's RTSP re-stream instead of the device directly.
-
-    Safe to call multiple times — skips if already registered or go2rtc unavailable.
+    Delegates to ``Go2RTCManager.register_camera()`` for protocol dispatch.
+    Safe to call multiple times — skips if already redirected or go2rtc unavailable.
     """
     go2rtc = getattr(request.app.state, "go2rtc", None)
     if go2rtc is None or not go2rtc.running:
         return
 
-    protocol = getattr(cam_config, "protocol", "rtsp")
-    cam_id = cam_config.camera_id
-
-    # Already redirected (protocol was changed to rtsp by a previous call)
-    if protocol == "rtsp" and cam_config.source.startswith("rtsp://127.0.0.1"):
+    # Already redirected by a previous call
+    if cam_config.protocol == "rtsp" and cam_config.source.startswith("rtsp://127.0.0.1"):
         return
 
-    if protocol == "usb":
-        from argus.streaming.go2rtc_manager import usb_to_go2rtc_source
-        go2rtc_source = usb_to_go2rtc_source(cam_config.source)
-        try:
-            go2rtc.add_stream(cam_id, go2rtc_source)
-        except Exception:
-            return
-        cam_config.source = f"rtsp://127.0.0.1:{go2rtc.rtsp_port}/{cam_id}"
+    original_protocol = cam_config.protocol
+    rtsp_url = go2rtc.register_camera(cam_config.camera_id, cam_config.source, cam_config.protocol)
+    if rtsp_url and original_protocol == "usb":
+        cam_config.source = rtsp_url
         cam_config.protocol = "rtsp"
-    elif protocol == "rtsp":
-        try:
-            go2rtc.add_stream(cam_id, cam_config.source)
-        except Exception:
-            pass
 
 
 class AddCameraRequest(BaseModel):
@@ -876,9 +861,7 @@ async def wall_status(request: Request):
                 "degradation": None,
             }
 
-            # Get live score data from the pipeline (CameraStatus doesn't
-            # carry the pipeline ref, so look it up from the manager).
-            pipeline = camera_manager._pipelines.get(cam_id)
+            pipeline = camera_manager.get_pipeline(cam_id)
             if pipeline is not None and hasattr(pipeline, "get_wall_status"):
                 wall_data = pipeline.get_wall_status()
                 tile["current_score"] = wall_data.get("current_score", 0.0)

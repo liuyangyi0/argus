@@ -158,7 +158,7 @@ class TestCameraForms:
                 stats=None,
             ),
         ]
-        camera_manager._pipelines = {}  # No active pipelines
+        camera_manager.get_pipeline.return_value = None
 
         app = create_app(
             camera_manager=camera_manager,
