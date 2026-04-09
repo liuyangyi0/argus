@@ -818,11 +818,16 @@ async def wall_status(request: Request):
         cameras = []
         for cam_status in camera_manager.get_status():
             cam_id = cam_status.camera_id
+            # Determine connection status: a camera is "online" if its
+            # pipeline is running, even if not yet fully connected (USB
+            # cameras may take a moment to initialize).
+            is_online = getattr(cam_status, "connected", False) or getattr(cam_status, "running", False)
             tile: dict = {
                 "camera_id": cam_id,
                 "name": getattr(cam_status, "name", cam_id),
-                "status": "online" if getattr(cam_status, "connected", False) else "offline",
+                "status": "online" if is_online else "offline",
                 "model_version": getattr(cam_status, "model_version_id", None),
+                "fps": None,
                 "current_score": 0.0,
                 "score_sparkline": [],
                 "alert_count_today": 0,
@@ -830,11 +835,18 @@ async def wall_status(request: Request):
                 "degradation": None,
             }
 
-            pipeline = getattr(cam_status, "pipeline", None)
+            # Get live score data from the pipeline (CameraStatus doesn't
+            # carry the pipeline ref, so look it up from the manager).
+            pipeline = camera_manager._pipelines.get(cam_id)
             if pipeline is not None and hasattr(pipeline, "get_wall_status"):
                 wall_data = pipeline.get_wall_status()
                 tile["current_score"] = wall_data.get("current_score", 0.0)
                 tile["score_sparkline"] = wall_data.get("score_sparkline", [])
+
+            # FPS from pipeline stats
+            stats = getattr(cam_status, "stats", None)
+            if stats is not None:
+                tile["fps"] = getattr(stats, "current_fps", None)
 
             if db is not None:
                 try:
