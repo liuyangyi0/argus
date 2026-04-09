@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onActivated, onDeactivated } from 'vue'
 import { useRouter } from 'vue-router'
+
+defineOptions({ name: 'OverviewPage' })
 import { Button, Space, Typography, Tooltip } from 'ant-design-vue'
 import {
   AppstoreOutlined,

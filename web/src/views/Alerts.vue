@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+
+defineOptions({ name: 'AlertsPage' })
 import {
   Table, Tag, Button, Space, Typography, Select, Tooltip,
   Divider, message, Segmented, Steps,
