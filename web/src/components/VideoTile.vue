@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, watch, ref } from 'vue'
+import { computed, onMounted, onUnmounted, onActivated, onDeactivated, watch, ref } from 'vue'
 import { Badge, Typography, Tooltip } from 'ant-design-vue'
 import {
   WarningOutlined,
@@ -88,6 +88,25 @@ watch(() => props.camera.status, (newStatus, oldStatus) => {
 
 onUnmounted(() => {
   observer?.disconnect()
+})
+
+// KeepAlive support: pause MJPEG fallback when page is cached (saves HTTP connections),
+// but keep WebRTC/MSE alive (they use go2rtc's separate port, no resource cost).
+onDeactivated(() => {
+  if (streamStatus.value === 'fallback' && mjpegRef.value) {
+    mjpegRef.value.src = ''
+  }
+})
+
+onActivated(() => {
+  // Re-attach MJPEG src if was in fallback mode
+  if (streamStatus.value === 'fallback' && mjpegRef.value) {
+    mjpegRef.value.src = mjpegUrl.value
+  }
+  // If stream was idle (first activation after mount already handled by IntersectionObserver)
+  if (streamStatus.value === 'idle' && props.camera.status === 'online') {
+    start()
+  }
 })
 
 function handleAlertBadgeClick(e: MouseEvent) {

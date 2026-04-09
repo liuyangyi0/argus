@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+
+defineOptions({ name: 'CamerasPage' })
 import { Table, Badge, Button, Typography, Space, Modal, Form, Input, Select, InputNumber, message } from 'ant-design-vue'
 import { PlusOutlined } from '@ant-design/icons-vue'
 import { getCameras, startCamera, stopCamera, getUsbDevices, addCamera } from '../api'

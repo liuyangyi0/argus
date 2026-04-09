@@ -87,7 +87,11 @@ function onMenuClick({ key }: { key: string | number }) {
       <Layout>
         <DegradationBar />
         <Layout.Content style="padding: 24px; overflow-y: auto">
-          <router-view />
+          <router-view v-slot="{ Component }">
+            <keep-alive :include="['OverviewPage', 'CamerasPage', 'AlertsPage']">
+              <component :is="Component" />
+            </keep-alive>
+          </router-view>
         </Layout.Content>
       </Layout>
     </Layout>
