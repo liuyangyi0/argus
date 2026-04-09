@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { Button, Space, Typography, Tooltip } from 'ant-design-vue'
 import {
   AppstoreOutlined,
   BlockOutlined,
   BorderOutlined,
   TableOutlined,
+  BellOutlined,
 } from '@ant-design/icons-vue'
 import VideoTile, { type CameraTileData } from '../components/VideoTile.vue'
 import AlertSidebar from '../components/AlertSidebar.vue'
@@ -13,6 +15,7 @@ import StatusStrip from '../components/StatusStrip.vue'
 import { getWallStatus, getHealth } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
+const router = useRouter()
 const cameras = ref<CameraTileData[]>([])
 const health = ref<any>(null)
 const loading = ref(true)
@@ -27,6 +30,19 @@ const statusLabel = computed(() => {
 const statusColor = computed(() => {
   const m: Record<string, string> = { healthy: '#22c55e', degraded: '#f59e0b', unhealthy: '#ef4444' }
   return m[systemStatus.value] || '#6b7280'
+})
+
+// High alert detection from camera tiles
+const highAlertCameras = computed(() =>
+  cameras.value.filter(c => c.active_alert?.severity === 'high')
+)
+const hasHighAlert = computed(() => highAlertCameras.value.length > 0)
+
+// Last alert time indicator
+const lastAlertTime = computed(() => {
+  const withAlerts = cameras.value.filter(c => c.active_alert)
+  if (withAlerts.length === 0) return null
+  return '活跃中'
 })
 
 async function fetchWallStatus() {
@@ -91,13 +107,16 @@ const displayCameras = computed(() => {
 
 function handleTileDblClick(cameraId: string) {
   if (layout.value === '1x1' && focusCamera.value === cameraId) {
-    // Return to 2x2
     layout.value = '2x2'
     focusCamera.value = null
   } else {
     layout.value = '1x1'
     focusCamera.value = cameraId
   }
+}
+
+function handleAlertClick(alertId: string) {
+  router.push(`/alerts?id=${alertId}`)
 }
 
 function setLayout(l: typeof layout.value) {
@@ -110,6 +129,29 @@ function setLayout(l: typeof layout.value) {
   <div style="display: flex; gap: 0; height: calc(100vh - 72px); margin: -24px; padding: 0">
     <!-- Video Wall Area -->
     <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 16px">
+      <!-- High alert banner -->
+      <div
+        v-if="hasHighAlert"
+        style="display: flex; align-items: center; gap: 10px; padding: 8px 16px; margin-bottom: 10px; background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.4); border-radius: 6px"
+      >
+        <BellOutlined style="color: #ef4444; font-size: 16px" />
+        <Typography.Text strong style="color: #ef4444; font-size: 13px">
+          {{ highAlertCameras.length }} 个高级告警需要处理
+        </Typography.Text>
+        <Typography.Text type="secondary" style="font-size: 12px">
+          ({{ highAlertCameras.map(c => c.camera_id).join(', ') }})
+        </Typography.Text>
+        <Button
+          type="primary"
+          danger
+          size="small"
+          style="margin-left: auto"
+          @click="router.push('/alerts?severity=high')"
+        >
+          查看
+        </Button>
+      </div>
+
       <!-- Toolbar -->
       <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid rgba(59, 130, 246, 0.12); flex-shrink: 0">
         <div style="display: flex; align-items: center; gap: 10px">
@@ -119,6 +161,14 @@ function setLayout(l: typeof layout.value) {
           />
           <Typography.Title :level="4" style="margin: 0">值班台</Typography.Title>
           <Typography.Text v-if="statusLabel" type="secondary" style="font-size: 12px">{{ statusLabel }}</Typography.Text>
+          <!-- Last alert indicator -->
+          <Typography.Text
+            v-if="lastAlertTime"
+            type="secondary"
+            style="font-size: 11px; margin-left: 8px; color: #ef4444"
+          >
+            告警 {{ lastAlertTime }}
+          </Typography.Text>
         </div>
         <Space>
           <Tooltip title="1x1">
@@ -180,6 +230,7 @@ function setLayout(l: typeof layout.value) {
           :layout="layout === 'focus' && idx === 0 ? 'focus-main' : layout === 'focus' ? 'focus-side' : layout"
           :style="layout === 'focus' && idx === 0 ? { gridRow: '1 / 3' } : {}"
           @dblclick="handleTileDblClick"
+          @alert-click="handleAlertClick"
         />
         <!-- Empty slots -->
         <div

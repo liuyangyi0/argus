@@ -36,7 +36,7 @@ onUnmounted(() => {
 })
 
 // go2rtc WebRTC/MSE player
-const { videoRef, status: streamStatus, start: startStream, stop: stopStream } = useGo2RTC(cameraId)
+const { videoRef, mjpegRef, status: streamStatus, start: startStream, stop: stopStream } = useGo2RTC(cameraId)
 const mjpegUrl = computed(() => `/api/cameras/${cameraId}/stream`)
 
 const lifecycleStep = computed(() => {
@@ -148,6 +148,7 @@ const configEntries = computed(() => flattenEntries(camera.value?.config))
             />
             <!-- MJPEG fallback -->
             <img
+              ref="mjpegRef"
               v-if="streamStatus === 'fallback'"
               :src="mjpegUrl"
               style="max-width: 100%; border-radius: 8px; background: #000"

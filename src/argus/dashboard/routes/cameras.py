@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import time
 
 import cv2
@@ -31,6 +32,58 @@ logger = structlog.get_logger()
 
 # Maximum stream duration in seconds (30 minutes)
 _MAX_STREAM_DURATION = 30 * 60
+
+# ── MJPEG streaming isolation ──
+# Dedicated thread pool for MJPEG frame encoding (cv2.imencode) so it can
+# never starve the default asyncio thread pool used by regular API requests.
+_STREAM_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=12, thread_name_prefix="mjpeg-enc",
+)
+
+# Server-wide cap on concurrent MJPEG streams to prevent resource exhaustion.
+_MAX_CONCURRENT_STREAMS = 8
+_stream_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_STREAMS)
+
+
+from typing import Callable
+
+
+def _mjpeg_response(request: Request, grab_fn: Callable[[], bytes | None]) -> Response:
+    """Build a StreamingResponse for an MJPEG stream, or 503 if overloaded.
+
+    ``grab_fn`` is a **synchronous** callable executed in the dedicated MJPEG
+    thread pool.  It should return JPEG bytes or ``None`` to skip a frame.
+    """
+    if _stream_semaphore.locked():
+        return Response(status_code=503, content="Too many active streams")
+
+    async def _generate():
+        loop = asyncio.get_running_loop()
+        async with _stream_semaphore:
+            start = time.monotonic()
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    if time.monotonic() - start > _MAX_STREAM_DURATION:
+                        break
+                    jpeg = await loop.run_in_executor(_STREAM_EXECUTOR, grab_fn)
+                    if jpeg is not None:
+                        yield (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n\r\n"
+                            + jpeg
+                            + b"\r\n"
+                        )
+                    await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                pass
+
+    return StreamingResponse(
+        _generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
 
 router = APIRouter()
 
@@ -697,35 +750,14 @@ async def camera_stream(request: Request, camera_id: str):
     if not camera_manager:
         return Response(status_code=503)
 
-    def _grab_and_encode():
+    def _grab():
         frame = camera_manager.get_latest_frame(camera_id)
         if frame is None:
             return None
         _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
         return buf.tobytes()
 
-    async def generate_frames():
-        start_time = time.monotonic()
-        try:
-            while True:
-                if time.monotonic() - start_time > _MAX_STREAM_DURATION:
-                    break
-                jpeg = await asyncio.to_thread(_grab_and_encode)
-                if jpeg is not None:
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n"
-                        + jpeg
-                        + b"\r\n"
-                    )
-                await asyncio.sleep(0.2)
-        except asyncio.CancelledError:
-            pass
-
-    return StreamingResponse(
-        generate_frames(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+    return _mjpeg_response(request, _grab)
 
 
 @router.get("/{camera_id}/heatmap-stream")
@@ -737,7 +769,7 @@ async def camera_heatmap_stream(request: Request, camera_id: str):
 
     import numpy as np
 
-    def _grab_and_encode_heatmap():
+    def _grab():
         frame = camera_manager.get_latest_frame(camera_id)
         if frame is None:
             return None
@@ -760,28 +792,7 @@ async def camera_heatmap_stream(request: Request, camera_id: str):
         _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
         return buf.tobytes()
 
-    async def generate_heatmap_frames():
-        start_time = time.monotonic()
-        try:
-            while True:
-                if time.monotonic() - start_time > _MAX_STREAM_DURATION:
-                    break
-                jpeg = await asyncio.to_thread(_grab_and_encode_heatmap)
-                if jpeg is not None:
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n"
-                        + jpeg
-                        + b"\r\n"
-                    )
-                await asyncio.sleep(0.2)
-        except asyncio.CancelledError:
-            pass
-
-    return StreamingResponse(
-        generate_heatmap_frames(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+    return _mjpeg_response(request, _grab)
 
 
 # ── Video Wall API (UX v2 §2) ──

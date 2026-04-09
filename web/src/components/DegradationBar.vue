@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { Tag, Typography } from 'ant-design-vue'
+import { DownOutlined } from '@ant-design/icons-vue'
 import { getDegradationSummary } from '../api'
+import { formatDuration } from '../utils/time'
 import { useWebSocket } from '../composables/useWebSocket'
 
 interface DegradationEvent {
@@ -49,6 +51,13 @@ const levelColor: Record<string, string> = {
   severe: '#ef4444',
 }
 
+const levelLabel: Record<string, string> = {
+  info: '提示',
+  warning: '警告',
+  moderate: '中度',
+  severe: '严重',
+}
+
 const barBackground = computed(() => {
   if (!maxLevel.value) return 'transparent'
   const colors: Record<string, string> = {
@@ -67,11 +76,13 @@ const barBorderColor = computed(() => {
 
 const displayEvents = computed(() => expanded.value ? events.value : events.value.slice(0, 3))
 const hasMore = computed(() => activeCount.value > 3)
+
 </script>
 
 <template>
   <div
     v-if="activeCount > 0"
+    :class="['degradation-bar', maxLevel === 'severe' && 'degradation-bar--severe']"
     :style="{
       background: barBackground,
       borderBottom: `1px solid ${barBorderColor}`,
@@ -80,16 +91,49 @@ const hasMore = computed(() => activeCount.value > 3)
     }"
     @click="hasMore && (expanded = !expanded)"
   >
-    <div v-for="evt in displayEvents" :key="evt.event_id" style="margin-bottom: 4px; display: flex; align-items: center; gap: 12px">
-      <Tag :color="levelColor[evt.level]" style="margin: 0; min-width: 48px; text-align: center">
-        {{ evt.level === 'severe' ? '严重' : evt.level === 'moderate' ? '中度' : evt.level === 'warning' ? '警告' : '提示' }}
+    <div v-for="evt in displayEvents" :key="evt.event_id" style="margin-bottom: 4px; display: flex; align-items: center; gap: 10px; flex-wrap: nowrap">
+      <!-- Severity tag -->
+      <Tag :color="levelColor[evt.level]" style="margin: 0; min-width: 40px; text-align: center; font-size: 11px; flex-shrink: 0">
+        {{ levelLabel[evt.level] || evt.level }}
       </Tag>
-      <Typography.Text strong style="flex-shrink: 0">{{ evt.title }}</Typography.Text>
-      <Typography.Text type="secondary" style="flex: 1">{{ evt.impact }}</Typography.Text>
-      <Typography.Text style="color: #60a5fa; flex-shrink: 0">{{ evt.action }}</Typography.Text>
+      <!-- Title -->
+      <Typography.Text strong style="flex-shrink: 0; font-size: 13px">{{ evt.title }}</Typography.Text>
+      <!-- Affected camera -->
+      <Tag v-if="evt.camera_id" size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: #2d2d4a; flex-shrink: 0">
+        {{ evt.camera_id }}
+      </Tag>
+      <Tag v-else size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: #2d2d4a; flex-shrink: 0">
+        全系统
+      </Tag>
+      <!-- Duration -->
+      <Typography.Text type="secondary" style="font-size: 11px; flex-shrink: 0">
+        {{ formatDuration(evt.started_at) }}
+      </Typography.Text>
+      <!-- Impact -->
+      <Typography.Text type="secondary" style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px">
+        {{ evt.impact }}
+      </Typography.Text>
+      <!-- Action link -->
+      <Typography.Text style="color: #60a5fa; flex-shrink: 0; font-size: 12px">{{ evt.action }}</Typography.Text>
     </div>
-    <div v-if="hasMore && !expanded" style="text-align: center; color: #9ca3af; font-size: 12px">
-      +{{ activeCount - 3 }} 项降级... 点击展开
+    <!-- Expand/collapse -->
+    <div v-if="hasMore" style="text-align: center; color: #9ca3af; font-size: 12px; margin-top: 4px; display: flex; align-items: center; justify-content: center; gap: 4px">
+      <template v-if="!expanded">+{{ activeCount - 3 }} 项降级</template>
+      <template v-else>收起</template>
+      <DownOutlined :style="{ fontSize: '10px', transform: expanded ? 'rotate(180deg)' : 'rotate(0)', transition: 'transform 0.2s' }" />
     </div>
   </div>
 </template>
+
+<style scoped>
+.degradation-bar {
+  transition: max-height 0.3s ease, padding 0.3s ease;
+}
+.degradation-bar--severe {
+  animation: degrade-pulse 2s ease-in-out infinite;
+}
+@keyframes degrade-pulse {
+  0%, 100% { border-bottom-color: #ef4444; }
+  50% { border-bottom-color: #991b1b; }
+}
+</style>

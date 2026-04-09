@@ -1,19 +1,33 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
-  Table, Tag, Button, Space, Typography, Select, Drawer,
-  Descriptions, Image, Divider, message,
+  Table, Tag, Button, Space, Typography, Select, Tooltip,
+  Divider, message, Segmented, Steps,
 } from 'ant-design-vue'
+import {
+  CloseOutlined,
+  CheckCircleOutlined,
+  StopOutlined,
+  ExportOutlined,
+} from '@ant-design/icons-vue'
 import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive } from '../api'
+import { formatRelativeTime } from '../utils/time'
 import { useWebSocket } from '../composables/useWebSocket'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
+
+const route = useRoute()
+const router = useRouter()
 
 const alerts = ref<any[]>([])
 const cameras = ref<any[]>([])
 const loading = ref(true)
 const filters = ref({ camera_id: '', severity: '' })
-const detailVisible = ref(false)
+
+// Detail panel state
 const selectedAlert = ref<any>(null)
+const detailData = ref<any>(null)
+const imageMode = ref<'composite' | 'snapshot' | 'heatmap'>('composite')
 
 async function fetchData() {
   try {
@@ -32,11 +46,14 @@ useWebSocket({
   topics: ['alerts'],
   onMessage(topic, data) {
     if (topic === 'alerts') {
-      // Backend pushes a single alert object, not the full list.
       if (data && typeof data === 'object' && !Array.isArray(data) && data.alert_id) {
         const idx = alerts.value.findIndex((a: any) => a.alert_id === data.alert_id)
         if (idx >= 0) {
           alerts.value[idx] = { ...alerts.value[idx], ...data }
+          // Update detail if viewing this alert
+          if (selectedAlert.value?.alert_id === data.alert_id) {
+            selectedAlert.value = { ...selectedAlert.value, ...data }
+          }
         } else {
           alerts.value.unshift(data)
         }
@@ -49,11 +66,51 @@ useWebSocket({
   fallbackInterval: 15000,
 })
 
-onMounted(fetchData)
+onMounted(async () => {
+  await fetchData()
+  // Support URL query: ?id=xxx to auto-open alert detail
+  if (route.query.id) {
+    const target = alerts.value.find(a => a.alert_id === route.query.id)
+    if (target) showDetail(target)
+  }
+})
+
+// Keyboard navigation
+const selectedIndex = ref(-1)
+
+function handleKeydown(e: KeyboardEvent) {
+  if (!alerts.value.length) return
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    selectedIndex.value = Math.min(selectedIndex.value + 1, alerts.value.length - 1)
+    showDetail(alerts.value[selectedIndex.value])
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    selectedIndex.value = Math.max(selectedIndex.value - 1, 0)
+    showDetail(alerts.value[selectedIndex.value])
+  } else if (e.key === 'Escape') {
+    closeDetail()
+  }
+}
+
+onMounted(() => document.addEventListener('keydown', handleKeydown))
+onUnmounted(() => document.removeEventListener('keydown', handleKeydown))
 
 function showDetail(record: any) {
   selectedAlert.value = record
-  detailVisible.value = true
+  selectedIndex.value = alerts.value.findIndex(a => a.alert_id === record.alert_id)
+  imageMode.value = 'composite'
+  detailData.value = record
+}
+
+function closeDetail() {
+  selectedAlert.value = null
+  detailData.value = null
+  selectedIndex.value = -1
+  // Clean up URL query
+  if (route.query.id) {
+    router.replace({ query: {} })
+  }
 }
 
 async function handleAcknowledge(id: string) {
@@ -61,7 +118,9 @@ async function handleAcknowledge(id: string) {
     await acknowledgeAlert(id)
     message.success('已确认')
     fetchData()
-    detailVisible.value = false
+    if (selectedAlert.value?.alert_id === id) {
+      selectedAlert.value = { ...selectedAlert.value, workflow_status: 'acknowledged' }
+    }
   } catch (e: any) {
     message.error(e.response?.data?.error || '确认失败')
   }
@@ -72,7 +131,9 @@ async function handleFalsePositive(id: string) {
     await markFalsePositive(id)
     message.success('已标记误报')
     fetchData()
-    detailVisible.value = false
+    if (selectedAlert.value?.alert_id === id) {
+      selectedAlert.value = { ...selectedAlert.value, workflow_status: 'false_positive' }
+    }
   } catch (e: any) {
     message.error(e.response?.data?.error || '标记失败')
   }
@@ -93,163 +154,419 @@ const workflowColor: Record<string, string> = {
   resolved: 'cyan', closed: 'default', false_positive: 'orange', uncertain: 'gold',
 }
 
-const columns = [
-  {
-    title: '严重度',
-    key: 'severity',
-    width: 100,
-    filters: [
-      { text: '高', value: 'high' },
-      { text: '中', value: 'medium' },
-      { text: '低', value: 'low' },
-      { text: '提示', value: 'info' },
-    ],
-  },
-  { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 120 },
-  { title: '区域', dataIndex: 'zone_id', key: 'zone_id', width: 100 },
-  {
-    title: '异常分数',
-    key: 'score',
-    width: 100,
-  },
-  {
-    title: '状态',
-    key: 'status',
-    width: 120,
-  },
-  {
-    title: '操作',
-    key: 'action',
-    width: 200,
-  },
-]
+// Workflow steps for timeline
+const workflowSteps = ['new', 'acknowledged', 'investigating', 'resolved', 'closed']
+const workflowStepIndex = computed(() => {
+  if (!selectedAlert.value) return 0
+  const status = selectedAlert.value.workflow_status
+  if (status === 'false_positive') return -1
+  return workflowSteps.indexOf(status)
+})
+
+
+function formatTimestamp(ts: string | number | undefined): string {
+  if (!ts) return '--'
+  const date = typeof ts === 'string' ? new Date(ts) : new Date(ts * 1000)
+  return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+// Row class for severity highlighting
+function rowClassName(record: any) {
+  if (record.alert_id === selectedAlert.value?.alert_id) return 'alert-row-selected'
+  if (record.severity === 'high' && record.workflow_status === 'new') return 'alert-row-high'
+  if (record.severity === 'medium' && record.workflow_status === 'new') return 'alert-row-medium'
+  return ''
+}
+
+// Anomaly score color
+function scoreColor(score: number): string {
+  if (score >= 0.95) return '#ef4444'
+  if (score >= 0.85) return '#f97316'
+  if (score >= 0.7) return '#f59e0b'
+  return '#3b82f6'
+}
+
+// Table columns — adapt based on whether detail is open
+const columns = computed(() => {
+  const base = [
+    { title: '', key: 'thumbnail', width: 56 },
+    {
+      title: '严重度',
+      key: 'severity',
+      width: 72,
+      filters: [
+        { text: '高', value: 'high' },
+        { text: '中', value: 'medium' },
+        { text: '低', value: 'low' },
+        { text: '提示', value: 'info' },
+      ],
+    },
+    { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 100, ellipsis: true },
+    { title: '分数', key: 'score', width: 72 },
+    { title: '时间', key: 'time', width: 90 },
+  ]
+  // When detail is closed, show more columns
+  if (!selectedAlert.value) {
+    base.splice(3, 0, { title: '区域', dataIndex: 'zone_id', key: 'zone_id', width: 80, ellipsis: true } as any)
+    base.push(
+      { title: '状态', key: 'status', width: 90 } as any,
+      { title: '操作', key: 'action', width: 160 } as any,
+    )
+  } else {
+    base.push({ title: '状态', key: 'status', width: 80 } as any)
+  }
+  return base
+})
 </script>
 
 <template>
-  <div>
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px">
-      <Typography.Title :level="3" style="margin: 0">告警中心</Typography.Title>
-      <Space>
-        <Select
-          v-model:value="filters.camera_id"
-          placeholder="全部摄像头"
-          allow-clear
-          style="width: 160px"
-          @change="fetchData"
+  <div style="display: flex; height: calc(100vh - 72px); margin: -24px; overflow: hidden">
+    <!-- Left: Alert List -->
+    <div
+      :style="{
+        width: selectedAlert ? '420px' : '100%',
+        flexShrink: 0,
+        display: 'flex',
+        flexDirection: 'column',
+        transition: 'width 0.25s ease',
+        borderRight: selectedAlert ? '1px solid #1f2937' : 'none',
+        overflow: 'hidden',
+      }"
+    >
+      <!-- Header -->
+      <div style="display: flex; justify-content: space-between; align-items: center; padding: 16px 20px 12px; flex-shrink: 0">
+        <Typography.Title :level="4" style="margin: 0">告警中心</Typography.Title>
+        <Space size="small">
+          <Select
+            v-model:value="filters.camera_id"
+            placeholder="全部摄像头"
+            allow-clear
+            size="small"
+            style="width: 130px"
+            @change="fetchData"
+          >
+            <Select.Option v-for="cam in cameras" :key="cam.camera_id" :value="cam.camera_id">
+              {{ cam.camera_id }}
+            </Select.Option>
+          </Select>
+          <Select
+            v-model:value="filters.severity"
+            placeholder="严重度"
+            allow-clear
+            size="small"
+            style="width: 90px"
+            @change="fetchData"
+          >
+            <Select.Option value="high">高</Select.Option>
+            <Select.Option value="medium">中</Select.Option>
+            <Select.Option value="low">低</Select.Option>
+            <Select.Option value="info">提示</Select.Option>
+          </Select>
+        </Space>
+      </div>
+
+      <!-- Table -->
+      <div style="flex: 1; overflow: auto; padding: 0 8px">
+        <Table
+          :columns="columns"
+          :data-source="alerts"
+          :loading="loading"
+          row-key="alert_id"
+          size="small"
+          :pagination="selectedAlert ? { pageSize: 50, simple: true, size: 'small' } : { pageSize: 20, showTotal: (total: number) => `共 ${total} 条` }"
+          :custom-row="(record: any) => ({
+            onClick: () => showDetail(record),
+            class: rowClassName(record),
+          })"
+          :scroll="{ y: selectedAlert ? 'calc(100vh - 160px)' : undefined }"
+          style="cursor: pointer"
         >
-          <Select.Option v-for="cam in cameras" :key="cam.camera_id" :value="cam.camera_id">
-            {{ cam.camera_id }}
-          </Select.Option>
-        </Select>
-        <Select
-          v-model:value="filters.severity"
-          placeholder="全部严重度"
-          allow-clear
-          style="width: 120px"
-          @change="fetchData"
-        >
-          <Select.Option value="high">高</Select.Option>
-          <Select.Option value="medium">中</Select.Option>
-          <Select.Option value="low">低</Select.Option>
-          <Select.Option value="info">提示</Select.Option>
-        </Select>
-      </Space>
+          <template #bodyCell="{ column, record }">
+            <!-- Thumbnail -->
+            <template v-if="column.key === 'thumbnail'">
+              <div style="width: 48px; height: 36px; border-radius: 3px; overflow: hidden; background: #0f0f1a">
+                <img
+                  v-if="record.snapshot_path"
+                  :src="`/api/alerts/${record.alert_id}/image/snapshot`"
+                  style="width: 100%; height: 100%; object-fit: cover"
+                  loading="lazy"
+                />
+                <div v-else style="width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #4a5568; font-size: 10px">
+                  --
+                </div>
+              </div>
+            </template>
+            <!-- Severity -->
+            <template v-if="column.key === 'severity'">
+              <Tag :color="severityColor[record.severity]" style="margin: 0">
+                {{ severityLabel[record.severity] || record.severity }}
+              </Tag>
+            </template>
+            <!-- Score -->
+            <template v-if="column.key === 'score'">
+              <span :style="{ color: scoreColor(record.anomaly_score), fontWeight: 600, fontSize: '12px' }">
+                {{ record.anomaly_score?.toFixed(2) }}
+              </span>
+            </template>
+            <!-- Time -->
+            <template v-if="column.key === 'time'">
+              <Tooltip :title="formatTimestamp(record.timestamp || record.created_at)">
+                <Typography.Text type="secondary" style="font-size: 11px">
+                  {{ formatRelativeTime(record.timestamp || record.created_at) }}
+                </Typography.Text>
+              </Tooltip>
+            </template>
+            <!-- Status -->
+            <template v-if="column.key === 'status'">
+              <Tag :color="workflowColor[record.workflow_status] || 'default'" style="margin: 0; font-size: 11px">
+                {{ workflowLabel[record.workflow_status] || record.workflow_status || '待处理' }}
+              </Tag>
+            </template>
+            <!-- Action (only when detail is closed) -->
+            <template v-if="column.key === 'action'">
+              <Space size="small" @click.stop>
+                <Button
+                  v-if="record.workflow_status === 'new'"
+                  type="primary"
+                  size="small"
+                  @click="handleAcknowledge(record.alert_id)"
+                >确认</Button>
+                <Button
+                  v-if="record.workflow_status === 'new' || record.workflow_status === 'acknowledged'"
+                  size="small"
+                  @click="handleFalsePositive(record.alert_id)"
+                >误报</Button>
+              </Space>
+            </template>
+          </template>
+        </Table>
+      </div>
     </div>
 
-    <Table
-      :columns="columns"
-      :data-source="alerts"
-      :loading="loading"
-      row-key="alert_id"
-      :pagination="{ pageSize: 20, showTotal: (total: number) => `共 ${total} 条` }"
-      :custom-row="(record: any) => ({ onClick: () => showDetail(record) })"
-      style="cursor: pointer"
+    <!-- Right: Detail Panel -->
+    <div
+      v-if="selectedAlert"
+      style="flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: #0d0d1a"
     >
-      <template #bodyCell="{ column, record }">
-        <template v-if="column.key === 'severity'">
-          <Tag :color="severityColor[record.severity]">{{ severityLabel[record.severity] || record.severity }}</Tag>
-        </template>
-        <template v-if="column.key === 'score'">
-          {{ record.anomaly_score?.toFixed(3) }}
-        </template>
-        <template v-if="column.key === 'status'">
-          <Tag :color="workflowColor[record.workflow_status] || 'default'">
-            {{ workflowLabel[record.workflow_status] || record.workflow_status || '待处理' }}
-          </Tag>
-        </template>
-        <template v-if="column.key === 'action'">
-          <Space @click.stop>
-            <Button
-              v-if="record.workflow_status === 'new'"
-              type="primary"
-              size="small"
-              @click="handleAcknowledge(record.alert_id)"
-            >确认</Button>
-            <Button
-              v-if="record.workflow_status === 'new' || record.workflow_status === 'acknowledged'"
-              size="small"
-              @click="handleFalsePositive(record.alert_id)"
-            >误报</Button>
-          </Space>
-        </template>
-      </template>
-    </Table>
+      <!-- Detail Header -->
+      <div style="display: flex; align-items: center; gap: 12px; padding: 12px 20px; background: #141420; border-bottom: 1px solid #1f2937; flex-shrink: 0">
+        <Tag
+          :color="severityColor[selectedAlert.severity]"
+          style="margin: 0; font-size: 13px; padding: 2px 10px"
+        >
+          {{ severityLabel[selectedAlert.severity] }}
+        </Tag>
+        <Typography.Text strong style="font-size: 14px">
+          {{ selectedAlert.camera_id }}
+        </Typography.Text>
+        <Typography.Text type="secondary" style="font-size: 12px">
+          {{ selectedAlert.zone_id }}
+        </Typography.Text>
+        <Typography.Text type="secondary" style="font-size: 12px">
+          {{ formatTimestamp(selectedAlert.timestamp || selectedAlert.created_at) }}
+        </Typography.Text>
 
-    <!-- Alert Detail Drawer -->
-    <Drawer
-      v-model:open="detailVisible"
-      :title="`告警详情 — ${selectedAlert?.alert_id?.slice(0, 24)}`"
-      :width="selectedAlert?.has_recording ? 900 : 640"
-      placement="right"
-    >
-      <template v-if="selectedAlert">
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 8px">
+          <Tag
+            :color="workflowColor[selectedAlert.workflow_status] || 'default'"
+            style="margin: 0"
+          >
+            {{ workflowLabel[selectedAlert.workflow_status] || '待处理' }}
+          </Tag>
+          <Tooltip title="导出证据包">
+            <Button size="small" type="text" style="color: #9ca3af">
+              <template #icon><ExportOutlined /></template>
+            </Button>
+          </Tooltip>
+          <Button size="small" type="text" style="color: #9ca3af" @click="closeDetail">
+            <template #icon><CloseOutlined /></template>
+          </Button>
+        </div>
+      </div>
+
+      <!-- Detail Content -->
+      <div style="flex: 1; overflow-y: auto; padding: 16px 20px">
         <!-- Replay Player (when recording exists) -->
         <ReplayPlayer
           v-if="selectedAlert.has_recording"
           :alert-id="selectedAlert.alert_id"
-          style="margin-bottom: 16px"
+          style="margin-bottom: 20px"
         />
 
-        <!-- Static snapshot fallback -->
-        <div v-if="selectedAlert.snapshot_path && !selectedAlert.has_recording" style="margin-bottom: 24px; text-align: center">
-          <Image
-            :src="`/api/alerts/${selectedAlert.alert_id}/image/composite`"
-            :fallback="`/api/alerts/${selectedAlert.alert_id}/image/snapshot`"
-            style="max-width: 100%; border-radius: 8px"
-          />
+        <!-- Static snapshot fallback (no recording) -->
+        <div v-if="!selectedAlert.has_recording && selectedAlert.snapshot_path" style="margin-bottom: 20px">
+          <!-- Image mode toggle -->
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px">
+            <Segmented
+              v-model:value="imageMode"
+              :options="[
+                { label: '叠加图', value: 'composite' },
+                { label: '原图', value: 'snapshot' },
+                { label: '热力图', value: 'heatmap' },
+              ]"
+              size="small"
+            />
+            <div style="margin-left: auto; display: flex; align-items: center; gap: 8px">
+              <Typography.Text type="secondary" style="font-size: 11px">异常分数</Typography.Text>
+              <div
+                :style="{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: '2px 10px',
+                  borderRadius: '12px',
+                  background: `${scoreColor(selectedAlert.anomaly_score)}22`,
+                  border: `1px solid ${scoreColor(selectedAlert.anomaly_score)}44`,
+                }"
+              >
+                <span :style="{ color: scoreColor(selectedAlert.anomaly_score), fontWeight: 700, fontSize: '14px' }">
+                  {{ selectedAlert.anomaly_score?.toFixed(4) }}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Image display -->
+          <div style="border-radius: 8px; overflow: hidden; background: #000; text-align: center">
+            <img
+              :src="`/api/alerts/${selectedAlert.alert_id}/image/${imageMode}`"
+              style="max-width: 100%; max-height: 480px; object-fit: contain"
+              :alt="selectedAlert.alert_id"
+            />
+          </div>
         </div>
-        <Descriptions :column="1" bordered size="small">
-          <Descriptions.Item label="告警 ID">
-            <span style="font-family: monospace; font-size: 12px">{{ selectedAlert.alert_id }}</span>
-          </Descriptions.Item>
-          <Descriptions.Item label="摄像头">{{ selectedAlert.camera_id }}</Descriptions.Item>
-          <Descriptions.Item label="区域">{{ selectedAlert.zone_id }}</Descriptions.Item>
-          <Descriptions.Item label="严重度">
-            <Tag :color="severityColor[selectedAlert.severity]">
-              {{ severityLabel[selectedAlert.severity] }}
-            </Tag>
-          </Descriptions.Item>
-          <Descriptions.Item label="异常分数">{{ selectedAlert.anomaly_score?.toFixed(4) }}</Descriptions.Item>
-          <Descriptions.Item label="状态">
-            <Tag :color="workflowColor[selectedAlert.workflow_status] || 'default'">
-              {{ workflowLabel[selectedAlert.workflow_status] || selectedAlert.workflow_status || '待处理' }}
-            </Tag>
-          </Descriptions.Item>
-          <Descriptions.Item label="备注" v-if="selectedAlert.notes">{{ selectedAlert.notes }}</Descriptions.Item>
-        </Descriptions>
-        <Divider />
-        <Space>
-          <Button
-            v-if="selectedAlert.workflow_status === 'new'"
-            type="primary"
-            @click="handleAcknowledge(selectedAlert.alert_id)"
-          >确认真实</Button>
-          <Button
-            v-if="selectedAlert.workflow_status === 'new' || selectedAlert.workflow_status === 'acknowledged'"
-            @click="handleFalsePositive(selectedAlert.alert_id)"
-          >标记误报</Button>
-        </Space>
-      </template>
-    </Drawer>
+
+        <!-- No image at all -->
+        <div
+          v-if="!selectedAlert.has_recording && !selectedAlert.snapshot_path"
+          style="padding: 40px; text-align: center; background: #1a1a2e; border-radius: 8px; margin-bottom: 20px"
+        >
+          <Typography.Text type="secondary" style="font-size: 14px">
+            无快照或录像数据
+          </Typography.Text>
+        </div>
+
+        <!-- Metadata & Actions Grid -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px">
+          <!-- Left: Metadata -->
+          <div style="background: #1a1a2e; border-radius: 8px; padding: 14px">
+            <Typography.Text strong style="font-size: 12px; color: #9ca3af; display: block; margin-bottom: 10px">
+              告警信息
+            </Typography.Text>
+            <div style="display: flex; flex-direction: column; gap: 8px">
+              <div style="display: flex; justify-content: space-between; align-items: center">
+                <Typography.Text type="secondary" style="font-size: 12px">告警 ID</Typography.Text>
+                <Typography.Text style="font-size: 11px; font-family: monospace; color: #94a3b8" copyable>
+                  {{ selectedAlert.alert_id?.slice(0, 16) }}...
+                </Typography.Text>
+              </div>
+              <div style="display: flex; justify-content: space-between">
+                <Typography.Text type="secondary" style="font-size: 12px">摄像头</Typography.Text>
+                <Typography.Text style="font-size: 12px">{{ selectedAlert.camera_id }}</Typography.Text>
+              </div>
+              <div style="display: flex; justify-content: space-between">
+                <Typography.Text type="secondary" style="font-size: 12px">区域</Typography.Text>
+                <Typography.Text style="font-size: 12px">{{ selectedAlert.zone_id }}</Typography.Text>
+              </div>
+              <div style="display: flex; justify-content: space-between; align-items: center">
+                <Typography.Text type="secondary" style="font-size: 12px">严重度</Typography.Text>
+                <Tag :color="severityColor[selectedAlert.severity]" style="margin: 0">
+                  {{ severityLabel[selectedAlert.severity] }}
+                </Tag>
+              </div>
+              <div style="display: flex; justify-content: space-between; align-items: center">
+                <Typography.Text type="secondary" style="font-size: 12px">异常分数</Typography.Text>
+                <span :style="{ color: scoreColor(selectedAlert.anomaly_score), fontWeight: 600, fontSize: '13px' }">
+                  {{ selectedAlert.anomaly_score?.toFixed(4) }}
+                </span>
+              </div>
+              <div style="display: flex; justify-content: space-between">
+                <Typography.Text type="secondary" style="font-size: 12px">触发时间</Typography.Text>
+                <Typography.Text style="font-size: 12px">
+                  {{ formatTimestamp(selectedAlert.timestamp || selectedAlert.created_at) }}
+                </Typography.Text>
+              </div>
+              <div v-if="selectedAlert.assigned_to" style="display: flex; justify-content: space-between">
+                <Typography.Text type="secondary" style="font-size: 12px">处理人</Typography.Text>
+                <Typography.Text style="font-size: 12px">{{ selectedAlert.assigned_to }}</Typography.Text>
+              </div>
+              <div v-if="selectedAlert.notes" style="display: flex; justify-content: space-between">
+                <Typography.Text type="secondary" style="font-size: 12px">备注</Typography.Text>
+                <Typography.Text style="font-size: 12px; max-width: 180px; text-align: right">{{ selectedAlert.notes }}</Typography.Text>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: Actions -->
+          <div style="background: #1a1a2e; border-radius: 8px; padding: 14px">
+            <Typography.Text strong style="font-size: 12px; color: #9ca3af; display: block; margin-bottom: 10px">
+              操作
+            </Typography.Text>
+            <div style="display: flex; flex-direction: column; gap: 8px">
+              <Button
+                v-if="selectedAlert.workflow_status === 'new'"
+                type="primary"
+                block
+                @click="handleAcknowledge(selectedAlert.alert_id)"
+              >
+                <template #icon><CheckCircleOutlined /></template>
+                确认真实
+              </Button>
+              <Button
+                v-if="selectedAlert.workflow_status === 'new' || selectedAlert.workflow_status === 'acknowledged'"
+                block
+                @click="handleFalsePositive(selectedAlert.alert_id)"
+              >
+                <template #icon><StopOutlined /></template>
+                标记误报
+              </Button>
+              <div v-if="selectedAlert.workflow_status !== 'new' && selectedAlert.workflow_status !== 'acknowledged'" style="text-align: center; padding: 12px 0">
+                <Tag :color="workflowColor[selectedAlert.workflow_status]" style="font-size: 13px; padding: 4px 16px">
+                  {{ workflowLabel[selectedAlert.workflow_status] }}
+                </Tag>
+              </div>
+
+              <!-- Workflow timeline -->
+              <Divider style="margin: 8px 0; border-color: #2d2d4a" />
+              <Typography.Text type="secondary" style="font-size: 11px; margin-bottom: 4px">工作流进度</Typography.Text>
+              <Steps
+                v-if="selectedAlert.workflow_status !== 'false_positive'"
+                :current="workflowStepIndex"
+                size="small"
+                direction="vertical"
+                style="font-size: 11px"
+              >
+                <Steps.Step title="待处理" />
+                <Steps.Step title="已确认" />
+                <Steps.Step title="调查中" />
+                <Steps.Step title="已解决" />
+                <Steps.Step title="已关闭" />
+              </Steps>
+              <div v-else style="text-align: center; padding: 8px 0">
+                <Tag color="orange" style="font-size: 12px; padding: 2px 12px">已标记为误报</Tag>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
+
+<style>
+/* Alert row highlighting */
+.alert-row-high td {
+  background: rgba(239, 68, 68, 0.06) !important;
+}
+.alert-row-medium td {
+  background: rgba(249, 115, 22, 0.04) !important;
+}
+.alert-row-selected td {
+  background: rgba(59, 130, 246, 0.12) !important;
+}
+
+/* Compact table in detail mode */
+.ant-table-small .ant-table-cell {
+  padding: 6px 8px !important;
+}
+</style>
