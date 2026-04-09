@@ -4,7 +4,7 @@ cameras:
   name: Demo Camera
   source: data/demo4.mp4
   protocol: file
-  fps_target: 5
+  fps_target: 15
   resolution:
   - 1920
   - 1080
@@ -93,6 +93,8 @@ cameras:
     pre_trigger_seconds: 60
     post_trigger_seconds: 30
     jpeg_quality: 85
+    video_crf: 23
+    video_preset: veryfast
     max_recording_age_days: 30
     archive_dir: data/recordings
   low_light:
@@ -102,7 +104,7 @@ cameras:
   name: c
   source: '0'
   protocol: usb
-  fps_target: 5
+  fps_target: 15
   resolution:
   - 640
   - 480
@@ -191,6 +193,8 @@ cameras:
     pre_trigger_seconds: 60
     post_trigger_seconds: 30
     jpeg_quality: 85
+    video_crf: 23
+    video_preset: veryfast
     max_recording_age_days: 30
     archive_dir: data/recordings
   low_light:

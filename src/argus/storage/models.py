@@ -640,8 +640,8 @@ class ModelVersionEvent(Base):
 class AlertRecordingRecord(Base):
     """Tracks solidified alert recordings on disk (FR-033).
 
-    Each alert may have an associated recording containing JPEG frames
-    and signal timeseries for replay in the multi-track timeline.
+    Each alert has an associated H.264 MP4 recording with signal
+    timeseries for replay in the multi-track timeline.
     """
 
     __tablename__ = "alert_recordings"
@@ -663,6 +663,11 @@ class AlertRecordingRecord(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="complete",
     )
+    video_codec: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="h264",
+    )
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False,
     )
@@ -681,6 +686,9 @@ class AlertRecordingRecord(Base):
             "file_size_bytes": self.file_size_bytes,
             "linked_alert_id": self.linked_alert_id,
             "status": self.status,
+            "video_codec": self.video_codec,
+            "width": self.width,
+            "height": self.height,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

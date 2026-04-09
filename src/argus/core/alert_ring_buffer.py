@@ -4,12 +4,12 @@ Each camera's pipeline appends a FrameSnapshot every frame. When an alert
 triggers, the buffer is solidified to disk with differential retention
 based on severity level:
 
-  HIGH:   front 60s + back 30s, original FPS
-  MEDIUM: front 60s + back 30s, downsampled to 2 FPS
-  LOW:    front 10s + back 10s, downsampled to 2 FPS
-  INFO:   trigger frame + heatmap only (no video)
+  HIGH:   front 60s + back 30s, 15 FPS (original)
+  MEDIUM: front 60s + back 30s, 10 FPS
+  LOW:    front 10s + back 10s, 5 FPS
+  INFO:   trigger frame only (no video)
 
-Memory budget: ~140 MB resident for 4 cameras at 5 FPS (see §1.2.1).
+Memory budget: ~432 MB resident for 4 cameras at 15 FPS.
 """
 
 from __future__ import annotations
@@ -76,9 +76,9 @@ class _RetentionPolicy:
 
 
 _RETENTION = {
-    "high": _RetentionPolicy(pre_seconds=60, post_seconds=30, target_fps=5),  # original FPS
-    "medium": _RetentionPolicy(pre_seconds=60, post_seconds=30, target_fps=2),
-    "low": _RetentionPolicy(pre_seconds=10, post_seconds=10, target_fps=2),
+    "high": _RetentionPolicy(pre_seconds=60, post_seconds=30, target_fps=15),
+    "medium": _RetentionPolicy(pre_seconds=60, post_seconds=30, target_fps=10),
+    "low": _RetentionPolicy(pre_seconds=10, post_seconds=10, target_fps=5),
     "info": _RetentionPolicy(pre_seconds=0, post_seconds=0, target_fps=0),  # trigger frame only
 }
 
@@ -118,7 +118,7 @@ class AlertFrameBuffer:
     as normal; when the handle's window expires, call `finish_post_capture()`.
     """
 
-    def __init__(self, fps: int = 5, pre_seconds: int = 60, post_seconds: int = 30):
+    def __init__(self, fps: int = 15, pre_seconds: int = 60, post_seconds: int = 30):
         self._fps = max(fps, 1)
         self._pre_seconds = pre_seconds
         self._post_seconds = post_seconds

@@ -84,11 +84,11 @@ class TestAlertFrameBuffer:
         assert recording.status == RecordingStatus.RECORDING
 
     def test_solidify_medium_severity_downsample(self):
-        """MEDIUM severity should downsample to 2 FPS."""
-        buf = AlertFrameBuffer(fps=5, pre_seconds=10, post_seconds=5)
+        """MEDIUM severity should downsample to 10 FPS."""
+        buf = AlertFrameBuffer(fps=15, pre_seconds=10, post_seconds=5)
         ts = time.time()
-        for i in range(50):
-            buf.append(_make_snapshot(timestamp=ts - 10 + i * 0.2, frame_number=i))
+        for i in range(150):
+            buf.append(_make_snapshot(timestamp=ts - 10 + i / 15, frame_number=i))
 
         recording = buf.solidify(
             alert_id="ALT-003",
@@ -97,16 +97,16 @@ class TestAlertFrameBuffer:
             trigger_timestamp=ts,
         )
         assert recording is not None
-        assert recording.fps == 2
-        # Downsampled to ~2 FPS over 10 seconds = ~20 frames
-        assert len(recording.frames) <= 25
+        assert recording.fps == 10
+        # Downsampled to ~10 FPS over 10 seconds = ~100 frames
+        assert len(recording.frames) <= 110
 
     def test_solidify_low_severity_short_window(self):
-        """LOW severity has shorter window (10s pre + 10s post)."""
-        buf = AlertFrameBuffer(fps=5, pre_seconds=60, post_seconds=30)
+        """LOW severity has shorter window (10s pre + 10s post) at 5 FPS."""
+        buf = AlertFrameBuffer(fps=15, pre_seconds=60, post_seconds=30)
         ts = time.time()
-        for i in range(300):
-            buf.append(_make_snapshot(timestamp=ts - 60 + i * 0.2, frame_number=i))
+        for i in range(900):
+            buf.append(_make_snapshot(timestamp=ts - 60 + i / 15, frame_number=i))
 
         recording = buf.solidify(
             alert_id="ALT-004",
@@ -115,8 +115,9 @@ class TestAlertFrameBuffer:
             trigger_timestamp=ts,
         )
         assert recording is not None
-        # LOW: only 10 seconds pre-trigger at 2 FPS = ~20 frames
-        assert len(recording.frames) <= 25
+        # LOW: only 10 seconds pre-trigger at 5 FPS = ~50 frames
+        assert recording.fps == 5
+        assert len(recording.frames) <= 60
 
     def test_solidify_empty_buffer_returns_none(self):
         buf = AlertFrameBuffer(fps=5)

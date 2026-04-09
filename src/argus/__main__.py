@@ -220,7 +220,13 @@ def main():
     record_store.start()
 
     recordings_dir = str(Path(config.storage.alerts_dir).parent / "recordings")
-    alert_recording_store = AlertRecordingStore(archive_dir=recordings_dir)
+    # Get video encoding config from first camera's ring_buffer config
+    _rb_cfg = config.cameras[0].ring_buffer if config.cameras else None
+    alert_recording_store = AlertRecordingStore(
+        archive_dir=recordings_dir,
+        video_crf=_rb_cfg.video_crf if _rb_cfg else 23,
+        video_preset=_rb_cfg.video_preset if _rb_cfg else "veryfast",
+    )
 
     # Start camera manager with all cameras
     manager = CameraManager(
