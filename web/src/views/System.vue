@@ -4,7 +4,7 @@ import {
   Card, Tabs, Descriptions, Typography, Table, Button, Space, Tag,
   Form, Input, Select, message, Popconfirm, Badge, Switch,
 } from 'ant-design-vue'
-import api, {
+import {
   getHealth,
   getUsers as apiGetUsers,
   createUser as apiCreateUser,
@@ -14,6 +14,8 @@ import api, {
   getDegradationHistory,
   getAudioAlerts,
   updateAudioAlerts,
+  reloadConfig,
+  createBackup,
 } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
@@ -149,10 +151,10 @@ function onAuditFilterChange() {
 }
 
 // ── Config functions ──
-async function reloadConfig() {
+async function handleReloadConfig() {
   configLoading.value = true
   try {
-    await api.post('/config/reload')
+    await reloadConfig()
     message.success('配置已重新加载')
   } catch (e: any) {
     message.error('重载失败')
@@ -161,12 +163,12 @@ async function reloadConfig() {
   }
 }
 
-async function createBackup() {
+async function handleCreateBackup() {
   try {
-    await api.post('/backup/create')
+    await createBackup()
     message.success('备份已创建')
   } catch (e: any) {
-    message.error(e.response?.data?.error || '备份失败')
+    message.error(e.message || '备份失败')
   }
 }
 
@@ -291,7 +293,7 @@ const degradationLevelLabels: Record<string, string> = {
       <Tabs.TabPane key="config" tab="配置管理">
         <Card title="系统配置">
           <Space>
-            <Button type="primary" :loading="configLoading" @click="reloadConfig">重新加载配置</Button>
+            <Button type="primary" :loading="configLoading" @click="handleReloadConfig">重新加载配置</Button>
           </Space>
           <p style="color: #666; margin-top: 12px; font-size: 13px">
             重新从 configs/default.yaml 加载配置。修改配置文件后点击此按钮生效。
@@ -305,7 +307,7 @@ const degradationLevelLabels: Record<string, string> = {
           <p style="color: #888; margin-bottom: 16px">
             备份内容：SQLite 数据库、配置文件。
           </p>
-          <Button type="primary" @click="createBackup">立即备份</Button>
+          <Button type="primary" @click="handleCreateBackup">立即备份</Button>
         </Card>
       </Tabs.TabPane>
 
