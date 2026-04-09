@@ -92,6 +92,8 @@ class MyMiddleware(BaseHTTPMiddleware):
 
 新增摄像头协议时（如 USB、ONVIF），**必须** 在 `go2rtc_manager.py` 的 `sync_cameras()` 和 `app.py` 的 lifespan 中同步注册。未注册的摄像头会回退到 MJPEG `<img>` 标签，每个占一个 HTTP 长连接（最长 30 分钟），多个摄像头直接吃满浏览器的 6 连接/origin 上限，导致所有后续请求排队超时。使用 `usb_to_go2rtc_source()` 将 USB 设备索引转为 `ffmpeg:device?video=N#video=h264` 格式。
 
+**Frigate 架构模式（本项目已采用）**: USB 摄像头由 go2rtc 独占打开，Pipeline 通过 go2rtc 的 RTSP re-stream (`rtsp://127.0.0.1:8554/{camera_id}`) 拿帧做推理。启动顺序：`__main__.py` 先启动 go2rtc 注册 USB 摄像头 → 将 `CameraConfig.source` 重定向为 RTSP URL → 再启动 CameraManager。
+
 ### ❌ MJPEG 流编码必须使用专用线程池
 
 `cv2.imencode()` 等 CPU 密集操作 **禁止** 使用 `asyncio.to_thread()`（会占满默认线程池），必须使用 `loop.run_in_executor(_STREAM_EXECUTOR, ...)` 指定专用 `ThreadPoolExecutor`，避免阻塞普通 API 请求。见 `src/argus/dashboard/routes/cameras.py` 中的 `_STREAM_EXECUTOR`。

@@ -81,11 +81,10 @@ def create_app(
 
         await ws_manager.start()
 
-        # Start go2rtc and register RTSP cameras.
-        # USB cameras are NOT registered here — they are exclusive devices
-        # that cannot be opened by both the pipeline (OpenCV) and go2rtc
-        # (FFmpeg) simultaneously.  USB streams go through the MJPEG fallback.
-        if go2rtc is not None:
+        # Start go2rtc if not already running.  When launched via __main__,
+        # go2rtc is started earlier so USB cameras can be redirected before
+        # the pipeline opens them.  The dashboard-only mode still needs this.
+        if go2rtc is not None and not go2rtc.running:
             cameras_cfg = getattr(config, "cameras", [])
             rtsp_streams: dict[str, str] = {}
             for cam in cameras_cfg:

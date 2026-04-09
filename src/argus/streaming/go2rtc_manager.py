@@ -354,12 +354,11 @@ class Go2RTCManager:
     # ------------------------------------------------------------------
 
     def sync_cameras(self, cameras: list[dict[str, Any]]) -> None:
-        """Register RTSP cameras from the Argus configuration.
+        """Register cameras from the Argus configuration with go2rtc.
 
-        USB cameras are NOT registered — they are exclusive devices that
-        cannot be opened by both the pipeline (OpenCV) and go2rtc (FFmpeg).
-        USB streams use the MJPEG fallback path via the pipeline's
-        ``get_latest_frame()``.
+        RTSP cameras are registered directly.  USB cameras are converted to
+        go2rtc's ``ffmpeg:device`` source format.  Other protocols (e.g.
+        ``file``) are skipped.
 
         Parameters
         ----------
@@ -372,14 +371,18 @@ class Go2RTCManager:
 
         for cam in cameras:
             protocol = cam.get("protocol", "rtsp")
-            if protocol != "rtsp":
-                continue
-
             cam_id = cam["camera_id"]
             source = cam["source"]
 
+            if protocol == "rtsp":
+                go2rtc_source = source
+            elif protocol == "usb":
+                go2rtc_source = usb_to_go2rtc_source(source)
+            else:
+                continue
+
             if cam_id not in registered:
-                self.add_stream(cam_id, source)
+                self.add_stream(cam_id, go2rtc_source)
             else:
                 registered.discard(cam_id)
 
