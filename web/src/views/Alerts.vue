@@ -5,15 +5,16 @@ import { useRoute, useRouter } from 'vue-router'
 defineOptions({ name: 'AlertsPage' })
 import {
   Table, Tag, Button, Space, Typography, Select, Tooltip,
-  Divider, message, Segmented, Steps,
+  Divider, message, Segmented, Steps, Modal,
 } from 'ant-design-vue'
 import {
   CloseOutlined,
   CheckCircleOutlined,
   StopOutlined,
   ExportOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons-vue'
-import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive } from '../api'
+import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive, deleteAlert, bulkDeleteAlerts, bulkAcknowledge, bulkFalsePositive } from '../api'
 import { formatRelativeTime } from '../utils/time'
 import { useWebSocket } from '../composables/useWebSocket'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
@@ -23,6 +24,7 @@ const router = useRouter()
 
 const alerts = ref<any[]>([])
 const cameras = ref<any[]>([])
+const totalAlerts = ref(0)
 const loading = ref(true)
 const filters = ref({ camera_id: '', severity: '' })
 
@@ -31,6 +33,9 @@ const selectedAlert = ref<any>(null)
 const detailData = ref<any>(null)
 const imageMode = ref<'composite' | 'snapshot' | 'heatmap'>('composite')
 
+// Bulk selection
+const selectedRowKeys = ref<string[]>([])
+
 async function fetchData() {
   try {
     const params: Record<string, any> = { limit: 100 }
@@ -38,6 +43,7 @@ async function fetchData() {
     if (filters.value.severity) params.severity = filters.value.severity
     const [a, c] = await Promise.all([getAlerts(params), getCameras()])
     alerts.value = a.alerts
+    totalAlerts.value = a.total ?? a.alerts.length
     cameras.value = c.cameras || []
   } finally {
     loading.value = false
@@ -138,6 +144,77 @@ async function handleFalsePositive(id: string) {
     }
   } catch (e: any) {
     message.error(e.response?.data?.error || '标记失败')
+  }
+}
+
+function handleDelete(id: string) {
+  Modal.confirm({
+    title: '确认删除',
+    content: '删除后无法恢复，确定要删除此条告警吗？',
+    okText: '删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        await deleteAlert(id)
+        message.success('已删除')
+        if (selectedAlert.value?.alert_id === id) {
+          closeDetail()
+        }
+        fetchData()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '删除失败')
+      }
+    },
+  })
+}
+
+// ── Bulk actions ──
+function handleBulkDelete() {
+  if (!selectedRowKeys.value.length) return
+  Modal.confirm({
+    title: '批量删除',
+    content: `确定要删除选中的 ${selectedRowKeys.value.length} 条告警吗？删除后无法恢复。`,
+    okText: '删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        const res = await bulkDeleteAlerts(selectedRowKeys.value)
+        message.success(res.message || `已删除 ${res.count} 条`)
+        selectedRowKeys.value = []
+        if (selectedAlert.value && !alerts.value.some(a => a.alert_id === selectedAlert.value.alert_id)) {
+          closeDetail()
+        }
+        fetchData()
+      } catch (e: any) {
+        message.error(e.response?.data?.error || '批量删除失败')
+      }
+    },
+  })
+}
+
+async function handleBulkAcknowledge() {
+  if (!selectedRowKeys.value.length) return
+  try {
+    const res = await bulkAcknowledge(selectedRowKeys.value)
+    message.success(res.message || `已确认 ${res.count} 条`)
+    selectedRowKeys.value = []
+    fetchData()
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '批量确认失败')
+  }
+}
+
+async function handleBulkFalsePositive() {
+  if (!selectedRowKeys.value.length) return
+  try {
+    const res = await bulkFalsePositive(selectedRowKeys.value)
+    message.success(res.message || `已标记 ${res.count} 条为误报`)
+    selectedRowKeys.value = []
+    fetchData()
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '批量标记失败')
   }
 }
 
@@ -269,13 +346,39 @@ const columns = computed(() => {
 
       <!-- Table -->
       <div style="flex: 1; overflow: auto; padding: 0 8px">
+        <!-- Bulk action bar -->
+        <div
+          v-if="selectedRowKeys.length > 0"
+          style="display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #1a1a2e; border-radius: 6px; margin-bottom: 8px"
+        >
+          <Typography.Text style="font-size: 12px">
+            已选 {{ selectedRowKeys.length }} 条
+          </Typography.Text>
+          <Button size="small" type="primary" @click="handleBulkAcknowledge">
+            <template #icon><CheckCircleOutlined /></template>
+            批量确认
+          </Button>
+          <Button size="small" @click="handleBulkFalsePositive">
+            <template #icon><StopOutlined /></template>
+            批量误报
+          </Button>
+          <Button size="small" danger @click="handleBulkDelete">
+            <template #icon><DeleteOutlined /></template>
+            批量删除
+          </Button>
+          <Button size="small" type="text" style="color: #9ca3af" @click="selectedRowKeys = []">
+            取消选择
+          </Button>
+        </div>
+
         <Table
           :columns="columns"
           :data-source="alerts"
           :loading="loading"
           row-key="alert_id"
           size="small"
-          :pagination="selectedAlert ? { pageSize: 50, simple: true, size: 'small' } : { pageSize: 20, showTotal: (total: number) => `共 ${total} 条` }"
+          :row-selection="{ selectedRowKeys, onChange: (keys: string[]) => { selectedRowKeys = keys } }"
+          :pagination="selectedAlert ? { pageSize: 50, simple: true, size: 'small' } : { pageSize: 20, total: totalAlerts, showTotal: (t: number) => `共 ${t} 条` }"
           :custom-row="(record: any) => ({
             onClick: () => showDetail(record),
             class: rowClassName(record),
@@ -527,6 +630,14 @@ const columns = computed(() => {
                   {{ workflowLabel[selectedAlert.workflow_status] }}
                 </Tag>
               </div>
+              <Button
+                danger
+                block
+                @click="handleDelete(selectedAlert.alert_id)"
+              >
+                <template #icon><DeleteOutlined /></template>
+                删除告警
+              </Button>
 
               <!-- Workflow timeline -->
               <Divider style="margin: 8px 0; border-color: #2d2d4a" />

@@ -369,15 +369,19 @@ class SecurityHeadersMiddleware:
             await self.app(scope, receive, send)
             return
 
+        path = scope.get("path", "")
+        # Video/static endpoints manage their own Cache-Control
+        is_cacheable = path.startswith("/api/replay/") or path.startswith("/static/")
+
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
-                headers = dict(message.get("headers", []))
                 extra = [
                     (b"x-content-type-options", b"nosniff"),
                     (b"x-frame-options", b"DENY"),
                     (b"x-xss-protection", b"1; mode=block"),
-                    (b"cache-control", b"no-store"),
                 ]
+                if not is_cacheable:
+                    extra.append((b"cache-control", b"no-store"))
                 message["headers"] = list(message.get("headers", [])) + extra
             await send(message)
 

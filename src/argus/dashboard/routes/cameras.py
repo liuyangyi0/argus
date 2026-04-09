@@ -563,6 +563,53 @@ async def add_camera(request: Request):
     return api_success({"camera_id": camera_id})
 
 
+@router.delete("/{camera_id}")
+async def delete_camera(request: Request, camera_id: str):
+    """Delete a camera configuration. Stops the camera first if running."""
+    camera_manager = request.app.state.camera_manager
+    config = request.app.state.config
+    if not camera_manager or not config:
+        return api_unavailable("不可用")
+
+    # Verify camera exists
+    cam_config = next((c for c in config.cameras if c.camera_id == camera_id), None)
+    if cam_config is None:
+        return api_not_found(f"摄像头 {camera_id} 不存在")
+
+    # Stop the camera if it's running
+    try:
+        await asyncio.to_thread(camera_manager.stop_camera, camera_id)
+    except Exception:
+        pass  # Camera may not be running
+
+    # Remove from config list
+    config.cameras = [c for c in config.cameras if c.camera_id != camera_id]
+
+    # Remove from camera manager's runtime list
+    if hasattr(camera_manager, "remove_camera_config"):
+        camera_manager.remove_camera_config(camera_id)
+
+    # Remove go2rtc stream registration
+    go2rtc = getattr(request.app.state, "go2rtc_manager", None)
+    if go2rtc and hasattr(go2rtc, "remove_stream"):
+        try:
+            go2rtc.remove_stream(camera_id)
+        except Exception:
+            pass
+
+    # Persist to config file
+    config_path = getattr(request.app.state, "config_path", None)
+    if config_path:
+        try:
+            from argus.config.loader import save_config as _save_config
+            _save_config(config, config_path)
+        except Exception:
+            logger.exception("camera.delete_save_failed", camera_id=camera_id)
+
+    logger.info("camera.deleted", camera_id=camera_id)
+    return api_success({"camera_id": camera_id, "message": "已删除"})
+
+
 @router.post("/{camera_id}/start")
 async def start_camera(request: Request, camera_id: str):
     """Start a stopped camera."""
@@ -575,7 +622,10 @@ async def start_camera(request: Request, camera_id: str):
     if cam_config:
         _ensure_go2rtc_stream(request, cam_config)
 
-    success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
+    try:
+        success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
+    except RuntimeError:
+        return api_unavailable("服务正在关闭")
     if success:
         return api_success({}, headers=htmx_toast_headers("摄像头已启动"))
     return api_internal_error("启动失败")
@@ -905,5 +955,8 @@ async def wall_status(request: Request):
             cameras.append(tile)
         return cameras
 
-    cameras = await asyncio.to_thread(_build_wall_data)
+    try:
+        cameras = await asyncio.to_thread(_build_wall_data)
+    except RuntimeError:
+        return api_unavailable("服务正在关闭")
     return api_success({"cameras": cameras})

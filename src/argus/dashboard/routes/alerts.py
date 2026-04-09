@@ -637,6 +637,52 @@ async def bulk_false_positive(request: Request):
     return api_success({"count": count, "message": f"已标记 {count} 条为误报"})
 
 
+@router.post("/bulk-delete")
+async def bulk_delete(request: Request):
+    """Bulk delete alerts."""
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    data = await request.json()
+    alert_ids = data.get("alert_ids", [])
+
+    recording_store = getattr(request.app.state, "recording_store", None)
+    count = 0
+    for aid in alert_ids:
+        success, image_paths = db.delete_alert(aid)
+        if success:
+            count += 1
+            # Clean up image files
+            for path_str in image_paths:
+                try:
+                    p = Path(path_str)
+                    if p.exists():
+                        p.unlink()
+                except OSError:
+                    pass
+            # Clean up recording directory
+            if recording_store:
+                rec_dir = recording_store._find_recording_dir(aid)
+                if rec_dir and rec_dir.exists():
+                    import shutil
+                    shutil.rmtree(rec_dir, ignore_errors=True)
+
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="bulk_delete",
+            target_type="alert",
+            target_id=",".join(alert_ids[:10]),
+            detail=f"批量删除 {count} 条告警",
+            ip_address=client_ip,
+        )
+
+    return api_success({"count": count, "message": f"已删除 {count} 条告警"})
+
+
 # ── CSV Export ──
 
 @router.get("/export-csv")
@@ -676,11 +722,13 @@ def export_csv(
 
 # ── Single alert operations ──
 
-@router.post("/{alert_id}/acknowledge", response_class=HTMLResponse)
+@router.post("/{alert_id}/acknowledge")
 def acknowledge_alert(request: Request, alert_id: str):
     """Acknowledge an alert."""
     db = request.app.state.db
-    if db and db.acknowledge_alert(alert_id, "operator"):
+    if not db:
+        return api_unavailable("数据库不可用")
+    if db.acknowledge_alert(alert_id, "operator"):
         audit = getattr(request.app.state, "audit_logger", None)
         client_ip = request.client.host if request.client else ""
         if audit:
@@ -691,11 +739,11 @@ def acknowledge_alert(request: Request, alert_id: str):
                 target_id=alert_id,
                 ip_address=client_ip,
             )
-        return HTMLResponse('<span style="color:#4caf50;font-size:12px;">已确认</span>')
-    return HTMLResponse('<span style="color:#f44336;font-size:12px;">操作失败</span>')
+        return api_success({"alert_id": alert_id, "message": "已确认"})
+    return api_not_found("告警不存在或操作失败")
 
 
-@router.post("/{alert_id}/false-positive", response_class=HTMLResponse)
+@router.post("/{alert_id}/false-positive")
 def mark_false_positive(request: Request, alert_id: str):
     """Mark an alert as a false positive and submit to feedback queue.
 
@@ -704,7 +752,9 @@ def mark_false_positive(request: Request, alert_id: str):
     snapshot is copied to the baseline directory via FeedbackManager.
     """
     db = request.app.state.db
-    if db and db.mark_false_positive(alert_id):
+    if not db:
+        return api_unavailable("数据库不可用")
+    if db.mark_false_positive(alert_id):
         audit = getattr(request.app.state, "audit_logger", None)
         client_ip = request.client.host if request.client else ""
         if audit:
@@ -719,8 +769,50 @@ def mark_false_positive(request: Request, alert_id: str):
         # Submit to feedback queue (handles baseline copy + queue entry)
         _submit_workflow_feedback(request, alert_id, "false_positive")
 
-        return HTMLResponse('<span style="color:#ff9800;font-size:12px;">已标记误报</span>')
-    return HTMLResponse('<span style="color:#f44336;font-size:12px;">操作失败</span>')
+        return api_success({"alert_id": alert_id, "message": "已标记误报"})
+    return api_not_found("告警不存在或操作失败")
+
+
+@router.delete("/{alert_id}")
+def delete_alert(request: Request, alert_id: str):
+    """Delete a single alert by ID."""
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    success, image_paths = db.delete_alert(alert_id)
+    if not success:
+        return api_not_found("告警不存在")
+
+    # Clean up image files from disk
+    for path_str in image_paths:
+        try:
+            p = Path(path_str)
+            if p.exists():
+                p.unlink()
+        except OSError:
+            pass
+
+    # Clean up recording directory if exists
+    recording_store = getattr(request.app.state, "recording_store", None)
+    if recording_store:
+        rec_dir = recording_store._find_recording_dir(alert_id)
+        if rec_dir and rec_dir.exists():
+            import shutil
+            shutil.rmtree(rec_dir, ignore_errors=True)
+
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="delete_alert",
+            target_type="alert",
+            target_id=alert_id,
+            ip_address=client_ip,
+        )
+
+    return api_success({"alert_id": alert_id, "message": "已删除"})
 
 
 def _submit_workflow_feedback(
@@ -879,4 +971,6 @@ def alerts_json(
         d["has_recording"] = rec is not None
         d["recording_status"] = rec.status if rec else None
         result.append(d)
-    return api_success({"alerts": result})
+
+    total = db.get_alert_count(camera_id=camera_id, severity=severity)
+    return api_success({"alerts": result, "total": total})

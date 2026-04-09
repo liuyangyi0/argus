@@ -84,7 +84,10 @@ class Mp4Encoder:
         self._preset = preset
         self._frame_count = 0
 
-        self._container = av.open(str(self._output_path), mode="w")
+        self._container = av.open(
+            str(self._output_path), mode="w",
+            options={"movflags": "+faststart"},
+        )
         self._stream = self._container.add_stream("libx264", rate=fps)
         self._stream.width = width
         self._stream.height = height
@@ -93,7 +96,6 @@ class Mp4Encoder:
             "crf": str(crf),
             "preset": preset,
             "profile": "baseline",
-            "movflags": "+faststart",
         }
         self._stream.gop_size = fps  # keyframe every 1 second
 
@@ -156,7 +158,10 @@ def concat_mp4(
         post_stream = in_post.streams.video[0]
         fps = int(pre_stream.average_rate)
 
-        output = av.open(str(output_path), mode="w")
+        output = av.open(
+            str(output_path), mode="w",
+            options={"movflags": "+faststart"},
+        )
         out_stream = output.add_stream("libx264", rate=fps)
         out_stream.width = pre_stream.width
         out_stream.height = pre_stream.height
@@ -165,7 +170,6 @@ def concat_mp4(
             "crf": str(crf),
             "preset": preset,
             "profile": "baseline",
-            "movflags": "+faststart",
         }
         out_stream.gop_size = fps
 

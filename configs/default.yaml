@@ -1,109 +1,9 @@
 node_id: argus-edge-01
 cameras:
-- camera_id: cam_01
-  name: Demo Camera
-  source: data/demo4.mp4
-  protocol: file
-  fps_target: 15
-  resolution:
-  - 1920
-  - 1080
-  zones: []
-  reconnect_delay: 5.0
-  max_reconnect_attempts: -1
-  watchdog_timeout: 30.0
-  mog2:
-    history: 500
-    var_threshold: 25.0
-    detect_shadows: true
-    change_pct_threshold: 0.005
-    denoise: true
-    enable_stabilization: true
-    heartbeat_frames: 150
-    lock_score_threshold: 0.85
-    lock_clear_frames: 10
-  person_filter:
-    confidence: 0.4
-    skip_frame_on_person: false
-    model_name: yolo11n.pt
-    classes_to_detect:
-    - 0
-    enable_tracking: false
-  anomaly:
-    model_type: patchcore
-    threshold: 0.7
-    image_size:
-    - 256
-    - 256
-    enable_multiscale: true
-    tile_size: 512
-    tile_overlap: 0.25
-    dinomaly_backbone: dinov2_vitb14
-    dinomaly_encoder_layers:
-    - 2
-    - 5
-    - 8
-    - 11
-    dinomaly_few_shot_images: 8
-    dinomaly_multi_class: false
-    quantization: fp16
-    quantization_calibration_images: 100
-    enable_calibration: true
-    ssim_baseline_frames: 15
-    ssim_sensitivity: 50.0
-    ssim_midpoint: 0.015
-    shadow_sample_rate: 5
-    warmup_frames: 10
-    warmup_max_latency_ms: 500.0
-    verify_model_signature: false
-    min_shadow_days: 3
-    min_canary_days: 7
-  simplex:
-    enabled: true
-    diff_threshold: 30
-    min_area_px: 500
-    min_static_seconds: 30.0
-    morph_kernel_size: 5
-    match_radius_px: 50
-  health:
-    enabled: true
-    freeze_detection: true
-    lens_contamination_detection: true
-    displacement_detection: true
-    flash_suppression: true
-    gain_drift_detection: true
-    freeze_window_frames: 10
-    sharpness_drop_pct: 0.3
-    displacement_threshold_px: 20.0
-    flash_sigma: 3.0
-    gain_drift_threshold_pct: 20.0
-  drift:
-    enabled: true
-    reference_window: 500
-    test_window: 100
-    p_value_threshold: 0.01
-    ks_threshold: 0.1
-    cooldown_minutes: 30
-  degradation:
-    max_consecutive_failures: 5
-    refuse_start_on_backbone_failure: false
-    watchdog_check_interval_seconds: 15.0
-  ring_buffer:
-    enabled: true
-    pre_trigger_seconds: 60
-    post_trigger_seconds: 30
-    jpeg_quality: 85
-    video_crf: 23
-    video_preset: veryfast
-    max_recording_age_days: 30
-    archive_dir: data/recordings
-  low_light:
-    enabled: true
-    brightness_threshold: 40.0
 - camera_id: c
   name: c
-  source: '0'
-  protocol: usb
+  source: rtsp://127.0.0.1:8554/c
+  protocol: rtsp
   fps_target: 15
   resolution:
   - 640
@@ -158,6 +58,8 @@ cameras:
     verify_model_signature: false
     min_shadow_days: 3
     min_canary_days: 7
+    backbone_max_per_camera: 5000
+    backbone_max_total_images: 50000
   simplex:
     enabled: true
     diff_threshold: 30
@@ -256,6 +158,10 @@ dashboard:
       enabled: true
       sound: beep_double_voice
       voice_template: '{camera} 高级别告警'
+  go2rtc_enabled: true
+  go2rtc_api_port: 1984
+  go2rtc_rtsp_port: 8554
+  go2rtc_binary: null
 storage:
   database_url: sqlite:///data/db/argus.db
   baselines_dir: data\baselines

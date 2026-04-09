@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import av
 import cv2
 import numpy as np
 import structlog
@@ -340,6 +341,102 @@ class AlertRecordingStore:
     def has_recording(self, alert_id: str) -> bool:
         """Check if a recording exists for the given alert."""
         return self._find_recording_dir(alert_id) is not None
+
+    def reindex_moov(self) -> int:
+        """Re-mux all existing MP4 files with moov atom at the beginning.
+
+        Fixes videos encoded before the movflags +faststart fix.
+        Returns number of files re-muxed.
+        """
+        if not self._archive_dir.exists():
+            return 0
+
+        count = 0
+        for mp4_path in self._archive_dir.rglob("*.mp4"):
+            # Check if moov is already at the front
+            try:
+                with open(mp4_path, "rb") as f:
+                    data = f.read(64)
+            except OSError:
+                continue
+            if len(data) < 16:
+                continue
+            ftyp_size = int.from_bytes(data[0:4], "big")
+            pos = ftyp_size
+            # Skip 'free' boxes after ftyp
+            while pos + 8 <= len(data):
+                box_type = data[pos + 4: pos + 8]
+                box_size = int.from_bytes(data[pos: pos + 4], "big")
+                if box_type == b"free":
+                    pos += box_size
+                    continue
+                break
+            if pos + 8 <= len(data) and data[pos + 4: pos + 8] == b"moov":
+                continue  # already faststart, skip
+
+            # Re-mux with faststart
+            tmp_path = mp4_path.with_suffix(".tmp.mp4")
+            inp = None
+            out = None
+            try:
+                inp = av.open(str(mp4_path))
+                in_stream = inp.streams.video[0]
+                fps = int(in_stream.average_rate) if in_stream.average_rate else 15
+                out = av.open(
+                    str(tmp_path), mode="w",
+                    options={"movflags": "+faststart"},
+                )
+                out_stream = out.add_stream("libx264", rate=fps)
+                out_stream.width = in_stream.width
+                out_stream.height = in_stream.height
+                out_stream.pix_fmt = "yuv420p"
+                out_stream.options = {
+                    "crf": str(self._video_crf),
+                    "preset": self._video_preset,
+                    "profile": "baseline",
+                }
+                out_stream.gop_size = fps
+
+                idx = 0
+                for frame in inp.decode(in_stream):
+                    frame.pts = idx
+                    for pkt in out_stream.encode(frame):
+                        out.mux(pkt)
+                    idx += 1
+                for pkt in out_stream.encode():
+                    out.mux(pkt)
+                out.close()
+                out = None
+                inp.close()
+                inp = None
+
+                # Replace original
+                mp4_path.unlink()
+                tmp_path.rename(mp4_path)
+                count += 1
+                logger.info("alert_recording.reindex_moov", path=str(mp4_path))
+            except Exception as e:
+                logger.warning("alert_recording.reindex_moov_failed", path=str(mp4_path), error=str(e))
+            finally:
+                if out is not None:
+                    try:
+                        out.close()
+                    except Exception:
+                        pass
+                if inp is not None:
+                    try:
+                        inp.close()
+                    except Exception:
+                        pass
+                if tmp_path.exists() and mp4_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+
+        if count > 0:
+            logger.info("alert_recording.reindex_moov_done", count=count)
+        return count
 
     def cleanup_old(self, max_age_days: int = 30) -> int:
         """Remove recordings older than max_age_days.

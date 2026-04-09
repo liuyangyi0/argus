@@ -97,6 +97,8 @@ def replay_video(request: Request, alert_id: str):
     """Return the MP4 video file with HTTP Range support for seeking.
 
     The browser <video> element uses Range requests for efficient playback.
+    Proper 206 Partial Content responses are required for seeking and
+    progressive loading (especially when moov atom is at end of file).
     """
     store = _get_recording_store(request)
     if store is None:
@@ -106,10 +108,55 @@ def replay_video(request: Request, alert_id: str):
     if video_path is None or not video_path.exists():
         return api_not_found("视频文件不存在")
 
+    file_size = video_path.stat().st_size
+    range_header = request.headers.get("range")
+
+    if range_header:
+        # Parse Range: bytes=start-end
+        try:
+            range_spec = range_header.strip().replace("bytes=", "")
+            parts = range_spec.split("-", 1)
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else file_size - 1
+        except (ValueError, IndexError):
+            start, end = 0, file_size - 1
+
+        start = max(0, min(start, file_size - 1))
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+
+        def ranged_file():
+            with open(video_path, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        from starlette.responses import StreamingResponse
+        return StreamingResponse(
+            ranged_file(),
+            status_code=206,
+            media_type="video/mp4",
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    # No Range header — return full file
     return FileResponse(
         path=str(video_path),
         media_type="video/mp4",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=3600",
+        },
     )
 
 
