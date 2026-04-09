@@ -3,7 +3,7 @@ import { ref, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Table, Badge, Button, Typography, Space, Modal, Form, Input, Select, InputNumber, message } from 'ant-design-vue'
 import { PlusOutlined } from '@ant-design/icons-vue'
-import api, { getCameras, startCamera, stopCamera, getUsbDevices } from '../api'
+import { getCameras, startCamera, stopCamera, getUsbDevices, addCamera } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
 const router = useRouter()
@@ -85,13 +85,13 @@ async function handleAddCamera() {
   try {
     const form = new FormData()
     Object.entries(addForm.value).forEach(([k, v]) => form.append(k, String(v)))
-    await api.post('/cameras', form)
+    await addCamera(form)
     message.success('摄像头已添加')
     addModalVisible.value = false
     addForm.value = { camera_id: '', name: '', source: '', protocol: 'rtsp', fps_target: 5, resolution: '1920,1080' }
     fetchData()
   } catch (e: any) {
-    message.error(e.response?.data?.error || '添加失败')
+    message.error(e.message || '添加失败')
   }
 }
 
