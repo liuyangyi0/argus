@@ -235,6 +235,17 @@ def main():
         video_preset=_rb_cfg.video_preset if _rb_cfg else "veryfast",
     )
 
+    # Repair recordings with broken PTS timestamps in background
+    def _bg_repair():
+        try:
+            repaired = alert_recording_store.repair_all()
+            if repaired > 0:
+                logger.info("startup.recordings_repaired", count=repaired)
+        except Exception:
+            logger.warning("startup.recording_repair_failed", exc_info=True)
+
+    threading.Thread(target=_bg_repair, name="recording-repair", daemon=True).start()
+
     # ── go2rtc frame-source redirection (Frigate-style architecture) ──
     # USB cameras are exclusive devices — only one process can open them.
     # We let go2rtc own the USB device and re-stream via RTSP so the

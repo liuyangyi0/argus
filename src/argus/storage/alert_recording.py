@@ -23,7 +23,8 @@ import structlog
 
 from argus.core.alert_ring_buffer import FrameSnapshot, SolidifiedRecording, RecordingStatus
 from argus.core.video_encoder import (
-    Mp4Encoder, concat_mp4, extract_frame_jpeg, jpeg_dimensions, _BYTES_PER_MB,
+    Mp4Encoder, concat_mp4, extract_frame_jpeg, jpeg_dimensions, repair_video_timestamps,
+    _BYTES_PER_MB,
 )
 
 logger = structlog.get_logger()
@@ -72,6 +73,49 @@ class AlertRecordingStore:
         self._video_crf = video_crf
         self._video_preset = video_preset
         self._path_cache: dict[str, Path] = {}  # alert_id -> rec_dir (O(1) lookup)
+
+    def repair_all(self) -> int:
+        """Re-encode recordings with broken PTS timestamps.
+
+        Per-file, skips if metadata already has ``pts_repaired`` flag.
+        Returns the number of videos repaired.
+        """
+        if not self._archive_dir.exists():
+            return 0
+
+        repaired = 0
+        for date_dir in sorted(self._archive_dir.iterdir()):
+            if not date_dir.is_dir():
+                continue
+            for camera_dir in date_dir.iterdir():
+                if not camera_dir.is_dir():
+                    continue
+                for alert_dir in camera_dir.iterdir():
+                    if not alert_dir.is_dir():
+                        continue
+                    video_path = _find_video_file(alert_dir)
+                    if video_path is None:
+                        continue
+                    meta_path = alert_dir / "metadata.json"
+                    if not meta_path.exists():
+                        continue
+                    try:
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                        if meta.get("pts_repaired"):
+                            continue
+                        fps = meta.get("fps", 15)
+                        if repair_video_timestamps(video_path, fps, self._video_crf, self._video_preset):
+                            meta["pts_repaired"] = True
+                            meta_path.write_text(
+                                json.dumps(meta, ensure_ascii=False), encoding="utf-8",
+                            )
+                            repaired += 1
+                    except Exception:
+                        logger.warning("alert_recording.repair_skip", path=str(alert_dir), exc_info=True)
+
+        if repaired > 0:
+            logger.info("alert_recording.repair_complete", repaired=repaired)
+        return repaired
 
     def save(self, recording: SolidifiedRecording) -> tuple[str, int]:
         """Persist a solidified recording to disk as MP4 video.

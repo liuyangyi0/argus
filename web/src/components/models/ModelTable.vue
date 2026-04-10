@@ -525,7 +525,7 @@ const columns = [
       <div
         v-for="(event, idx) in stageHistory"
         :key="idx"
-        style="padding: 12px; margin-bottom: 8px; background: #1e1e36; border-radius: 6px"
+        style="padding: 12px; margin-bottom: 8px; background: var(--argus-hover-bg); border-radius: 6px"
       >
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px">
           <Space>

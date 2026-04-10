@@ -55,6 +55,21 @@ def jpeg_dimensions(jpeg_bytes: bytes) -> tuple[int, int] | None:
     return None
 
 
+def _create_h264_output(
+    path: Path, fps: int, width: int, height: int,
+    crf: int = 23, preset: str = "veryfast",
+) -> tuple[av.container.OutputContainer, av.stream.Stream]:
+    """Create an H.264 MP4 output container + stream with standard settings."""
+    container = av.open(str(path), mode="w", options={"movflags": "+faststart"})
+    stream = container.add_stream("libx264", rate=fps)
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = "yuv420p"
+    stream.options = {"crf": str(crf), "preset": preset, "profile": "baseline"}
+    stream.gop_size = fps  # keyframe every 1 second
+    return container, stream
+
+
 class Mp4Encoder:
     """Encodes JPEG frames into an H.264 MP4 file.
 
@@ -84,20 +99,9 @@ class Mp4Encoder:
         self._preset = preset
         self._frame_count = 0
 
-        self._container = av.open(
-            str(self._output_path), mode="w",
-            options={"movflags": "+faststart"},
+        self._container, self._stream = _create_h264_output(
+            self._output_path, fps, width, height, crf, preset,
         )
-        self._stream = self._container.add_stream("libx264", rate=fps)
-        self._stream.width = width
-        self._stream.height = height
-        self._stream.pix_fmt = "yuv420p"
-        self._stream.options = {
-            "crf": str(crf),
-            "preset": preset,
-            "profile": "baseline",
-        }
-        self._stream.gop_size = fps  # keyframe every 1 second
 
     def write_jpeg_frame(self, jpeg_bytes: bytes) -> None:
         """Decode a JPEG buffer and encode it as an H.264 frame."""
@@ -142,6 +146,7 @@ def concat_mp4(
     output_path: Path,
     crf: int = 23,
     preset: str = "veryfast",
+    fps: int | None = None,
 ) -> int:
     """Concatenate two MP4 files by re-encoding into a single output.
 
@@ -156,22 +161,12 @@ def concat_mp4(
     try:
         pre_stream = in_pre.streams.video[0]
         post_stream = in_post.streams.video[0]
-        fps = int(pre_stream.average_rate)
+        if fps is None:
+            fps = int(pre_stream.average_rate)
 
-        output = av.open(
-            str(output_path), mode="w",
-            options={"movflags": "+faststart"},
+        output, out_stream = _create_h264_output(
+            output_path, fps, pre_stream.width, pre_stream.height, crf, preset,
         )
-        out_stream = output.add_stream("libx264", rate=fps)
-        out_stream.width = pre_stream.width
-        out_stream.height = pre_stream.height
-        out_stream.pix_fmt = "yuv420p"
-        out_stream.options = {
-            "crf": str(crf),
-            "preset": preset,
-            "profile": "baseline",
-        }
-        out_stream.gop_size = fps
 
         frame_idx = 0
         for frame in in_pre.decode(pre_stream):
@@ -275,3 +270,50 @@ def get_video_frame_count(mp4_path: Path) -> int | None:
             container.close()
     except Exception:
         return None
+
+
+def repair_video_timestamps(mp4_path: Path, fps: int, crf: int = 23, preset: str = "veryfast") -> bool:
+    """Re-encode an MP4 in-place with correct PTS timestamps.
+
+    Checks average_rate to decide if repair is needed, then streams
+    decode→encode (one frame at a time) to avoid buffering the whole video.
+    Returns True if repaired, False if skipped or failed.
+    """
+    tmp_path = mp4_path.with_suffix(".tmp.mp4")
+    try:
+        container = av.open(str(mp4_path))
+        try:
+            stream = container.streams.video[0]
+            avg_rate = float(stream.average_rate) if stream.average_rate else 0
+            if avg_rate > 0 and abs(avg_rate - fps) / fps < 0.5:
+                return False  # already correct
+
+            frame_count = 0
+            out_container, out_stream = _create_h264_output(
+                tmp_path, fps, stream.width, stream.height, crf, preset,
+            )
+            try:
+                for frame in container.decode(video=0):
+                    frame.pts = frame_count
+                    for packet in out_stream.encode(frame):
+                        out_container.mux(packet)
+                    frame_count += 1
+
+                for packet in out_stream.encode():
+                    out_container.mux(packet)
+            finally:
+                out_container.close()
+        finally:
+            container.close()
+
+        if frame_count == 0:
+            tmp_path.unlink(missing_ok=True)
+            return False
+
+        tmp_path.replace(mp4_path)
+        logger.info("video_encoder.repaired", path=str(mp4_path), frames=frame_count, fps=fps)
+        return True
+    except Exception:
+        logger.warning("video_encoder.repair_failed", path=str(mp4_path), exc_info=True)
+        tmp_path.unlink(missing_ok=True)
+        return False
