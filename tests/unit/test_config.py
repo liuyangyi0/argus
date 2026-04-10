@@ -112,7 +112,7 @@ class TestConfigLoader:
         config = load_config("configs/default.yaml")
         assert config.node_id == "argus-edge-01"
         assert len(config.cameras) >= 1
-        assert config.cameras[0].camera_id == "cam_01"
+        assert config.cameras[0].camera_id == "c"
 
 
 class TestDinomaly2Config:
