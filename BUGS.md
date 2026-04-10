@@ -19,27 +19,27 @@
 - `test_load_default_config_file` 断言 `camera_id == "cam_01"` 但实际值已改为 `"c"`
 - **提交:** 1f27ef0
 
+### [已修复] P1 — 告警时间线返回空数据
+- `/api/alerts/timeline` 返回 `"cameras": []`
+- **根因:** `alerts.py:1071` 使用 `.timestamp()` 将 datetime 转为 epoch float，与 SQLite 的 DateTime 字符串比较不兼容
+- **修复:** 直接传 datetime 对象给 SQLAlchemy where 条件
+
+### [已修复] P2 — 前端 bundle 过大
+- 拆分前：api chunk 1.46MB, dist chunk 572KB
+- 拆分后：antd 独立 chunk (可缓存)，echarts 独立 chunk，应用代码 37KB
+- **修复:** vite.config.ts 添加 manualChunks 拆分 antd 和 echarts
+
+### [已关闭] P3 — Prometheus 指标全零
+- **非 bug:** 指标已正确集成到 pipeline.py，启动后需要数秒积累帧数据
+- 确认: `argus_frames_processed_total{camera_id="c"} 8119.0`, `argus_anomaly_score 0.88`
+
 ---
 
-## 待修复
-
-### P2 — 前端 bundle 过大
-- `api-GPQ5V0N3.js` 达 1.46MB (gzip 448KB)
-- `dist-CBppCSgD.js` 达 572KB (gzip 191KB)
-- 建议：动态 import() 拆分路由级组件，懒加载 ECharts
-
-### P3 — Prometheus 指标全零
-- `argus_inference_latency_seconds` 所有 bucket 为 0
-- 可能原因：metrics 模块已注册但 pipeline 中未调用 observe()
-- 需要确认 metrics.py 是否已集成到 pipeline.py
+## 待观察
 
 ### P3 — 训练任务状态 "failed"
 - 唯一的训练任务 `8b2dff72-8c3` 状态为 failed
 - 需检查失败原因，确认训练流程是否正常
-
-### P3 — 告警时间线返回空 cameras
-- `/api/alerts/timeline` 返回 `"cameras": []`
-- 有 21 条告警但时间线无数据，可能是日期过滤问题
 
 ---
 
