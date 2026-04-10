@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue'
 import {
   Card, Table, Button, Tag, Space, Select,
-  Popconfirm, message, Drawer, Descriptions, Typography, Empty,
+  Popconfirm, message, Drawer, Descriptions, Typography,
 } from 'ant-design-vue'
 import {
   CheckOutlined, CloseOutlined, ReloadOutlined,

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { Card, Table, Tag, Space, Collapse } from 'ant-design-vue'
+import { Table, Tag, Space, Collapse } from 'ant-design-vue'
 import { HistoryOutlined } from '@ant-design/icons-vue'
 import { getVersionEvents } from '../../api'
 import { STAGE_MAP } from '../../composables/useModelState'

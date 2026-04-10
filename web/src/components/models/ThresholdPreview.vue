@@ -29,7 +29,8 @@ async function fetchPreview() {
 
 // Debounce threshold changes
 let timer: ReturnType<typeof setTimeout> | null = null
-function onThresholdChange(val: number) {
+function onThresholdChange(val: number | number[]) {
+  if (Array.isArray(val)) return
   threshold.value = val
   if (timer) clearTimeout(timer)
   timer = setTimeout(fetchPreview, 300)
@@ -118,7 +119,7 @@ watch(previewData, (data) => {
             <Statistic
               title="超过阈值"
               :value="previewData.above_threshold"
-              value-style="color: #ff4d4f"
+              :value-style="{ color: '#ff4d4f' }"
             />
           </Col>
           <Col :span="6">

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { h, ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { theme, Layout, Menu, Typography, Tooltip } from 'ant-design-vue'
+import { Layout, Menu, Typography, Tooltip } from 'ant-design-vue'
 import {
   DesktopOutlined,
   CameraOutlined,

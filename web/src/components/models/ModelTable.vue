@@ -275,7 +275,7 @@ function handleOpenABCompare(record: any) {
   })
 }
 
-function handleMenuClick(record: any, { key }: { key: string }) {
+function handleMenuClick(record: any, { key }: { key: string | number }) {
   switch (key) {
     case 'reexport': handleReexport(record); break
     case 'recalibrate': handleRecalibrate(record); break

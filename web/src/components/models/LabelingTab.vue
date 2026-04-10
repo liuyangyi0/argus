@@ -2,11 +2,11 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import {
   Card, Table, Button, Space, Select, Tag, Image, Statistic, Row, Col,
-  message, Modal, Popconfirm, Empty, Badge, Progress, Typography, Tooltip,
+  message, Modal, Empty, Badge, Progress, Tooltip,
 } from 'ant-design-vue'
 import {
   CheckOutlined, CloseOutlined, ForwardOutlined, ReloadOutlined,
-  ExperimentOutlined, QuestionCircleOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons-vue'
 import {
   getLabelingQueue, labelEntry, skipEntry, getLabelingStats,
@@ -32,7 +32,7 @@ const columns = [
     dataIndex: 'frame_path',
     key: 'thumbnail',
     width: 80,
-    customRender: ({ record }: any) => null, // handled in template
+    customRender: ({ record: _record }: any) => null, // handled in template
   },
   { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 120 },
   {
@@ -40,14 +40,14 @@ const columns = [
     dataIndex: 'anomaly_score',
     key: 'anomaly_score',
     width: 100,
-    customRender: ({ text }: any) => null, // handled in template
+    customRender: ({ text: _text }: any) => null, // handled in template
   },
   {
     title: '不确定性',
     dataIndex: 'entropy',
     key: 'entropy',
     width: 100,
-    customRender: ({ text }: any) => null, // handled in template
+    customRender: ({ text: _text }: any) => null, // handled in template
   },
   {
     title: '状态',
@@ -171,22 +171,22 @@ onMounted(() => {
       </Col>
       <Col :span="4">
         <Card size="small">
-          <Statistic title="已标注" :value="stats.labeled || 0" value-style="color: #52c41a" />
+          <Statistic title="已标注" :value="stats.labeled || 0" :value-style="{ color: '#52c41a' }" />
         </Card>
       </Col>
       <Col :span="4">
         <Card size="small">
-          <Statistic title="标记正常" :value="stats.by_label?.normal || 0" value-style="color: #1890ff" />
+          <Statistic title="标记正常" :value="stats.by_label?.normal || 0" :value-style="{ color: '#1890ff' }" />
         </Card>
       </Col>
       <Col :span="4">
         <Card size="small">
-          <Statistic title="标记异常" :value="stats.by_label?.anomaly || 0" value-style="color: #ff4d4f" />
+          <Statistic title="标记异常" :value="stats.by_label?.anomaly || 0" :value-style="{ color: '#ff4d4f' }" />
         </Card>
       </Col>
       <Col :span="4">
         <Card size="small">
-          <Statistic title="已跳过" :value="stats.skipped || 0" value-style="color: #999" />
+          <Statistic title="已跳过" :value="stats.skipped || 0" :value-style="{ color: '#999' }" />
         </Card>
       </Col>
       <Col :span="4">

@@ -43,16 +43,14 @@ const borderStyle = computed(() => {
   return { border: '1px solid var(--argus-border)' }
 })
 
-const statusBadge = computed(() => {
-  if (props.camera.active_alert) return 'error'
-  if (props.camera.degradation) return 'warning'
-  if (props.camera.status === 'online') return 'success'
-  return 'default'
-})
-
 // go2rtc WebRTC/MSE player
 const cameraIdRef = computed(() => props.camera.camera_id)
-const { videoRef, mjpegRef, status: streamStatus, start, stop } = useGo2RTC(cameraIdRef)
+const _go2rtc = useGo2RTC(cameraIdRef)
+// @ts-expect-error TS6133 — used as template ref="videoRef"
+const videoRef = _go2rtc.videoRef
+const mjpegRef = _go2rtc.mjpegRef
+const streamStatus = _go2rtc.status
+const { start, stop } = _go2rtc
 
 // Legacy MJPEG fallback URL
 const mjpegUrl = computed(() => `/api/cameras/${props.camera.camera_id}/stream`)

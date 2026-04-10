@@ -66,6 +66,7 @@ interface Segment {
   end: string
   severity: string
   alert_count: number
+  first_alert_id?: string
 }
 
 interface CameraTimeline {

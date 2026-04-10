@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import {
-  Card, Form, Select, Button, Table, Tag, Collapse,
+  Form, Select, Button, Table, Tag, Collapse,
   message,
 } from 'ant-design-vue'
 import { ExperimentOutlined } from '@ant-design/icons-vue'
