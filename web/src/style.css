@@ -17,17 +17,29 @@ body {
 /* ── CSS Variables for theme-aware components ── */
 :root, .dark-theme {
   --argus-card-bg: linear-gradient(135deg, #1a1a2e 0%, #16162a 100%);
+  --argus-card-bg-solid: #1a1a2e;
   --argus-border: #2d2d4a;
   --argus-text: #e2e8f0;
   --argus-text-muted: #6b7280;
   --argus-surface: #12121e;
+  --argus-header-bg: #141414;
+  --argus-footer-bg: #0f0f1a;
+  --argus-hover-bg: #1e1e36;
+  --argus-sidebar-border: #1f2937;
+  --argus-icon-muted: #2d2d4a;
 }
 .light-theme {
   --argus-card-bg: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+  --argus-card-bg-solid: #ffffff;
   --argus-border: #e5e7eb;
   --argus-text: #111827;
   --argus-text-muted: #6b7280;
   --argus-surface: #f1f5f9;
+  --argus-header-bg: #f1f5f9;
+  --argus-footer-bg: #f8fafc;
+  --argus-hover-bg: #e2e8f0;
+  --argus-sidebar-border: #e5e7eb;
+  --argus-icon-muted: #d1d5db;
 }
 
 /* ── Light theme overrides ── */
