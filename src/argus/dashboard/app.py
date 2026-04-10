@@ -229,7 +229,7 @@ def create_app(
         from argus.dashboard.routes.baseline import router as baseline_router
         app.include_router(baseline_router, prefix="/api/baseline", tags=["baseline"])
     except ImportError:
-        pass
+        logger.debug("app.baseline_router_import_failed", exc_info=True)
 
     # ── WebSocket ──
     @app.websocket("/ws")

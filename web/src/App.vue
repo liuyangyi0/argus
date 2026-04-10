@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { h, ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { Layout, Menu, Typography, Tooltip } from 'ant-design-vue'
+import { Layout, Menu, Typography, Tooltip, Modal } from 'ant-design-vue'
 import {
   DesktopOutlined,
   CameraOutlined,
@@ -12,6 +12,7 @@ import {
   BulbFilled,
 } from '@ant-design/icons-vue'
 import DegradationBar from './components/DegradationBar.vue'
+import ErrorBoundary from './components/ErrorBoundary.vue'
 import { useThemeStore } from './stores/theme'
 import { useWebSocket } from './composables/useWebSocket'
 
@@ -57,11 +58,34 @@ function checkMobile() {
   isMobile.value = window.innerWidth < 768
   if (isMobile.value) collapsed.value = true
 }
+let _resizeTimer: ReturnType<typeof setTimeout> | null = null
+function debouncedCheckMobile() {
+  if (_resizeTimer) clearTimeout(_resizeTimer)
+  _resizeTimer = setTimeout(checkMobile, 200)
+}
+// Global keyboard shortcuts
+const shortcutHelpVisible = ref(false)
+const navKeys: Record<string, string> = { '1': '/overview', '2': '/cameras', '3': '/alerts', '4': '/models', '5': '/system' }
+
+function handleKeyDown(e: KeyboardEvent) {
+  // Ignore when typing in inputs
+  const tag = (e.target as HTMLElement)?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+
+  if (e.key === '?') { shortcutHelpVisible.value = !shortcutHelpVisible.value; return }
+  if (e.key === 'Escape') { shortcutHelpVisible.value = false; return }
+  if (navKeys[e.key]) { router.push(navKeys[e.key]); return }
+}
+
 onMounted(() => {
   checkMobile()
-  window.addEventListener('resize', checkMobile)
+  window.addEventListener('resize', debouncedCheckMobile)
+  window.addEventListener('keydown', handleKeyDown)
 })
-onUnmounted(() => window.removeEventListener('resize', checkMobile))
+onUnmounted(() => {
+  window.removeEventListener('resize', debouncedCheckMobile)
+  window.removeEventListener('keydown', handleKeyDown)
+})
 </script>
 
 <template>
@@ -106,6 +130,7 @@ onUnmounted(() => window.removeEventListener('resize', checkMobile))
             <a-button
               type="text"
               shape="circle"
+              :aria-label="themeStore.isDark ? '切换亮色主题' : '切换暗色主题'"
               @click="themeStore.toggle()"
             >
               <template #icon>
@@ -127,6 +152,8 @@ onUnmounted(() => window.removeEventListener('resize', checkMobile))
         <!-- WebSocket disconnect banner -->
         <div
           v-if="!wsConnected && (wsReconnecting || wsFallbackMode)"
+          role="alert"
+          aria-live="polite"
           :style="{
             background: wsFallbackMode ? '#faad14' : '#ff4d4f',
             color: '#fff',
@@ -149,13 +176,40 @@ onUnmounted(() => window.removeEventListener('resize', checkMobile))
         </div>
         <DegradationBar />
         <Layout.Content style="padding: 24px; overflow-y: auto">
-          <router-view v-slot="{ Component }">
-            <keep-alive :include="['OverviewPage', 'CamerasPage', 'AlertsPage']">
-              <component :is="Component" />
-            </keep-alive>
-          </router-view>
+          <ErrorBoundary>
+            <router-view v-slot="{ Component }">
+              <Transition name="page-fade" mode="out-in">
+                <keep-alive :include="['OverviewPage', 'CamerasPage', 'AlertsPage']">
+                  <component :is="Component" />
+                </keep-alive>
+              </Transition>
+            </router-view>
+          </ErrorBoundary>
         </Layout.Content>
       </Layout>
     </Layout>
+    <!-- Keyboard shortcuts help -->
+    <Modal v-model:open="shortcutHelpVisible" title="键盘快捷键" :footer="null" width="360px">
+      <div style="display: grid; grid-template-columns: 60px 1fr; gap: 8px 16px; font-size: 13px">
+        <kbd>?</kbd><span>显示快捷键帮助</span>
+        <kbd>1</kbd><span>值班台</span>
+        <kbd>2</kbd><span>摄像头</span>
+        <kbd>3</kbd><span>告警</span>
+        <kbd>4</kbd><span>模型管理</span>
+        <kbd>5</kbd><span>系统</span>
+        <kbd>Esc</kbd><span>关闭弹窗</span>
+      </div>
+    </Modal>
   </a-config-provider>
 </template>
+
+<style>
+.page-fade-enter-active,
+.page-fade-leave-active {
+  transition: opacity 0.15s ease;
+}
+.page-fade-enter-from,
+.page-fade-leave-to {
+  opacity: 0;
+}
+</style>

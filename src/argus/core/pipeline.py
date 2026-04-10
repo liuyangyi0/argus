@@ -1178,7 +1178,7 @@ class DetectionPipeline:
                 if snap is not None:
                     cusum_evidence[zone_key] = snap.evidence
             except Exception:
-                pass
+                logger.debug("pipeline.cusum_evidence_extraction_failed", exc_info=True)
 
             self._last_inference_record = InferenceRecord(
                 frame_id=frame_id,
@@ -1260,7 +1260,7 @@ class DetectionPipeline:
                     else:
                         rb_heatmap_raw = amap.copy() if amap.dtype == np.uint8 else amap
                 except Exception:
-                    pass
+                    logger.debug("pipeline.heatmap_extraction_failed", exc_info=True)
 
             rb_all_boxes: list[dict] = [
                 {

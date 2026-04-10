@@ -10,11 +10,12 @@ import {
 } from '@ant-design/icons-vue'
 import { getTrainingHistory, compareModels } from '../../api'
 import { GRADE_COLORS, RECOMMENDATION_COLORS, RECOMMENDATION_TEXT } from '../../composables/useModelState'
+import type { TrainingRecord } from '../../types/api'
 
-const trainingHistory = ref<any[]>([])
+const trainingHistory = ref<TrainingRecord[]>([])
 const historyLoading = ref(false)
 const historyDetailVisible = ref(false)
-const historyDetail = ref<any>(null)
+const historyDetail = ref<TrainingRecord | null>(null)
 
 const compareVisible = ref(false)
 const compareForm = ref({ old_record_id: undefined as number | undefined, new_record_id: undefined as number | undefined })
@@ -31,7 +32,7 @@ async function loadHistory() {
     const res = await getTrainingHistory()
     trainingHistory.value = res.records || []
   } catch (e) {
-    console.error('Failed to load training history', e)
+    message.error('加载训练历史失败')
   } finally {
     historyLoading.value = false
   }

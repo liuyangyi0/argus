@@ -17,10 +17,11 @@ import {
   reexportModel, recalibrateModel,
 } from '../../api'
 import { STAGE_MAP, VALID_TRANSITIONS, STAGE_LABELS } from '../../composables/useModelState'
+import type { ModelInfo, ModelVersionEvent, CameraSummary } from '../../types/api'
 
 const props = defineProps<{
-  models: any[]
-  cameras: any[]
+  models: ModelInfo[]
+  cameras: CameraSummary[]
 }>()
 
 const emit = defineEmits<{
@@ -38,7 +39,7 @@ const shadowReport = ref<any>(null)
 const shadowReportVisible = ref(false)
 const shadowReportLoading = ref(false)
 const stageHistoryVisible = ref(false)
-const stageHistory = ref<any[]>([])
+const stageHistory = ref<ModelVersionEvent[]>([])
 const stageHistoryLoading = ref(false)
 const reexportModalVisible = ref(false)
 const reexportForm = ref({ version_id: '', export_format: 'openvino', quantization: 'fp16' })
@@ -56,7 +57,7 @@ const stageCounts = computed(() => {
 
 const sortedModels = computed(() => {
   const order: Record<string, number> = { production: 0, canary: 1, shadow: 2, candidate: 3, retired: 4 }
-  return [...props.models].sort((a: any, b: any) =>
+  return [...props.models].sort((a: ModelInfo, b: ModelInfo) =>
     (order[a.stage] ?? 5) - (order[b.stage] ?? 5)
   )
 })

@@ -317,6 +317,36 @@ async def test_webhook(request: Request):
         return api_internal_error(str(e))
 
 
+@router.get("/storage/info")
+def storage_info_json(request: Request):
+    """JSON endpoint for storage usage and retention info."""
+    config = request.app.state.config
+    db = request.app.state.db
+
+    result: dict = {"retention_days": 90, "alert_count": 0}
+    if config:
+        result["retention_days"] = config.storage.alert_retention_days
+
+    if db:
+        try:
+            result["alert_count"] = db.get_alert_count()
+        except Exception:
+            logger.debug("config.alert_count_query_failed", exc_info=True)
+
+    try:
+        usage = shutil.disk_usage("data")
+        result["disk"] = {
+            "total_gb": round(usage.total / (1024**3), 1),
+            "used_gb": round(usage.used / (1024**3), 1),
+            "free_gb": round(usage.free / (1024**3), 1),
+            "percent_used": round(usage.used / usage.total * 100, 1),
+        }
+    except OSError:
+        result["disk"] = None
+
+    return api_success(result)
+
+
 @router.get("/storage", response_class=HTMLResponse)
 def storage_tab(request: Request):
     """Storage usage and maintenance."""
@@ -347,7 +377,7 @@ def storage_tab(request: Request):
             </div>
         </div>"""
     except OSError:
-        pass
+        logger.debug("config.disk_usage_render_failed", exc_info=True)
 
     # Retention & cleanup
     retention_days = config.storage.alert_retention_days if config else 90

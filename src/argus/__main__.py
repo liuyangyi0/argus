@@ -457,7 +457,7 @@ def main():
                 try:
                     _go2rtc.close()
                 except Exception:
-                    pass
+                    logger.debug("shutdown.go2rtc_close_failed", exc_info=True)
         scheduler.stop()
         manager.stop_all()
         record_store.stop()

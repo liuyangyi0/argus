@@ -47,6 +47,8 @@ class CircuitBreaker:
         self._last_failure_time = 0.0
         self._half_open_attempts = 0
         self._lock = threading.Lock()
+        self._last_persist_time = 0.0
+        self._persist_min_interval = 5.0  # seconds — rate-limit disk writes
         self._load_state()
 
     @property
@@ -80,29 +82,33 @@ class CircuitBreaker:
     def record_success(self) -> None:
         """Record a successful dispatch. Closes the circuit."""
         with self._lock:
+            state_changed = self._state != CircuitState.CLOSED
             if self._state == CircuitState.HALF_OPEN:
                 logger.info("circuit_breaker.closed", msg="Recovery successful")
             self._state = CircuitState.CLOSED
             self._failure_count = 0
             self._half_open_attempts = 0
-            self._persist_state()
+            self._persist_state(force=state_changed)
 
     def record_failure(self) -> None:
         """Record a failed dispatch. May open the circuit."""
         with self._lock:
             self._failure_count += 1
             self._last_failure_time = time.monotonic()
+            state_changed = False
 
             if self._state == CircuitState.HALF_OPEN:
                 self._half_open_attempts += 1
                 if self._half_open_attempts >= self._config.half_open_max_attempts:
                     self._state = CircuitState.OPEN
+                    state_changed = True
                     logger.warning("circuit_breaker.open", msg="Half-open test failed")
             elif self._failure_count >= self._config.failure_threshold:
                 self._state = CircuitState.OPEN
+                state_changed = True
                 logger.warning("circuit_breaker.open", failures=self._failure_count)
 
-            self._persist_state()
+            self._persist_state(force=state_changed)
 
     def get_status(self) -> dict:
         """Get circuit breaker status for dashboard display."""
@@ -114,8 +120,16 @@ class CircuitBreaker:
                 "recovery_timeout": self._config.recovery_timeout_seconds,
             }
 
-    def _persist_state(self) -> None:
-        """Write state to file so OPEN survives restart."""
+    def _persist_state(self, *, force: bool = False) -> None:
+        """Write state to file so OPEN survives restart.
+
+        Rate-limited to at most once per ``_persist_min_interval`` seconds
+        to reduce disk I/O during failure storms.  State transitions (CLOSED↔OPEN)
+        always persist immediately via *force=True*.
+        """
+        now = time.monotonic()
+        if not force and (now - self._last_persist_time) < self._persist_min_interval:
+            return
         try:
             self._config.fallback_file.parent.mkdir(parents=True, exist_ok=True)
             data = {
@@ -125,6 +139,7 @@ class CircuitBreaker:
             tmp = self._config.fallback_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(data))
             tmp.replace(self._config.fallback_file)
+            self._last_persist_time = now
         except Exception:
             logger.debug("circuit_breaker.state_save_failed", exc_info=True)
 

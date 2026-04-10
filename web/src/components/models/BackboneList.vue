@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { Card, Table, Tag, Empty } from 'ant-design-vue'
+import { Card, Table, Tag, Empty, message } from 'ant-design-vue'
 import { getBackbones } from '../../api'
 
 const backbones = ref<any[]>([])
@@ -10,7 +10,7 @@ async function loadBackbones() {
     const res = await getBackbones()
     backbones.value = res.backbones || []
   } catch (e) {
-    console.error(e)
+    message.error('加载骨干模型列表失败')
   }
 }
 

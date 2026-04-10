@@ -1,6 +1,7 @@
 import axios, { type AxiosResponse } from 'axios'
 import type { ApiResponse } from '../types/api'
 import { ApiError } from '../types/api'
+import { logger } from '../utils/logger'
 
 export const api = axios.create({
   baseURL: '/api',
@@ -12,7 +13,7 @@ api.interceptors.response.use(
   (err) => {
     const body = err.response?.data
     const msg = body?.msg ?? body?.error ?? err.message ?? '请求失败'
-    console.error('[API]', msg)
+    logger.debug('[API]', msg)
     return Promise.reject(err)
   }
 )

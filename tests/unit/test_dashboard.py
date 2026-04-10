@@ -159,6 +159,9 @@ class TestCameraForms:
             ),
         ]
         camera_manager.get_pipeline.return_value = None
+        camera_manager.get_backpressure_stats.return_value = {
+            "cam_02": {"pending": 0, "dropped": 0, "backpressured": False},
+        }
 
         app = create_app(
             camera_manager=camera_manager,

@@ -93,7 +93,7 @@ def overview(request: Request):
         total_gb = usage.total / (1024**3)
         disk_text = f"{free_gb:.1f}/{total_gb:.0f}GB"
     except OSError:
-        pass
+        logger.debug("dashboard.disk_usage_check_failed", exc_info=True)
 
     # System status banner
     status_messages = {

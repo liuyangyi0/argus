@@ -59,7 +59,7 @@ def validate_anomaly_result(result: object) -> list[ContractViolation]:
                     "anomaly_map", f"expected 2D+, got {anomaly_map.ndim}D"
                 ))
         except ImportError:
-            pass
+            logger.debug("validation.numpy_import_failed", exc_info=True)
 
     _log_violations("anomaly_result", violations)
     return violations

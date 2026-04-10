@@ -12,19 +12,20 @@ import {
   getTrainingJobs, getTrainingJob, confirmTrainingJob, rejectTrainingJob,
 } from '../../api'
 import { TRAINING_STATUS_MAP, JOB_TYPE_LABELS, TRIGGER_LABELS } from '../../composables/useModelState'
+import type { TrainingJobInfo, CameraSummary } from '../../types/api'
 
 const props = defineProps<{
-  cameras: any[]
+  cameras: CameraSummary[]
 }>()
 
 const emit = defineEmits<{
   'update:pendingCount': [count: number]
 }>()
 
-const jobs = ref<any[]>([])
+const jobs = ref<TrainingJobInfo[]>([])
 const loading = ref(false)
 const detailDrawer = ref(false)
-const detailJob = ref<any>(null)
+const detailJob = ref<TrainingJobInfo | null>(null)
 
 const filterStatus = ref<string | undefined>(undefined)
 const filterJobType = ref<string | undefined>(undefined)
@@ -39,7 +40,7 @@ async function loadJobs() {
     jobs.value = res.jobs || []
     emit('update:pendingCount', res.pending_count || 0)
   } catch (e) {
-    console.error(e)
+    message.error('操作失败')
   } finally {
     loading.value = false
   }

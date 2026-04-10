@@ -22,22 +22,23 @@ import {
 import {
   SESSION_LABELS, SAMPLING_STRATEGIES, JOB_STATUS_MAP, BASELINE_STATE_MAP,
 } from '../../composables/useModelState'
+import type { BaselineInfo, BaselineVersionInfo, CameraSummary, TaskInfo } from '../../types/api'
 
 const props = defineProps<{
-  cameras: any[]
-  captureTasks: any[]
-  taskTitle: (task: any) => string
-  taskProgressStatus: (task: any) => 'success' | 'exception' | 'normal' | 'active'
-  canPauseTask: (task: any) => boolean
-  canResumeTask: (task: any) => boolean
-  canAbortTask: (task: any) => boolean
-  canDismissTask: (task: any) => boolean
+  cameras: CameraSummary[]
+  captureTasks: TaskInfo[]
+  taskTitle: (task: TaskInfo) => string
+  taskProgressStatus: (task: TaskInfo) => 'success' | 'exception' | 'normal' | 'active'
+  canPauseTask: (task: TaskInfo) => boolean
+  canResumeTask: (task: TaskInfo) => boolean
+  canAbortTask: (task: TaskInfo) => boolean
+  canDismissTask: (task: TaskInfo) => boolean
   handleDismissTask: (taskId: string) => void
   loadTasks: () => void
 }>()
 
 // ── State ──
-const baselines = ref<any[]>([])
+const baselines = ref<BaselineInfo[]>([])
 const baselinesLoading = ref(false)
 const captureModalVisible = ref(false)
 const captureForm = ref({ camera_id: '', count: 100, interval: 2.0, session_label: 'daytime' })
@@ -58,12 +59,12 @@ const optimizingBaseline = ref<string | null>(null)
 
 const versionDrawerVisible = ref(false)
 const versionDrawerCamera = ref('')
-const baselineVersions = ref<any[]>([])
+const baselineVersions = ref<BaselineVersionInfo[]>([])
 const versionsLoading = ref(false)
 const verifyingVersion = ref<string | null>(null)
 const activatingVersion = ref<string | null>(null)
 
-const cameraGroups = ref<any[]>([])
+const cameraGroups = ref<{ group_id: string; name: string; camera_ids: string[]; image_count: number; current_version: string | null }[]>([])
 const groupsLoading = ref(false)
 const mergingGroup = ref<string | null>(null)
 const mergingFP = ref<string | null>(null)
@@ -76,7 +77,7 @@ async function loadBaselines() {
     const res = await getBaselines()
     baselines.value = res.baselines || []
   } catch (e) {
-    console.error('Failed to load baselines', e)
+    message.error('加载基线列表失败')
   } finally {
     baselinesLoading.value = false
   }
@@ -88,7 +89,7 @@ async function loadBaselineVersions(cameraId: string) {
     const res = await getBaselineVersions({ camera_id: cameraId })
     baselineVersions.value = res.versions || []
   } catch (e) {
-    console.error('Failed to load baseline versions', e)
+    message.error('加载基线版本失败')
     baselineVersions.value = []
   } finally {
     versionsLoading.value = false
@@ -101,7 +102,7 @@ async function loadCameraGroups() {
     const res = await getCameraGroups()
     cameraGroups.value = res.groups || []
   } catch (e) {
-    console.error('Failed to load camera groups', e)
+    message.error('加载摄像头组失败')
   } finally {
     groupsLoading.value = false
   }

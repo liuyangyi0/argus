@@ -665,7 +665,7 @@ async def bulk_delete(request: Request):
                     if p.exists():
                         p.unlink()
                 except OSError:
-                    pass
+                    logger.debug("alerts.image_delete_failed", path=path_str, exc_info=True)
             # Clean up recording directory
             if recording_store:
                 rec_dir = recording_store._find_recording_dir(aid)
@@ -887,7 +887,7 @@ def delete_alert(request: Request, alert_id: str):
             if p.exists():
                 p.unlink()
         except OSError:
-            pass
+            logger.debug("alerts.image_delete_failed", path=path_str, exc_info=True)
 
     # Clean up recording directory if exists
     recording_store = getattr(request.app.state, "recording_store", None)

@@ -172,7 +172,7 @@ class AnomalibDetector:
                     msg="PostProcessor MinMax not fit — using raw score with sigmoid normalization",
                 )
         except Exception:
-            pass
+            logger.debug("detector.postprocessor_calibration_failed", exc_info=True)
 
     def calibrate_raw_scores(self, baseline_dir: Path | None = None) -> None:
         """Calibrate raw score normalization using baseline images.

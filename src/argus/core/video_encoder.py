@@ -205,6 +205,7 @@ def extract_frame_jpeg(
     try:
         container = av.open(str(mp4_path))
     except Exception:
+        logger.debug("video_encoder.open_failed", path=str(mp4_path), exc_info=True)
         return None
 
     try:
@@ -219,7 +220,7 @@ def extract_frame_jpeg(
             try:
                 container.seek(target_pts, stream=stream)
             except av.error.FFmpegError:
-                pass  # seek failed, fall back to sequential decode
+                logger.debug("video_encoder.seek_failed", index=index, exc_info=True)
 
         # Decode forward from seek position, counting frames
         for i, frame in enumerate(container.decode(stream)):
