@@ -153,6 +153,16 @@ def create_maintenance_tasks(
 
         scheduler.add_interval_task("cleanup_alerts", cleanup_alerts, hours=6)
 
+        def cleanup_inference_records():
+            try:
+                count = database.delete_old_inference_records(days=30)
+                if count > 0:
+                    logger.info("maintenance.inference_cleaned", deleted=count)
+            except Exception as e:
+                logger.error("maintenance.inference_cleanup_failed", error=str(e))
+
+        scheduler.add_interval_task("cleanup_inference", cleanup_inference_records, hours=6)
+
     # Monitor disk space every 5 minutes
     def check_disk_space():
         try:

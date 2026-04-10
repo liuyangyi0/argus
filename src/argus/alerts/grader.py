@@ -438,9 +438,17 @@ class AlertGrader:
             for key in stale_keys:
                 del self._trackers[key]
                 self._last_alerts.pop(key, None)
-        if stale_keys:
-            logger.debug("grader.pruned_trackers", count=len(stale_keys), keys=stale_keys)
-        return len(stale_keys)
+            # Also prune expired event groups (beyond aggregation window)
+            stale_groups = [
+                key for key, (_, first_time, _) in self._event_groups.items()
+                if (now - first_time) > self._aggregation_window * 2
+            ]
+            for key in stale_groups:
+                del self._event_groups[key]
+        pruned = len(stale_keys) + len(stale_groups)
+        if pruned:
+            logger.debug("grader.pruned_trackers", trackers=len(stale_keys), event_groups=len(stale_groups))
+        return pruned
 
     def save_evidence_state(self, path: Path) -> None:
         """Persist CUSUM evidence to disk for crash recovery.

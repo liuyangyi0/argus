@@ -409,6 +409,8 @@ def main():
 
     logger.info("argus.running", cameras=len(started), msg="Press Ctrl+C to stop")
 
+    _go2rtc_check_counter = 0
+
     try:
         while running and manager.is_running:
             time.sleep(1.0)
@@ -424,6 +426,17 @@ def main():
                 METRICS.camera_status.labels(camera_id=status.camera_id).set(
                     1.0 if status.connected else 0.0,
                 )
+
+            # Check go2rtc health every 10 seconds and auto-restart if crashed
+            _go2rtc_check_counter += 1
+            if _go2rtc is not None and _go2rtc_check_counter % 10 == 0:
+                if not _go2rtc.running:
+                    logger.error("go2rtc.crashed", msg="Process died, attempting restart")
+                    try:
+                        _go2rtc.start()
+                        logger.info("go2rtc.auto_restarted")
+                    except Exception as e:
+                        logger.error("go2rtc.restart_failed", error=str(e))
 
             # Periodic status in verbose mode
             if args.verbose:
