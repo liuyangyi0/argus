@@ -27,6 +27,7 @@ body {
   --argus-hover-bg: #1e1e36;
   --argus-sidebar-border: #1f2937;
   --argus-icon-muted: #2d2d4a;
+  --argus-font-mono: 'Cascadia Code', 'Fira Code', Consolas, monospace;
 }
 .light-theme {
   --argus-card-bg: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);

@@ -1,16 +1,22 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { Button, Space, Tag, Typography, Select } from 'ant-design-vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { Select } from 'ant-design-vue'
 import {
-  StepBackwardOutlined,
-  StepForwardOutlined,
   CaretRightOutlined,
   PauseOutlined,
-  FastBackwardOutlined,
-  FastForwardOutlined,
 } from '@ant-design/icons-vue'
 import SignalTrack from './SignalTrack.vue'
-import { getReplayMetadata, getReplaySignals, getReplayVideoUrl, getReplayFrameUrl, getReplayHeatmapUrl, getReplayReference, pinReplayFrame } from '../api'
+import { getReplayMetadata, getReplaySignals, getReplayVideoUrl, getReplayHeatmapUrl, getReplayReference, pinReplayFrame } from '../api'
+
+function videoErrorMessage(err: MediaError | DOMException): string {
+  if ('code' in err && typeof err.code === 'number') {
+    const msgs: Record<number, string> = { 1: '视频加载被中止', 2: '网络错误', 3: '视频解码失败', 4: '视频格式不支持' }
+    return msgs[err.code] || `视频错误 (code=${err.code})`
+  }
+  if (err.name === 'NotAllowedError') return '浏览器阻止自动播放，请点击视频区域后重试'
+  if (err.name === 'NotSupportedError') return '视频格式不支持'
+  return `播放失败: ${err.message || err.name}`
+}
 
 const props = defineProps<{
   alertId: string
@@ -26,6 +32,8 @@ const referenceFrame = ref<string | null>(null)
 const referenceDate = ref('')
 const loadingRef = ref(false)
 const videoEl = ref<HTMLVideoElement | null>(null)
+const videoError = ref('')
+const pendingSeekIndex = ref<number | null>(null)
 
 const selectedRefOption = ref('yesterday')
 const clipStart = ref<number | null>(null)
@@ -37,7 +45,9 @@ const hasHeatmaps = computed(() => signals.value?.has_heatmaps || false)
 
 const fps = computed(() => metadata.value?.fps || 15)
 const videoUrl = computed(() => getReplayVideoUrl(props.alertId))
-const heatmapUrl = computed(() => getReplayHeatmapUrl(props.alertId, currentIndex.value))
+// Freeze heatmap index when playing to avoid per-frame HTTP requests
+const heatmapIndex = ref(0)
+const heatmapUrl = computed(() => getReplayHeatmapUrl(props.alertId, heatmapIndex.value))
 
 function onRefOptionChange(value: any) {
   selectedRefOption.value = value
@@ -69,6 +79,15 @@ function onRefOptionChange(value: any) {
   loadReference(dateStr)
 }
 
+function safePlay() {
+  if (!videoEl.value) return
+  videoEl.value.play().catch((err: DOMException) => {
+    if (err.name === 'AbortError') return
+    videoError.value = videoErrorMessage(err)
+    playing.value = false
+  })
+}
+
 // Load data
 async function loadData() {
   try {
@@ -76,20 +95,20 @@ async function loadData() {
       getReplayMetadata(props.alertId),
       getReplaySignals(props.alertId),
     ])
-    metadata.value = metaRes.data
-    signals.value = sigRes.data
+    metadata.value = metaRes
+    signals.value = sigRes
 
-    // After metadata loads, seek video to trigger frame
-    await nextTick()
-    if (videoEl.value && metadata.value?.trigger_frame_index !== undefined) {
-      const triggerTime = metadata.value.trigger_frame_index / fps.value
-      videoEl.value.currentTime = triggerTime
+    // Defer seek to trigger frame until video is ready (canplay event)
+    if (metadata.value?.trigger_frame_index !== undefined) {
+      pendingSeekIndex.value = metadata.value.trigger_frame_index
       currentIndex.value = metadata.value.trigger_frame_index
+      heatmapIndex.value = metadata.value.trigger_frame_index
     }
 
     loadReference()
   } catch (e) {
     console.error('Replay load error', e)
+    metadata.value = null
   }
 }
 
@@ -117,20 +136,45 @@ onMounted(loadData)
 // Video event handlers
 function onTimeUpdate() {
   if (!videoEl.value) return
-  const idx = Math.floor(videoEl.value.currentTime * fps.value)
-  const max = (metadata.value?.frame_count || 1) - 1
-  currentIndex.value = Math.min(idx, max)
+  const idx = Math.min(
+    Math.floor(videoEl.value.currentTime * fps.value),
+    (metadata.value?.frame_count || 1) - 1,
+  )
+  if (idx !== currentIndex.value) currentIndex.value = idx
 }
 
-function onVideoPlay() { playing.value = true }
-function onVideoPause() { playing.value = false }
-function onVideoEnded() { playing.value = false }
+function onVideoPlay() {
+  playing.value = true
+  videoError.value = ''
+}
+function onVideoPause() {
+  playing.value = false
+  heatmapIndex.value = currentIndex.value
+}
+function onVideoEnded() {
+  playing.value = false
+  heatmapIndex.value = currentIndex.value
+}
+function onVideoCanPlay() {
+  videoError.value = ''
+  // Execute pending seek (trigger frame) now that video is ready
+  if (pendingSeekIndex.value !== null && videoEl.value) {
+    const seekTime = pendingSeekIndex.value / fps.value
+    videoEl.value.currentTime = seekTime
+    pendingSeekIndex.value = null
+  }
+}
+function onVideoError() {
+  const el = videoEl.value
+  if (!el?.error) return
+  videoError.value = videoErrorMessage(el.error)
+}
 
 // Playback controls — delegate to <video> element
 function togglePlay() {
   if (!videoEl.value) return
   if (videoEl.value.paused) {
-    videoEl.value.play()
+    safePlay()
   } else {
     videoEl.value.pause()
   }
@@ -167,8 +211,8 @@ function handleKeydown(e: KeyboardEvent) {
     case 'ArrowLeft': stepFrame(-1); break
     case 'ArrowRight': stepFrame(1); break
     case 'k': case 'K': if (videoEl.value) videoEl.value.pause(); break
-    case 'j': case 'J': speed.value = Math.max(0.25, speed.value / 2); if (videoEl.value?.paused) videoEl.value.play(); break
-    case 'l': case 'L': speed.value = Math.min(4, speed.value * 2); if (videoEl.value?.paused) videoEl.value.play(); break
+    case 'j': case 'J': speed.value = Math.max(0.25, speed.value / 2); if (videoEl.value?.paused) safePlay(); break
+    case 'l': case 'L': speed.value = Math.min(4, speed.value * 2); if (videoEl.value?.paused) safePlay(); break
     case 'Home': goToStart(); break
     case 'End': goToEnd(); break
     case '[': clipStart.value = currentIndex.value; break
@@ -204,6 +248,17 @@ const statusText = computed(() => {
 
 const speeds = [0.25, 0.5, 1, 2, 4]
 
+// Timeline progress (used for both progress bar and playhead)
+const progressPct = computed(() => {
+  const total = Math.max((metadata.value?.frame_count || 1) - 1, 1)
+  return (currentIndex.value / total) * 100
+})
+
+// Signal track data (extract .map() out of template to avoid new arrays per render)
+const simplexData = computed(() => signals.value?.simplex_scores?.map((s: any) => s ?? 0) || [])
+const hasSimplexData = computed(() => signals.value?.simplex_scores?.some((s: any) => s != null) || false)
+const yoloPersonsData = computed(() => signals.value?.yolo_persons?.map((p: any) => p.count || 0) || [])
+
 const triggerProgressPct = computed(() => {
   if (!metadata.value) return 50
   const triggerIdx = metadata.value.trigger_frame_index || 0
@@ -229,198 +284,202 @@ async function handlePinFrame() {
 </script>
 
 <template>
-  <div v-if="metadata" style="background: #0f0f1a; border-radius: 8px; padding: 12px">
+  <div v-if="metadata" class="replay-root">
     <!-- Video area: main + reference -->
-    <div style="display: flex; gap: 12px; margin-bottom: 12px">
+    <div class="replay-viewport-row">
       <!-- Main playback window -->
-      <div style="flex: 1; min-width: 0">
-        <div style="position: relative; background: #000; border-radius: 4px; overflow: hidden; aspect-ratio: 16/9">
+      <div class="replay-main">
+        <div class="replay-player">
           <video
             ref="videoEl"
             :src="videoUrl"
             preload="auto"
-            style="width: 100%; height: 100%; object-fit: contain; display: block"
+            class="replay-video"
             @timeupdate="onTimeUpdate"
             @play="onVideoPlay"
             @pause="onVideoPause"
             @ended="onVideoEnded"
+            @canplay="onVideoCanPlay"
+            @error="onVideoError"
           />
           <!-- Heatmap overlay -->
           <img
             v-if="showHeatmap && hasHeatmaps"
             :src="heatmapUrl"
-            style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; opacity: 0.4; pointer-events: none; mix-blend-mode: screen"
+            class="replay-heatmap"
           />
           <!-- YOLO detection boxes overlay -->
           <svg
             v-if="showBoxes && currentBoxes.length > 0"
-            style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none"
-            viewBox="0 0 1920 1080"
+            class="replay-boxes"
+            :viewBox="`0 0 ${metadata.width || 1920} ${metadata.height || 1080}`"
             preserveAspectRatio="xMidYMid meet"
           >
-            <rect
-              v-for="(box, idx) in currentBoxes" :key="idx"
-              :x="box.bbox?.[0] || 0" :y="box.bbox?.[1] || 0"
-              :width="(box.bbox?.[2] || 0) - (box.bbox?.[0] || 0)"
-              :height="(box.bbox?.[3] || 0) - (box.bbox?.[1] || 0)"
-              fill="none" stroke="#10b981" stroke-width="3"
-            />
-            <text
-              v-for="(box, idx) in currentBoxes" :key="'t'+idx"
-              :x="(box.bbox?.[0] || 0) + 4" :y="(box.bbox?.[1] || 0) - 4"
-              fill="#10b981" font-size="24"
-            >{{ box.class }} {{ box.confidence }}</text>
+            <template v-for="(box, idx) in currentBoxes" :key="idx">
+              <rect
+                :x="box.bbox?.[0] || 0" :y="box.bbox?.[1] || 0"
+                :width="(box.bbox?.[2] || 0) - (box.bbox?.[0] || 0)"
+                :height="(box.bbox?.[3] || 0) - (box.bbox?.[1] || 0)"
+                fill="none" stroke="#10b981" stroke-width="2"
+              />
+              <text
+                :x="(box.bbox?.[0] || 0) + 4" :y="(box.bbox?.[1] || 0) - 6"
+                fill="#fff" font-family="monospace" font-size="12" font-weight="600"
+                style="text-shadow: 0 0 4px rgba(0,0,0,.9), 0 0 8px rgba(0,0,0,.5)"
+              >{{ box.class }} {{ box.confidence?.toFixed?.(2) }}</text>
+            </template>
           </svg>
-          <div v-if="metadata.status === 'recording'" style="position: absolute; top: 8px; right: 8px">
-            <Tag color="red">录制中</Tag>
+          <!-- HUD: top -->
+          <div class="replay-hud replay-hud-top">
+            <span v-if="metadata.status === 'recording'" class="hud-rec">&#9679; REC</span>
+            <span v-else class="hud-cam">{{ metadata.camera_id || '' }}</span>
+            <span>{{ metadata.width || 1920 }}&#215;{{ metadata.height || 1080 }} // {{ fps }} FPS</span>
           </div>
+          <!-- HUD: bottom -->
+          <div class="replay-hud replay-hud-bottom">
+            <span>{{ currentTimestamp }}</span>
+            <span>FRAME {{ currentIndex + 1 }} / {{ metadata.frame_count }}</span>
+          </div>
+          <!-- Video error -->
+          <div v-if="videoError" class="replay-error">{{ videoError }}</div>
         </div>
       </div>
-      <!-- Reference window with date selector -->
-      <div style="width: 240px; flex-shrink: 0">
-        <div style="display: flex; align-items: center; gap: 4px; margin-bottom: 4px">
-          <Typography.Text type="secondary" style="font-size: 12px; flex-shrink: 0">历史对照</Typography.Text>
+
+      <!-- Reference window -->
+      <div class="replay-ref">
+        <div class="replay-ref-label">
+          <span>历史对照 · Reference</span>
           <Select
             :value="selectedRefOption"
             size="small"
-            style="flex: 1; font-size: 11px"
+            style="flex: 1; min-width: 100px"
             @change="onRefOptionChange"
           >
-            <Select.Option value="yesterday">昨天同一时刻</Select.Option>
-            <Select.Option value="last_week">上周同一日</Select.Option>
-            <Select.Option value="prev_week">本月上一周</Select.Option>
-            <Select.Option value="custom">手动选择...</Select.Option>
+            <Select.Option value="yesterday">昨天</Select.Option>
+            <Select.Option value="last_week">上周</Select.Option>
+            <Select.Option value="prev_week">两周前</Select.Option>
+            <Select.Option value="custom">手动...</Select.Option>
           </Select>
         </div>
-        <div style="background: #000; border-radius: 4px; overflow: hidden; aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center">
+        <div class="replay-ref-img">
           <img v-if="referenceFrame" :src="referenceFrame" style="width: 100%; height: 100%; object-fit: contain; display: block" />
-          <Typography.Text v-else type="secondary" style="font-size: 12px">
-            {{ loadingRef ? '加载中...' : '无历史数据' }}
-          </Typography.Text>
+          <span v-else class="replay-ref-empty">{{ loadingRef ? '...' : '无数据' }}</span>
         </div>
-        <Typography.Text v-if="referenceDate" type="secondary" style="font-size: 11px; margin-top: 2px; display: block">
-          {{ referenceDate }}
-        </Typography.Text>
+        <div v-if="referenceDate" class="replay-ref-date">{{ referenceDate }}</div>
       </div>
     </div>
 
     <!-- DVR Controls -->
-    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap">
-      <Space size="small">
-        <Button size="small" @click="goToStart"><template #icon><StepBackwardOutlined /></template></Button>
-        <Button size="small" @click="stepFrame(-1)"><template #icon><FastBackwardOutlined /></template></Button>
-        <Button size="small" type="primary" @click="togglePlay">
-          <template #icon>
-            <PauseOutlined v-if="playing" />
-            <CaretRightOutlined v-else />
-          </template>
-        </Button>
-        <Button size="small" @click="stepFrame(1)"><template #icon><FastForwardOutlined /></template></Button>
-        <Button size="small" @click="goToEnd"><template #icon><StepForwardOutlined /></template></Button>
-      </Space>
+    <div class="replay-controls">
+      <button class="ctrl-btn" @click="goToStart" title="Start">&#9198;</button>
+      <button class="ctrl-btn" @click="stepFrame(-1)" title="-1 frame">&#9664;&#9664;</button>
+      <button class="ctrl-btn ctrl-play" @click="togglePlay">
+        <PauseOutlined v-if="playing" />
+        <CaretRightOutlined v-else />
+      </button>
+      <button class="ctrl-btn" @click="stepFrame(1)" title="+1 frame">&#9654;&#9654;</button>
+      <button class="ctrl-btn" @click="goToEnd" title="End">&#9197;</button>
 
-      <Space size="small">
-        <Button
+      <div class="ctrl-speeds">
+        <button
           v-for="s in speeds" :key="s"
-          size="small"
-          :type="speed === s ? 'primary' : 'default'"
+          :class="['speed-btn', { on: speed === s }]"
           @click="speed = s"
-        >
-          {{ s }}x
-        </Button>
-      </Space>
+        >{{ s }}x</button>
+      </div>
 
       <!-- Overlay toggles -->
-      <Space size="small" style="margin-left: 8px">
-        <Button
-          size="small"
-          :type="showHeatmap ? 'primary' : 'default'"
+      <div class="ctrl-toggles">
+        <button
+          :class="['toggle-btn', { on: showHeatmap }]"
           :disabled="!hasHeatmaps"
           @click="showHeatmap = !showHeatmap"
           title="热力图叠加"
-        >
-          &#128293; 热力
-        </Button>
-        <Button
-          size="small"
-          :type="showBoxes ? 'primary' : 'default'"
+        >热力</button>
+        <button
+          :class="['toggle-btn', { on: showBoxes }]"
           @click="showBoxes = !showBoxes"
           title="YOLO 检测框"
-        >
-          &#128230; 框选
-        </Button>
-      </Space>
+        >框选</button>
+      </div>
 
-      <Typography.Text type="secondary" style="margin-left: auto; font-size: 12px">
-        {{ currentIndex + 1 }}/{{ metadata.frame_count }} · {{ currentTimestamp }} · {{ statusText }}
-      </Typography.Text>
+      <span class="ctrl-frame-info">
+        FRAME <b>{{ currentIndex + 1 }}</b> / {{ metadata.frame_count }} · {{ currentTimestamp }}
+      </span>
     </div>
 
     <!-- Timeline scrubber -->
-    <div style="margin-bottom: 8px; position: relative">
+    <div class="replay-timeline">
+      <div class="tl-bar">
+        <div class="tl-progress" :style="{ width: progressPct + '%' }"></div>
+        <div class="tl-head" :style="{ left: progressPct + '%' }"></div>
+      </div>
       <input
         type="range"
         :min="0"
         :max="(metadata.frame_count || 1) - 1"
         :value="currentIndex"
         @input="seekTo(Number(($event.target as HTMLInputElement).value))"
-        style="width: 100%; accent-color: #3b82f6"
+        class="tl-input"
       />
       <!-- Recording-in-progress indicator -->
-      <div v-if="metadata.status === 'recording'" style="display: flex; align-items: center; justify-content: flex-end; margin-top: 2px">
+      <div v-if="metadata.status === 'recording'" class="replay-recording-bar">
         <div style="flex: 1; display: flex; align-items: center; gap: 4px">
           <div :style="{ width: triggerProgressPct + '%' }" />
-          <div style="width: 8px; height: 8px; border-radius: 50%; background: #ef4444; flex-shrink: 0" />
-          <div style="flex: 1; height: 2px; border-top: 2px dashed #4a5568" />
+          <div class="rec-dot" />
+          <div style="flex: 1; height: 2px; border-top: 2px dashed var(--argus-border)" />
         </div>
-        <Typography.Text type="secondary" style="font-size: 11px; margin-left: 8px; flex-shrink: 0; color: #ef4444">
-          &#9210; 录制中 · 剩余 {{ remainingRecordingSeconds }}s
-        </Typography.Text>
+        <span class="rec-text">&#9210; 录制中 · 剩余 {{ remainingRecordingSeconds }}s</span>
       </div>
     </div>
 
     <!-- Signal tracks -->
-    <div v-if="signals && metadata.severity !== 'low' && metadata.severity !== 'info'" style="display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px">
-      <SignalTrack
-        v-if="signals.anomaly_scores"
-        :data="signals.anomaly_scores"
-        :current-index="currentIndex"
-        label="Dinomaly"
-        color="#ef4444"
-        :height="32"
-        @seek="seekTo"
-      />
-      <SignalTrack
-        v-if="signals.simplex_scores?.some((s: any) => s != null)"
-        :data="signals.simplex_scores.map((s: any) => s ?? 0)"
-        :current-index="currentIndex"
-        label="Simplex"
-        color="#f97316"
-        :height="32"
-        @seek="seekTo"
-      />
-      <SignalTrack
-        v-for="(values, zone) in (signals.cusum_evidence || {})"
-        :key="zone"
-        :data="values"
-        :current-index="currentIndex"
-        :label="'CUSUM'"
-        color="#8b5cf6"
-        :height="32"
-        @seek="seekTo"
-      />
-      <SignalTrack
-        v-if="signals.yolo_persons"
-        :data="signals.yolo_persons.map((p: any) => p.count || 0)"
-        :current-index="currentIndex"
-        label="YOLO人员"
-        color="#10b981"
-        :height="24"
-        @seek="seekTo"
-      />
+    <div v-if="signals && metadata.severity !== 'low' && metadata.severity !== 'info'" class="replay-signals">
+      <div v-if="signals.anomaly_scores" class="sig-wrap" style="border-left-color: #ef4444">
+        <SignalTrack
+          :data="signals.anomaly_scores"
+          :current-index="currentIndex"
+          label="Dinomaly"
+          color="#ef4444"
+          :height="32"
+          @seek="seekTo"
+        />
+      </div>
+      <div v-if="hasSimplexData" class="sig-wrap" style="border-left-color: #f97316">
+        <SignalTrack
+          :data="simplexData"
+          :current-index="currentIndex"
+          label="Simplex"
+          color="#f97316"
+          :height="32"
+          @seek="seekTo"
+        />
+      </div>
+      <template v-for="(values, zone) in (signals.cusum_evidence || {})" :key="zone">
+        <div class="sig-wrap" style="border-left-color: #8b5cf6">
+          <SignalTrack
+            :data="values"
+            :current-index="currentIndex"
+            :label="'CUSUM'"
+            color="#8b5cf6"
+            :height="32"
+            @seek="seekTo"
+          />
+        </div>
+      </template>
+      <div v-if="signals.yolo_persons" class="sig-wrap" style="border-left-color: #10b981">
+        <SignalTrack
+          :data="yoloPersonsData"
+          :current-index="currentIndex"
+          label="YOLO人员"
+          color="#10b981"
+          :height="24"
+          @seek="seekTo"
+        />
+      </div>
       <!-- Operator action track -->
-      <div v-if="signals.operator_actions?.length" style="height: 20px; position: relative; background: #1a1a2e; border-radius: 2px; overflow: hidden">
-        <Typography.Text type="secondary" style="font-size: 10px; position: absolute; left: 4px; top: 2px">操作员</Typography.Text>
+      <div v-if="signals.operator_actions?.length" class="sig-wrap" style="border-left-color: #f59e0b; height: 20px; position: relative; overflow: hidden">
+        <span style="font-size: 10px; position: absolute; left: 8px; top: 2px; color: var(--argus-text-muted); font-family: monospace; letter-spacing: .1em">操作员</span>
         <div
           v-for="(action, idx) in signals.operator_actions"
           :key="idx"
@@ -440,24 +499,388 @@ async function handlePinFrame() {
     </div>
 
     <!-- Key frames -->
-    <div v-if="keyFrames.length > 0" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
-      <Typography.Text type="secondary" style="font-size: 12px">关键帧:</Typography.Text>
-      <Tag
+    <div v-if="keyFrames.length > 0" class="replay-keyframes">
+      <span class="kf-label">关键帧</span>
+      <button
         v-for="kf in keyFrames" :key="kf.index"
-        :color="kf.type === 'trigger' ? 'red' : kf.type === 'evidence_threshold' ? 'orange' : 'blue'"
-        style="cursor: pointer"
+        :class="['kf-tag', kf.type === 'trigger' ? 'kf-purple' : '']"
         @click="seekTo(kf.index)"
-      >
-        {{ kf.label }} (#{{ kf.index }})
-      </Tag>
-      <Button size="small" type="dashed" @click="handlePinFrame" style="font-size: 11px">
-        + 标记当前帧
-      </Button>
+      >{{ kf.label }} · #{{ kf.index }}</button>
+      <button class="kf-tag kf-add" @click="handlePinFrame">+ 标记当前帧</button>
     </div>
   </div>
 
   <!-- Loading / no recording -->
-  <div v-else style="padding: 24px; text-align: center; color: #6b7280">
+  <div v-else style="padding: 24px; text-align: center; color: var(--argus-text-muted)">
     加载回放数据...
   </div>
 </template>
+
+<style scoped>
+.replay-root {
+  background: var(--argus-surface);
+  border-radius: 6px;
+  border: 1px solid var(--argus-border);
+  padding: 0;
+  overflow: hidden;
+}
+
+/* ── Viewport ── */
+.replay-viewport-row {
+  display: flex;
+  gap: 0;
+}
+.replay-main {
+  flex: 1;
+  min-width: 0;
+}
+.replay-player {
+  position: relative;
+  background: #000;
+  aspect-ratio: 16/9;
+  overflow: hidden;
+}
+.replay-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.replay-heatmap {
+  position: absolute;
+  top: 0; left: 0; width: 100%; height: 100%;
+  object-fit: contain;
+  opacity: 0.4;
+  pointer-events: none;
+  mix-blend-mode: screen;
+}
+.replay-boxes {
+  position: absolute;
+  top: 0; left: 0; width: 100%; height: 100%;
+  pointer-events: none;
+}
+
+/* ── HUD overlays ── */
+.replay-hud {
+  position: absolute;
+  left: 12px; right: 12px;
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--argus-font-mono);
+  font-size: 10px;
+  letter-spacing: .12em;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0,0,0,.7);
+}
+.replay-hud-top {
+  top: 10px;
+  color: rgba(255,255,255,.5);
+}
+.replay-hud-bottom {
+  bottom: 10px;
+  color: rgba(255,255,255,.6);
+}
+.hud-rec {
+  color: #f59e0b;
+  animation: hud-blink 1.5s infinite;
+}
+.hud-cam {
+  color: rgba(255,255,255,.5);
+}
+@keyframes hud-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .4; }
+}
+
+.replay-error {
+  position: absolute;
+  bottom: 8px; left: 8px; right: 8px;
+  background: rgba(239,68,68,0.9);
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+/* ── Reference panel ── */
+.replay-ref {
+  width: 220px;
+  flex-shrink: 0;
+  background: var(--argus-card-bg-solid);
+  border-left: 1px solid var(--argus-border);
+  display: flex;
+  flex-direction: column;
+}
+.replay-ref-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  font-family: var(--argus-font-mono);
+  font-size: 9px;
+  color: var(--argus-text-muted);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--argus-border);
+}
+.replay-ref-img {
+  flex: 1;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+}
+.replay-ref-empty {
+  font-size: 11px;
+  color: var(--argus-text-muted);
+}
+.replay-ref-date {
+  padding: 4px 10px;
+  font-family: var(--argus-font-mono);
+  font-size: 10px;
+  color: var(--argus-text-muted);
+  letter-spacing: .1em;
+  border-top: 1px solid var(--argus-border);
+}
+
+/* ── Controls bar ── */
+.replay-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--argus-border);
+  background: var(--argus-card-bg-solid);
+}
+.ctrl-btn {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--argus-border);
+  background: transparent;
+  color: var(--argus-text);
+  cursor: pointer;
+  font-size: 10px;
+  transition: all .12s;
+}
+.ctrl-btn:hover {
+  border-color: #3b82f6;
+  color: #3b82f6;
+}
+.ctrl-play {
+  width: 34px;
+  height: 34px;
+  background: #3b82f6;
+  border-color: #3b82f6;
+  color: #fff;
+  border-radius: 50%;
+  font-size: 14px;
+}
+.ctrl-play:hover {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #fff;
+}
+.ctrl-speeds {
+  display: flex;
+  margin-left: 8px;
+}
+.speed-btn {
+  padding: 4px 8px;
+  border: 1px solid var(--argus-border);
+  border-right: none;
+  background: transparent;
+  color: var(--argus-text-muted);
+  font-family: var(--argus-font-mono);
+  font-size: 10px;
+  cursor: pointer;
+  transition: all .12s;
+}
+.speed-btn:last-child {
+  border-right: 1px solid var(--argus-border);
+}
+.speed-btn:hover {
+  color: var(--argus-text);
+}
+.speed-btn.on {
+  background: var(--argus-text);
+  color: var(--argus-surface);
+  border-color: var(--argus-text);
+}
+.ctrl-toggles {
+  display: flex;
+  gap: 4px;
+  margin-left: 8px;
+}
+.toggle-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--argus-border);
+  background: transparent;
+  color: var(--argus-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all .12s;
+}
+.toggle-btn:hover {
+  border-color: #3b82f6;
+  color: var(--argus-text);
+}
+.toggle-btn.on {
+  border-color: #3b82f6;
+  color: #3b82f6;
+  background: rgba(59,130,246,.1);
+}
+.toggle-btn:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+}
+.ctrl-frame-info {
+  margin-left: auto;
+  font-family: var(--argus-font-mono);
+  font-size: 10px;
+  color: var(--argus-text-muted);
+  letter-spacing: .08em;
+}
+.ctrl-frame-info b {
+  color: #f59e0b;
+}
+
+/* ── Timeline ── */
+.replay-timeline {
+  padding: 12px 16px 6px;
+  position: relative;
+}
+.tl-bar {
+  height: 3px;
+  background: var(--argus-border);
+  position: relative;
+  border-radius: 2px;
+  pointer-events: none;
+}
+.tl-progress {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  background: #3b82f6;
+  border-radius: 2px;
+  transition: width .05s linear;
+}
+.tl-head {
+  position: absolute;
+  top: -4px;
+  width: 2px;
+  height: 11px;
+  background: #f59e0b;
+  transform: translateX(-1px);
+  transition: left .05s linear;
+}
+.tl-input {
+  position: absolute;
+  left: 16px; right: 16px;
+  top: 6px;
+  width: calc(100% - 32px);
+  height: 20px;
+  opacity: 0;
+  cursor: pointer;
+  margin: 0;
+}
+.replay-recording-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+.rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f59e0b;
+  flex-shrink: 0;
+  animation: hud-blink 1.5s infinite;
+}
+.rec-text {
+  font-family: var(--argus-font-mono);
+  font-size: 11px;
+  margin-left: 8px;
+  flex-shrink: 0;
+  color: #f59e0b;
+}
+
+/* ── Signal tracks ── */
+.replay-signals {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 16px 8px;
+}
+.sig-wrap {
+  border-left: 3px solid transparent;
+  padding-left: 6px;
+  background: var(--argus-card-bg-solid);
+  border-radius: 2px;
+}
+
+/* ── Keyframes ── */
+.replay-keyframes {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-top: 1px solid var(--argus-border);
+}
+.kf-label {
+  font-family: var(--argus-font-mono);
+  font-size: 10px;
+  color: var(--argus-text-muted);
+  letter-spacing: .15em;
+  text-transform: uppercase;
+}
+.kf-tag {
+  padding: 3px 10px;
+  border: 1px solid #3b82f6;
+  color: #3b82f6;
+  font-family: var(--argus-font-mono);
+  font-size: 10px;
+  background: rgba(59,130,246,.06);
+  cursor: pointer;
+  transition: all .12s;
+}
+.kf-tag:hover {
+  background: rgba(59,130,246,.15);
+}
+.kf-purple {
+  border-color: #8b5cf6;
+  color: #8b5cf6;
+  background: rgba(139,92,246,.06);
+}
+.kf-purple:hover {
+  background: rgba(139,92,246,.15);
+}
+.kf-add {
+  border-style: dashed;
+  border-color: var(--argus-border);
+  color: var(--argus-text-muted);
+  background: transparent;
+}
+.kf-add:hover {
+  border-color: #3b82f6;
+  color: #3b82f6;
+}
+
+/* ── Mobile ── */
+@media (max-width: 768px) {
+  .replay-viewport-row {
+    flex-direction: column;
+  }
+  .replay-ref {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--argus-border);
+  }
+  .ctrl-speeds {
+    display: none;
+  }
+}
+</style>
