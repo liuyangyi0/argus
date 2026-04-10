@@ -91,6 +91,10 @@ class AlertRecord(Base):
     )
     assigned_to: Mapped[str | None] = mapped_column(String(100), nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Alert aggregation: alerts in same camera+zone within a window share this ID
+    event_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    event_group_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
@@ -113,6 +117,8 @@ class AlertRecord(Base):
             "workflow_status": self.workflow_status,
             "assigned_to": self.assigned_to,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "event_group_id": self.event_group_id,
+            "event_group_count": self.event_group_count,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -689,6 +695,74 @@ class AlertRecordingRecord(Base):
             "video_codec": self.video_codec,
             "width": self.width,
             "height": self.height,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class LabelingQueueStatus(str, Enum):
+    """Status of a labeling queue entry."""
+
+    PENDING = "pending"
+    LABELED = "labeled"
+    SKIPPED = "skipped"
+
+
+class LabelingQueueRecord(Base):
+    """Uncertain frame queued for operator labeling (active learning).
+
+    Frames with high prediction uncertainty are pushed here by the
+    ActiveLearningSampler. Operators label them as normal/anomaly,
+    and labeled frames feed back into incremental retraining.
+    """
+
+    __tablename__ = "labeling_queue"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    zone_id: Mapped[str] = mapped_column(String(50), nullable=False, default="default")
+    frame_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    frame_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    anomaly_score: Mapped[float] = mapped_column(Float, nullable=False)
+    entropy: Mapped[float] = mapped_column(Float, nullable=False)
+    model_version_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # Labeling
+    label: Mapped[str | None] = mapped_column(
+        String(20), nullable=True,
+        comment="normal / anomaly — set by operator",
+    )
+    labeled_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    labeled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Queue lifecycle
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending",
+        index=True,
+    )
+    trained_into: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+        comment="model_version_id of the training run that consumed this label",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "camera_id": self.camera_id,
+            "zone_id": self.zone_id,
+            "frame_number": self.frame_number,
+            "frame_path": self.frame_path,
+            "anomaly_score": self.anomaly_score,
+            "entropy": self.entropy,
+            "model_version_id": self.model_version_id,
+            "label": self.label,
+            "labeled_by": self.labeled_by,
+            "labeled_at": self.labeled_at.isoformat() if self.labeled_at else None,
+            "status": self.status,
+            "trained_into": self.trained_into,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

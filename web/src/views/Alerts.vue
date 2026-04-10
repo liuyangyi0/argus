@@ -5,7 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 defineOptions({ name: 'AlertsPage' })
 import {
   Table, Tag, Button, Space, Typography, Select, Tooltip,
-  Divider, message, Segmented, Steps, Modal,
+  Divider, message, Segmented, Steps, Modal, Popover, List, Spin,
 } from 'ant-design-vue'
 import {
   CloseOutlined,
@@ -14,7 +14,7 @@ import {
   ExportOutlined,
   DeleteOutlined,
 } from '@ant-design/icons-vue'
-import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive, deleteAlert, bulkDeleteAlerts, bulkAcknowledge, bulkFalsePositive } from '../api'
+import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive, deleteAlert, bulkDeleteAlerts, bulkAcknowledge, bulkFalsePositive, getAlertGroup } from '../api'
 import { formatRelativeTime } from '../utils/time'
 import { useWebSocket } from '../composables/useWebSocket'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
@@ -35,6 +35,33 @@ const selectedAlert = ref<any>(null)
 const detailData = ref<any>(null)
 const imageMode = ref<'composite' | 'snapshot' | 'heatmap' | 'compare'>('composite')
 const annotationMode = ref(false)
+
+// Event group expansion
+const groupAlerts = ref<any[]>([])
+const groupLoading = ref(false)
+const groupPopoverVisible = ref<Record<string, boolean>>({})
+
+async function loadGroupAlerts(eventGroupId: string) {
+  groupLoading.value = true
+  try {
+    const data = await getAlertGroup(eventGroupId)
+    groupAlerts.value = data.alerts || []
+  } catch {
+    groupAlerts.value = []
+  } finally {
+    groupLoading.value = false
+  }
+}
+
+function toggleGroupPopover(eventGroupId: string) {
+  const isOpen = groupPopoverVisible.value[eventGroupId]
+  // Close all others
+  groupPopoverVisible.value = {}
+  if (!isOpen) {
+    groupPopoverVisible.value[eventGroupId] = true
+    loadGroupAlerts(eventGroupId)
+  }
+}
 
 // Bulk selection
 const selectedRowKeys = ref<string[]>([])
@@ -221,6 +248,21 @@ async function handleBulkFalsePositive() {
   }
 }
 
+function buildExportParams(): string {
+  const params = new URLSearchParams()
+  if (filters.value.camera_id) params.set('camera_id', filters.value.camera_id)
+  if (filters.value.severity) params.set('severity', filters.value.severity)
+  return params.toString() ? '?' + params.toString() : ''
+}
+
+function handleExportCSV() {
+  window.open(`/api/alerts/export-csv${buildExportParams()}`, '_blank')
+}
+
+function handleExportPDF() {
+  window.open(`/api/alerts/export-pdf${buildExportParams()}`, '_blank')
+}
+
 const severityColor: Record<string, string> = {
   high: 'red', medium: 'orange', low: 'gold', info: 'blue',
 }
@@ -344,6 +386,16 @@ const columns = computed(() => {
             <Select.Option value="low">低</Select.Option>
             <Select.Option value="info">提示</Select.Option>
           </Select>
+          <Tooltip title="导出 CSV">
+            <Button size="small" @click="handleExportCSV">
+              CSV
+            </Button>
+          </Tooltip>
+          <Tooltip title="导出 PDF (打印报告)">
+            <Button size="small" @click="handleExportPDF">
+              PDF
+            </Button>
+          </Tooltip>
         </Space>
       </div>
 
@@ -406,9 +458,52 @@ const columns = computed(() => {
             </template>
             <!-- Severity -->
             <template v-if="column.key === 'severity'">
-              <Tag :color="severityColor[record.severity]" style="margin: 0">
-                {{ severityLabel[record.severity] || record.severity }}
-              </Tag>
+              <Space :size="4">
+                <Tag :color="severityColor[record.severity]" style="margin: 0">
+                  {{ severityLabel[record.severity] || record.severity }}
+                </Tag>
+                <Popover
+                  v-if="record.event_group_count > 1 && record.event_group_id"
+                  :open="groupPopoverVisible[record.event_group_id]"
+                  trigger="click"
+                  placement="right"
+                  :destroy-tooltip-on-hide="true"
+                  @openChange="(v: boolean) => { if (!v) groupPopoverVisible[record.event_group_id] = false }"
+                >
+                  <template #content>
+                    <div style="max-width: 320px; max-height: 300px; overflow-y: auto">
+                      <Typography.Text strong style="margin-bottom: 8px; display: block">
+                        事件组 ({{ groupAlerts.length }} 条)
+                      </Typography.Text>
+                      <Spin v-if="groupLoading" size="small" />
+                      <List v-else :data-source="groupAlerts" size="small" :split="true">
+                        <template #renderItem="{ item }">
+                          <List.Item style="padding: 4px 0; cursor: pointer" @click="showDetail(item); groupPopoverVisible = {}">
+                            <Space :size="8">
+                              <Tag :color="severityColor[item.severity]" style="margin: 0; font-size: 10px">
+                                {{ severityLabel[item.severity] }}
+                              </Tag>
+                              <Typography.Text style="font-size: 12px">
+                                {{ item.anomaly_score?.toFixed(3) }}
+                              </Typography.Text>
+                              <Typography.Text type="secondary" style="font-size: 11px">
+                                {{ formatRelativeTime(item.timestamp) }}
+                              </Typography.Text>
+                            </Space>
+                          </List.Item>
+                        </template>
+                      </List>
+                    </div>
+                  </template>
+                  <Tag
+                    color="default"
+                    style="margin: 0; font-size: 10px; cursor: pointer"
+                    @click.stop="toggleGroupPopover(record.event_group_id)"
+                  >
+                    x{{ record.event_group_count }}
+                  </Tag>
+                </Popover>
+              </Space>
             </template>
             <!-- Score -->
             <template v-if="column.key === 'score'">

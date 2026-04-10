@@ -308,6 +308,21 @@ class AnomalibDetector:
             return self._predict_anomalib(frame)
         return self._predict_ssim_fallback(frame)
 
+    def predict_batch(self, frames: list[np.ndarray]) -> list[AnomalyResult]:
+        """Run anomaly detection on a batch of frames.
+
+        Processes each frame independently (Anomalib models don't natively
+        support batch inference), but avoids per-call overhead by reusing
+        the loaded model reference.
+
+        Args:
+            frames: List of BGR images.
+
+        Returns:
+            List of AnomalyResult, one per frame.
+        """
+        return [self.predict(frame) for frame in frames]
+
     def _predict_anomalib(self, frame: np.ndarray) -> AnomalyResult:
         """Predict using loaded Anomalib model."""
         # Validate frame

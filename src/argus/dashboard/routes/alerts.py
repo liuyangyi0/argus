@@ -685,6 +685,38 @@ async def bulk_delete(request: Request):
     return api_success({"count": count, "message": f"已删除 {count} 条告警"})
 
 
+# ── Event Group ──
+
+@router.get("/group/{event_group_id}")
+def get_alert_group(
+    request: Request,
+    event_group_id: str,
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Get all alerts belonging to an event group."""
+    from sqlalchemy import select
+    from argus.storage.models import AlertRecord
+
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    with db.get_session() as session:
+        stmt = (
+            select(AlertRecord)
+            .where(AlertRecord.event_group_id == event_group_id)
+            .order_by(AlertRecord.timestamp.desc())
+            .limit(limit)
+        )
+        records = list(session.scalars(stmt).all())
+
+    return api_success(data={
+        "event_group_id": event_group_id,
+        "count": len(records),
+        "alerts": [r.to_dict() for r in records],
+    })
+
+
 # ── CSV Export ──
 
 @router.get("/export-csv")
@@ -720,6 +752,65 @@ def export_csv(
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=argus_alerts.csv"},
     )
+
+
+@router.get("/export-pdf", response_model=None)
+def export_pdf_report(
+    request: Request,
+    camera_id: str | None = Query(None),
+    severity: str | None = Query(None),
+):
+    """Export alerts as a printable HTML report (use browser Ctrl+P to save as PDF)."""
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    alerts = db.get_alerts(camera_id=camera_id, severity=severity, limit=10000)
+
+    severity_cn = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
+    from datetime import datetime as dt
+
+    rows_html = ""
+    for i, a in enumerate(alerts, 1):
+        ts = a.timestamp.strftime("%Y-%m-%d %H:%M:%S") if a.timestamp else ""
+        sev = severity_cn.get(a.severity, a.severity)
+        status = "已确认" if a.acknowledged else ("误报" if a.false_positive else "待处理")
+        rows_html += f"""<tr>
+            <td>{i}</td><td>{ts}</td><td>{a.camera_id}</td>
+            <td>{a.zone_id}</td><td>{sev}</td>
+            <td>{a.anomaly_score:.4f}</td><td>{status}</td>
+            <td>{a.notes or ''}</td>
+        </tr>"""
+
+    now = dt.now().strftime("%Y-%m-%d %H:%M")
+    filter_desc = ""
+    if camera_id:
+        filter_desc += f" | 摄像头: {camera_id}"
+    if severity:
+        filter_desc += f" | 严重度: {severity_cn.get(severity, severity)}"
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Argus 告警报告</title>
+<style>
+  body {{ font-family: 'Microsoft YaHei', sans-serif; padding: 20px; color: #333; }}
+  h1 {{ font-size: 18px; border-bottom: 2px solid #333; padding-bottom: 8px; }}
+  .meta {{ font-size: 12px; color: #666; margin-bottom: 16px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+  th, td {{ border: 1px solid #ccc; padding: 4px 8px; text-align: left; }}
+  th {{ background: #f5f5f5; font-weight: bold; }}
+  tr:nth-child(even) {{ background: #fafafa; }}
+  @media print {{ body {{ padding: 0; }} }}
+</style></head><body>
+<h1>Argus 核电站异物检测 — 告警报告</h1>
+<div class="meta">生成时间: {now} | 共 {len(alerts)} 条{filter_desc}</div>
+<table>
+<tr><th>#</th><th>时间</th><th>摄像头</th><th>区域</th><th>严重度</th><th>异常分数</th><th>状态</th><th>备注</th></tr>
+{rows_html}
+</table>
+<script>window.print()</script>
+</body></html>"""
+
+    return HTMLResponse(content=html)
 
 
 # ── Single alert operations ──

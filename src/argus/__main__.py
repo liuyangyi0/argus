@@ -262,6 +262,17 @@ def main():
             logger.warning("go2rtc.start_failed", error=str(exc))
             _go2rtc = None
 
+    # Active learning sampler — subscribes to FrameAnalyzed events and
+    # pushes high-uncertainty frames to the labeling queue for operators.
+    from argus.core.active_learning import ActiveLearningSampler, ActiveLearningConfig
+    active_learning_sampler = ActiveLearningSampler(
+        config=ActiveLearningConfig(enabled=True),
+        event_bus=event_bus,
+        database=db,
+    )
+    # Attach sampler to event_bus so pipeline can buffer frames for saving
+    event_bus._active_sampler = active_learning_sampler  # type: ignore[attr-defined]
+
     # Start camera manager with all cameras
     manager = CameraManager(
         cameras=cameras,
@@ -312,6 +323,7 @@ def main():
         )
         app.state.audit_logger = audit_logger
         app.state.recording_store = alert_recording_store  # FR-033: shared with pipelines
+        app.state.active_learning_sampler = active_learning_sampler
         if app.state.baseline_lifecycle is not None:
             app.state.baseline_lifecycle._audit = audit_logger
         app.state.backup_manager = backup_mgr

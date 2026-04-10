@@ -589,6 +589,100 @@ class ModelTrainer:
 
         return result
 
+    # ── Incremental training from active learning labels ──
+
+    def incremental_train(
+        self,
+        camera_id: str,
+        zone_id: str = "default",
+        model_type: str = "patchcore",
+        labeled_entries: list | None = None,
+        database: object | None = None,
+        progress_callback: callable | None = None,
+        anomaly_config: object | None = None,
+    ) -> TrainingResult:
+        """Incremental retraining using active learning labels.
+
+        Normal-labeled frames are merged into the baselines directory,
+        then a full retraining is triggered. The labeled entries are
+        tracked so they aren't re-used in future incremental runs.
+
+        Args:
+            labeled_entries: List of LabelingQueueRecord objects with labels.
+                If None and database provided, fetches untrained labeled entries.
+            database: Database instance for fetching/marking entries.
+        """
+        start = time.monotonic()
+
+        def _progress(pct: int, msg: str) -> None:
+            if progress_callback:
+                progress_callback(pct, msg)
+
+        _progress(5, "正在收集主动学习标注数据...")
+
+        # Fetch labeled entries from DB if not provided
+        if labeled_entries is None and database is not None:
+            labeled_entries = database.get_labeled_entries(
+                camera_id=camera_id,
+                trained_into="",
+            )
+
+        if not labeled_entries:
+            return self._fail(start, error="没有可用的标注数据用于增量训练")
+
+        normal_frames = [e for e in labeled_entries if e.label == "normal"]
+        anomaly_frames = [e for e in labeled_entries if e.label == "anomaly"]
+
+        logger.info(
+            "incremental_train.starting",
+            camera_id=camera_id,
+            normal_count=len(normal_frames),
+            anomaly_count=len(anomaly_frames),
+        )
+
+        # Copy normal-labeled frames to baselines directory
+        _progress(10, f"正在合并 {len(normal_frames)} 张正常样本到基线...")
+        baselines_dir = self._baseline_manager.get_baseline_dir(camera_id, zone_id)
+        baselines_dir.mkdir(parents=True, exist_ok=True)
+
+        copied = 0
+        for entry in normal_frames:
+            src = Path(entry.frame_path)
+            if src.exists():
+                dst = baselines_dir / f"al_{src.name}"
+                if not dst.exists():
+                    shutil.copy2(str(src), str(dst))
+                    copied += 1
+
+        logger.info(
+            "incremental_train.baselines_merged",
+            camera_id=camera_id,
+            copied=copied,
+            total_normal=len(normal_frames),
+        )
+
+        # Run full training with the merged baselines
+        _progress(20, "正在使用合并后的基线启动模型训练...")
+        result = self.train(
+            camera_id=camera_id,
+            zone_id=zone_id,
+            model_type=model_type,
+            progress_callback=lambda pct, msg: _progress(20 + int(pct * 0.75), msg),
+            anomaly_config=anomaly_config,
+            skip_baseline_validation=True,
+        )
+
+        # Mark entries as consumed by this training run
+        if database is not None and result.status == TrainingStatus.COMPLETE:
+            entry_ids = [e.id for e in labeled_entries]
+            version_id = result.model_version_id or f"incremental-{camera_id}-{int(time.time())}"
+            database.mark_labeling_trained(entry_ids, trained_into=version_id)
+            _progress(100, f"增量训练完成 — 模型版本: {version_id}")
+        else:
+            _progress(100, f"增量训练失败: {result.error or '未知错误'}")
+
+        return result
+
     # ── TRN-001: Pre-training validation ──
 
     def _validate_baseline_quality(

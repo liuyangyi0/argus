@@ -7,6 +7,8 @@ import BaselineTab from '../components/models/BaselineTab.vue'
 import TrainingTab from '../components/models/TrainingTab.vue'
 import ModelsTab from '../components/models/ModelsTab.vue'
 import ModelComparison from '../components/models/ModelComparison.vue'
+import LabelingTab from '../components/models/LabelingTab.vue'
+import ThresholdPreview from '../components/models/ThresholdPreview.vue'
 
 const route = useRoute()
 const {
@@ -27,6 +29,7 @@ const {
 const initialTab = route.query.tab === 'training' ? 'training'
   : route.query.tab === 'models' ? 'models'
   : route.query.tab === 'comparison' ? 'comparison'
+  : route.query.tab === 'labeling' ? 'labeling'
   : 'baselines'
 const activeTab = ref(initialTab)
 
@@ -70,6 +73,14 @@ onMounted(async () => {
 
       <Tabs.TabPane key="comparison" tab="A/B 对比">
         <ModelComparison :cameras="cameras" />
+      </Tabs.TabPane>
+
+      <Tabs.TabPane key="labeling" tab="标注队列">
+        <LabelingTab :cameras="cameras" />
+      </Tabs.TabPane>
+
+      <Tabs.TabPane key="threshold" tab="阈值预览">
+        <ThresholdPreview :cameras="cameras" />
       </Tabs.TabPane>
     </Tabs>
   </div>

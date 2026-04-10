@@ -222,6 +222,9 @@ def create_app(
     from argus.dashboard.routes.streaming import router as streaming_router
     app.include_router(streaming_router, prefix="/api/streaming", tags=["streaming"])
 
+    from argus.dashboard.routes.labeling import router as labeling_router
+    app.include_router(labeling_router, prefix="/api/labeling", tags=["labeling"])
+
     try:
         from argus.dashboard.routes.baseline import router as baseline_router
         app.include_router(baseline_router, prefix="/api/baseline", tags=["baseline"])

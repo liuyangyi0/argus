@@ -67,6 +67,9 @@ class Alert:
     # UX v2 §5.1: Severity-based handling policy
     # "quick" (LOW), "confirm" (MEDIUM), "detail_required" (HIGH)
     handling_policy: str = "quick"
+    # Alert aggregation: alerts in same camera+zone within a window share this ID
+    event_group_id: str | None = None
+    event_group_count: int = 1
 
 
 class DetectionType(str, Enum):
@@ -125,6 +128,9 @@ class AlertGrader:
         self._trackers: dict[str, _AnomalyTracker] = defaultdict(_AnomalyTracker)
         self._last_alerts: dict[str, float] = {}  # zone_key -> last alert timestamp
         self._last_camera_alerts: dict[str, float] = {}  # camera_id -> last alert timestamp
+        # Alert aggregation: zone_key -> (event_group_id, first_alert_time, count)
+        self._event_groups: dict[str, tuple[str, float, int]] = {}
+        self._aggregation_window = getattr(config, "aggregation_window_seconds", 300.0)  # 5 min
         # Random offset avoids ID collisions across process restarts
         self._alert_counter = random.randint(1000, 9999)
         self._tracker_lock = threading.Lock()
@@ -299,8 +305,15 @@ class AlertGrader:
             # Timestamp-based ID with random suffix for collision resistance
             ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
             rnd = random.randint(0, 0xFFFF)
+            alert_id = f"ALT-{self._node_id}-{ts}-{seq:04d}-{rnd:04x}"
+
+            # Alert aggregation: assign event_group_id
+            event_group_id, event_group_count = self._assign_event_group(
+                zone_key, alert_id, time.time(),
+            )
+
             alert = Alert(
-                alert_id=f"ALT-{self._node_id}-{ts}-{seq:04d}-{rnd:04x}",
+                alert_id=alert_id,
                 camera_id=camera_id,
                 zone_id=zone_id,
                 severity=final_severity,
@@ -312,12 +325,37 @@ class AlertGrader:
                 detection_type=detection_type,
                 detected_objects=detected_objects or [],
                 handling_policy=HANDLING_POLICIES.get(final_severity, "quick"),
+                event_group_id=event_group_id,
+                event_group_count=event_group_count,
             )
 
             # Reset tracker after emitting alert
             self._trackers[zone_key] = _AnomalyTracker()
 
         return alert
+
+    def _assign_event_group(
+        self, zone_key: str, alert_id: str, alert_time: float,
+    ) -> tuple[str, int]:
+        """Assign an event_group_id for alert aggregation.
+
+        Alerts from the same zone within the aggregation window share the
+        same event_group_id. The first alert in a window creates a new group.
+
+        Returns (event_group_id, event_group_count).
+        """
+        existing = self._event_groups.get(zone_key)
+        if existing is not None:
+            group_id, first_time, count = existing
+            if alert_time - first_time < self._aggregation_window:
+                new_count = count + 1
+                self._event_groups[zone_key] = (group_id, first_time, new_count)
+                return group_id, new_count
+
+        # New group
+        group_id = f"EVG-{alert_id}"
+        self._event_groups[zone_key] = (group_id, alert_time, 1)
+        return group_id, 1
 
     def _score_to_severity(self, score: float) -> AlertSeverity | None:
         """Map an anomaly score to a severity level."""

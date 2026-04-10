@@ -13,6 +13,7 @@ import {
 } from '@ant-design/icons-vue'
 import DegradationBar from './components/DegradationBar.vue'
 import { useThemeStore } from './stores/theme'
+import { useWebSocket } from './composables/useWebSocket'
 
 const router = useRouter()
 const route = useRoute()
@@ -40,6 +41,11 @@ function onMenuClick({ key }: { key: string | number }) {
   const item = menuItems.find(m => m.key === String(key))
   if (item) router.push(item.path)
 }
+
+// WebSocket connection state for global banner
+const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFallbackMode, retryCount: wsRetryCount, nextRetryIn: wsNextRetryIn } = useWebSocket({
+  topics: ['health'],
+})
 
 const siderBg = computed(() => themeStore.isDark ? '#0f0f1a' : '#ffffff')
 const siderBorder = computed(() => themeStore.isDark ? '#1f2937' : '#e5e7eb')
@@ -118,6 +124,29 @@ onUnmounted(() => window.removeEventListener('resize', checkMobile))
         </div>
       </Layout.Sider>
       <Layout>
+        <!-- WebSocket disconnect banner -->
+        <div
+          v-if="!wsConnected && (wsReconnecting || wsFallbackMode)"
+          :style="{
+            background: wsFallbackMode ? '#faad14' : '#ff4d4f',
+            color: '#fff',
+            textAlign: 'center',
+            padding: '6px 16px',
+            fontSize: '13px',
+            fontWeight: 500,
+            zIndex: 1000,
+          }"
+        >
+          <template v-if="wsFallbackMode">
+            WebSocket 连接失败，已切换至轮询模式
+          </template>
+          <template v-else>
+            正在重新连接... ({{ wsRetryCount }}/3)
+            <span v-if="wsNextRetryIn > 0" style="margin-left: 8px; opacity: 0.8">
+              {{ wsNextRetryIn }}s 后重试
+            </span>
+          </template>
+        </div>
         <DegradationBar />
         <Layout.Content style="padding: 24px; overflow-y: auto">
           <router-view v-slot="{ Component }">
