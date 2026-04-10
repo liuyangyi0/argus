@@ -413,6 +413,8 @@ class AlertDispatcher:
         deadline = time.monotonic() + timeout
         while self._db_queue.qsize() > 0 and time.monotonic() < deadline:
             time.sleep(0.01)
+        # Allow the DB worker thread to finish processing the last item
+        time.sleep(0.05)
 
     def get_circuit_breaker_status(self) -> dict:
         """Get circuit breaker status for dashboard display (DET-009)."""
