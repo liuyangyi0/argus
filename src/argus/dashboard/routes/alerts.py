@@ -1068,8 +1068,8 @@ def alerts_timeline(
     with db.get_session() as session:
         stmt = (
             select(AlertRecord)
-            .where(AlertRecord.timestamp >= day_start.timestamp())
-            .where(AlertRecord.timestamp < day_end.timestamp())
+            .where(AlertRecord.timestamp >= day_start)
+            .where(AlertRecord.timestamp < day_end)
             .order_by(AlertRecord.timestamp.asc())
         )
         day_alerts = list(session.scalars(stmt).all())
