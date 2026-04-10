@@ -10,6 +10,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import structlog
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
@@ -25,6 +26,8 @@ from argus.dashboard.api_response import (
 )
 from argus.dashboard.components import empty_state, page_header, status_badge
 from argus.dashboard.forms import parse_request_form
+
+logger = structlog.get_logger()
 
 router = APIRouter()
 
@@ -310,7 +313,7 @@ async def alerts_list(
             <span>{status_badge("info")} {cnt_info}</span>
         </div>"""
     except Exception:
-        pass
+        logger.warning("alerts.stats_query_failed", exc_info=True)
 
     # Filter controls
     severity_options = ""

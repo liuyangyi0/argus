@@ -148,7 +148,7 @@ def _compute_dataset_hash(image_paths: list[Path]) -> str:
         try:
             h.update(str(p.stat().st_mtime_ns).encode())
         except OSError:
-            pass
+            logger.debug("backbone_trainer.file_stat_failed", path=str(p), exc_info=True)
     return h.hexdigest()[:16]
 
 

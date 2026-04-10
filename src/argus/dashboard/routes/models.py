@@ -111,7 +111,7 @@ async def activate_model(request: Request, version_id: str):
             if isinstance(body, dict):
                 triggered_by = body.get("triggered_by", triggered_by)
         except Exception:
-            pass
+            logger.debug("models.request_body_parse_failed", exc_info=True)
 
         record, runtime_synced = activate_model_version(
             request,
@@ -815,7 +815,7 @@ async def ab_live_compare(request: Request):
             cal = json.loads(shadow_record.calibration_thresholds)
             shadow_threshold = cal.get("threshold", 0.5)
         except Exception:
-            pass
+            logger.warning("models.calibration_thresholds_parse_failed", exc_info=True)
 
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(

@@ -580,7 +580,7 @@ async def delete_camera(request: Request, camera_id: str):
     try:
         await asyncio.to_thread(camera_manager.stop_camera, camera_id)
     except Exception:
-        pass  # Camera may not be running
+        logger.debug("camera.stop_on_delete_failed", camera_id=camera_id, exc_info=True)
 
     # Remove from config list
     config.cameras = [c for c in config.cameras if c.camera_id != camera_id]
@@ -595,7 +595,7 @@ async def delete_camera(request: Request, camera_id: str):
         try:
             go2rtc.remove_stream(camera_id)
         except Exception:
-            pass
+            logger.debug("camera.go2rtc_stream_remove_failed", camera_id=camera_id, exc_info=True)
 
     # Persist to config file
     config_path = getattr(request.app.state, "config_path", None)

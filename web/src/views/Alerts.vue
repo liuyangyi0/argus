@@ -436,7 +436,7 @@ const columns = computed(() => {
             onClick: () => showDetail(record),
             class: rowClassName(record),
           })"
-          :scroll="{ y: selectedAlert ? 'calc(100vh - 160px)' : undefined }"
+          :scroll="{ x: 800, y: selectedAlert ? 'calc(100vh - 160px)' : undefined }"
           style="cursor: pointer"
         >
           <template #bodyCell="{ column, record }">

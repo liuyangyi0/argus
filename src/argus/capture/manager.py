@@ -879,4 +879,4 @@ class CameraManager:
                 tmp.write_text(str(time.time()))
                 tmp.replace(heartbeat_path)
             except Exception:
-                pass  # non-critical
+                logger.debug("camera.watchdog_heartbeat_failed", exc_info=True)
