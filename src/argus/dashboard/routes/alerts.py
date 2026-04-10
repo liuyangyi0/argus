@@ -1100,7 +1100,7 @@ def alerts_timeline(
         current_seg = None
 
         for a in cam_alerts:
-            ts = datetime.fromtimestamp(a.timestamp)
+            ts = a.timestamp if isinstance(a.timestamp, datetime) else datetime.fromtimestamp(a.timestamp)
             sev = a.severity.value if hasattr(a.severity, "value") else str(a.severity)
             aid = a.alert_id
 
