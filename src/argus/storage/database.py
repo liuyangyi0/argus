@@ -94,7 +94,7 @@ class Database:
                     conn.commit()
                     logger.info("database.migration", table=table, column=column)
                 except Exception:
-                    pass  # Column already exists
+                    logger.debug("database.migration_column_exists", table=table, column=column)
 
     def get_session(self) -> Session:
         """Get a new database session."""

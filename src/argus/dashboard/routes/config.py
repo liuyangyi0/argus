@@ -356,7 +356,7 @@ def storage_tab(request: Request):
         try:
             alert_count = db.get_alert_count()
         except Exception:
-            pass
+            logger.warning("config.alert_count_query_failed", exc_info=True)
 
     cleanup_html = f"""
     <div class="card">
@@ -393,7 +393,7 @@ def cleanup_data(request: Request):
             Path(p).unlink(missing_ok=True)
             removed_files += 1
         except Exception:
-            pass
+            logger.debug("config.alert_file_cleanup_failed", path=str(p), exc_info=True)
 
     return api_success(
         {"deleted": deleted, "files": removed_files},

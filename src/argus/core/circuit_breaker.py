@@ -126,7 +126,7 @@ class CircuitBreaker:
             tmp.write_text(json.dumps(data))
             tmp.replace(self._config.fallback_file)
         except Exception:
-            pass  # Best-effort persistence
+            logger.debug("circuit_breaker.state_save_failed", exc_info=True)
 
     def _load_state(self) -> None:
         """Restore state from file on startup."""
@@ -144,4 +144,4 @@ class CircuitBreaker:
                         failures=self._failure_count,
                     )
         except Exception:
-            pass  # Start fresh if state file is corrupt
+            logger.warning("circuit_breaker.state_load_failed", exc_info=True)

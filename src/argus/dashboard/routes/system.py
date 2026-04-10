@@ -77,7 +77,7 @@ def overview(request: Request):
             high_alerts = db.get_alert_count(severity="high")
             medium_alerts = db.get_alert_count(severity="medium")
         except Exception:
-            pass
+            logger.warning("dashboard.alert_count_query_failed", exc_info=True)
 
     if camera_manager:
         cameras_status = camera_manager.get_status()
@@ -268,7 +268,7 @@ def overview(request: Request):
                     </div>
                 </div>"""
         except Exception:
-            pass
+            logger.warning("dashboard.recent_alerts_query_failed", exc_info=True)
 
     return HTMLResponse(f"""
     <div data-ws-topic="health" data-ws-refresh-url="/api/system/overview"
