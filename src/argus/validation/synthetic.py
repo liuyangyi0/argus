@@ -9,8 +9,11 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
+import structlog
 import cv2
 import numpy as np
+
+logger = structlog.get_logger()
 
 
 def _random_perspective_transform(
@@ -167,7 +170,7 @@ def generate_synthetic(
             from tqdm import tqdm
             iterator = tqdm(iterator, desc="Generating synthetic images", unit="img")
         except ImportError:
-            pass
+            logger.debug("synthetic.tqdm_not_available", exc_info=True)
 
     generated = 0
     for i in iterator:

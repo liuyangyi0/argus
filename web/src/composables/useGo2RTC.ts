@@ -9,6 +9,7 @@
 
 import { ref, onUnmounted, type Ref } from 'vue'
 import axios from 'axios'
+import { logger } from '../utils/logger'
 
 export type StreamStatus = 'idle' | 'connecting' | 'playing' | 'error' | 'fallback'
 
@@ -50,7 +51,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
       const resp = await axios.get(`/api/streaming/${getCameraId()}`)
       return resp.data as StreamInfo
     } catch (e) {
-      console.warn(`[go2rtc] fetchStreamInfo failed for ${getCameraId()}:`, e)
+      logger.debug(`[go2rtc] fetchStreamInfo failed for ${getCameraId()}:`, e)
       return null
     }
   }
@@ -62,23 +63,23 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
       const settle = (ok: boolean) => { if (!settled) { settled = true; clearTimeout(timeout); resolve(ok) } }
 
       const timeout = setTimeout(() => {
-        console.warn(`[go2rtc] WebRTC timeout for ${cam}, pc state: ${pc?.connectionState}`)
+        logger.debug(`[go2rtc] WebRTC timeout for ${cam}, pc state: ${pc?.connectionState}`)
         cleanup()
         settle(false)
       }, 15_000)
 
       try {
-        console.debug(`[go2rtc] WebRTC connecting: ${wsUrl}`)
+        logger.debug(`[go2rtc] WebRTC connecting: ${wsUrl}`)
         ws = new WebSocket(wsUrl)
 
         ws.onopen = () => {
-          console.debug(`[go2rtc] WebRTC ws open for ${cam}`)
+          logger.debug(`[go2rtc] WebRTC ws open for ${cam}`)
           pc = new RTCPeerConnection({
             iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
           })
 
           pc.ontrack = (event) => {
-            console.debug(`[go2rtc] WebRTC ontrack for ${cam}, videoRef=${!!videoRef.value}`)
+            logger.debug(`[go2rtc] WebRTC ontrack for ${cam}, videoRef=${!!videoRef.value}`)
             if (videoRef.value && event.streams[0]) {
               videoRef.value.srcObject = event.streams[0]
               status.value = 'playing'
@@ -87,7 +88,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
           }
 
           pc.onconnectionstatechange = () => {
-            console.debug(`[go2rtc] WebRTC state: ${pc?.connectionState} for ${cam}`)
+            logger.debug(`[go2rtc] WebRTC state: ${pc?.connectionState} for ${cam}`)
             if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')) {
               if (reconnectCount < MAX_RECONNECT) {
                 reconnectCount++
@@ -112,7 +113,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
           pc.createOffer().then((offer) => {
             pc!.setLocalDescription(offer).then(() => {
-              console.debug(`[go2rtc] WebRTC offer sent for ${cam}`)
+              logger.debug(`[go2rtc] WebRTC offer sent for ${cam}`)
               ws!.send(JSON.stringify({
                 type: 'webrtc/offer',
                 value: offer.sdp,
@@ -123,7 +124,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
         ws.onmessage = (event) => {
           const msg = JSON.parse(event.data)
-          console.debug(`[go2rtc] WebRTC msg: ${msg.type} for ${cam}`)
+          logger.debug(`[go2rtc] WebRTC msg: ${msg.type} for ${cam}`)
           if (msg.type === 'webrtc/answer' && pc) {
             pc.setRemoteDescription(new RTCSessionDescription({
               type: 'answer',
@@ -135,13 +136,13 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
         }
 
         ws.onerror = (ev) => {
-          console.warn(`[go2rtc] WebRTC ws error for ${cam}:`, ev)
+          logger.warn(`[go2rtc] WebRTC ws error for ${cam}:`, ev)
           cleanup()
           settle(false)
         }
 
         ws.onclose = (ev) => {
-          console.debug(`[go2rtc] WebRTC ws close for ${cam}, code=${ev.code}`)
+          logger.debug(`[go2rtc] WebRTC ws close for ${cam}, code=${ev.code}`)
           if (!settled) {
             cleanup()
             settle(false)
@@ -161,14 +162,14 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
       const settle = (ok: boolean) => { if (!settled) { settled = true; clearTimeout(timeout); resolve(ok) } }
 
       const timeout = setTimeout(() => {
-        console.warn(`[go2rtc] MSE timeout for ${getCameraId()}`)
+        logger.warn(`[go2rtc] MSE timeout for ${getCameraId()}`)
         cleanupMSE()
         settle(false)
       }, 15_000)
 
       try {
         if (!videoRef.value) {
-          console.warn(`[go2rtc] MSE: videoRef is null for ${getCameraId()}, skipping`)
+          logger.warn(`[go2rtc] MSE: videoRef is null for ${getCameraId()}, skipping`)
           settle(false)
           return
         }
@@ -177,7 +178,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
         videoRef.value.src = URL.createObjectURL(mediaSource)
 
         mediaSource.addEventListener('sourceopen', () => {
-          console.debug(`[go2rtc] MSE sourceopen for ${getCameraId()}, connecting: ${wsUrl}`)
+          logger.debug(`[go2rtc] MSE sourceopen for ${getCameraId()}, connecting: ${wsUrl}`)
           mseWs = new WebSocket(wsUrl)
           mseWs.binaryType = 'arraybuffer'
 
@@ -219,13 +220,13 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
           }
 
           mseWs.onerror = (ev) => {
-            console.warn(`[go2rtc] MSE ws error for ${getCameraId()}:`, ev)
+            logger.warn(`[go2rtc] MSE ws error for ${getCameraId()}:`, ev)
             cleanupMSE()
             settle(false)
           }
 
           mseWs.onclose = (ev) => {
-            console.debug(`[go2rtc] MSE ws close for ${getCameraId()}, code=${ev.code}`)
+            logger.debug(`[go2rtc] MSE ws close for ${getCameraId()}, code=${ev.code}`)
             if (!settled) {
               cleanupMSE()
               settle(false)
@@ -257,7 +258,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
   async function start() {
     stop()
     if (_activeStreamCount >= MAX_CONCURRENT_STREAMS) {
-      console.warn(`[go2rtc] connection budget exhausted (${_activeStreamCount}/${MAX_CONCURRENT_STREAMS})`)
+      logger.warn(`[go2rtc] connection budget exhausted (${_activeStreamCount}/${MAX_CONCURRENT_STREAMS})`)
       status.value = 'error'
       return
     }

@@ -483,6 +483,8 @@ class CameraManager:
                 return
             cam_config = next((c for c in self._cameras if c.camera_id == camera_id), None)
             s = pipeline.stats
+            with self._bp_lock:
+                dropped = self._frames_dropped.get(camera_id, 0)
             self._on_status_change("cameras", {
                 "camera_id": camera_id,
                 "name": cam_config.name if cam_config else camera_id,
@@ -494,6 +496,7 @@ class CameraManager:
                     "anomalies_detected": s.anomalies_detected,
                     "alerts_emitted": s.alerts_emitted,
                     "avg_latency_ms": round(s.avg_latency_ms, 1),
+                    "frames_dropped": dropped,
                 } if s else None,
             })
         except Exception as e:

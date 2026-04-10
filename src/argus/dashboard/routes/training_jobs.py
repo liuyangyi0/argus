@@ -109,7 +109,7 @@ async def get_training_job(request: Request, job_id: str):
             try:
                 data[field] = json.loads(data[field])
             except (json.JSONDecodeError, TypeError):
-                pass
+                logger.debug("training_job.json_parse_failed", field=field, exc_info=True)
     return api_success(data)
 
 

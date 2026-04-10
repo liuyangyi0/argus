@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { Select } from 'ant-design-vue'
+import { Select, message } from 'ant-design-vue'
 import {
   CaretRightOutlined,
   PauseOutlined,
@@ -110,7 +110,7 @@ async function loadData() {
 
     loadReference()
   } catch (e) {
-    console.error('Replay load error', e)
+    message.error('回放数据加载失败')
     metadata.value = null
   }
 }

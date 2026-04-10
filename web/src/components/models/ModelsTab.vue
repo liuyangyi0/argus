@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { Statistic, Card } from 'ant-design-vue'
+import { Statistic, Card, message } from 'ant-design-vue'
 import { getModelRegistry } from '../../api'
 import ModelTable from './ModelTable.vue'
 import EventLog from './EventLog.vue'
@@ -17,7 +17,7 @@ async function loadAllModels() {
     const res = await getModelRegistry()
     allModels.value = res.models || []
   } catch (e) {
-    console.error('Failed to load models', e)
+    message.error('加载模型列表失败')
   }
 }
 

@@ -8,6 +8,10 @@ export const getHealth = () =>
 // ── Config ──
 export const reloadConfig = () => api.post('/config/reload').then(u)
 
+// ── Storage & Retention ──
+export const getStorageInfo = () => api.get('/config/storage/info').then(u)
+export const cleanupAlerts = () => api.post('/config/cleanup').then(u)
+
 // ── Backup ──
 export const createBackup = () => api.post('/backup/create').then(u)
 

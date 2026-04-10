@@ -917,10 +917,16 @@ async def wall_status(request: Request):
                 tile["current_score"] = wall_data.get("current_score", 0.0)
                 tile["score_sparkline"] = wall_data.get("score_sparkline", [])
 
-            # FPS from pipeline stats
+            # FPS and backpressure from pipeline stats
             stats = getattr(cam_status, "stats", None)
             if stats is not None:
                 tile["fps"] = getattr(stats, "current_fps", None)
+
+            # Backpressure visibility (P0-2)
+            bp_stats = camera_manager.get_backpressure_stats()
+            bp = bp_stats.get(cam_id, {})
+            tile["frames_dropped"] = bp.get("dropped", 0)
+            tile["backpressured"] = bp.get("backpressured", False)
 
             if db is not None:
                 try:
@@ -932,7 +938,7 @@ async def wall_status(request: Request):
                     )
                     tile["alert_count_today"] = today_count
                 except Exception:
-                    pass
+                    logger.debug("cameras.alert_count_today_failed", camera_id=cam_id, exc_info=True)
 
             if db is not None:
                 try:
@@ -943,7 +949,7 @@ async def wall_status(request: Request):
                             "severity": recent[0].severity,
                         }
                 except Exception:
-                    pass
+                    logger.debug("cameras.recent_alert_query_failed", camera_id=cam_id, exc_info=True)
 
             if health_monitor is not None:
                 health = health_monitor.get_camera_health(cam_id)

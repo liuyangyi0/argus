@@ -13,6 +13,7 @@ Ref: https://github.com/AlexxIT/go2rtc
 
 from __future__ import annotations
 
+import atexit
 import json
 import platform
 import shutil
@@ -124,6 +125,9 @@ class Go2RTCManager:
         self._auto_config_dir = config_dir is None  # track for cleanup
         self._http = httpx.Client(base_url=self._base_url, timeout=5.0)
 
+        # Safety net: ensure cleanup even on unexpected interpreter shutdown
+        atexit.register(self.close)
+
     # ------------------------------------------------------------------
     # Config generation
     # ------------------------------------------------------------------
@@ -168,7 +172,7 @@ class Go2RTCManager:
                 try:
                     self._http.post("/api/exit", timeout=2)
                 except Exception:
-                    pass
+                    logger.debug("go2rtc.graceful_exit_failed", exc_info=True)
                 time.sleep(1)
                 # If still alive, find and kill by port (Windows)
                 if platform.system() == "Windows":
@@ -196,7 +200,7 @@ class Go2RTCManager:
                             capture_output=True, timeout=5,
                         )
                     except Exception:
-                        pass
+                        logger.debug("go2rtc.unix_fuser_kill_failed", exc_info=True)
                 time.sleep(0.5)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException):
             pass  # No stale process — port is free
@@ -429,13 +433,18 @@ class Go2RTCManager:
         try:
             self._http.close()
         except Exception:
-            pass
+            logger.debug("go2rtc.http_client_close_failed", exc_info=True)
         # Clean up auto-created temp config directory
         if self._auto_config_dir and self._config_dir.exists():
             shutil.rmtree(self._config_dir, ignore_errors=True)
+        # Unregister atexit handler to avoid double-cleanup
+        try:
+            atexit.unregister(self.close)
+        except Exception:
+            logger.debug("go2rtc.atexit_unregister_failed", exc_info=True)
 
     def __del__(self) -> None:
         try:
             self.close()
         except Exception:
-            pass
+            logger.debug("go2rtc.destructor_close_failed", exc_info=True)

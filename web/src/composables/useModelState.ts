@@ -1,6 +1,8 @@
 import { ref, computed } from 'vue'
+import { message } from 'ant-design-vue'
 import { getCameras, getTasks, dismissTask } from '../api'
 import { useWebSocket } from './useWebSocket'
+import type { CameraSummary, TaskInfo } from '../types/api'
 
 // ── Constants ──
 
@@ -99,10 +101,10 @@ export const TRIGGER_LABELS: Record<string, string> = {
 // ── Shared state composable ──
 
 export function useModelState() {
-  const cameras = ref<any[]>([])
-  const tasks = ref<any[]>([])
+  const cameras = ref<CameraSummary[]>([])
+  const tasks = ref<TaskInfo[]>([])
 
-  function upsertTaskUpdate(task: any) {
+  function upsertTaskUpdate(task: TaskInfo) {
     const index = tasks.value.findIndex(existing => existing.task_id === task.task_id)
     if (index >= 0) {
       tasks.value[index] = { ...tasks.value[index], ...task }
@@ -132,7 +134,7 @@ export function useModelState() {
       const res = await getCameras()
       cameras.value = res.cameras || []
     } catch (e) {
-      console.error('Failed to load cameras', e)
+      message.error('加载摄像头列表失败')
     }
   }
 
@@ -141,7 +143,7 @@ export function useModelState() {
       const res = await getTasks()
       tasks.value = res.tasks || []
     } catch (e) {
-      console.error('Failed to load tasks', e)
+      message.error('加载任务列表失败')
     }
   }
 
@@ -150,7 +152,7 @@ export function useModelState() {
       await dismissTask(taskId)
       loadTasks()
     } catch (e) {
-      console.error('Failed to dismiss task', e)
+      message.error('关闭任务失败')
     }
   }
 
@@ -161,32 +163,32 @@ export function useModelState() {
     tasks.value.filter(t => t.task_type === 'model_training')
   )
 
-  function taskTitle(task: any) {
+  function taskTitle(task: TaskInfo) {
     if (task.task_type === 'model_training') return '模型训练'
     if (task.task_type === 'baseline_capture') return '基线采集'
     return task.task_type
   }
 
-  function taskProgressStatus(task: any) {
+  function taskProgressStatus(task: TaskInfo) {
     if (task.status === 'failed') return 'exception'
     if (task.status === 'complete') return 'success'
     if (task.status === 'paused') return 'normal'
     return 'active'
   }
 
-  function canPauseTask(task: any) {
+  function canPauseTask(task: TaskInfo) {
     return task.task_type === 'baseline_capture' && task.status === 'running'
   }
 
-  function canResumeTask(task: any) {
+  function canResumeTask(task: TaskInfo) {
     return task.task_type === 'baseline_capture' && task.status === 'paused'
   }
 
-  function canAbortTask(task: any) {
+  function canAbortTask(task: TaskInfo) {
     return task.task_type === 'baseline_capture' && (task.status === 'running' || task.status === 'paused')
   }
 
-  function canDismissTask(task: any) {
+  function canDismissTask(task: TaskInfo) {
     return task.status === 'complete' || task.status === 'failed' || task.status === 'aborted'
   }
 

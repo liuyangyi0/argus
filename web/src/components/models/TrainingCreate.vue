@@ -24,8 +24,21 @@ const createForm = ref({
   model_type: 'patchcore',
   zone_id: 'default',
 })
+const formRef = ref()
+const createLoading = ref(false)
+
+const formRules = {
+  camera_id: [{ required: true, message: '请选择摄像头' }],
+}
+
+const canSubmit = ref(true)
 
 async function handleCreate() {
+  if (createForm.value.job_type === 'anomaly_head' && !createForm.value.camera_id) {
+    message.warning('请先选择摄像头')
+    return
+  }
+  createLoading.value = true
   try {
     await createTrainingJob(createForm.value)
     message.success('训练任务已创建，等待确认')
@@ -34,6 +47,8 @@ async function handleCreate() {
     emit('refresh')
   } catch (e: any) {
     message.error(e.response?.data?.error || '创建失败')
+  } finally {
+    createLoading.value = false
   }
 }
 </script>
@@ -63,6 +78,7 @@ async function handleCreate() {
       @ok="handleCreate"
       ok-text="创建"
       cancel-text="取消"
+      :confirm-loading="createLoading"
     >
       <Form layout="vertical" style="margin-top: 16px">
         <Form.Item label="任务类型">

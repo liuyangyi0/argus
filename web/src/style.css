@@ -16,6 +16,19 @@ body {
 
 /* ── CSS Variables for theme-aware components ── */
 :root, .dark-theme {
+  /* Spacing scale (4px grid) */
+  --argus-space-xs: 4px;
+  --argus-space-sm: 8px;
+  --argus-space-md: 12px;
+  --argus-space-lg: 16px;
+  --argus-space-xl: 24px;
+  /* Type scale */
+  --argus-font-caption: 11px;
+  --argus-font-small: 12px;
+  --argus-font-body: 13px;
+  --argus-font-subheading: 15px;
+  --argus-font-heading: 18px;
+  /* Colors */
   --argus-card-bg: linear-gradient(135deg, #1a1a2e 0%, #16162a 100%);
   --argus-card-bg-solid: #1a1a2e;
   --argus-border: #2d2d4a;
@@ -48,6 +61,18 @@ body {
 .light-theme #app { background: #f1f5f9; }
 .light-theme ::-webkit-scrollbar-thumb { background: #cbd5e1; }
 .light-theme ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ── Keyboard shortcut styling ── */
+kbd {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-family: var(--argus-font-mono);
+  background: var(--argus-surface);
+  border: 1px solid var(--argus-border);
+  border-radius: 4px;
+  text-align: center;
+}
 
 /* ── Mobile responsive globals ── */
 @media (max-width: 768px) {

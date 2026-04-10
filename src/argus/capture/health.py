@@ -154,7 +154,7 @@ class CameraHealthAnalyzer:
                 if displacement > self._displacement_threshold:
                     result.warnings.append("mechanical_displacement")
             except cv2.error:
-                pass
+                logger.debug("health.optical_flow_failed", exc_info=True)
 
         self._prev_gray = gray.copy()
         return result

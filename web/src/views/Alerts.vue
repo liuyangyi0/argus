@@ -79,6 +79,12 @@ async function fetchData() {
   }
 }
 
+let _filterTimer: ReturnType<typeof setTimeout> | null = null
+function debouncedFetchData() {
+  if (_filterTimer) clearTimeout(_filterTimer)
+  _filterTimer = setTimeout(fetchData, 300)
+}
+
 useWebSocket({
   topics: ['alerts'],
   onMessage(topic, data) {
@@ -304,12 +310,7 @@ function rowClassName(record: any) {
 }
 
 // Anomaly score color
-function scoreColor(score: number): string {
-  if (score >= 0.95) return '#ef4444'
-  if (score >= 0.85) return '#f97316'
-  if (score >= 0.7) return '#f59e0b'
-  return '#3b82f6'
-}
+import { scoreColor } from '../utils/colors'
 
 // Table columns — adapt based on whether detail is open
 const columns = computed(() => {
@@ -345,7 +346,7 @@ const columns = computed(() => {
 </script>
 
 <template>
-  <div style="display: flex; height: calc(100vh - 72px); margin: -24px; overflow: hidden">
+  <div class="alerts-layout">
     <!-- Left: Alert List -->
     <div
       :style="{
@@ -378,7 +379,7 @@ const columns = computed(() => {
             allow-clear
             size="small"
             style="width: 130px"
-            @change="fetchData"
+            @change="debouncedFetchData"
           >
             <Select.Option v-for="cam in cameras" :key="cam.camera_id" :value="cam.camera_id">
               {{ cam.camera_id }}
@@ -390,7 +391,7 @@ const columns = computed(() => {
             <button :class="['alerts-chip', { on: filters.severity === 'medium' }]" @click="filters.severity = 'medium'; fetchData()">中</button>
             <button :class="['alerts-chip', { on: filters.severity === 'low' }]" @click="filters.severity = 'low'; fetchData()">低</button>
           </div>
-          <div class="alerts-chip-group" style="margin-left: auto">
+          <div class="alerts-chip-group alerts-chip-group--end">
             <button class="alerts-chip alerts-chip--export" @click="handleExportCSV">CSV ↓</button>
             <button class="alerts-chip alerts-chip--export" @click="handleExportPDF">PDF ↓</button>
           </div>
@@ -398,11 +399,11 @@ const columns = computed(() => {
       </div>
 
       <!-- Table -->
-      <div style="flex: 1; overflow: auto; padding: 0 8px">
+      <div class="alert-list-body">
         <!-- Bulk action bar -->
         <div
           v-if="selectedRowKeys.length > 0"
-          style="display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--argus-card-bg-solid); border-radius: 6px; margin-bottom: 8px"
+          class="bulk-action-bar"
         >
           <Typography.Text style="font-size: 12px">
             已选 {{ selectedRowKeys.length }} 条
@@ -446,7 +447,7 @@ const columns = computed(() => {
                 <img
                   v-if="record.snapshot_path"
                   :src="`/api/alerts/${record.alert_id}/image/snapshot`"
-                  style="width: 100%; height: 100%; object-fit: cover"
+                  class="alert-thumb-img"
                   loading="lazy"
                 />
                 <div v-else class="alert-thumb-empty">--</div>
@@ -467,7 +468,7 @@ const columns = computed(() => {
                   @openChange="(v: boolean) => { if (!v) groupPopoverVisible[record.event_group_id] = false }"
                 >
                   <template #content>
-                    <div style="max-width: 320px; max-height: 300px; overflow-y: auto">
+                    <div class="group-popover-content">
                       <Typography.Text strong style="margin-bottom: 8px; display: block">
                         事件组 ({{ groupAlerts.length }} 条)
                       </Typography.Text>
@@ -545,7 +546,7 @@ const columns = computed(() => {
     <!-- Right: Detail Panel -->
     <div
       v-if="selectedAlert"
-      style="flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--argus-surface)"
+      class="detail-panel"
     >
       <!-- Detail Header -->
       <div class="detail-header">
@@ -579,18 +580,18 @@ const columns = computed(() => {
       </div>
 
       <!-- Detail Content -->
-      <div style="flex: 1; overflow-y: auto; padding: 16px 20px">
+      <div class="detail-content">
         <!-- Replay Player (when recording exists) -->
         <ReplayPlayer
           v-if="selectedAlert.has_recording"
           :alert-id="selectedAlert.alert_id"
-          style="margin-bottom: 20px"
+          class="detail-section-spacing"
         />
 
         <!-- Static snapshot fallback (no recording) -->
-        <div v-if="!selectedAlert.has_recording && selectedAlert.snapshot_path" style="margin-bottom: 20px">
+        <div v-if="!selectedAlert.has_recording && selectedAlert.snapshot_path" class="detail-section-spacing">
           <!-- Image mode toggle -->
-          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px">
+          <div class="image-mode-bar">
             <Segmented
               v-model:value="imageMode"
               :options="[
@@ -600,7 +601,7 @@ const columns = computed(() => {
               ]"
               size="small"
             />
-            <div style="margin-left: auto; display: flex; align-items: center; gap: 8px">
+            <div class="score-display-wrapper">
               <Typography.Text type="secondary" style="font-size: 11px">异常分数</Typography.Text>
               <div
                 :style="{
@@ -621,7 +622,7 @@ const columns = computed(() => {
           </div>
 
           <!-- Image display: standard view or comparison slider -->
-          <div v-if="imageMode === 'compare'" style="margin-bottom: 12px">
+          <div v-if="imageMode === 'compare'" class="compare-section">
             <ImageCompareSlider
               :left-src="`/api/alerts/${selectedAlert.alert_id}/image/snapshot`"
               :right-src="`/api/alerts/${selectedAlert.alert_id}/image/heatmap`"
@@ -634,11 +635,11 @@ const columns = computed(() => {
               按住 Alt 悬停可放大区域
             </Typography.Text>
           </div>
-          <div v-else style="border-radius: 8px; overflow: hidden; background: #000; text-align: center; position: relative">
+          <div v-else class="image-viewer">
             <img
               ref="alertImageRef"
               :src="`/api/alerts/${selectedAlert.alert_id}/image/${imageMode}`"
-              style="max-width: 100%; max-height: 480px; object-fit: contain"
+              class="alert-detail-img"
               :alt="selectedAlert.alert_id"
             />
             <!-- Canvas annotation overlay (toggled) -->
@@ -650,7 +651,7 @@ const columns = computed(() => {
               :camera-id="selectedAlert.camera_id"
             />
           </div>
-          <div style="display: flex; gap: 6px; margin-top: 6px">
+          <div class="image-action-bar">
             <Button size="small" :type="imageMode === 'compare' ? 'primary' : 'default'" @click="imageMode = imageMode === 'compare' ? 'composite' : 'compare'">
               {{ imageMode === 'compare' ? '返回普通视图' : '对比滑块' }}
             </Button>
@@ -663,7 +664,7 @@ const columns = computed(() => {
         <!-- No image at all -->
         <div
           v-if="!selectedAlert.has_recording && !selectedAlert.snapshot_path"
-          style="padding: 40px; text-align: center; background: var(--argus-card-bg-solid); border-radius: 8px; margin-bottom: 20px"
+          class="no-image-placeholder"
         >
           <Typography.Text type="secondary" style="font-size: 14px">
             无快照或录像数据
@@ -701,7 +702,7 @@ const columns = computed(() => {
               </div>
               <div v-if="selectedAlert.notes" class="meta-row">
                 <span class="meta-k">NOTES</span>
-                <span class="meta-v" style="max-width: 180px; text-align: right">{{ selectedAlert.notes }}</span>
+                <span class="meta-v meta-v--notes">{{ selectedAlert.notes }}</span>
               </div>
             </div>
           </div>
@@ -712,7 +713,7 @@ const columns = computed(() => {
               <span>操作 · Actions</span>
               <b>{{ (workflowLabel[selectedAlert.workflow_status] || '待处理').toUpperCase() }}</b>
             </div>
-            <div class="meta-panel-bd" style="display: flex; flex-direction: column; gap: 8px">
+            <div class="meta-panel-bd actions-panel-bd">
               <Button
                 v-if="selectedAlert.workflow_status === 'new'"
                 type="primary"
@@ -730,7 +731,7 @@ const columns = computed(() => {
                 <template #icon><StopOutlined /></template>
                 标记误报
               </Button>
-              <div v-if="selectedAlert.workflow_status !== 'new' && selectedAlert.workflow_status !== 'acknowledged'" style="text-align: center; padding: 12px 0">
+              <div v-if="selectedAlert.workflow_status !== 'new' && selectedAlert.workflow_status !== 'acknowledged'" class="status-display">
                 <Tag :color="workflowColor[selectedAlert.workflow_status]" style="font-size: 13px; padding: 4px 16px">
                   {{ workflowLabel[selectedAlert.workflow_status] }}
                 </Tag>
@@ -745,8 +746,8 @@ const columns = computed(() => {
               </Button>
 
               <!-- Workflow timeline -->
-              <div style="border-top: 1px solid var(--argus-border); margin-top: 4px; padding-top: 10px">
-                <div style="font-size: 10px; color: var(--argus-text-muted); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 8px">工作流进度</div>
+              <div class="workflow-timeline">
+                <div class="workflow-label">工作流进度</div>
                 <Steps
                   v-if="selectedAlert.workflow_status !== 'false_positive'"
                   :current="workflowStepIndex"
@@ -760,7 +761,7 @@ const columns = computed(() => {
                   <Steps.Step title="已解决" />
                   <Steps.Step title="已关闭" />
                 </Steps>
-                <div v-else style="text-align: center; padding: 8px 0">
+                <div v-else class="false-positive-display">
                   <Tag color="orange" style="font-size: 12px; padding: 2px 12px">已标记为误报</Tag>
                 </div>
               </div>
@@ -987,6 +988,141 @@ const columns = computed(() => {
 .meta-v {
   color: var(--argus-text);
   font-size: 12px;
+}
+.meta-v--notes {
+  max-width: 180px;
+  text-align: right;
+}
+
+/* ── Layout ── */
+.alerts-layout {
+  display: flex;
+  height: calc(100vh - 72px);
+  margin: -24px;
+  overflow: hidden;
+}
+.alerts-chip-group--end {
+  margin-left: auto;
+}
+.alert-list-body {
+  flex: 1;
+  overflow: auto;
+  padding: 0 8px;
+}
+
+/* ── Bulk action bar ── */
+.bulk-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--argus-card-bg-solid);
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+
+/* ── Thumbnail image ── */
+.alert-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ── Group popover ── */
+.group-popover-content {
+  max-width: 320px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* ── Detail panel ── */
+.detail-panel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--argus-surface);
+}
+.detail-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+.detail-section-spacing {
+  margin-bottom: 20px;
+}
+
+/* ── Image mode bar ── */
+.image-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.score-display-wrapper {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.compare-section {
+  margin-bottom: 12px;
+}
+.image-viewer {
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  text-align: center;
+  position: relative;
+}
+.alert-detail-img {
+  max-width: 100%;
+  max-height: 480px;
+  object-fit: contain;
+}
+.image-action-bar {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* ── No image placeholder ── */
+.no-image-placeholder {
+  padding: 40px;
+  text-align: center;
+  background: var(--argus-card-bg-solid);
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+
+/* ── Actions panel ── */
+.actions-panel-bd {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.status-display {
+  text-align: center;
+  padding: 12px 0;
+}
+
+/* ── Workflow timeline ── */
+.workflow-timeline {
+  border-top: 1px solid var(--argus-border);
+  margin-top: 4px;
+  padding-top: 10px;
+}
+.workflow-label {
+  font-size: 10px;
+  color: var(--argus-text-muted);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.false-positive-display {
+  text-align: center;
+  padding: 8px 0;
 }
 </style>
 

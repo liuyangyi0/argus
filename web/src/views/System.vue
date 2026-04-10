@@ -2,7 +2,7 @@
 import { ref, reactive, onMounted } from 'vue'
 import {
   Card, Tabs, Descriptions, Typography, Table, Button, Space, Tag,
-  Form, Input, Select, message, Popconfirm, Badge, Switch,
+  Form, Input, Select, message, Popconfirm, Badge, Switch, Skeleton,
 } from 'ant-design-vue'
 import {
   getHealth,
@@ -16,6 +16,8 @@ import {
   updateAudioAlerts,
   reloadConfig,
   createBackup,
+  getStorageInfo,
+  cleanupAlerts,
 } from '../api'
 import { useWebSocket } from '../composables/useWebSocket'
 
@@ -43,6 +45,24 @@ const degradationEvents = ref<any[]>([])
 const degradationLoading = ref(false)
 const degradationDays = ref(7)
 
+// ── Storage & Retention ──
+const storageInfo = ref<any>(null)
+const cleanupLoading = ref(false)
+
+async function loadStorageInfo() {
+  try { storageInfo.value = await getStorageInfo() } catch { /* silent */ }
+}
+
+async function handleCleanup() {
+  cleanupLoading.value = true
+  try {
+    const res = await cleanupAlerts()
+    message.success(`已清理 ${res.deleted} 条旧告警`)
+    loadStorageInfo()
+  } catch { message.error('清理失败') }
+  finally { cleanupLoading.value = false }
+}
+
 // ── Audio Alerts ──
 const audioConfig = ref<any>({ low: {}, medium: {}, high: {} })
 const audioLoading = ref(false)
@@ -52,7 +72,7 @@ async function fetchHealth() {
     const res = await getHealth()
     health.value = res
   } catch (e) {
-    console.error(e)
+    message.error('操作失败')
   }
 }
 
@@ -65,7 +85,7 @@ const { } = useWebSocket({
   fallbackInterval: 15000,
 })
 
-onMounted(fetchHealth)
+onMounted(() => { fetchHealth(); loadStorageInfo() })
 
 // ── Users functions ──
 async function loadUsers() {
@@ -74,7 +94,6 @@ async function loadUsers() {
     const res = await apiGetUsers()
     users.value = res.users
   } catch (e) {
-    console.error(e)
     message.error('加载用户列表失败')
   } finally {
     usersLoading.value = false
@@ -132,7 +151,6 @@ async function loadAudit() {
     const uniqueUsers = new Set<string>(res.entries.map((e: any) => e.user).filter(Boolean))
     auditUserOptions.value = Array.from(uniqueUsers).sort()
   } catch (e) {
-    console.error(e)
     message.error('加载审计日志失败')
   } finally {
     auditLoading.value = false
@@ -250,6 +268,9 @@ const degradationLevelLabels: Record<string, string> = {
     <Tabs :activeKey="activeTab" @change="onTabChange">
       <!-- Overview -->
       <Tabs.TabPane key="overview" tab="系统概览">
+        <Card v-if="!health">
+          <Skeleton active :paragraph="{ rows: 4 }" />
+        </Card>
         <Card v-if="health">
           <Descriptions :column="2" bordered size="small" title="运行状态">
             <Descriptions.Item label="系统状态">
@@ -286,6 +307,30 @@ const degradationLevelLabels: Record<string, string> = {
               </template>
             </template>
           </Table>
+        </Card>
+
+        <!-- Storage & Retention -->
+        <Card title="存储与维护" style="margin-top: 16px" v-if="storageInfo">
+          <Descriptions :column="2" bordered size="small">
+            <Descriptions.Item label="告警记录总数">{{ storageInfo.alert_count }}</Descriptions.Item>
+            <Descriptions.Item label="告警保留天数">{{ storageInfo.retention_days }} 天</Descriptions.Item>
+            <Descriptions.Item v-if="storageInfo.disk" label="磁盘已用">
+              {{ storageInfo.disk.used_gb }} / {{ storageInfo.disk.total_gb }} GB ({{ storageInfo.disk.percent_used }}%)
+            </Descriptions.Item>
+            <Descriptions.Item v-if="storageInfo.disk" label="磁盘可用">
+              {{ storageInfo.disk.free_gb }} GB
+            </Descriptions.Item>
+          </Descriptions>
+          <div style="margin-top: 12px">
+            <Popconfirm
+              :title="`确定清理超过 ${storageInfo.retention_days} 天的旧告警数据？`"
+              ok-text="确定"
+              cancel-text="取消"
+              @confirm="handleCleanup"
+            >
+              <Button type="primary" danger :loading="cleanupLoading">清理旧告警</Button>
+            </Popconfirm>
+          </div>
         </Card>
       </Tabs.TabPane>
 
@@ -430,11 +475,11 @@ const degradationLevelLabels: Record<string, string> = {
       <Tabs.TabPane key="users" tab="用户管理">
         <Card title="添加用户" style="margin-bottom: 16px">
           <Form layout="inline" @finish="createUser">
-            <Form.Item>
+            <Form.Item :rules="[{ required: true, message: '请输入用户名' }]" name="username">
               <Input v-model:value="newUser.username" placeholder="用户名" />
             </Form.Item>
-            <Form.Item>
-              <Input.Password v-model:value="newUser.password" placeholder="密码" />
+            <Form.Item :rules="[{ required: true, min: 6, message: '密码至少6位' }]" name="password">
+              <Input.Password v-model:value="newUser.password" placeholder="密码 (至少6位)" />
             </Form.Item>
             <Form.Item>
               <Select v-model:value="newUser.role" style="width: 120px">

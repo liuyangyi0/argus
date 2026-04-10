@@ -74,7 +74,7 @@ export interface TaskInfo {
   task_id: string
   task_type: string
   camera_id: string | null
-  status: 'pending' | 'running' | 'complete' | 'failed'
+  status: 'pending' | 'running' | 'complete' | 'failed' | 'paused' | 'aborted'
   progress: number
   message: string
   error: string | null
@@ -115,6 +115,145 @@ export interface AuditEntry {
   target_id: string
   details: string
   ip_address: string
+}
+
+// ── Baseline Types ──
+
+export interface BaselineInfo {
+  camera_id: string
+  version: string
+  image_count: number
+  session_label: string
+  status: string
+  state: string | null
+}
+
+export interface BaselineVersionInfo {
+  id: number
+  camera_id: string
+  zone_id: string
+  version: string
+  state: string
+  image_count: number
+  verified_by: string | null
+  verified_at: string | null
+  verified_by_secondary: string | null
+  activated_at: string | null
+  retired_at: string | null
+  retirement_reason: string | null
+  group_id: string | null
+  created_at: string | null
+}
+
+// ── Training Types ──
+
+export interface TrainingRecord {
+  id: number
+  camera_id: string
+  zone_id: string
+  model_type: string
+  export_format: string | null
+  baseline_version: string
+  baseline_count: number
+  train_count: number
+  val_count: number
+  pre_validation_passed: boolean
+  corruption_rate: number | null
+  near_duplicate_rate: number | null
+  brightness_std: number | null
+  val_score_mean: number | null
+  val_score_std: number | null
+  val_score_max: number | null
+  val_score_p95: number | null
+  quality_grade: string | null
+  threshold_recommended: number | null
+  model_path: string | null
+  export_path: string | null
+  checkpoint_valid: boolean | null
+  export_valid: boolean | null
+  smoke_test_passed: boolean | null
+  inference_latency_ms: number | null
+  status: string
+  error: string | null
+  duration_seconds: number
+  trained_at: string | null
+  created_at: string | null
+}
+
+export interface TrainingJobInfo {
+  id: number
+  job_id: string
+  job_type: string
+  camera_id: string | null
+  zone_id: string
+  model_type: string | null
+  trigger_type: string | null
+  triggered_by: string | null
+  confirmation_required: boolean
+  confirmed_by: string | null
+  confirmed_at: string | null
+  status: string
+  base_model_version: string | null
+  dataset_version: string | null
+  hyperparameters: string | Record<string, unknown> | null
+  metrics: string | Record<string, unknown> | null
+  artifacts_path: string | null
+  validation_report: string | Record<string, unknown> | null
+  model_version_id: string | null
+  created_at: string | null
+  started_at: string | null
+  completed_at: string | null
+  duration_seconds: number | null
+  error: string | null
+}
+
+// ── Model Types ──
+
+export interface ModelInfo {
+  id: number
+  model_version_id: string
+  camera_id: string
+  model_type: string
+  model_hash: string
+  data_hash: string
+  code_version: string | null
+  training_params: string | null
+  calibration_thresholds: string | null
+  backbone_version_id: string | null
+  created_at: string | null
+  is_active: boolean
+  stage: string
+  component_type: string
+  model_path: string | null
+  canary_camera_id: string | null
+}
+
+export interface ModelVersionEvent {
+  id: number
+  timestamp: string | null
+  camera_id: string
+  from_version: string | null
+  to_version: string
+  from_stage: string | null
+  to_stage: string
+  triggered_by: string
+  reason: string | null
+  warmup_latency_ms: number | null
+  sha256_verified: boolean
+}
+
+// ── Degradation Types ──
+
+export interface DegradationEvent {
+  event_id: string
+  level: string
+  category: string
+  camera_id: string | null
+  title: string
+  impact: string
+  action: string
+  started_at: number
+  resolved_at: number | null
 }
 
 // ── Response Payload Shapes (used as T in ApiResponse<T>) ──

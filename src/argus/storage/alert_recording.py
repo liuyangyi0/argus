@@ -466,17 +466,17 @@ class AlertRecordingStore:
                     try:
                         out.close()
                     except Exception:
-                        pass
+                        logger.debug("alert_recording.output_close_failed", exc_info=True)
                 if inp is not None:
                     try:
                         inp.close()
                     except Exception:
-                        pass
+                        logger.debug("alert_recording.input_close_failed", exc_info=True)
                 if tmp_path.exists() and mp4_path.exists():
                     try:
                         tmp_path.unlink()
                     except Exception:
-                        pass
+                        logger.debug("alert_recording.temp_cleanup_failed", exc_info=True)
 
         if count > 0:
             logger.info("alert_recording.reindex_moov_done", count=count)

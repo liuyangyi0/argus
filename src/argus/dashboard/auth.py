@@ -267,7 +267,7 @@ class AuthMiddleware:
                         await self.app(scope, receive, send)
                         return
                 except Exception:
-                    pass
+                    logger.debug("auth.api_token_verify_failed", exc_info=True)
 
         # Not authenticated — redirect browsers to /login, return JSON for API
         accepts_html = "text/html" in request.headers.get("accept", "")

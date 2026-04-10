@@ -196,6 +196,7 @@ class ConnectionManager:
                     if client.websocket.client_state == WebSocketState.CONNECTED:
                         await client.websocket.send_text(message)
                 except Exception:
+                    logger.debug("ws.broadcast_send_failed", client_id=client_id, exc_info=True)
                     dead_clients.append(client_id)
 
             for client_id in dead_clients:
@@ -220,6 +221,7 @@ class ConnectionManager:
                             json.dumps({"topic": "ping", "timestamp": time.time()})
                         )
                 except Exception:
+                    logger.debug("ws.heartbeat_send_failed", client_id=client_id, exc_info=True)
                     dead_clients.append(client_id)
 
             for client_id in dead_clients:
@@ -232,7 +234,7 @@ class ConnectionManager:
             if client.websocket.client_state == WebSocketState.CONNECTED:
                 await client.websocket.close()
         except Exception:
-            pass  # close errors are expected during shutdown
+            logger.debug("ws.client_close_failed", exc_info=True)
 
     @property
     def connection_count(self) -> int:

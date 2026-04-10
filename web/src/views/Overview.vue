@@ -13,6 +13,8 @@ import {
   VideoCameraOutlined,
 } from '@ant-design/icons-vue'
 import VideoTile, { type CameraTileData } from '../components/VideoTile.vue'
+import ContentSkeleton from '../components/ContentSkeleton.vue'
+import EmptyState from '../components/EmptyState.vue'
 import AlertSidebar from '../components/AlertSidebar.vue'
 import StatusStrip from '../components/StatusStrip.vue'
 import ScoreTrendPanel from '../components/ScoreTrendPanel.vue'
@@ -140,10 +142,10 @@ const layoutButtons = [
         <div class="high-alert-inner">
           <div class="high-alert-pulse" />
           <BellOutlined style="color: #ef4444; font-size: 16px" />
-          <Typography.Text strong style="color: #fca5a5; font-size: 13px">
+          <Typography.Text strong style="color: #dc2626; font-size: 13px">
             {{ highAlertCameras.length }} 个高级告警需要立即处理
           </Typography.Text>
-          <Typography.Text type="secondary" style="font-size: 12px; color: #ef444488">
+          <Typography.Text type="secondary" style="font-size: 12px; color: #ef4444aa">
             {{ highAlertCameras.map(c => c.camera_id).join(', ') }}
           </Typography.Text>
           <Button
@@ -188,7 +190,18 @@ const layoutButtons = [
       <StatusStrip :health="health" :cameras="cameras" />
 
       <!-- Video Grid -->
-      <div class="video-grid" :style="gridStyle">
+      <div v-if="loading" class="video-grid" :style="gridStyle">
+        <ContentSkeleton v-for="n in 4" :key="'skel-' + n" type="card" :rows="6" />
+      </div>
+      <EmptyState
+        v-else-if="cameras.length === 0"
+        icon="camera"
+        title="未配置摄像头"
+        description="前往摄像头页面添加您的第一台摄像头"
+        action-text="添加摄像头"
+        action-route="/cameras"
+      />
+      <div v-else class="video-grid" :style="gridStyle">
         <VideoTile
           v-for="(cam, idx) in displayCameras"
           :key="cam.camera_id"
