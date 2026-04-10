@@ -204,6 +204,8 @@ class AlertDispatcher:
                 anomaly_score=alert.anomaly_score,
                 snapshot_path=snapshot_path,
                 heatmap_path=heatmap_path,
+                event_group_id=getattr(alert, "event_group_id", None),
+                event_group_count=getattr(alert, "event_group_count", 1),
             )
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))

@@ -1108,6 +1108,10 @@ class DetectionPipeline:
 
         # Event bus (skip allocation if no subscribers)
         if self._event_bus is not None and self._event_bus.has_subscribers(FrameAnalyzed):
+            # Buffer frame for active learning sampler before publishing
+            _al_sampler = getattr(self._event_bus, '_active_sampler', None)
+            if _al_sampler is not None:
+                _al_sampler.buffer_frame(cam_id, frame_data.frame_number, frame_data.frame)
             self._event_bus.publish(FrameAnalyzed(
                 camera_id=cam_id,
                 frame_number=frame_data.frame_number,

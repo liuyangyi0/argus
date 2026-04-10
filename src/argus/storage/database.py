@@ -20,6 +20,8 @@ from argus.storage.models import (
     FeedbackRecord,
     FeedbackStatus,
     InferenceRecord,
+    LabelingQueueRecord,
+    LabelingQueueStatus,
     TrainingJobRecord,
     TrainingRecord,
     User,
@@ -81,6 +83,9 @@ class Database:
             ("alert_recordings", "video_codec", "VARCHAR(10) DEFAULT 'h264'"),
             ("alert_recordings", "width", "INTEGER"),
             ("alert_recordings", "height", "INTEGER"),
+            # Alert aggregation
+            ("alerts", "event_group_id", "VARCHAR(64)"),
+            ("alerts", "event_group_count", "INTEGER DEFAULT 1"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
@@ -107,6 +112,8 @@ class Database:
         anomaly_score: float,
         snapshot_path: str | None = None,
         heatmap_path: str | None = None,
+        event_group_id: str | None = None,
+        event_group_count: int = 1,
         _max_retries: int = 3,
     ) -> AlertRecord:
         """Save an alert to the database with retry on transient failures.
@@ -130,6 +137,8 @@ class Database:
                         anomaly_score=anomaly_score,
                         snapshot_path=snapshot_path,
                         heatmap_path=heatmap_path,
+                        event_group_id=event_group_id,
+                        event_group_count=event_group_count,
                     )
                     session.add(record)
                     session.commit()
@@ -785,6 +794,147 @@ class Database:
         if count:
             logger.info("database.recordings_cleaned", deleted=count, cutoff_days=max_age_days)
         return count
+
+    # ── Labeling queue (active learning) ──
+
+    def save_labeling_entry(self, record: LabelingQueueRecord) -> LabelingQueueRecord:
+        """Save an uncertain frame to the labeling queue."""
+        with self.get_session() as session:
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            logger.debug(
+                "database.labeling_entry_saved",
+                camera_id=record.camera_id,
+                frame_number=record.frame_number,
+            )
+            return record
+
+    def get_labeling_queue(
+        self,
+        camera_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[LabelingQueueRecord]:
+        """Get labeling queue entries with optional filters."""
+        with self.get_session() as session:
+            stmt = select(LabelingQueueRecord).order_by(
+                LabelingQueueRecord.entropy.desc(),
+                LabelingQueueRecord.created_at.desc(),
+            )
+            if camera_id:
+                stmt = stmt.where(LabelingQueueRecord.camera_id == camera_id)
+            if status:
+                stmt = stmt.where(LabelingQueueRecord.status == status)
+            else:
+                stmt = stmt.where(
+                    LabelingQueueRecord.status == LabelingQueueStatus.PENDING
+                )
+            stmt = stmt.offset(offset).limit(limit)
+            return list(session.scalars(stmt).all())
+
+    def label_entry(
+        self,
+        entry_id: int,
+        label: str,
+        labeled_by: str,
+    ) -> LabelingQueueRecord | None:
+        """Label an entry in the labeling queue. Returns updated record or None."""
+        with self.get_session() as session:
+            record = session.scalar(
+                select(LabelingQueueRecord).where(LabelingQueueRecord.id == entry_id)
+            )
+            if record is None:
+                return None
+            record.label = label
+            record.labeled_by = labeled_by
+            record.labeled_at = datetime.now(timezone.utc)
+            record.status = LabelingQueueStatus.LABELED
+            session.commit()
+            session.refresh(record)
+            return record
+
+    def get_labeling_stats(self, camera_id: str | None = None) -> dict:
+        """Return labeling queue statistics."""
+        with self.get_session() as session:
+            base = select(
+                LabelingQueueRecord.status,
+                sa_func.count(),
+            ).group_by(LabelingQueueRecord.status)
+            if camera_id:
+                base = base.where(LabelingQueueRecord.camera_id == camera_id)
+            rows = session.execute(base).all()
+
+        stats: dict = {"total": 0, "pending": 0, "labeled": 0, "skipped": 0}
+        for status_val, count in rows:
+            stats["total"] += count
+            stats[status_val] = count
+
+        # Count labels by type
+        with self.get_session() as session:
+            label_stmt = (
+                select(LabelingQueueRecord.label, sa_func.count())
+                .where(LabelingQueueRecord.status == LabelingQueueStatus.LABELED)
+                .group_by(LabelingQueueRecord.label)
+            )
+            if camera_id:
+                label_stmt = label_stmt.where(LabelingQueueRecord.camera_id == camera_id)
+            label_rows = session.execute(label_stmt).all()
+
+        stats["by_label"] = {label: count for label, count in label_rows if label}
+        return stats
+
+    def get_labeled_entries(
+        self,
+        camera_id: str | None = None,
+        label: str | None = None,
+        trained_into: str | None = None,
+        limit: int = 500,
+    ) -> list[LabelingQueueRecord]:
+        """Get labeled entries, optionally filtered. Used for incremental training."""
+        with self.get_session() as session:
+            stmt = (
+                select(LabelingQueueRecord)
+                .where(LabelingQueueRecord.status == LabelingQueueStatus.LABELED)
+                .order_by(LabelingQueueRecord.labeled_at.asc())
+            )
+            if camera_id:
+                stmt = stmt.where(LabelingQueueRecord.camera_id == camera_id)
+            if label:
+                stmt = stmt.where(LabelingQueueRecord.label == label)
+            if trained_into is not None:
+                if trained_into == "":
+                    stmt = stmt.where(LabelingQueueRecord.trained_into.is_(None))
+                else:
+                    stmt = stmt.where(LabelingQueueRecord.trained_into == trained_into)
+            stmt = stmt.limit(limit)
+            return list(session.scalars(stmt).all())
+
+    def mark_labeling_trained(
+        self,
+        entry_ids: list[int],
+        trained_into: str,
+    ) -> int:
+        """Mark labeled entries as consumed by a training run."""
+        if not entry_ids:
+            return 0
+        updated = 0
+        with self.get_session() as session:
+            for eid in entry_ids:
+                record = session.scalar(
+                    select(LabelingQueueRecord).where(LabelingQueueRecord.id == eid)
+                )
+                if record and record.status == LabelingQueueStatus.LABELED:
+                    record.trained_into = trained_into
+                    updated += 1
+            session.commit()
+        logger.info(
+            "database.labeling_batch_trained",
+            count=updated,
+            trained_into=trained_into,
+        )
+        return updated
 
     def close(self) -> None:
         """Close the database engine."""

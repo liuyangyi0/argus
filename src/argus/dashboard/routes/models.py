@@ -873,3 +873,88 @@ async def backbone_upgrade(request: Request):
         })
     else:
         return api_internal_error("Backbone升级失败")
+
+
+@router.get("/threshold-preview")
+def threshold_preview(
+    request: Request,
+    camera_id: str | None = None,
+    threshold: float = 0.5,
+    days: int = 7,
+) -> JSONResponse:
+    """Preview detection metrics at a given anomaly threshold.
+
+    Uses historical inference records to compute:
+    - Total frames
+    - Frames above threshold (would trigger alert)
+    - Alert rate (fraction of frames above threshold)
+    - Score percentiles (p50, p90, p95, p99)
+
+    This allows operators to tune the threshold with real data feedback.
+    """
+    from sqlalchemy import select, func as sa_func
+    from argus.storage.models import InferenceRecord
+
+    db = request.app.state.db
+    if db is None:
+        return api_unavailable("数据库未初始化")
+
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+
+    with db.get_session() as session:
+        base = select(InferenceRecord).where(InferenceRecord.timestamp >= cutoff_ts)
+        if camera_id:
+            base = base.where(InferenceRecord.camera_id == camera_id)
+
+        # Get all scores for this camera in the time window
+        score_stmt = select(InferenceRecord.anomaly_score).where(
+            InferenceRecord.timestamp >= cutoff_ts
+        )
+        if camera_id:
+            score_stmt = score_stmt.where(InferenceRecord.camera_id == camera_id)
+
+        scores = [row[0] for row in session.execute(score_stmt).all()]
+
+    if not scores:
+        return api_success(data={
+            "total_frames": 0,
+            "above_threshold": 0,
+            "alert_rate": 0.0,
+            "threshold": threshold,
+            "percentiles": {},
+            "message": "暂无推理记录",
+        })
+
+    scores_arr = np.array(scores)
+    total = len(scores_arr)
+    above = int(np.sum(scores_arr >= threshold))
+    alert_rate = above / total if total > 0 else 0.0
+
+    percentiles = {
+        "p50": float(np.percentile(scores_arr, 50)),
+        "p75": float(np.percentile(scores_arr, 75)),
+        "p90": float(np.percentile(scores_arr, 90)),
+        "p95": float(np.percentile(scores_arr, 95)),
+        "p99": float(np.percentile(scores_arr, 99)),
+        "max": float(np.max(scores_arr)),
+        "min": float(np.min(scores_arr)),
+        "mean": float(np.mean(scores_arr)),
+    }
+
+    # Generate histogram for score distribution
+    hist_counts, hist_edges = np.histogram(scores_arr, bins=50, range=(0.0, 1.0))
+    histogram = [
+        {"bin_start": float(hist_edges[i]), "bin_end": float(hist_edges[i + 1]), "count": int(hist_counts[i])}
+        for i in range(len(hist_counts))
+    ]
+
+    return api_success(data={
+        "total_frames": total,
+        "above_threshold": above,
+        "alert_rate": round(alert_rate, 6),
+        "threshold": threshold,
+        "percentiles": percentiles,
+        "histogram": histogram,
+        "days": days,
+        "camera_id": camera_id,
+    })

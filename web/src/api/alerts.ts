@@ -19,3 +19,5 @@ export const getAlertTimeline = (date?: string) =>
   api.get('/alerts/timeline', { params: date ? { date } : {} }).then(u)
 export const saveAnnotations = (alertId: string, annotations: any[]) =>
   api.post(`/alerts/${alertId}/annotations`, { annotations }).then(u)
+export const getAlertGroup = (eventGroupId: string) =>
+  api.get(`/alerts/group/${eventGroupId}`).then(u)

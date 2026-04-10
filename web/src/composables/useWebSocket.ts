@@ -46,6 +46,11 @@ let retryCount = 0
 let retryTimer: ReturnType<typeof setTimeout> | null = null
 const MAX_RETRIES = 3
 const globalConnected = ref(false)
+const globalReconnecting = ref(false)
+const globalRetryCount = ref(0)
+const globalFallbackMode = ref(false)
+const globalNextRetryIn = ref(0) // seconds until next retry
+let countdownTimer: ReturnType<typeof setInterval> | null = null
 
 function allTopics(): Topic[] {
   const topics = new Set<Topic>()
@@ -67,6 +72,11 @@ function wsConnect() {
 
   ws.onopen = () => {
     globalConnected.value = true
+    globalReconnecting.value = false
+    globalRetryCount.value = 0
+    globalFallbackMode.value = false
+    globalNextRetryIn.value = 0
+    if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null }
     retryCount = 0
     // Stop all fallback polling
     for (const sub of subscribers.values()) {
@@ -99,6 +109,7 @@ function wsConnect() {
 
   ws.onclose = () => {
     globalConnected.value = false
+    globalReconnecting.value = true
     ws = null
     scheduleReconnect()
   }
@@ -111,14 +122,26 @@ function wsConnect() {
 function scheduleReconnect() {
   if (subscribers.size === 0) return
   retryCount++
+  globalRetryCount.value = retryCount
   if (retryCount > MAX_RETRIES) {
     // Fall back to per-subscriber polling
+    globalFallbackMode.value = true
+    globalReconnecting.value = false
     for (const sub of subscribers.values()) {
       startFallbackPolling(sub)
     }
     return
   }
   const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 30000)
+  globalNextRetryIn.value = Math.ceil(delay / 1000)
+  if (countdownTimer) clearInterval(countdownTimer)
+  countdownTimer = setInterval(() => {
+    globalNextRetryIn.value = Math.max(0, globalNextRetryIn.value - 1)
+    if (globalNextRetryIn.value <= 0 && countdownTimer) {
+      clearInterval(countdownTimer)
+      countdownTimer = null
+    }
+  }, 1000)
   retryTimer = setTimeout(wsConnect, delay)
 }
 
@@ -207,6 +230,10 @@ export function useWebSocket(options: UseWebSocketOptions) {
 
   return {
     connected,
+    reconnecting: globalReconnecting,
+    retryCount: globalRetryCount,
+    fallbackMode: globalFallbackMode,
+    nextRetryIn: globalNextRetryIn,
     error,
     topicData,
   }

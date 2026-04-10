@@ -34,6 +34,10 @@ export const getBackboneStatus = () => api.get('/models/backbone/status').then(u
 export const batchInference = (cameraId: string, imagePaths: string[]) =>
   api.post('/models/batch-inference', { camera_id: cameraId, image_paths: imagePaths }).then(u)
 
+// ── Threshold Preview ──
+export const getThresholdPreview = (params: { camera_id?: string; threshold?: number; days?: number }) =>
+  api.get('/models/threshold-preview', { params }).then(u)
+
 // ── A/B Comparison ──
 export const getABScores = (versionId: string, params?: { camera_id?: string; days?: number; limit?: number }) =>
   api.get(`/models/${versionId}/ab-scores`, { params }).then(u)

@@ -285,6 +285,86 @@ class YOLOObjectDetector:
             masked_frame=masked_frame,
         )
 
+    def detect_batch(self, frames: list[np.ndarray]) -> list[ObjectDetectionResult]:
+        """Detect objects in a batch of frames.
+
+        Ultralytics YOLO natively supports batch input, passing all frames
+        in a single forward pass for better GPU utilization.
+
+        Falls back to sequential detection if tracking is enabled (tracking
+        requires sequential frame ordering).
+        """
+        if not frames:
+            return []
+
+        # Tracking requires sequential processing (state is per-frame)
+        if self.enable_tracking or self._sahi_enabled:
+            return [self.detect(frame) for frame in frames]
+
+        self._ensure_model()
+        if not self._available:
+            empty = PersonFilterResult(persons=[], has_persons=False, filter_available=False)
+            return [empty] * len(frames)
+
+        # Batch predict
+        try:
+            batch_results = self._model.predict(
+                frames,
+                classes=self.classes_to_detect,
+                conf=self.confidence,
+                verbose=False,
+            )
+        except Exception:
+            # Fallback to sequential
+            return [self.detect(frame) for frame in frames]
+
+        results_out: list[ObjectDetectionResult] = []
+        for i, frame in enumerate(frames):
+            objects = []
+            if i < len(batch_results) and batch_results[i].boxes is not None:
+                for box in batch_results[i].boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    conf = float(box.conf[0])
+                    class_id = int(box.cls[0])
+                    class_name = COCO_CLASS_NAMES.get(class_id, f"class_{class_id}")
+                    objects.append(ObjectDetection(
+                        x1=x1, y1=y1, x2=x2, y2=y2,
+                        confidence=conf,
+                        class_id=class_id,
+                        class_name=class_name,
+                    ))
+
+            persons = [o for o in objects if o.class_id == 0]
+            non_person = [o for o in objects if o.class_id != 0]
+            has_persons = len(persons) > 0
+
+            masked_frame = None
+            if has_persons and not self.skip_frame_on_person:
+                masked_frame = frame.copy()
+                h, w = frame.shape[:2]
+                for p in persons:
+                    px1 = max(0, p.x1 - self.mask_padding)
+                    py1 = max(0, p.y1 - self.mask_padding)
+                    px2 = min(w, p.x2 + self.mask_padding)
+                    py2 = min(h, p.y2 + self.mask_padding)
+                    region = masked_frame[py1:py2, px1:px2]
+                    if region.size > 0:
+                        ksize = max(51, ((min(px2 - px1, py2 - py1) // 2) | 1))
+                        masked_frame[py1:py2, px1:px2] = cv2.GaussianBlur(
+                            region, (ksize, ksize), 0
+                        )
+
+            results_out.append(ObjectDetectionResult(
+                objects=objects,
+                has_objects=len(objects) > 0,
+                has_persons=has_persons,
+                persons=persons,
+                non_person_objects=non_person,
+                masked_frame=masked_frame,
+            ))
+
+        return results_out
+
 
 # Backward-compatible alias
 YOLOPersonDetector = YOLOObjectDetector
