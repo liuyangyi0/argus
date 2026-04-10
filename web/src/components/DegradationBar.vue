@@ -99,10 +99,10 @@ const hasMore = computed(() => activeCount.value > 3)
       <!-- Title -->
       <Typography.Text strong style="flex-shrink: 0; font-size: 13px">{{ evt.title }}</Typography.Text>
       <!-- Affected camera -->
-      <Tag v-if="evt.camera_id" size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: #2d2d4a; flex-shrink: 0">
+      <Tag v-if="evt.camera_id" size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: var(--argus-border); flex-shrink: 0">
         {{ evt.camera_id }}
       </Tag>
-      <Tag v-else size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: #2d2d4a; flex-shrink: 0">
+      <Tag v-else size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: var(--argus-border); flex-shrink: 0">
         全系统
       </Tag>
       <!-- Duration -->

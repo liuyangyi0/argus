@@ -78,7 +78,7 @@ onUnmounted(() => window.removeEventListener('resize', checkMobile))
         <div :style="{ padding: '20px 16px', textAlign: 'center', borderBottom: `1px solid ${siderBorder}` }">
           <Typography.Title
             :level="4"
-            style="color: #3b82f6; margin: 0; letter-spacing: 3px"
+            :style="{ color: themeStore.tokens.colorPrimary, margin: 0, letterSpacing: '3px' }"
           >
             {{ collapsed ? 'A' : 'ARGUS' }}
           </Typography.Title>

@@ -166,8 +166,8 @@ const layoutButtons = [
             :class="{ 'status-glow--pulse': systemStatus !== 'healthy' }"
             :style="{ background: statusColor, boxShadow: `0 0 10px ${statusColor}88` }"
           />
-          <Typography.Title :level="4" style="margin: 0; color: #e2e8f0">值班台</Typography.Title>
-          <Typography.Text v-if="statusLabel" style="font-size: 12px; color: #6b7280">{{ statusLabel }}</Typography.Text>
+          <Typography.Title :level="4" style="margin: 0; color: var(--argus-text)">值班台</Typography.Title>
+          <Typography.Text v-if="statusLabel" style="font-size: 12px; color: var(--argus-text-muted)">{{ statusLabel }}</Typography.Text>
         </div>
         <div class="toolbar-right">
           <Tooltip v-for="btn in layoutButtons" :key="btn.key" :title="btn.tip">
@@ -205,7 +205,7 @@ const layoutButtons = [
           class="empty-tile"
         >
           <div class="empty-tile-content">
-            <VideoCameraOutlined style="font-size: 24px; color: #2d2d4a" />
+            <VideoCameraOutlined style="font-size: 24px; color: var(--argus-icon-muted)" />
             <span>未配置</span>
           </div>
         </div>
@@ -245,10 +245,11 @@ const layoutButtons = [
   flex-direction: column;
   padding: 16px;
   gap: 10px;
+  overflow-y: auto;
 }
 
 .overview-sidebar {
-  border-left: 1px solid #1f2937;
+  border-left: 1px solid var(--argus-sidebar-border);
   padding: 16px 12px 16px 0;
   flex-shrink: 0;
 }
@@ -310,12 +311,12 @@ const layoutButtons = [
 }
 
 .layout-btn:not(.layout-btn--active) {
-  color: #6b7280;
+  color: var(--argus-text-muted);
 }
 
 .layout-btn:not(.layout-btn--active):hover {
-  background: #1e1e36;
-  color: #e2e8f0;
+  background: var(--argus-hover-bg);
+  color: var(--argus-text);
 }
 
 .status-glow {
@@ -339,16 +340,16 @@ const layoutButtons = [
   display: grid;
   gap: 8px;
   flex: 1;
-  min-height: 0;
+  min-height: 320px;
 }
 
 .empty-tile {
-  border: 1px dashed #2d2d4a;
+  border: 1px dashed var(--argus-border);
   border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #12121e;
+  background: var(--argus-surface);
   transition: border-color 0.3s;
 }
 
@@ -361,7 +362,7 @@ const layoutButtons = [
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  color: #2d2d4a;
+  color: var(--argus-icon-muted);
   font-size: 12px;
 }
 
@@ -373,7 +374,7 @@ const layoutButtons = [
   }
   .overview-sidebar {
     border-left: none;
-    border-top: 1px solid #1f2937;
+    border-top: 1px solid var(--argus-sidebar-border);
     padding: 12px;
     max-height: 40vh;
     overflow-y: auto;

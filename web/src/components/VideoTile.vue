@@ -40,7 +40,7 @@ const borderStyle = computed(() => {
     return { border: '2px solid #f59e0b' }
   }
   if (props.camera.current_score > 0.5) return { border: '2px solid #f59e0b' }
-  return { border: '1px solid #2d2d4a' }
+  return { border: '1px solid var(--argus-border)' }
 })
 
 const statusBadge = computed(() => {
@@ -103,8 +103,8 @@ onActivated(() => {
   if (streamStatus.value === 'fallback' && mjpegRef.value) {
     mjpegRef.value.src = mjpegUrl.value
   }
-  // If stream was idle (first activation after mount already handled by IntersectionObserver)
-  if (streamStatus.value === 'idle' && props.camera.status === 'online') {
+  // Restart stream if idle or error (e.g., WebRTC died while page was cached)
+  if ((streamStatus.value === 'idle' || streamStatus.value === 'error') && props.camera.status === 'online') {
     start()
   }
 })
@@ -124,7 +124,7 @@ function handleAlertBadgeClick(e: MouseEvent) {
       ...borderStyle,
       borderRadius: '6px',
       overflow: 'hidden',
-      background: '#1a1a2e',
+      background: 'var(--argus-card-bg-solid)',
       display: 'flex',
       flexDirection: 'column',
       height: '100%',
@@ -132,7 +132,7 @@ function handleAlertBadgeClick(e: MouseEvent) {
     @dblclick="emit('dblclick', camera.camera_id)"
   >
     <!-- Header: 20px status bar -->
-    <div style="display: flex; align-items: center; gap: 6px; padding: 3px 10px; background: #141414; flex-shrink: 0; min-height: 20px">
+    <div style="display: flex; align-items: center; gap: 6px; padding: 3px 10px; background: var(--argus-header-bg); flex-shrink: 0; min-height: 20px">
       <Typography.Text strong style="font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
         {{ camera.name || camera.camera_id }}
       </Typography.Text>
@@ -195,10 +195,19 @@ function handleAlertBadgeClick(e: MouseEvent) {
       </div>
       <!-- Connecting indicator -->
       <div
-        v-if="streamStatus === 'connecting'"
+        v-if="camera.status === 'online' && streamStatus === 'connecting'"
         style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #64748b; font-size: 12px"
       >
         连接中...
+      </div>
+      <!-- Error state: stream failed -->
+      <div
+        v-if="camera.status === 'online' && streamStatus === 'error'"
+        style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #ef4444; font-size: 12px; cursor: pointer"
+        @click.stop="start()"
+      >
+        <div style="margin-bottom: 4px">连接失败</div>
+        <div style="color: #64748b; font-size: 11px">点击重试</div>
       </div>
       <!-- FPS label overlay -->
       <div
@@ -210,7 +219,7 @@ function handleAlertBadgeClick(e: MouseEvent) {
     </div>
 
     <!-- Footer: 28px status bar -->
-    <div style="display: flex; align-items: center; gap: 8px; padding: 4px 10px; background: #0f0f1a; flex-shrink: 0; min-height: 28px">
+    <div style="display: flex; align-items: center; gap: 8px; padding: 4px 10px; background: var(--argus-footer-bg); flex-shrink: 0; min-height: 28px">
       <div style="flex: 1; min-width: 0">
         <Sparkline
           :data="camera.score_sparkline"

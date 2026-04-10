@@ -7,8 +7,11 @@ import { CanvasRenderer } from 'echarts/renderers'
 import { GridComponent, TooltipComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 import type { CameraTileData } from './VideoTile.vue'
+import { useThemeStore } from '../stores/theme'
 
 use([CanvasRenderer, GaugeChart, LineChart, GridComponent, TooltipComponent])
+
+const themeStore = useThemeStore()
 
 interface HealthData {
   status: string
@@ -112,7 +115,7 @@ function makeGauge(opts: { min: number; max: number; value: number; color: strin
       max: opts.max,
       pointer: { show: false },
       progress: { show: true, width: 6, roundCap: true, itemStyle: { color: opts.color } },
-      axisLine: { lineStyle: { width: 6, color: [[1, '#1e1e36']] } },
+      axisLine: { lineStyle: { width: 6, color: [[1, themeStore.isDark ? '#1e1e36' : '#e5e7eb']] } },
       axisTick: { show: false },
       splitLine: { show: false },
       axisLabel: { show: false },
@@ -279,13 +282,13 @@ const hasActiveAlerts = computed(() =>
   display: flex;
   gap: 10px;
   flex-shrink: 0;
-  margin-bottom: 12px;
+  margin-bottom: 4px;
 }
 
 .status-card {
   flex: 1;
-  background: linear-gradient(135deg, #1a1a2e 0%, #16162a 100%);
-  border: 1px solid #2d2d4a;
+  background: var(--argus-card-bg);
+  border: 1px solid var(--argus-border);
   border-radius: 8px;
   padding: 10px 14px;
   min-width: 0;
@@ -306,7 +309,7 @@ const hasActiveAlerts = computed(() =>
 }
 
 .status-card:hover {
-  border-color: #3d3d5c;
+  border-color: var(--argus-border);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   transform: translateY(-1px);
 }
@@ -317,7 +320,7 @@ const hasActiveAlerts = computed(() =>
 
 .card-shimmer {
   height: 100%;
-  background: linear-gradient(90deg, #1e1e36 25%, #2a2a44 50%, #1e1e36 75%);
+  background: linear-gradient(90deg, var(--argus-hover-bg) 25%, var(--argus-surface) 50%, var(--argus-hover-bg) 75%);
   background-size: 200% 100%;
   animation: shimmer 1.5s infinite;
   border-radius: 4px;
@@ -346,7 +349,7 @@ const hasActiveAlerts = computed(() =>
 .uptime-badge {
   font-size: 10px;
   color: #4a5568;
-  background: #1e1e36;
+  background: var(--argus-hover-bg);
   padding: 1px 6px;
   border-radius: 3px;
 }
@@ -426,7 +429,7 @@ const hasActiveAlerts = computed(() =>
 
 .spark-placeholder {
   height: 28px;
-  background: linear-gradient(90deg, #1e1e36 0%, #22223a 50%, #1e1e36 100%);
+  background: linear-gradient(90deg, var(--argus-hover-bg) 0%, var(--argus-surface) 50%, var(--argus-hover-bg) 100%);
   border-radius: 3px;
 }
 

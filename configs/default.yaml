@@ -2,8 +2,8 @@ node_id: argus-edge-01
 cameras:
 - camera_id: c
   name: c
-  source: rtsp://127.0.0.1:8554/c
-  protocol: rtsp
+  source: "0"
+  protocol: usb
   fps_target: 15
   resolution:
   - 640

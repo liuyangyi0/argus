@@ -117,7 +117,7 @@ async function quickAction(alertId: string, severity: string, action: string) {
     </div>
 
     <!-- System status -->
-    <Card size="small" style="background: #1a1a2e">
+    <Card size="small" style="background: var(--argus-card-bg-solid)">
       <div style="display: flex; justify-content: space-between; align-items: center">
         <Typography.Text type="secondary">摄像头</Typography.Text>
         <Badge :status="connectedCount === totalCameras && totalCameras > 0 ? 'success' : 'warning'" />
@@ -133,7 +133,7 @@ async function quickAction(alertId: string, severity: string, action: string) {
       size="small"
       title="高级告警"
       :style="{
-        background: '#1a1a2e',
+        background: 'var(--argus-card-bg-solid)',
         borderColor: highFlash ? '#ef4444' : '#ef444488',
         boxShadow: highFlash ? '0 0 12px rgba(239,68,68,0.4)' : 'none',
         transition: 'border-color 0.3s, box-shadow 0.3s',
@@ -168,7 +168,7 @@ async function quickAction(alertId: string, severity: string, action: string) {
     </Card>
 
     <!-- MEDIUM alerts -->
-    <Card v-if="mediumAlerts.length > 0" size="small" title="中级告警" style="background: #1a1a2e">
+    <Card v-if="mediumAlerts.length > 0" size="small" title="中级告警" style="background: var(--argus-card-bg-solid)">
       <div v-for="a in mediumAlerts.slice(0, 5)" :key="a.alert_id" style="margin-bottom: 8px; padding: 6px; border-radius: 4px; background: rgba(249,115,22,0.06)">
         <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px">
           <Tag color="orange" style="margin: 0; font-size: 10px; padding: 0 4px; line-height: 18px">中</Tag>
@@ -190,7 +190,7 @@ async function quickAction(alertId: string, severity: string, action: string) {
     </Card>
 
     <!-- LOW / INFO alerts -->
-    <Card v-if="lowAlerts.length > 0" size="small" title="低级/提示" style="background: #1a1a2e">
+    <Card v-if="lowAlerts.length > 0" size="small" title="低级/提示" style="background: var(--argus-card-bg-solid)">
       <div v-for="a in lowAlerts.slice(0, 8)" :key="a.alert_id" style="margin-bottom: 6px; display: flex; align-items: center; gap: 6px">
         <Tag :color="severityColor[a.severity]" style="margin: 0; min-width: 28px; text-align: center; font-size: 10px; padding: 0 4px; line-height: 18px">
           {{ severityLabel[a.severity] }}
@@ -209,7 +209,7 @@ async function quickAction(alertId: string, severity: string, action: string) {
     </Card>
 
     <!-- Pending tasks -->
-    <Card v-if="tasks.length > 0" size="small" title="待办任务" style="background: #1a1a2e">
+    <Card v-if="tasks.length > 0" size="small" title="待办任务" style="background: var(--argus-card-bg-solid)">
       <div v-for="t in tasks.slice(0, 5)" :key="t.id || t.task_id" style="margin-bottom: 4px">
         <Typography.Text style="font-size: 12px">{{ t.description || t.name || t.task_id }}</Typography.Text>
       </div>
