@@ -55,10 +55,14 @@ class Database:
         Base.metadata.create_all(self._engine)
         self._session_factory = sessionmaker(bind=self._engine)
 
-        # Enable WAL mode for better concurrent read/write performance
+        # Enable WAL mode + performance pragmas for SQLite
         if self._database_url.startswith("sqlite"):
             with self._engine.connect() as conn:
                 conn.execute(text("PRAGMA journal_mode=WAL"))
+                conn.execute(text("PRAGMA busy_timeout=5000"))
+                conn.execute(text("PRAGMA synchronous=NORMAL"))
+                conn.execute(text("PRAGMA cache_size=-64000"))
+                conn.execute(text("PRAGMA temp_store=MEMORY"))
                 conn.commit()
 
         # Auto-migrate: add missing columns to existing tables
