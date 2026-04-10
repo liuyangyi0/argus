@@ -1,4 +1,4 @@
-# Argus Bug 清单 — 冒烟测试 2026-04-10
+# Argus Bug 清单 — 打磨阶段 2026-04-10
 
 ## 测试环境
 - Windows 11 Pro, Python 3.11.9, Node 22+
@@ -10,87 +10,94 @@
 ## 已修复
 
 ### [已修复] P1 — 前端构建失败：33 个 TypeScript 编译错误
-- 未使用的导入/变量 (18处)
-- 类型不匹配 (12处)
-- enum 语法不兼容 erasableSyntaxOnly (1处)
 - **提交:** 3ff48fa
 
+### [已修复] P1 — 告警时间线返回空数据
+- **根因:** `alerts.py:1071` .timestamp() 返回 float 与 DateTime 比较不兼容
+- **提交:** dc2431f
+
+### [已修复] P1 — 告警时间线 datetime.fromtimestamp TypeError
+- **根因:** `alerts.py:1103` 对已有 datetime 对象调用 datetime.fromtimestamp()
+- **提交:** 72081d3
+
 ### [已修复] P2 — test_config 断言过时
-- `test_load_default_config_file` 断言 `camera_id == "cam_01"` 但实际值已改为 `"c"`
 - **提交:** 1f27ef0
 
-### [已修复] P1 — 告警时间线返回空数据
-- `/api/alerts/timeline` 返回 `"cameras": []`
-- **根因:** `alerts.py:1071` 使用 `.timestamp()` 将 datetime 转为 epoch float，与 SQLite 的 DateTime 字符串比较不兼容
-- **修复:** 直接传 datetime 对象给 SQLAlchemy where 条件
+### [已修复] P2 — 前端 bundle 过大 (1.46MB → 37KB + 缓存)
+- **提交:** dc2431f
 
-### [已修复] P2 — 前端 bundle 过大
-- 拆分前：api chunk 1.46MB, dist chunk 572KB
-- 拆分后：antd 独立 chunk (可缓存)，echarts 独立 chunk，应用代码 37KB
-- **修复:** vite.config.ts 添加 manualChunks 拆分 antd 和 echarts
+### [已修复] P2 — dispatcher flush_db_queue 竞态条件
+- **提交:** ad86a85
 
-### [已关闭] P3 — Prometheus 指标全零
-- **非 bug:** 指标已正确集成到 pipeline.py，启动后需要数秒积累帧数据
-- 确认: `argus_frames_processed_total{camera_id="c"} 8119.0`, `argus_anomaly_score 0.88`
+### [已修复] P2 — 16 处静默失败 (except: pass) 添加日志
+- **提交:** d74d19e
 
----
+### [已修复] P2 — alert grader _event_groups 内存泄漏
+- **提交:** 36c0fe3
 
-## 待观察
+### [已修复] P2 — SQLite 缺少性能 pragmas
+- 添加 busy_timeout、synchronous=NORMAL、cache_size、temp_store
+- **提交:** 36c0fe3
 
-### P3 — 训练任务状态 "failed"
-- 唯一的训练任务 `8b2dff72-8c3` 状态为 failed
-- 需检查失败原因，确认训练流程是否正常
+### [已修复] P2 — 推理记录无自动清理
+- delete_old_inference_records 方法已存在但未接入调度器
+- **提交:** 36c0fe3
 
----
+### [已修复] P2 — go2rtc 崩溃无自动重启
+- 主循环每10秒检查进程状态，崩溃后自动重启
+- **提交:** 36c0fe3
 
-## 冒烟测试通过项
+### [已关闭] — Prometheus 指标全零
+- **非 bug:** 启动后需数秒积累帧数据
 
-### 后端 API（全部通过）
-- [x] `/api/system/health` — 200, 返回正确状态
-- [x] `/api/cameras/json` — 摄像头列表正常，stats 数据完整
-- [x] `/api/cameras/c/detail/json` — 详情正常，stages 完整
-- [x] `/api/cameras/c/snapshot` — 返回 image/jpeg
-- [x] `/api/alerts/json` — 告警列表正常，21 条告警
-- [x] `/api/alerts/export-csv` — 200
-- [x] `/api/replay/{alert_id}/metadata` — 回放元数据正常
-- [x] `/api/models/json` — 模型列表正常
-- [x] `/api/models/backbone/status` — 骨干网络状态正常
-- [x] `/api/models/threshold-preview` — 阈值预览正常
-- [x] `/api/training-jobs/json` — 训练任务列表正常
-- [x] `/api/baseline/list/json` — 基线列表正常
-- [x] `/api/degradation/active` — 退化状态正常（空）
-- [x] `/api/users/json` — 用户列表正常
-- [x] `/api/audit/json` — 审计日志正常
-- [x] `/api/labeling/queue` — 标注队列正常
-- [x] `/api/labeling/stats` — 标注统计正常
-- [x] `/api/tasks/json` — 任务列表正常
-- [x] `/api/streaming` — go2rtc 流状态正常
-- [x] `/api/system/metrics` — Prometheus 指标端点正常
-- [x] `/api/config/audio-alerts` — 音频告警配置正常
-- [x] `/api/reports/json` — 报表数据正常
-- [x] 404 错误处理正确（非存在摄像头/告警返回 code 40400）
-
-### 后端测试
-- [x] 1027 passed / 0 failed（修复 test_config 后）
-
-### 前端构建
-- [x] `vue-tsc -b` 零错误
-- [x] `vite build` 成功
+### [已关闭] — 训练任务 "failed"
+- **非 bug:** 基线图片近似重复率 97.9% > 80% 上限，数据质量问题
 
 ---
 
-## 待测试（需要浏览器）
+## 测试统计
 
-以下功能需要浏览器交互验证，本次因 Chrome 扩展未连接而跳过：
+| 指标 | 打磨前 | 打磨后 |
+|------|--------|--------|
+| 单元测试数 | 1027 | **1093** (+66) |
+| 测试通过率 | 99.9% | **100%** |
+| TS 编译错误 | 33 | **0** |
+| 静默失败 | 45 | **29** (关键的已加日志) |
+| Bundle 大小 | 1.46MB 单chunk | **37KB + 缓存** |
 
-- [ ] WebSocket 实时推送（告警、健康状态、任务进度）
+---
+
+## UI 验证结果 (Preview 工具)
+
+### 已验证通过
+- [x] 总览页面 — 暗色+亮色主题正常，1366x768 布局完整
+- [x] 告警页面 — 表格数据、操作按钮、筛选器正常
+- [x] 摄像头页面 — 列表、启停按钮、详情入口正常
+- [x] 模型管理页面 — 标签页切换、基线列表正常
+- [x] 系统页面 — 运行状态、配置、用户管理正常
+- [x] 亮色/暗色主题切换 — 所有页面样式一致
+
+### 待浏览器测试
+- [ ] WebSocket 实时推送（告警、健康状态）
 - [ ] 摄像头实时流播放（go2rtc WebRTC/MSE）
 - [ ] 告警回放播放器（视频 + 热力图）
 - [ ] 区域编辑器交互（多边形绘制/删除）
-- [ ] 标注覆盖层（画布标注）
-- [ ] 图片对比滑块
 - [ ] 训练任务创建完整流程
 - [ ] 基线采集完整流程
-- [ ] 亮色/暗色主题切换
-- [ ] 各表格分页/筛选/排序
-- [ ] 表单验证（摄像头添加、用户创建等）
+
+---
+
+## 全部提交记录
+
+| Commit | 内容 |
+|--------|------|
+| d643636 | 录像PTS修复 + 回放播放器重构 |
+| bf8e49a | 事件总线、推理队列、指标、主动学习 |
+| 1f27ef0 | test_config 断言修复 |
+| 3ff48fa | 33个 TS 编译错误修复 |
+| c675504 | BUGS.md 清单 |
+| dc2431f | 告警时间线查询 + bundle 拆分 |
+| 72081d3 | 66个新测试 + timeline datetime bug |
+| ad86a85 | dispatcher 竞态条件修复 |
+| d74d19e | 16处静默失败日志 + 表格滚动保护 |
+| 36c0fe3 | 健壮性加固（内存、SQLite、go2rtc） |
