@@ -27,7 +27,7 @@ const props = defineProps<{
   cameras: any[]
   captureTasks: any[]
   taskTitle: (task: any) => string
-  taskProgressStatus: (task: any) => string
+  taskProgressStatus: (task: any) => 'success' | 'exception' | 'normal' | 'active'
   canPauseTask: (task: any) => boolean
   canResumeTask: (task: any) => boolean
   canAbortTask: (task: any) => boolean

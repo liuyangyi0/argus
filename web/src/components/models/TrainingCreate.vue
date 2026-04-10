@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import {
-  Card, Button, Form, Select, Input, Modal, Tag, Space,
-  Popconfirm, message, Badge,
+  Card, Button, Form, Select, Input, Modal, Space,
+  message, Badge,
 } from 'ant-design-vue'
 import { PlusOutlined } from '@ant-design/icons-vue'
 import { createTrainingJob } from '../../api'

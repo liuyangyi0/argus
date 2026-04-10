@@ -37,7 +37,14 @@ onUnmounted(() => {
 })
 
 // go2rtc WebRTC/MSE player
-const { videoRef, mjpegRef, status: streamStatus, start: startStream, stop: stopStream } = useGo2RTC(cameraId)
+const _go2rtc = useGo2RTC(cameraId)
+// @ts-expect-error TS6133 — used as template ref="videoRef"
+const videoRef = _go2rtc.videoRef
+// @ts-expect-error TS6133 — used as template ref="mjpegRef"
+const mjpegRef = _go2rtc.mjpegRef
+const streamStatus = _go2rtc.status
+const startStream = _go2rtc.start
+const stopStream = _go2rtc.stop
 const mjpegUrl = computed(() => `/api/cameras/${cameraId}/stream`)
 const snapshotUrl = computed(() => `/api/cameras/${cameraId}/snapshot`)
 const zoneEditorData = ref<any[]>(camera.value?.zones || [])

@@ -10,17 +10,18 @@ export interface ApiResponse<T = any> {
 
 // ── Error Codes (mirrors backend ErrorCode) ──
 
-export enum ErrorCode {
-  SUCCESS = 0,
-  VALIDATION_ERROR = 40000,
-  CONFIRMATION_REQUIRED = 40001,
-  AUTH_REQUIRED = 40100,
-  FORBIDDEN = 40300,
-  NOT_FOUND = 40400,
-  CONFLICT = 40900,
-  INTERNAL_ERROR = 50000,
-  SERVICE_UNAVAILABLE = 50300,
-}
+export const ErrorCode = {
+  SUCCESS: 0,
+  VALIDATION_ERROR: 40000,
+  CONFIRMATION_REQUIRED: 40001,
+  AUTH_REQUIRED: 40100,
+  FORBIDDEN: 40300,
+  NOT_FOUND: 40400,
+  CONFLICT: 40900,
+  INTERNAL_ERROR: 50000,
+  SERVICE_UNAVAILABLE: 50300,
+} as const
+export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode]
 
 // ── ApiError class for structured error handling ──
 
@@ -119,7 +120,7 @@ export interface AuditEntry {
 // ── Response Payload Shapes (used as T in ApiResponse<T>) ──
 
 export interface CamerasPayload { cameras: CameraSummary[] }
-export interface AlertsPayload { alerts: AlertSummary[] }
+export interface AlertsPayload { alerts: AlertSummary[]; total?: number }
 export interface TasksPayload { tasks: TaskInfo[] }
 export interface HealthPayload extends HealthInfo {}
 export interface UsersPayload { users: UserInfo[] }

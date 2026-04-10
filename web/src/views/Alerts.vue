@@ -63,7 +63,7 @@ function toggleGroupPopover(eventGroupId: string) {
 }
 
 // Bulk selection
-const selectedRowKeys = ref<string[]>([])
+const selectedRowKeys = ref<(string | number)[]>([])
 
 async function fetchData() {
   try {
@@ -207,7 +207,7 @@ function handleBulkDelete() {
     cancelText: '取消',
     async onOk() {
       try {
-        const res = await bulkDeleteAlerts(selectedRowKeys.value)
+        const res = await bulkDeleteAlerts(selectedRowKeys.value as string[])
         message.success(res.message || `已删除 ${res.count} 条`)
         selectedRowKeys.value = []
         if (selectedAlert.value && !alerts.value.some(a => a.alert_id === selectedAlert.value.alert_id)) {
@@ -224,7 +224,7 @@ function handleBulkDelete() {
 async function handleBulkAcknowledge() {
   if (!selectedRowKeys.value.length) return
   try {
-    const res = await bulkAcknowledge(selectedRowKeys.value)
+    const res = await bulkAcknowledge(selectedRowKeys.value as string[])
     message.success(res.message || `已确认 ${res.count} 条`)
     selectedRowKeys.value = []
     fetchData()
@@ -236,7 +236,7 @@ async function handleBulkAcknowledge() {
 async function handleBulkFalsePositive() {
   if (!selectedRowKeys.value.length) return
   try {
-    const res = await bulkFalsePositive(selectedRowKeys.value)
+    const res = await bulkFalsePositive(selectedRowKeys.value as string[])
     message.success(res.message || `已标记 ${res.count} 条为误报`)
     selectedRowKeys.value = []
     fetchData()
@@ -430,7 +430,7 @@ const columns = computed(() => {
           :loading="loading"
           row-key="alert_id"
           size="small"
-          :row-selection="{ selectedRowKeys, onChange: (keys: string[]) => { selectedRowKeys = keys } }"
+          :row-selection="{ selectedRowKeys, onChange: (keys: (string | number)[]) => { selectedRowKeys = keys } }"
           :pagination="selectedAlert ? { pageSize: 50, simple: true, size: 'small' } : { pageSize: 20, total: totalAlerts, showTotal: (t: number) => `共 ${t} 条` }"
           :custom-row="(record: any) => ({
             onClick: () => showDetail(record),

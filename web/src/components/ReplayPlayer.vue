@@ -9,13 +9,16 @@ import SignalTrack from './SignalTrack.vue'
 import { getReplayMetadata, getReplaySignals, getReplayVideoUrl, getReplayHeatmapUrl, getReplayReference, pinReplayFrame } from '../api'
 
 function videoErrorMessage(err: MediaError | DOMException): string {
-  if ('code' in err && typeof err.code === 'number') {
+  if (err instanceof MediaError) {
     const msgs: Record<number, string> = { 1: '视频加载被中止', 2: '网络错误', 3: '视频解码失败', 4: '视频格式不支持' }
     return msgs[err.code] || `视频错误 (code=${err.code})`
   }
-  if (err.name === 'NotAllowedError') return '浏览器阻止自动播放，请点击视频区域后重试'
-  if (err.name === 'NotSupportedError') return '视频格式不支持'
-  return `播放失败: ${err.message || err.name}`
+  if (err instanceof DOMException) {
+    if (err.name === 'NotAllowedError') return '浏览器阻止自动播放，请点击视频区域后重试'
+    if (err.name === 'NotSupportedError') return '视频格式不支持'
+    return `播放失败: ${err.message || err.name}`
+  }
+  return `播放失败`
 }
 
 const props = defineProps<{
@@ -236,14 +239,6 @@ const currentTimestamp = computed(() => {
   if (!ts) return ''
   const d = new Date(ts * 1000)
   return d.toLocaleTimeString('zh-CN')
-})
-
-const statusText = computed(() => {
-  if (!metadata.value) return ''
-  if (metadata.value.status === 'recording') {
-    return '录制中...'
-  }
-  return `${metadata.value.frame_count} 帧 / ${metadata.value.fps} FPS`
 })
 
 const speeds = [0.25, 0.5, 1, 2, 4]
