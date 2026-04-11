@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 import structlog
 
+from skimage.metrics import structural_similarity as _ssim_fn
+
 from argus.config.schema import CaptureQualityConfig
 
 logger = structlog.get_logger()
@@ -232,17 +234,20 @@ class FrameQualityFilter:
             b = prev_frame
         b = cv2.resize(b, (size, size))
 
-        from skimage.metrics import structural_similarity
-
-        return float(structural_similarity(a, b, data_range=255))
+        return float(_ssim_fn(a, b, data_range=255))
 
     def _check_person(self, frame: np.ndarray) -> bool:
-        """Returns True if persons are detected in the frame."""
+        """Returns True if persons are detected in the frame.
+
+        Conservative default: when detection fails, assumes persons ARE
+        present so the frame is excluded from training data. This prevents
+        contaminating anomaly models with frames containing people.
+        """
         if self._person_detector is None:
             # Retry after cooldown if previous attempt failed
             if self._person_detector_failed_at > 0:
                 if time.monotonic() - self._person_detector_failed_at < self._PERSON_DETECTOR_RETRY_SECONDS:
-                    return False
+                    return True  # conservative: assume person present
             try:
                 from argus.person.detector import YOLOPersonDetector
 
@@ -254,11 +259,11 @@ class FrameQualityFilter:
             except Exception:
                 logger.warning("quality.person_detector_unavailable")
                 self._person_detector_failed_at = time.monotonic()
-                return False
+                return True  # conservative: assume person present
 
         try:
             result = self._person_detector.detect(frame)
             return result.has_persons
         except Exception:
             logger.warning("quality.person_detection_failed", exc_info=True)
-            return False
+            return True  # conservative: assume person present

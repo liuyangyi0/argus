@@ -7,6 +7,7 @@ report, recommend threshold, and record results.
 
 from __future__ import annotations
 
+import gc
 import random
 import shutil
 import time
@@ -365,6 +366,7 @@ class ModelTrainer:
             pre_validation=pre_validation,
         )
 
+        engine = model = None
         try:
             engine, model = self._train_anomalib(
                 data_dir=train_dir,
@@ -422,6 +424,11 @@ class ModelTrainer:
                     error=f"模型导出失败: {e}",
                     **common_fail_kwargs,
                 )
+            finally:
+                # Release training artifacts to free memory
+                del engine, model
+                engine = model = None
+                gc.collect()
 
         # Output validation + smoke test (TRN-006)
         # Returns (validation_dict, loaded_detector_or_None)
@@ -646,13 +653,26 @@ class ModelTrainer:
         baselines_dir.mkdir(parents=True, exist_ok=True)
 
         copied = 0
+        copy_errors = 0
         for entry in normal_frames:
             src = Path(entry.frame_path)
             if src.exists():
                 dst = baselines_dir / f"al_{src.name}"
                 if not dst.exists():
-                    shutil.copy2(str(src), str(dst))
-                    copied += 1
+                    try:
+                        shutil.copy2(str(src), str(dst))
+                        copied += 1
+                    except OSError as e:
+                        copy_errors += 1
+                        logger.warning(
+                            "incremental_train.copy_failed",
+                            src=str(src), error=str(e),
+                        )
+        if copy_errors > 0 and copied == 0:
+            logger.error(
+                "incremental_train.all_copies_failed",
+                total=len(normal_frames), errors=copy_errors,
+            )
 
         logger.info(
             "incremental_train.baselines_merged",

@@ -177,6 +177,8 @@ class InferenceQueue:
                 )
                 # Pad with None or trim
                 for i, req in enumerate(batch):
+                    if req.future.cancelled():
+                        continue
                     if i < len(results):
                         req.future.set_result(results[i])
                     else:
@@ -185,7 +187,8 @@ class InferenceQueue:
                         )
             else:
                 for req, result in zip(batch, results):
-                    req.future.set_result(result)
+                    if not req.future.cancelled():
+                        req.future.set_result(result)
         except Exception as e:
             # Batch failed — fall back to sequential
             logger.warning(
@@ -198,11 +201,15 @@ class InferenceQueue:
     def _run_sequential(self, batch: list[_InferenceRequest]) -> None:
         """Run inference one frame at a time."""
         for req in batch:
+            if req.future.cancelled():
+                continue
             try:
                 result = self._predict_fn(req.frame)
-                req.future.set_result(result)
+                if not req.future.cancelled():
+                    req.future.set_result(result)
             except Exception as e:
-                req.future.set_exception(e)
+                if not req.future.cancelled():
+                    req.future.set_exception(e)
 
     @property
     def pending(self) -> int:

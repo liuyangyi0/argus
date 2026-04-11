@@ -62,7 +62,12 @@ async function handleConfirm(jobId: string) {
     message.success('任务已确认，进入队列')
     loadJobs()
   } catch (e: any) {
-    message.error(e.response?.data?.error || '确认失败')
+    if (e.response?.status === 409) {
+      message.warning('任务已被其他操作员确认或状态已变更')
+      loadJobs()
+    } else {
+      message.error(e.response?.data?.error || '确认失败')
+    }
   }
 }
 
@@ -72,7 +77,12 @@ async function handleReject(jobId: string) {
     message.info('任务已拒绝')
     loadJobs()
   } catch (e: any) {
-    message.error(e.response?.data?.error || '拒绝失败')
+    if (e.response?.status === 409) {
+      message.warning('任务已被其他操作员处理或状态已变更')
+      loadJobs()
+    } else {
+      message.error(e.response?.data?.error || '拒绝失败')
+    }
   }
 }
 

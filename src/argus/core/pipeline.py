@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -93,7 +93,7 @@ class PipelineStats:
     __slots__ = (
         "_lock", "frames_captured", "frames_skipped_no_change",
         "frames_skipped_person", "frames_analyzed", "frames_heartbeat",
-        "frames_dropped_backpressure", "anomalies_detected",
+        "frames_dropped_backpressure", "frames_timeout", "anomalies_detected",
         "alerts_emitted", "avg_latency_ms", "_latency_sum",
     )
 
@@ -105,6 +105,7 @@ class PipelineStats:
         self.frames_analyzed: int = 0
         self.frames_heartbeat: int = 0
         self.frames_dropped_backpressure: int = 0
+        self.frames_timeout: int = 0
         self.anomalies_detected: int = 0
         self.alerts_emitted: int = 0
         self.avg_latency_ms: float = 0.0
@@ -137,6 +138,8 @@ class DetectionPipeline:
     - Heartbeat: Every N frames, skip MOG2 and force full Anomalib analysis
     - Anomaly lock: Confirmed anomaly regions bypass MOG2 until cleared
     """
+
+    _TIMEOUT_DEGRADE_THRESHOLD = 5
 
     def __init__(
         self,
@@ -317,6 +320,9 @@ class DetectionPipeline:
 
         # Track person filter degradation (HIGH-04)
         self._person_filter_warned = False
+
+        # Consecutive inference timeout counter for degradation detection
+        self._consecutive_timeouts = 0
 
         # Thread safety for hot-updates
         self._config_lock = threading.Lock()
@@ -713,10 +719,34 @@ class DetectionPipeline:
             anomaly_future: Future = _INFERENCE_EXECUTOR.submit(
                 self._anomaly_detector.predict, frame,
             )
-            detection_result: ObjectDetectionResult = yolo_future.result()
-            t2_yolo_done = time.monotonic()
-            anomaly_result: AnomalyResult = anomaly_future.result()
-            t3_anomaly_done = time.monotonic()
+            try:
+                detection_result: ObjectDetectionResult = yolo_future.result(timeout=30.0)
+                t2_yolo_done = time.monotonic()
+                anomaly_result: AnomalyResult = anomaly_future.result(timeout=30.0)
+                t3_anomaly_done = time.monotonic()
+            except TimeoutError:
+                self.stats.frames_timeout += 1
+                self._consecutive_timeouts += 1
+                if self._consecutive_timeouts >= self._TIMEOUT_DEGRADE_THRESHOLD:
+                    logger.error(
+                        "pipeline.inference_degraded",
+                        camera_id=self.camera_config.camera_id,
+                        consecutive=self._consecutive_timeouts,
+                        msg="Inference repeatedly timing out — model may be stuck",
+                    )
+                else:
+                    logger.error(
+                        "pipeline.inference_timeout",
+                        camera_id=self.camera_config.camera_id,
+                        consecutive=self._consecutive_timeouts,
+                        msg="Inference future timed out after 30s — skipping frame",
+                    )
+                yolo_future.cancel()
+                anomaly_future.cancel()
+                self._update_lock_state_time(time.monotonic())
+                return None
+
+            self._consecutive_timeouts = 0  # reset on successful inference
 
             # HIGH-04: Warn once if person filter is unavailable
             if not detection_result.filter_available and not self._person_filter_warned:
@@ -1386,7 +1416,7 @@ class DetectionPipeline:
                                 alert_id=alert.alert_id,
                                 exc_info=True,
                             )
-                    alert._solidified_recording = recording  # type: ignore[attr-defined]
+                    alert._solidified_recording = recording
             except Exception:
                 logger.warning(
                     "pipeline.ring_buffer_solidify_failed",

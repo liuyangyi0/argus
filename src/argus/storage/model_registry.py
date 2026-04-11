@@ -444,4 +444,5 @@ class ModelRegistry:
             )
             return result.stdout.strip() if result.returncode == 0 else None
         except Exception:
+            logger.warning("model_registry.git_hash_unavailable", exc_info=True)
             return None

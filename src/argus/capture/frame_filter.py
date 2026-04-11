@@ -221,6 +221,7 @@ class FrameFilter:
                                 count += 1
             result.person_count = count
         except Exception:  # noqa: BLE001
+            logger.warning("frame_filter.person_detection_failed", exc_info=True)
             result.person_count = 0
 
     def _check_dedup(self, gray: np.ndarray, result: FilterResult) -> bool:
@@ -280,5 +281,6 @@ class FrameFilter:
         numerator = (2.0 * mu1_mu2 + c1) * (2.0 * sigma12 + c2)
         denominator = (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
 
+        denominator = np.maximum(denominator, 1e-12)
         ssim_map = numerator / denominator
         return float(ssim_map.mean())

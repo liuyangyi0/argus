@@ -51,7 +51,7 @@ _HYPERPARAMETER_LIMITS: dict[str, dict] = {
 }
 
 
-def _validate_hyperparameters(params: dict) -> list[str]:
+def validate_hyperparameters(params: dict) -> list[str]:
     """Validate hyperparameters against known limits. Returns list of errors."""
     errors: list[str] = []
     for key, value in params.items():
@@ -198,7 +198,7 @@ class TrainingJobExecutor:
 
         # Parse and validate hyperparameters
         params = json.loads(job.hyperparameters) if job.hyperparameters else {}
-        param_errors = _validate_hyperparameters(params)
+        param_errors = validate_hyperparameters(params)
         if param_errors:
             raise ValueError(f"Invalid hyperparameters: {'; '.join(param_errors)}")
 
@@ -266,7 +266,7 @@ class TrainingJobExecutor:
 
         # Parse and validate hyperparameters
         params = json.loads(job.hyperparameters) if job.hyperparameters else {}
-        param_errors = _validate_hyperparameters(params)
+        param_errors = validate_hyperparameters(params)
         if param_errors:
             raise ValueError(f"Invalid hyperparameters: {'; '.join(param_errors)}")
 
@@ -329,10 +329,17 @@ class TrainingJobExecutor:
                 )
                 artifacts_path = str(pkg_path)
             except Exception as e:
-                logger.warning("job_executor.packaging_failed", error=str(e))
+                logger.error("job_executor.packaging_failed", error=str(e))
+                _packaging_error = str(e)
+            else:
+                _packaging_error = None
+        else:
+            _packaging_error = None
 
         # Build metrics dict
         metrics = {}
+        if _packaging_error:
+            metrics["packaging_error"] = _packaging_error
         if result.quality_report:
             metrics["quality_grade"] = result.quality_report.grade
         if result.val_stats:

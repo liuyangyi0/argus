@@ -27,12 +27,6 @@ const createForm = ref({
 const formRef = ref()
 const createLoading = ref(false)
 
-const formRules = {
-  camera_id: [{ required: true, message: '请选择摄像头' }],
-}
-
-const canSubmit = ref(true)
-
 async function handleCreate() {
   if (createForm.value.job_type === 'anomaly_head' && !createForm.value.camera_id) {
     message.warning('请先选择摄像头')

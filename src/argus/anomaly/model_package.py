@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import shutil
 import time
 import uuid
@@ -141,12 +142,59 @@ class ModelPackager:
         Returns:
             Path to the created package directory.
         """
+        # Pre-flight: verify output directory is writable
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if not os.access(output_dir, os.W_OK):
+            raise PermissionError(f"Output directory not writable: {output_dir}")
+
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         short_id = uuid.uuid4().hex[:6]
         pkg_name = f"{camera_id or 'backbone'}_{model_type or 'ssl'}_{ts}_{short_id}"
-        pkg_dir = output_dir / pkg_name
-        pkg_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = output_dir / pkg_name
 
+        # Assemble in a temp directory; atomic rename on success
+        tmp_dir = output_dir / f".tmp_{pkg_name}"
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            self._assemble(
+                pkg_dir=tmp_dir,
+                model_dir=model_dir,
+                export_dir=export_dir,
+                training_job=training_job,
+                validation_report=validation_report,
+                calibration_path=calibration_path,
+                backbone_ref=backbone_ref,
+                dataset_ref=dataset_ref,
+                camera_id=camera_id,
+                model_type=model_type,
+                training_params=training_params,
+                calibration_image_ids=calibration_image_ids,
+            )
+            tmp_dir.rename(final_dir)
+        except Exception:
+            # Clean up partial assembly
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
+
+        return final_dir
+
+    def _assemble(
+        self,
+        pkg_dir: Path,
+        model_dir: Path,
+        export_dir: Path | None,
+        training_job: dict | None,
+        validation_report: dict | None,
+        calibration_path: Path | None,
+        backbone_ref: str,
+        dataset_ref: str,
+        camera_id: str | None,
+        model_type: str | None,
+        training_params: dict | None,
+        calibration_image_ids: list[str] | None,
+    ) -> None:
+        """Write all package files into *pkg_dir*."""
         created_at = datetime.now(timezone.utc).isoformat()
 
         # 1. Copy OpenVINO model files
@@ -173,7 +221,6 @@ class ModelPackager:
                 "created_at": created_at,
                 **training_params,
             }
-            # Write as YAML if available, else fall back to JSON with matching extension
             try:
                 import yaml
                 (pkg_dir / "config.yaml").write_text(
@@ -181,6 +228,10 @@ class ModelPackager:
                     encoding="utf-8",
                 )
             except ImportError:
+                logger.warning(
+                    "model_package.yaml_unavailable",
+                    msg="PyYAML not installed, writing config.json instead",
+                )
                 (pkg_dir / "config.json").write_text(
                     json.dumps(config_data, indent=2, ensure_ascii=False),
                     encoding="utf-8",
@@ -252,8 +303,6 @@ class ModelPackager:
             files=len(checksums),
             signed=bool(self._signing_key),
         )
-
-        return pkg_dir
 
     def verify(self, package_dir: Path) -> bool:
         """Verify package integrity using SHA256SUMS and optional signature."""
