@@ -130,7 +130,7 @@ async function loadReport() {
       camera_id: selectedCamera.value || undefined,
       days: daysRange.value,
     })
-  } catch { shadowReport.value = null }
+  } catch (e) { console.error('ModelComparison: loadReport failed', e); shadowReport.value = null }
   finally { loadingReport.value = false }
 }
 
@@ -143,7 +143,7 @@ async function loadScores() {
       limit: 500,
     })
     abScores.value = res.scores || []
-  } catch { abScores.value = [] }
+  } catch (e) { console.error('ModelComparison: loadScores failed', e); abScores.value = [] }
   finally { loadingScores.value = false }
 }
 
@@ -154,7 +154,7 @@ async function loadDistribution() {
       camera_id: selectedCamera.value || undefined,
       days: daysRange.value,
     })
-  } catch { abDistribution.value = null }
+  } catch (e) { console.error('ModelComparison: loadDistribution failed', e); abDistribution.value = null }
   finally { loadingDistribution.value = false }
 }
 

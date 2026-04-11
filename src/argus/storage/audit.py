@@ -6,7 +6,7 @@ compliance and traceability.
 from __future__ import annotations
 from datetime import datetime, timezone
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func as sa_func, select
 from argus.storage.database import Database
 from argus.storage.models import AuditLog
 
@@ -65,9 +65,9 @@ class AuditLogger:
     def count_logs(self, user: str | None = None, action: str | None = None) -> int:
         """Count audit log entries."""
         with self._db.get_session() as session:
-            stmt = select(AuditLog)
+            stmt = select(sa_func.count()).select_from(AuditLog)
             if user:
                 stmt = stmt.where(AuditLog.user == user)
             if action:
                 stmt = stmt.where(AuditLog.action == action)
-            return len(list(session.scalars(stmt).all()))
+            return session.scalar(stmt) or 0

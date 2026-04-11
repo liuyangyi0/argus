@@ -72,6 +72,7 @@ class CameraHealthAnalyzer:
         self._calibration_count = 0
         self._calibration_sharpness: list[float] = []
         self._calibration_brightness: list[float] = []
+        self._optical_flow_warned: bool = False
 
     def analyze(self, frame: np.ndarray) -> HealthCheckResult:
         """Run all health checks on a single frame. <5ms total."""
@@ -154,7 +155,11 @@ class CameraHealthAnalyzer:
                 if displacement > self._displacement_threshold:
                     result.warnings.append("mechanical_displacement")
             except cv2.error:
-                logger.debug("health.optical_flow_failed", exc_info=True)
+                if not self._optical_flow_warned:
+                    self._optical_flow_warned = True
+                    logger.warning("health.optical_flow_failed", exc_info=True)
+                else:
+                    logger.debug("health.optical_flow_failed", exc_info=True)
 
         self._prev_gray = gray.copy()
         return result
@@ -177,4 +182,5 @@ class CameraHealthAnalyzer:
         self._prev_gray = None
         self._calibration_count = 0
         self._calibration_sharpness.clear()
+        self._optical_flow_warned = False
         self._calibration_brightness.clear()

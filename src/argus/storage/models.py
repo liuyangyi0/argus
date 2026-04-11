@@ -385,6 +385,7 @@ class InferenceRecord(Base):
     camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     zone_id: Mapped[str] = mapped_column(String(50), nullable=False, default="default")
     frame_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Float epoch (not DateTime) for bulk-insert performance at ~1200 rows/min
     timestamp: Mapped[float] = mapped_column(Float, nullable=False)
     model_version_id: Mapped[str | None] = mapped_column(
         String(128), nullable=True, index=True,

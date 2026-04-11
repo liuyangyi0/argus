@@ -274,9 +274,9 @@ class CameraManager:
             pipeline.shutdown()
 
         for camera_id, thread in list(self._threads.items()):
-            thread.join(timeout=10.0)
+            thread.join(timeout=30.0)
             if thread.is_alive():
-                logger.warning("manager.thread_timeout", camera_id=camera_id)
+                logger.error("manager.thread_join_failed", camera_id=camera_id)
 
         self._pipelines.clear()
         self._runners.clear()
@@ -311,7 +311,7 @@ class CameraManager:
         if pipeline:
             pipeline.shutdown()
         if thread:
-            thread.join(timeout=10.0)
+            thread.join(timeout=30.0)
 
     def get_status(self) -> list[CameraStatus]:
         """Get status of all configured cameras."""

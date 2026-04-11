@@ -23,6 +23,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
+from argus.anomaly.job_executor import validate_hyperparameters
 from argus.storage.models import (
     AuditLog,
     TrainingJobRecord,
@@ -158,6 +159,13 @@ async def create_training_job(request: Request):
             )
 
     hyperparams = body.get("hyperparameters")
+    if hyperparams and isinstance(hyperparams, dict):
+        param_errors = validate_hyperparameters(hyperparams)
+        if param_errors:
+            return api_validation_error(
+                f"超参数校验失败: {'; '.join(param_errors)}",
+            )
+
     job_id = str(uuid.uuid4())[:12]
 
     base_model_version = None
@@ -211,9 +219,10 @@ async def confirm_training_job(request: Request, job_id: str):
     confirmed_by = body.get("confirmed_by", "operator")
     now = datetime.now(timezone.utc)
 
-    # Atomic update: only transition if still pending (prevents double-confirm race)
+    # Atomic compare-and-swap: only transition if still pending_confirmation
     updated = db.update_training_job(
         job_id,
+        expected_status=TrainingJobStatus.PENDING_CONFIRMATION.value,
         status=TrainingJobStatus.QUEUED.value,
         confirmed_by=confirmed_by,
         confirmed_at=now,
@@ -249,11 +258,14 @@ async def reject_training_job(request: Request, job_id: str):
     rejected_by = body.get("rejected_by", "operator")
     reason = body.get("reason", "")
 
-    db.update_training_job(
+    updated = db.update_training_job(
         job_id,
+        expected_status=TrainingJobStatus.PENDING_CONFIRMATION.value,
         status=TrainingJobStatus.REJECTED.value,
         error=f"Rejected by {rejected_by}: {reason}" if reason else f"Rejected by {rejected_by}",
     )
+    if not updated:
+        return api_conflict("任务已确认或状态已变更")
 
     _write_audit(
         db, rejected_by, "training_job.reject", job_id,

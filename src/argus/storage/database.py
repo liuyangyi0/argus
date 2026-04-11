@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
-from sqlalchemy import create_engine, func as sa_func, select, text
+from sqlalchemy import create_engine, func as sa_func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from argus.storage.models import (
@@ -97,8 +97,16 @@ class Database:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
                     conn.commit()
                     logger.info("database.migration", table=table, column=column)
-                except Exception:
-                    logger.debug("database.migration_column_exists", table=table, column=column)
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if "duplicate" in err_msg or "already exists" in err_msg:
+                        logger.debug("database.migration_column_exists", table=table, column=column)
+                    else:
+                        logger.warning(
+                            "database.migration_failed",
+                            table=table, column=column, error=str(e),
+                            exc_info=True,
+                        )
 
     def get_session(self) -> Session:
         """Get a new database session."""
@@ -410,12 +418,20 @@ class Database:
             stmt = stmt.limit(limit)
             return list(session.scalars(stmt).all())
 
-    def update_training_job(self, job_id: str, **kwargs) -> bool:
-        """Update training job fields. Returns True if found and updated."""
+    def update_training_job(
+        self, job_id: str, *, expected_status: str | None = None, **kwargs
+    ) -> bool:
+        """Update training job fields. Returns True if found and updated.
+
+        If *expected_status* is provided, the update only proceeds when
+        the current status matches — this provides atomic compare-and-swap
+        semantics for status transitions.
+        """
         with self.get_session() as session:
-            record = session.scalar(
-                select(TrainingJobRecord).where(TrainingJobRecord.job_id == job_id)
-            )
+            stmt = select(TrainingJobRecord).where(TrainingJobRecord.job_id == job_id)
+            if expected_status is not None:
+                stmt = stmt.where(TrainingJobRecord.status == expected_status)
+            record = session.scalar(stmt)
             if record is None:
                 return False
             for key, value in kwargs.items():
@@ -580,15 +596,22 @@ class Database:
         now = datetime.now(timezone.utc)
         updated = 0
         with self.get_session() as session:
-            for fid in feedback_ids:
-                record = session.scalar(
-                    select(FeedbackRecord).where(FeedbackRecord.feedback_id == fid)
+            # Bulk update — chunk to stay within SQLite's 999 variable limit
+            for i in range(0, len(feedback_ids), 900):
+                chunk = feedback_ids[i : i + 900]
+                result = session.execute(
+                    update(FeedbackRecord)
+                    .where(
+                        FeedbackRecord.feedback_id.in_(chunk),
+                        FeedbackRecord.status == FeedbackStatus.PENDING,
+                    )
+                    .values(
+                        status=FeedbackStatus.PROCESSED,
+                        trained_into=trained_into,
+                        processed_at=now,
+                    )
                 )
-                if record and record.status == FeedbackStatus.PENDING:
-                    record.status = FeedbackStatus.PROCESSED
-                    record.trained_into = trained_into
-                    record.processed_at = now
-                    updated += 1
+                updated += result.rowcount
             session.commit()
         logger.info(
             "database.feedback_batch_processed",
@@ -718,7 +741,7 @@ class Database:
     def user_count(self) -> int:
         """Return total number of users."""
         with self.get_session() as session:
-            return len(list(session.scalars(select(User)).all()))
+            return session.scalar(select(sa_func.count()).select_from(User)) or 0
 
     # ── Alert recordings ──
 
@@ -925,13 +948,17 @@ class Database:
             return 0
         updated = 0
         with self.get_session() as session:
-            for eid in entry_ids:
-                record = session.scalar(
-                    select(LabelingQueueRecord).where(LabelingQueueRecord.id == eid)
+            for i in range(0, len(entry_ids), 900):
+                chunk = entry_ids[i : i + 900]
+                result = session.execute(
+                    update(LabelingQueueRecord)
+                    .where(
+                        LabelingQueueRecord.id.in_(chunk),
+                        LabelingQueueRecord.status == LabelingQueueStatus.LABELED,
+                    )
+                    .values(trained_into=trained_into)
                 )
-                if record and record.status == LabelingQueueStatus.LABELED:
-                    record.trained_into = trained_into
-                    updated += 1
+                updated += result.rowcount
             session.commit()
         logger.info(
             "database.labeling_batch_trained",

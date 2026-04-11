@@ -141,14 +141,15 @@ class TestDedupFilter:
 
 class TestPersonFilter:
     def test_graceful_when_unavailable(self, natural_frame):
-        """When YOLO is unavailable, person check should be skipped."""
+        """When YOLO is unavailable, conservative default: assume person present."""
         config = CaptureQualityConfig()
         f = FrameQualityFilter(config)
         # Force detector to be unavailable
         f._person_detector = False
         result = f.check(natural_frame)
-        # Should not reject for person
-        assert result.rejection_reason != "person"
+        # Conservative: broken detector should reject frame (assume person present)
+        # to prevent contaminating anomaly training data with people
+        assert result.rejection_reason == "person"
 
 
 # ── Disabled filter ─���

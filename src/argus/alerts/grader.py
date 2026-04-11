@@ -16,11 +16,15 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import numpy as np
 import structlog
 
 from pathlib import Path
+
+if TYPE_CHECKING:
+    from argus.core.alert_ring_buffer import SolidifiedRecording
 
 from argus.config.schema import AlertConfig, AlertSeverity, SeverityThresholds, ZonePriority
 
@@ -70,6 +74,8 @@ class Alert:
     # Alert aggregation: alerts in same camera+zone within a window share this ID
     event_group_id: str | None = None
     event_group_count: int = 1
+    # Set by pipeline after alert recording is solidified to disk
+    _solidified_recording: SolidifiedRecording | None = None
 
 
 class DetectionType(str, Enum):

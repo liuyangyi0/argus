@@ -43,11 +43,13 @@ class InferenceBuffer:
     ):
         self._db = database
         self._flush_seconds = flush_seconds
-        self._buffer: deque[InferenceRecord] = deque(maxlen=max_size)
+        self._max_size = max_size
+        self._buffer: deque[InferenceRecord] = deque()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._total_flushed = 0
+        self._overflow_logged = False
 
     def start(self) -> None:
         """Start the background flush thread."""
@@ -63,7 +65,7 @@ class InferenceBuffer:
         logger.info(
             "inference_buffer.started",
             flush_seconds=self._flush_seconds,
-            max_size=self._buffer.maxlen,
+            max_size=self._max_size,
         )
 
     def stop(self) -> None:
@@ -78,10 +80,19 @@ class InferenceBuffer:
     def append(self, record: InferenceRecord) -> None:
         """Add an inference record to the buffer (thread-safe).
 
-        If the buffer is full (maxlen reached), the oldest record
-        is automatically dropped (deque behavior).
+        If the buffer exceeds max_size, the oldest record is dropped
+        with a warning log.
         """
         with self._lock:
+            if len(self._buffer) >= self._max_size:
+                self._buffer.popleft()
+                if not self._overflow_logged:
+                    self._overflow_logged = True
+                    logger.warning(
+                        "inference_buffer.overflow",
+                        size=self._max_size,
+                        msg="oldest record dropped — flush may be too slow",
+                    )
             self._buffer.append(record)
 
     def _flush_loop(self) -> None:
@@ -91,15 +102,27 @@ class InferenceBuffer:
             self._flush()
 
     def _flush(self) -> None:
-        """Drain the buffer and bulk-insert to DB."""
+        """Drain the buffer and bulk-insert to DB.
+
+        Records are only removed from the buffer after a successful
+        DB commit, preventing data loss on transient DB failures.
+        """
         with self._lock:
             if not self._buffer:
                 return
             batch = list(self._buffer)
-            self._buffer.clear()
 
         try:
             count = self._db.save_inference_batch(batch)
+            # Success — now safe to remove the flushed records.
+            with self._lock:
+                n = min(len(batch), len(self._buffer))
+                if n >= len(self._buffer):
+                    self._buffer.clear()
+                else:
+                    for _ in range(n):
+                        self._buffer.popleft()
+                self._overflow_logged = False
             self._total_flushed += count
             logger.debug(
                 "inference_buffer.flushed",
@@ -112,6 +135,7 @@ class InferenceBuffer:
                 batch_size=len(batch),
                 exc_info=True,
             )
+            # Records remain in the buffer for the next flush attempt.
 
     @property
     def pending_count(self) -> int:

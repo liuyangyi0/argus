@@ -32,7 +32,7 @@ export const getBackboneStatus = () => api.get('/models/backbone/status').then(u
 
 // ── Batch Inference ──
 export const batchInference = (cameraId: string, imagePaths: string[]) =>
-  api.post('/models/batch-inference', { camera_id: cameraId, image_paths: imagePaths }).then(u)
+  api.post('/models/batch-inference', { camera_id: cameraId, image_paths: imagePaths }, { timeout: 120000 }).then(u)
 
 // ── Threshold Preview ──
 export const getThresholdPreview = (params: { camera_id?: string; threshold?: number; days?: number }) =>
