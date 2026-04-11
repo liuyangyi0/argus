@@ -109,6 +109,7 @@ class PipelineStats:
         "frames_skipped_person", "frames_analyzed", "frames_heartbeat",
         "frames_dropped_backpressure", "frames_timeout", "anomalies_detected",
         "alerts_emitted", "avg_latency_ms", "_latency_sum",
+        "current_fps", "_fps_last_count", "_fps_last_time",
     )
 
     def __init__(self) -> None:
@@ -124,6 +125,25 @@ class PipelineStats:
         self.alerts_emitted: int = 0
         self.avg_latency_ms: float = 0.0
         self._latency_sum: float = 0.0
+        # Real-time FPS: updated every 2 seconds from frame count delta
+        self.current_fps: float = 0.0
+        self._fps_last_count: int = 0
+        self._fps_last_time: float = 0.0
+
+    def update_fps(self) -> None:
+        """Recompute current_fps from frame count delta (call once per frame)."""
+        now = time.time()
+        with self._lock:
+            if self._fps_last_time == 0.0:
+                self._fps_last_time = now
+                self._fps_last_count = self.frames_captured
+                return
+            elapsed = now - self._fps_last_time
+            if elapsed >= 2.0:
+                delta = self.frames_captured - self._fps_last_count
+                self.current_fps = round(delta / elapsed, 1)
+                self._fps_last_count = self.frames_captured
+                self._fps_last_time = now
 
     def snapshot(self) -> dict:
         """Return a consistent point-in-time copy of all counters."""
@@ -137,6 +157,7 @@ class PipelineStats:
                 "anomalies": self.anomalies_detected,
                 "alerts": self.alerts_emitted,
                 "avg_latency_ms": round(self.avg_latency_ms, 1),
+                "current_fps": self.current_fps,
             }
 
 
@@ -549,6 +570,7 @@ class DetectionPipeline:
         """Run the detection pipeline on a single frame."""
         start = time.monotonic()
         self.stats.frames_captured += 1
+        self.stats.update_fps()
         self._frame_counter += 1
         frame = frame_data.frame
 
