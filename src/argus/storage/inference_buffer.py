@@ -49,7 +49,7 @@ class InferenceBuffer:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._total_flushed = 0
-        self._overflow_logged = False
+        self._last_overflow_warn: float = 0.0
 
     def start(self) -> None:
         """Start the background flush thread."""
@@ -86,8 +86,9 @@ class InferenceBuffer:
         with self._lock:
             if len(self._buffer) >= self._max_size:
                 self._buffer.popleft()
-                if not self._overflow_logged:
-                    self._overflow_logged = True
+                now = time.monotonic()
+                if now - self._last_overflow_warn > 60.0:
+                    self._last_overflow_warn = now
                     logger.warning(
                         "inference_buffer.overflow",
                         size=self._max_size,
@@ -122,7 +123,7 @@ class InferenceBuffer:
                 else:
                     for _ in range(n):
                         self._buffer.popleft()
-                self._overflow_logged = False
+                self._last_overflow_warn = 0.0
             self._total_flushed += count
             logger.debug(
                 "inference_buffer.flushed",
