@@ -1,9 +1,14 @@
 import { api, u } from './client'
+import type {
+  ModelRegistryResponse, ShadowReportResponse,
+  ABScoresResponse, ABDistributionResponse, ABLiveCompareResponse,
+  BatchInferenceResponse,
+} from '../types/api'
 
 // ── Models ──
 export const getModels = () => api.get('/baseline/models/json').then(u)
 export const deployModel = (data: Record<string, any>) => api.post('/baseline/deploy', data).then(u)
-export const getModelRegistry = (cameraId?: string) =>
+export const getModelRegistry = (cameraId?: string): Promise<ModelRegistryResponse> =>
   api.get('/models/json', { params: cameraId ? { camera_id: cameraId } : {} }).then(u)
 export const activateModel = (versionId: string) =>
   api.post(`/models/${versionId}/activate`).then(u)
@@ -26,12 +31,12 @@ export const getStageHistory = (versionId: string) =>
   api.get(`/models/${versionId}/stage-history`).then(u)
 export const getVersionEvents = (params?: { camera_id?: string; limit?: number }) =>
   api.get('/models/events/list', { params }).then(u)
-export const getShadowReport = (versionId: string, params?: { camera_id?: string; days?: number }) =>
+export const getShadowReport = (versionId: string, params?: { camera_id?: string; days?: number }): Promise<ShadowReportResponse> =>
   api.get(`/models/${versionId}/shadow-report`, { params }).then(u)
 export const getBackboneStatus = () => api.get('/models/backbone/status').then(u)
 
 // ── Batch Inference ──
-export const batchInference = (cameraId: string, imagePaths: string[]) =>
+export const batchInference = (cameraId: string, imagePaths: string[]): Promise<BatchInferenceResponse> =>
   api.post('/models/batch-inference', { camera_id: cameraId, image_paths: imagePaths }, { timeout: 120000 }).then(u)
 
 // ── Threshold Preview ──
@@ -39,9 +44,9 @@ export const getThresholdPreview = (params: { camera_id?: string; threshold?: nu
   api.get('/models/threshold-preview', { params }).then(u)
 
 // ── A/B Comparison ──
-export const getABScores = (versionId: string, params?: { camera_id?: string; days?: number; limit?: number }) =>
+export const getABScores = (versionId: string, params?: { camera_id?: string; days?: number; limit?: number }): Promise<ABScoresResponse> =>
   api.get(`/models/${versionId}/ab-scores`, { params }).then(u)
-export const getABDistribution = (versionId: string, params?: { camera_id?: string; days?: number; bins?: number }) =>
+export const getABDistribution = (versionId: string, params?: { camera_id?: string; days?: number; bins?: number }): Promise<ABDistributionResponse> =>
   api.get(`/models/${versionId}/ab-distribution`, { params }).then(u)
-export const runABLiveCompare = (cameraId: string, shadowVersionId: string) =>
+export const runABLiveCompare = (cameraId: string, shadowVersionId: string): Promise<ABLiveCompareResponse> =>
   api.post('/models/ab-live-compare', { camera_id: cameraId, shadow_version_id: shadowVersionId }, { timeout: 60000 }).then(u)

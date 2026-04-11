@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+from skimage.metrics import structural_similarity
 
 
 @dataclass
@@ -244,43 +245,7 @@ class FrameFilter:
             return False
         return True
 
-    # ------------------------------------------------------------------
-    # SSIM helpers (no scipy dependency)
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def _compute_ssim(
-        img1: np.ndarray,
-        img2: np.ndarray,
-        k1: float = 0.01,
-        k2: float = 0.03,
-        win_size: int = 7,
-    ) -> float:
-        """Compute mean SSIM between two single-channel images of equal size.
-
-        Uses a uniform window (box filter) for speed.
-        """
-        L = 255.0  # noqa: N806
-        c1 = (k1 * L) ** 2
-        c2 = (k2 * L) ** 2
-
-        img1 = img1.astype(np.float64)
-        img2 = img2.astype(np.float64)
-
-        mu1 = cv2.blur(img1, (win_size, win_size))
-        mu2 = cv2.blur(img2, (win_size, win_size))
-
-        mu1_sq = mu1 * mu1
-        mu2_sq = mu2 * mu2
-        mu1_mu2 = mu1 * mu2
-
-        sigma1_sq = cv2.blur(img1 * img1, (win_size, win_size)) - mu1_sq
-        sigma2_sq = cv2.blur(img2 * img2, (win_size, win_size)) - mu2_sq
-        sigma12 = cv2.blur(img1 * img2, (win_size, win_size)) - mu1_mu2
-
-        numerator = (2.0 * mu1_mu2 + c1) * (2.0 * sigma12 + c2)
-        denominator = (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
-
-        denominator = np.maximum(denominator, 1e-12)
-        ssim_map = numerator / denominator
-        return float(ssim_map.mean())
+    def _compute_ssim(img1: np.ndarray, img2: np.ndarray, **_kw) -> float:
+        """Compute mean SSIM between two single-channel images of equal size."""
+        return float(structural_similarity(img1, img2, data_range=255))

@@ -170,6 +170,8 @@ class ModelPackager:
                 training_params=training_params,
                 calibration_image_ids=calibration_image_ids,
             )
+            if final_dir.exists():
+                shutil.rmtree(final_dir)
             tmp_dir.rename(final_dir)
         except Exception:
             # Clean up partial assembly

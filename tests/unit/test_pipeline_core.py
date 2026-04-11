@@ -282,7 +282,7 @@ class TestPersonFilter:
 
         fd = _make_frame_data()
         # Use the thread pool submit path — mock _INFERENCE_EXECUTOR
-        with patch("argus.core.pipeline._INFERENCE_EXECUTOR") as mock_exec:
+        with patch.object(pipeline, "_inference_executor") as mock_exec:
             from concurrent.futures import Future
             yolo_fut = Future()
             yolo_fut.set_result(detection)
@@ -309,7 +309,7 @@ class TestPersonFilter:
             is_anomalous=False, threshold=0.7,
         )
 
-        with patch("argus.core.pipeline._INFERENCE_EXECUTOR") as mock_exec:
+        with patch.object(pipeline, "_inference_executor") as mock_exec:
             from concurrent.futures import Future
             yolo_fut = Future()
             yolo_fut.set_result(detection)
@@ -353,7 +353,7 @@ class TestAnomalyDetection:
         pipeline._alert_grader.evaluate.return_value = alert_to_return
 
         with (
-            patch("argus.core.pipeline._INFERENCE_EXECUTOR") as mock_exec,
+            patch.object(pipeline, "_inference_executor") as mock_exec,
             patch("argus.core.pipeline.METRICS"),
         ):
             from concurrent.futures import Future
@@ -429,7 +429,7 @@ class TestLearningMode:
             is_anomalous=True, threshold=0.7,
         )
 
-        with patch("argus.core.pipeline._INFERENCE_EXECUTOR") as mock_exec:
+        with patch.object(pipeline, "_inference_executor") as mock_exec:
             from concurrent.futures import Future
             yolo_fut = Future()
             yolo_fut.set_result(detection)
@@ -460,7 +460,7 @@ class TestLearningMode:
             is_anomalous=False, threshold=0.7,
         )
 
-        with patch("argus.core.pipeline._INFERENCE_EXECUTOR") as mock_exec:
+        with patch.object(pipeline, "_inference_executor") as mock_exec:
             from concurrent.futures import Future
             yolo_fut = Future()
             yolo_fut.set_result(detection)
@@ -538,7 +538,7 @@ class TestPipelineStats:
             is_anomalous=False, threshold=0.7,
         )
 
-        with patch("argus.core.pipeline._INFERENCE_EXECUTOR") as mock_exec:
+        with patch.object(pipeline, "_inference_executor") as mock_exec:
             from concurrent.futures import Future
             yolo_fut = Future()
             yolo_fut.set_result(detection)
@@ -583,7 +583,7 @@ class TestExceptionSafety:
             has_change=True, change_ratio=0.1,
         )
 
-        with patch("argus.core.pipeline._INFERENCE_EXECUTOR") as mock_exec:
+        with patch.object(pipeline, "_inference_executor") as mock_exec:
             from concurrent.futures import Future
             yolo_fut = Future()
             yolo_fut.set_result(ObjectDetectionResult(has_persons=False))

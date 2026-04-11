@@ -7,6 +7,7 @@ import {
 import { PlusOutlined } from '@ant-design/icons-vue'
 import { createTrainingJob } from '../../api'
 import { MODEL_TYPES } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 
 const props = defineProps<{
   cameras: any[]
@@ -24,7 +25,6 @@ const createForm = ref({
   model_type: 'patchcore',
   zone_id: 'default',
 })
-const formRef = ref()
 const createLoading = ref(false)
 
 async function handleCreate() {
@@ -40,7 +40,7 @@ async function handleCreate() {
     createForm.value = { job_type: 'anomaly_head', camera_id: undefined, model_type: 'patchcore', zone_id: 'default' }
     emit('refresh')
   } catch (e: any) {
-    message.error(e.response?.data?.error || '创建失败')
+    message.error(extractErrorMessage(e, '创建失败'))
   } finally {
     createLoading.value = false
   }
@@ -76,27 +76,30 @@ async function handleCreate() {
     >
       <Form layout="vertical" style="margin-top: 16px">
         <Form.Item label="任务类型">
-          <Select v-model:value="createForm.job_type">
+          <Select v-model:value="createForm.job_type" :disabled="createLoading">
             <Select.Option value="anomaly_head">异常检测头 (按摄像头)</Select.Option>
             <Select.Option value="ssl_backbone">SSL 骨干微调 (全厂共享)</Select.Option>
           </Select>
         </Form.Item>
         <Form.Item v-if="createForm.job_type === 'anomaly_head'" label="摄像头">
-          <Select v-model:value="createForm.camera_id" placeholder="选择摄像头">
+          <Select v-model:value="createForm.camera_id" placeholder="选择摄像头" :disabled="createLoading">
             <Select.Option v-for="c in cameras" :key="c.camera_id" :value="c.camera_id">
               {{ c.name || c.camera_id }}
             </Select.Option>
           </Select>
         </Form.Item>
         <Form.Item v-if="createForm.job_type === 'anomaly_head'" label="模型类型">
-          <Select v-model:value="createForm.model_type">
+          <Select v-model:value="createForm.model_type" :disabled="createLoading">
             <Select.Option v-for="mt in MODEL_TYPES" :key="mt.value" :value="mt.value">
               {{ mt.label }}
             </Select.Option>
           </Select>
         </Form.Item>
         <Form.Item label="区域">
-          <Input v-model:value="createForm.zone_id" placeholder="default" />
+          <Input v-model:value="createForm.zone_id" placeholder="default" :disabled="createLoading" />
+          <div style="color: #8890a0; font-size: 12px; margin-top: 4px">
+            区域ID对应配置中定义的检测区域，默认为 "default"（全画面）
+          </div>
         </Form.Item>
       </Form>
     </Modal>

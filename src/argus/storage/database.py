@@ -474,7 +474,12 @@ class Database:
             ).all())
 
     def activate_backbone(self, backbone_version_id: str) -> bool:
-        """Set a backbone as active (deactivates others)."""
+        """Set a backbone as active (deactivates others).
+
+        Uses a single transaction to atomically deactivate all + activate target,
+        preventing race conditions where concurrent calls could leave zero or
+        multiple backbones active.
+        """
         with self.get_session() as session:
             record = session.scalar(
                 select(BackboneRecord).where(
@@ -483,9 +488,12 @@ class Database:
             )
             if record is None:
                 return False
-            session.query(BackboneRecord).filter(
-                BackboneRecord.is_active == True
-            ).update({"is_active": False})
+            # Atomic: deactivate all then activate target in one flush
+            session.execute(
+                update(BackboneRecord).where(
+                    BackboneRecord.is_active == True
+                ).values(is_active=False)
+            )
             record.is_active = True
             session.commit()
             return True

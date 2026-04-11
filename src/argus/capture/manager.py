@@ -7,8 +7,10 @@ all cameras, and aggregates alerts from all pipelines.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -124,6 +126,12 @@ class CameraManager:
                 pairs=len(pairs),
                 threshold=cross_camera_config.corroboration_threshold,
             )
+
+        # Shared inference executor for all pipelines — sized to camera count
+        n_workers = min(max(len(cameras), 2) * 2, os.cpu_count() or 4)
+        self._inference_executor = ThreadPoolExecutor(
+            max_workers=n_workers, thread_name_prefix="inference"
+        )
 
         # 5.3: Process-level watchdog
         self._watchdog_thread: threading.Thread | None = None
@@ -281,6 +289,7 @@ class CameraManager:
         self._pipelines.clear()
         self._runners.clear()
         self._threads.clear()
+        self._inference_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("manager.stopped")
 
     def add_camera_config(self, cam_config: CameraConfig) -> None:
@@ -633,6 +642,7 @@ class CameraManager:
             recording_store=self._alert_recording_store,
             database=self._db,
             event_bus=self._event_bus,
+            inference_executor=self._inference_executor,
         )
 
         # 5.1: Wrap pipeline in CameraInferenceRunner

@@ -131,6 +131,8 @@ class TrainingResult:
     output_validation: dict | None = None
     model_version_id: str | None = None
     validation_report: object | None = None  # ValidationReport from training_validator
+    calibration_status: str | None = None  # "ok", "skipped", "failed"
+    baseline_validation_skipped: bool = False
 
 
 def _list_images(directory: Path) -> list[Path]:
@@ -368,67 +370,67 @@ class ModelTrainer:
 
         engine = model = None
         try:
-            engine, model = self._train_anomalib(
-                data_dir=train_dir,
-                output_dir=output_dir,
-                model_type=model_type,
-                image_size=image_size,
-                anomaly_config=anomaly_config,
-                resume_from=resume_from,
-                backbone_checkpoint=backbone_checkpoint,
-            )
-        except ImportError:
-            return self._fail(start, error="anomalib 未安装", **common_fail_kwargs)
-        except Exception as e:
-            logger.error("training.failed", error=str(e))
-            return self._fail(start, error=str(e), **common_fail_kwargs)
-
-        # Export
-        export_path_str = None
-        actual_export_format = export_format
-        actual_quantization = quantization
-        if export_format:
-            self._status = TrainingStatus.EXPORTING
-            quant_label = f" + {quantization}" if quantization != "fp32" else ""
-            _progress(70, f"正在导出 {export_format}{quant_label} 格式...")
             try:
-                export_path_str = str(self._exports_dir / camera_id / zone_id)
-                Path(export_path_str).mkdir(parents=True, exist_ok=True)
-                export_result = self._export_model(
-                    engine=engine,
-                    model=model,
-                    export_format=export_format,
-                    export_path=export_path_str,
-                    quantization=quantization,
-                    val_dir=val_dir,
-                    calibration_images=calibration_images,
+                engine, model = self._train_anomalib(
+                    data_dir=train_dir,
+                    output_dir=output_dir,
+                    model_type=model_type,
+                    image_size=image_size,
+                    anomaly_config=anomaly_config,
+                    resume_from=resume_from,
+                    backbone_checkpoint=backbone_checkpoint,
                 )
-                actual_export_format = export_result["actual_format"]
-                actual_quantization = export_result["actual_quantization"]
-                if actual_export_format != export_format:
-                    logger.warning(
-                        "training.export_format_changed",
-                        requested=export_format,
-                        actual=actual_export_format,
-                    )
-                if actual_quantization != quantization:
-                    logger.warning(
-                        "training.quantization_changed",
-                        requested=quantization,
-                        actual=actual_quantization,
-                    )
+            except ImportError:
+                return self._fail(start, error="anomalib 未安装", **common_fail_kwargs)
             except Exception as e:
-                logger.error("training.export_failed", error=str(e))
-                return self._fail(
-                    start,
-                    error=f"模型导出失败: {e}",
-                    **common_fail_kwargs,
-                )
-            finally:
-                # Release training artifacts to free memory
-                del engine, model
-                engine = model = None
-                gc.collect()
+                logger.error("training.failed", error=str(e))
+                return self._fail(start, error=str(e), **common_fail_kwargs)
+
+            # Export
+            export_path_str = None
+            actual_export_format = export_format
+            actual_quantization = quantization
+            if export_format:
+                self._status = TrainingStatus.EXPORTING
+                quant_label = f" + {quantization}" if quantization != "fp32" else ""
+                _progress(70, f"正在导出 {export_format}{quant_label} 格式...")
+                try:
+                    export_path_str = str(self._exports_dir / camera_id / zone_id)
+                    Path(export_path_str).mkdir(parents=True, exist_ok=True)
+                    export_result = self._export_model(
+                        engine=engine,
+                        model=model,
+                        export_format=export_format,
+                        export_path=export_path_str,
+                        quantization=quantization,
+                        val_dir=val_dir,
+                        calibration_images=calibration_images,
+                    )
+                    actual_export_format = export_result["actual_format"]
+                    actual_quantization = export_result["actual_quantization"]
+                    if actual_export_format != export_format:
+                        logger.warning(
+                            "training.export_format_changed",
+                            requested=export_format,
+                            actual=actual_export_format,
+                        )
+                    if actual_quantization != quantization:
+                        logger.warning(
+                            "training.quantization_changed",
+                            requested=quantization,
+                            actual=actual_quantization,
+                        )
+                except Exception as e:
+                    logger.error("training.export_failed", error=str(e))
+                    return self._fail(
+                        start,
+                        error=f"模型导出失败: {e}",
+                        **common_fail_kwargs,
+                    )
+        finally:
+            # Release training artifacts to free memory — runs on ALL exit paths
+            del engine, model
+            gc.collect()
 
         # Output validation + smoke test (TRN-006)
         # Returns (validation_dict, loaded_detector_or_None)
@@ -542,6 +544,8 @@ class ModelTrainer:
             output_validation=output_validation,
             model_version_id=model_version_id,
             validation_report=validation_report,
+            calibration_status=calibration_status,
+            baseline_validation_skipped=skip_baseline_validation and not pre_validation.get("passed", True),
         )
         self._status = TrainingStatus.COMPLETE
         self._last_result = result
@@ -556,6 +560,7 @@ class ModelTrainer:
         )
 
         # Conformal calibration (A2-3): run on val set scores if detector available
+        calibration_status = "skipped"
         if detector is not None and val_stats.get("scores"):
             try:
                 from argus.alerts.calibration import ConformalCalibrator
@@ -569,12 +574,14 @@ class ModelTrainer:
                         cal_result, cal_path, sorted_scores=np.sort(cal_scores)
                     )
                     logger.info("trainer.calibration_saved", path=str(cal_path))
+                    calibration_status = "ok"
                 else:
                     logger.warning(
                         "trainer.calibration_skipped",
                         reason=f"Not enough scores for calibration ({len(cal_scores)} < 50)",
                     )
             except Exception as e:
+                calibration_status = "failed"
                 logger.warning("trainer.calibration_failed", error=str(e))
 
         # Strip raw scores from val_stats to avoid bloating DB/JSON storage.
@@ -588,10 +595,18 @@ class ModelTrainer:
             try:
                 shutil.rmtree(split_dir)
             except OSError as e:
+                try:
+                    files = [f for f in split_dir.rglob("*") if f.is_file()]
+                    n_files = len(files)
+                    size_mb = sum(f.stat().st_size for f in files) / (1024 * 1024)
+                except Exception:
+                    n_files, size_mb = -1, -1.0
                 logger.warning(
                     "trainer.split_cleanup_failed",
                     path=str(split_dir),
                     error=str(e),
+                    files=n_files,
+                    size_mb=round(size_mb, 1),
                 )
 
         return result
@@ -1031,32 +1046,43 @@ class ModelTrainer:
             return {"error": "验证集为空", "recommendation": "inconclusive"}
 
         results = {}
-        for label, model_path in [("old", Path(old_model_path)), ("new", Path(new_model_path))]:
-            detector = AnomalibDetector(model_path=model_path, threshold=0.5)
-            if not detector.load():
-                return {"error": f"无法加载{label}模型: {model_path}", "recommendation": "inconclusive"}
+        detectors: list[AnomalibDetector] = []
+        try:
+            for label, model_path in [("old", Path(old_model_path)), ("new", Path(new_model_path))]:
+                detector = AnomalibDetector(model_path=model_path, threshold=0.5)
+                detectors.append(detector)
+                if not detector.load():
+                    return {"error": f"无法加载{label}模型: {model_path}", "recommendation": "inconclusive"}
 
-            scores = []
-            total_latency = 0.0
-            for img_path in val_images:
-                frame = cv2.imread(str(img_path))
-                if frame is None:
-                    continue
-                t0 = time.monotonic()
-                pred = detector.predict(frame)
-                total_latency += time.monotonic() - t0
-                scores.append(pred.anomaly_score)
+                scores = []
+                total_latency = 0.0
+                for img_path in val_images:
+                    frame = cv2.imread(str(img_path))
+                    if frame is None:
+                        continue
+                    t0 = time.monotonic()
+                    pred = detector.predict(frame)
+                    total_latency += time.monotonic() - t0
+                    scores.append(pred.anomaly_score)
 
-            arr = np.array(scores) if scores else np.array([0.0])
-            avg_latency = (total_latency / len(scores) * 1000) if scores else 0.0
+                arr = np.array(scores) if scores else np.array([0.0])
+                avg_latency = (total_latency / len(scores) * 1000) if scores else 0.0
 
-            results[label] = {
-                "mean": float(arr.mean()),
-                "std": float(arr.std()),
-                "max": float(arr.max()),
-                "p95": float(np.percentile(arr, 95)),
-                "latency_ms": round(avg_latency, 1),
-            }
+                results[label] = {
+                    "mean": float(arr.mean()),
+                    "std": float(arr.std()),
+                    "max": float(arr.max()),
+                    "p95": float(np.percentile(arr, 95)),
+                    "latency_ms": round(avg_latency, 1),
+                }
+        finally:
+            for d in detectors:
+                try:
+                    d.unload()
+                except Exception:
+                    pass
+            del detectors
+            gc.collect()
 
         old_s = results["old"]
         new_s = results["new"]
@@ -1260,9 +1286,19 @@ class ModelTrainer:
 
         # Checkpoint resumption
         fit_kwargs = {"model": model, "datamodule": datamodule}
-        if resume_from and Path(resume_from).exists():
-            fit_kwargs["ckpt_path"] = resume_from
-            logger.info("trainer.resuming_from_checkpoint", path=resume_from)
+        if resume_from:
+            ckpt = Path(resume_from)
+            if not ckpt.exists():
+                logger.warning("trainer.checkpoint_not_found", path=resume_from)
+            elif ckpt.stat().st_size < 1024:
+                logger.warning(
+                    "trainer.checkpoint_too_small",
+                    path=resume_from,
+                    size=ckpt.stat().st_size,
+                )
+            else:
+                fit_kwargs["ckpt_path"] = resume_from
+                logger.info("trainer.resuming_from_checkpoint", path=resume_from)
 
         engine.fit(**fit_kwargs)
 

@@ -198,7 +198,7 @@ export interface TrainingJobInfo {
   hyperparameters: string | Record<string, unknown> | null
   metrics: string | Record<string, unknown> | null
   artifacts_path: string | null
-  validation_report: string | Record<string, unknown> | null
+  validation_report: string | Record<string, any> | null
   model_version_id: string | null
   created_at: string | null
   started_at: string | null
@@ -264,3 +264,55 @@ export interface TasksPayload { tasks: TaskInfo[] }
 export interface HealthPayload extends HealthInfo {}
 export interface UsersPayload { users: UserInfo[] }
 export interface AuditPayload { entries: AuditEntry[] }
+
+// ── Model API Response Shapes ──
+
+export interface ModelRegistryResponse {
+  models: ModelInfo[]
+  active_model?: ModelInfo
+  total?: number
+}
+
+export interface TrainingJobsResponse {
+  jobs: TrainingJobInfo[]
+  total: number
+  pending_count: number
+}
+
+export interface ShadowReportResponse {
+  total_samples: number
+  production_alert_rate: number
+  shadow_alert_rate: number
+  false_positive_delta: number
+  avg_score_divergence: number
+  avg_shadow_latency_ms: number
+}
+
+export interface ABScoresResponse {
+  scores: Array<{ t: string; prod: number; shadow: number }>
+}
+
+export interface ABDistributionResponse {
+  bins: number[]
+  prod: number[]
+  shadow: number[]
+}
+
+export interface ABLiveCompareResponse {
+  camera_id: string
+  shadow_version_id: string
+  production: { score: number; heatmap_b64?: string }
+  shadow: { score: number; heatmap_b64?: string }
+  original_b64?: string
+}
+
+export interface BatchInferenceResponse {
+  results: Array<{
+    path: string
+    score: number
+    is_anomaly: boolean
+    error?: string
+  }>
+  scored: number
+  total: number
+}
