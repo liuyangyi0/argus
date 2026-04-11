@@ -308,7 +308,10 @@ class CameraManager:
         if cam_config is None:
             logger.error("manager.camera_not_found", camera_id=camera_id)
             return False
-        return self._start_camera(cam_config)
+        result = self._start_camera(cam_config)
+        if result:
+            self._broadcast_wall_update()
+        return result
 
     def stop_camera(self, camera_id: str) -> None:
         """Stop a single camera by ID."""
@@ -321,6 +324,7 @@ class CameraManager:
             pipeline.shutdown()
         if thread:
             thread.join(timeout=30.0)
+        self._broadcast_wall_update()
 
     def get_status(self) -> list[CameraStatus]:
         """Get status of all configured cameras."""
@@ -481,6 +485,39 @@ class CameraManager:
                 }
                 for cam_id in [c.camera_id for c in self._cameras]
             }
+
+    def _broadcast_wall_update(self) -> None:
+        """Broadcast full wall status to all WebSocket subscribers.
+
+        Called after camera start/stop so the dashboard updates immediately
+        instead of waiting for the next poll cycle.
+        """
+        if not self._on_status_change:
+            return
+        try:
+            cameras = []
+            for cam_config in self._cameras:
+                pipeline = self._pipelines.get(cam_config.camera_id)
+                is_online = pipeline is not None and cam_config.camera_id in self._threads
+                tile: dict = {
+                    "camera_id": cam_config.camera_id,
+                    "name": cam_config.name,
+                    "status": "online" if is_online else "offline",
+                    "fps": None,
+                    "current_score": 0.0,
+                    "score_sparkline": [],
+                }
+                if pipeline is not None and hasattr(pipeline, "get_wall_status"):
+                    wall_data = pipeline.get_wall_status()
+                    tile["current_score"] = wall_data.get("current_score", 0.0)
+                    tile["score_sparkline"] = wall_data.get("score_sparkline", [])
+                stats = pipeline.stats if pipeline else None
+                if stats is not None:
+                    tile["fps"] = getattr(stats, "current_fps", None)
+                cameras.append(tile)
+            self._on_status_change("wall", {"cameras": cameras})
+        except Exception:
+            logger.debug("manager.wall_broadcast_failed", exc_info=True)
 
     def _notify_camera_status(self, camera_id: str) -> None:
         """Notify WebSocket subscribers of camera status change."""

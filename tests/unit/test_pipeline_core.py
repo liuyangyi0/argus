@@ -557,6 +557,7 @@ class TestPipelineStats:
         expected_keys = {
             "captured", "skipped_no_change", "skipped_person",
             "analyzed", "heartbeats", "anomalies", "alerts", "avg_latency_ms",
+            "current_fps",
         }
         assert set(snap.keys()) == expected_keys
 
