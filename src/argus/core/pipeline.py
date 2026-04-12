@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,9 +29,22 @@ import structlog
 
 import uuid
 
-# Dedicated thread pool for parallel YOLO+Anomaly inference
-# Separate from default asyncio pool to avoid blocking API requests (see CLAUDE.md)
-_INFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inference")
+# Default inference executor — used when no shared executor is injected.
+# Prefer injecting a shared executor from CameraManager for proper lifecycle management.
+_DEFAULT_INFERENCE_EXECUTOR: ThreadPoolExecutor | None = None
+_DEFAULT_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_default_inference_executor() -> ThreadPoolExecutor:
+    """Lazy-init a fallback executor for standalone pipeline usage."""
+    global _DEFAULT_INFERENCE_EXECUTOR
+    if _DEFAULT_INFERENCE_EXECUTOR is None:
+        with _DEFAULT_EXECUTOR_LOCK:
+            if _DEFAULT_INFERENCE_EXECUTOR is None:
+                _DEFAULT_INFERENCE_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="inference"
+                )
+    return _DEFAULT_INFERENCE_EXECUTOR
 
 from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
 from types import MappingProxyType
@@ -95,6 +109,7 @@ class PipelineStats:
         "frames_skipped_person", "frames_analyzed", "frames_heartbeat",
         "frames_dropped_backpressure", "frames_timeout", "anomalies_detected",
         "alerts_emitted", "avg_latency_ms", "_latency_sum",
+        "current_fps", "_fps_last_count", "_fps_last_time",
     )
 
     def __init__(self) -> None:
@@ -110,6 +125,25 @@ class PipelineStats:
         self.alerts_emitted: int = 0
         self.avg_latency_ms: float = 0.0
         self._latency_sum: float = 0.0
+        # Real-time FPS: updated every 2 seconds from frame count delta
+        self.current_fps: float = 0.0
+        self._fps_last_count: int = 0
+        self._fps_last_time: float = 0.0
+
+    def update_fps(self) -> None:
+        """Recompute current_fps from frame count delta (call once per frame)."""
+        now = time.time()
+        with self._lock:
+            if self._fps_last_time == 0.0:
+                self._fps_last_time = now
+                self._fps_last_count = self.frames_captured
+                return
+            elapsed = now - self._fps_last_time
+            if elapsed >= 2.0:
+                delta = self.frames_captured - self._fps_last_count
+                self.current_fps = round(delta / elapsed, 1)
+                self._fps_last_count = self.frames_captured
+                self._fps_last_time = now
 
     def snapshot(self) -> dict:
         """Return a consistent point-in-time copy of all counters."""
@@ -123,6 +157,7 @@ class PipelineStats:
                 "anomalies": self.anomalies_detected,
                 "alerts": self.alerts_emitted,
                 "avg_latency_ms": round(self.avg_latency_ms, 1),
+                "current_fps": self.current_fps,
             }
 
 
@@ -158,11 +193,13 @@ class DetectionPipeline:
         recording_store: object | None = None,
         database: object | None = None,
         event_bus: EventBus | None = None,
+        inference_executor: ThreadPoolExecutor | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
         self._on_drift = on_drift
         self._event_bus = event_bus
+        self._inference_executor = inference_executor or _get_default_inference_executor()
         self._model_version_id = model_version_id
         self._shadow_runner = shadow_runner
         self._feedback_manager = feedback_manager
@@ -328,7 +365,7 @@ class DetectionPipeline:
         self._config_lock = threading.Lock()
 
         # Cached per-zone anomaly masks (invalidated on update_zones, bounded to 64)
-        self._zone_mask_cache: dict[tuple[str, int, int], np.ndarray] = {}
+        self._zone_mask_cache: OrderedDict[tuple[str, int, int], np.ndarray] = OrderedDict()
         self._zone_mask_cache_limit = 64
 
         # Thread safety for anomaly lock state (HIGH-03)
@@ -533,6 +570,7 @@ class DetectionPipeline:
         """Run the detection pipeline on a single frame."""
         start = time.monotonic()
         self.stats.frames_captured += 1
+        self.stats.update_fps()
         self._frame_counter += 1
         frame = frame_data.frame
 
@@ -713,10 +751,10 @@ class DetectionPipeline:
 
         if skip_on_person:
             # Parallel: submit both to thread pool concurrently
-            yolo_future: Future = _INFERENCE_EXECUTOR.submit(
+            yolo_future: Future = self._inference_executor.submit(
                 self._object_detector.detect, frame,
             )
-            anomaly_future: Future = _INFERENCE_EXECUTOR.submit(
+            anomaly_future: Future = self._inference_executor.submit(
                 self._anomaly_detector.predict, frame,
             )
             try:
@@ -741,8 +779,20 @@ class DetectionPipeline:
                         consecutive=self._consecutive_timeouts,
                         msg="Inference future timed out after 30s — skipping frame",
                     )
-                yolo_future.cancel()
-                anomaly_future.cancel()
+                if not yolo_future.cancel():
+                    logger.warning(
+                        "pipeline.future_cancel_failed",
+                        camera_id=self.camera_config.camera_id,
+                        stage="yolo",
+                        msg="YOLO inference still running after timeout — worker thread busy",
+                    )
+                if not anomaly_future.cancel():
+                    logger.warning(
+                        "pipeline.future_cancel_failed",
+                        camera_id=self.camera_config.camera_id,
+                        stage="anomaly",
+                        msg="Anomaly inference still running after timeout — worker thread busy",
+                    )
                 self._update_lock_state_time(time.monotonic())
                 return None
 
@@ -1668,7 +1718,9 @@ class DetectionPipeline:
         cache_key = (zone_id, map_h, map_w)
 
         zone_mask = self._zone_mask_cache.get(cache_key)
-        if zone_mask is None:
+        if zone_mask is not None:
+            self._zone_mask_cache.move_to_end(cache_key)  # LRU touch
+        else:
             frame_h, frame_w = frame_shape[:2]
             scale_x = map_w / frame_w
             scale_y = map_h / frame_h
@@ -1679,8 +1731,7 @@ class DetectionPipeline:
             zone_mask = np.zeros((map_h, map_w), dtype=np.uint8)
             cv2.fillPoly(zone_mask, [scaled_pts], 255)
             if len(self._zone_mask_cache) >= self._zone_mask_cache_limit:
-                oldest_key = next(iter(self._zone_mask_cache))
-                del self._zone_mask_cache[oldest_key]
+                self._zone_mask_cache.popitem(last=False)  # evict LRU (oldest)
             self._zone_mask_cache[cache_key] = zone_mask
 
         zone_values = anomaly_map[zone_mask > 0]
@@ -1718,6 +1769,10 @@ class DetectionPipeline:
                             "pipeline.lock_auto_cleared",
                             camera_id=self.camera_config.camera_id,
                         )
+                else:
+                    # Score bounced back above clear threshold (middle zone) —
+                    # reset the clear timer to prevent premature unlock
+                    self._lock_last_below_time = None
 
     def _update_lock_state_time(self, now: float) -> None:
         """Update lock clear timer without a detection result (e.g., person-skipped frames).

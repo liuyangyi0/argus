@@ -218,6 +218,11 @@ class Go2RTCManager:
             logger.warning("go2rtc.already_running", pid=self._process.pid)
             return
 
+        # Re-create HTTP client if it was closed (e.g. after close() or crash)
+        if self._http.is_closed:
+            self._http = httpx.Client(base_url=self._base_url, timeout=5.0)
+            self._closed = False
+
         # Kill orphaned go2rtc from a previous run that wasn't cleaned up
         self._kill_stale_process()
 

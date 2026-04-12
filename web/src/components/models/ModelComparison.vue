@@ -21,6 +21,7 @@ import {
   getABScores, getABDistribution, runABLiveCompare,
 } from '../../api'
 import { STAGE_MAP } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 import { useThemeStore } from '../../stores/theme'
 
 use([CanvasRenderer, LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, MarkLineComponent])
@@ -73,6 +74,12 @@ const daysRange = ref(7)
 // ── Heatmap overlay ──
 const heatmapOpacity = ref(60)
 
+// ── Aggregated loading ──
+const isAnyLoading = computed(() => loadingReport.value || loadingScores.value || loadingDistribution.value)
+
+// ── Refresh deduplication ──
+let refreshInProgress = false
+
 // ── Auto-refresh ──
 const autoRefresh = ref(false)
 let refreshTimer: ReturnType<typeof setInterval> | null = null
@@ -118,9 +125,13 @@ watch(selectedShadow, () => {
 
 async function loadAllData() {
   if (!selectedShadow.value) return
-  loadReport()
-  loadScores()
-  loadDistribution()
+  if (refreshInProgress) return  // deduplicate concurrent refreshes
+  refreshInProgress = true
+  try {
+    await Promise.allSettled([loadReport(), loadScores(), loadDistribution()])
+  } finally {
+    refreshInProgress = false
+  }
 }
 
 async function loadReport() {
@@ -130,7 +141,7 @@ async function loadReport() {
       camera_id: selectedCamera.value || undefined,
       days: daysRange.value,
     })
-  } catch (e) { console.error('ModelComparison: loadReport failed', e); shadowReport.value = null }
+  } catch (e) { message.error(extractErrorMessage(e, '加载影子报告失败')); shadowReport.value = null }
   finally { loadingReport.value = false }
 }
 
@@ -143,7 +154,7 @@ async function loadScores() {
       limit: 500,
     })
     abScores.value = res.scores || []
-  } catch (e) { console.error('ModelComparison: loadScores failed', e); abScores.value = [] }
+  } catch (e) { message.error(extractErrorMessage(e, '加载评分数据失败')); abScores.value = [] }
   finally { loadingScores.value = false }
 }
 
@@ -154,7 +165,7 @@ async function loadDistribution() {
       camera_id: selectedCamera.value || undefined,
       days: daysRange.value,
     })
-  } catch (e) { console.error('ModelComparison: loadDistribution failed', e); abDistribution.value = null }
+  } catch (e) { message.error(extractErrorMessage(e, '加载分布数据失败')); abDistribution.value = null }
   finally { loadingDistribution.value = false }
 }
 
@@ -168,7 +179,7 @@ async function runLiveCompare() {
   try {
     liveResult.value = await runABLiveCompare(selectedCamera.value, selectedShadow.value)
   } catch (e: any) {
-    message.error(e?.message || '实时对比失败')
+    message.error(extractErrorMessage(e, '实时对比失败'))
   } finally {
     loadingLive.value = false
   }
@@ -372,7 +383,7 @@ const fpDeltaColor = computed(() => fpDelta.value > 0 ? '#ff4d4f' : fpDelta.valu
           </Select>
         </Col>
         <Col :span="8" style="display: flex; gap: 8px; align-items: flex-end; padding-top: 18px">
-          <Button type="primary" :disabled="!selectedShadow" @click="loadAllData">
+          <Button type="primary" :disabled="!selectedShadow" :loading="isAnyLoading" @click="loadAllData">
             <template #icon><ReloadOutlined /></template>
             刷新
           </Button>
@@ -652,6 +663,12 @@ const fpDeltaColor = computed(() => fpDelta.value > 0 ? '#ff4d4f' : fpDelta.valu
 }
 
 @media (max-width: 1200px) {
+  .ab-heatmap-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 768px) {
   .ab-heatmap-grid {
     grid-template-columns: 1fr;
   }

@@ -436,7 +436,7 @@ const columns = [
       <Form.Item label="目标阶段">
         <Select v-model:value="promoteForm.target_stage" style="width: 100%">
           <Select.Option
-            v-for="stage in (VALID_TRANSITIONS[models.find(m => m.model_version_id === promoteForm.version_id)?.stage] || [])"
+            v-for="stage in (VALID_TRANSITIONS[models.find(m => m.model_version_id === promoteForm.version_id)?.stage ?? ''] || [])"
             :key="stage"
             :value="stage"
           >
@@ -530,8 +530,8 @@ const columns = [
       >
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px">
           <Space>
-            <Tag :color="(STAGE_MAP[event.from_stage] || { color: 'default' }).color">
-              {{ (STAGE_MAP[event.from_stage] || { text: event.from_stage || '?' }).text }}
+            <Tag :color="(STAGE_MAP[event.from_stage ?? ''] || { color: 'default' }).color">
+              {{ (STAGE_MAP[event.from_stage ?? ''] || { text: event.from_stage || '?' }).text }}
             </Tag>
             <span style="color: #8890a0">&rarr;</span>
             <Tag :color="(STAGE_MAP[event.to_stage] || { color: 'default' }).color">

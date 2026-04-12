@@ -335,6 +335,12 @@ def main():
         app.state.audit_logger = audit_logger
         app.state.recording_store = alert_recording_store  # FR-033: shared with pipelines
         app.state.active_learning_sampler = active_learning_sampler
+
+        # Wire camera status changes → WebSocket broadcast so dashboard
+        # updates immediately when cameras start/stop (not just on poll).
+        ws_mgr = getattr(app.state, "ws_manager", None)
+        if ws_mgr is not None:
+            manager._on_status_change = ws_mgr.broadcast
         if app.state.baseline_lifecycle is not None:
             app.state.baseline_lifecycle._audit = audit_logger
         app.state.backup_manager = backup_mgr
