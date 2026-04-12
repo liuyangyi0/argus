@@ -917,10 +917,10 @@ async def wall_status(request: Request):
                 tile["current_score"] = wall_data.get("current_score", 0.0)
                 tile["score_sparkline"] = wall_data.get("score_sparkline", [])
 
-            # FPS and backpressure from pipeline stats
+            # FPS from pipeline stats (computed every 2s in process_frame)
             stats = getattr(cam_status, "stats", None)
-            if stats is not None:
-                tile["fps"] = getattr(stats, "current_fps", None)
+            if stats is not None and getattr(stats, "current_fps", 0) > 0:
+                tile["fps"] = stats.current_fps
 
             # Backpressure visibility (P0-2)
             bp_stats = camera_manager.get_backpressure_stats()

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted } from 'vue'
 import {
   Card, Table, Button, Tag, Space, Select,
   Popconfirm, message, Drawer, Descriptions, Typography,
@@ -12,6 +12,7 @@ import {
   getTrainingJobs, getTrainingJob, confirmTrainingJob, rejectTrainingJob,
 } from '../../api'
 import { TRAINING_STATUS_MAP, JOB_TYPE_LABELS, TRIGGER_LABELS } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 import type { TrainingJobInfo, CameraSummary } from '../../types/api'
 
 const props = defineProps<{
@@ -40,7 +41,7 @@ async function loadJobs() {
     jobs.value = res.jobs || []
     emit('update:pendingCount', res.pending_count || 0)
   } catch (e) {
-    message.error('操作失败')
+    message.error(extractErrorMessage(e, '加载训练任务失败'))
   } finally {
     loading.value = false
   }
@@ -52,7 +53,7 @@ async function showDetail(jobId: string) {
     detailJob.value = res
     detailDrawer.value = true
   } catch (e) {
-    message.error('加载详情失败')
+    message.error(extractErrorMessage(e, '加载详情失败'))
   }
 }
 
@@ -98,9 +99,36 @@ const jobColumns = [
   { title: '操作', key: 'actions', width: 200, fixed: 'right' as const },
 ]
 
-defineExpose({ loadJobs })
+// Elapsed time ticker — only runs when jobs are in "running" state
+const nowTick = ref(Date.now())
+let elapsedTimer: ReturnType<typeof setInterval> | null = null
+
+function startElapsedTimer() {
+  if (elapsedTimer) return
+  elapsedTimer = setInterval(() => { nowTick.value = Date.now() }, 1000)
+}
+function stopElapsedTimer() {
+  if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null }
+}
+
+watch(jobs, (list) => {
+  if (list.some(j => j.status === 'running')) startElapsedTimer()
+  else stopElapsedTimer()
+}, { immediate: true })
 
 onMounted(loadJobs)
+onUnmounted(stopElapsedTimer)
+
+function formatElapsed(job: TrainingJobInfo): string {
+  if (job.status !== 'running' || !job.started_at) return '-'
+  const elapsed = Math.round((nowTick.value - new Date(job.started_at).getTime()) / 1000)
+  if (elapsed < 0) return '-'
+  const m = Math.floor(elapsed / 60)
+  const s = elapsed % 60
+  return m > 0 ? `${m}m${s}s` : `${s}s`
+}
+
+defineExpose({ loadJobs })
 </script>
 
 <template>
@@ -175,7 +203,12 @@ onMounted(loadJobs)
             {{ record.created_at?.replace('T', ' ').slice(0, 19) }}
           </template>
           <template v-else-if="column.key === 'duration_seconds'">
-            {{ record.duration_seconds != null ? record.duration_seconds.toFixed(1) : '-' }}
+            <template v-if="record.status === 'running'">
+              <span style="color: #1890ff">{{ formatElapsed(record as TrainingJobInfo) }}</span>
+            </template>
+            <template v-else>
+              {{ record.duration_seconds != null ? record.duration_seconds.toFixed(1) : '-' }}
+            </template>
           </template>
           <template v-else-if="column.key === 'actions'">
             <Space>
@@ -223,7 +256,7 @@ onMounted(loadJobs)
             </Tag>
           </Descriptions.Item>
           <Descriptions.Item label="触发方式">
-            {{ TRIGGER_LABELS[detailJob.trigger_type] || detailJob.trigger_type }}
+            {{ TRIGGER_LABELS[detailJob.trigger_type!] || detailJob.trigger_type }}
           </Descriptions.Item>
           <Descriptions.Item label="触发者">{{ detailJob.triggered_by || '-' }}</Descriptions.Item>
           <Descriptions.Item label="确认者">{{ detailJob.confirmed_by || '-' }}</Descriptions.Item>

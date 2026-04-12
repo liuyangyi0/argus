@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import structlog
+from scipy.stats import ks_2samp
 
 logger = structlog.get_logger()
 
@@ -108,33 +109,12 @@ class DriftDetector:
 
     @staticmethod
     def _ks_2samp(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
-        """Pure numpy KS two-sample test (no scipy dependency).
+        """KS two-sample test via scipy.
 
-        Returns (ks_statistic, approximate_p_value).
+        Returns (ks_statistic, p_value).
         """
-        a_sorted = np.sort(a)
-        b_sorted = np.sort(b)
-        all_values = np.concatenate([a_sorted, b_sorted])
-        all_values.sort()
-
-        cdf_a = np.searchsorted(a_sorted, all_values, side="right") / len(a)
-        cdf_b = np.searchsorted(b_sorted, all_values, side="right") / len(b)
-        ks_stat = float(np.max(np.abs(cdf_a - cdf_b)))
-
-        # Approximate p-value using asymptotic formula (Kolmogorov distribution)
-        # 10 terms gives good accuracy for lam up to ~4.0
-        n = len(a) * len(b) / (len(a) + len(b))
-        lam = (np.sqrt(n) + 0.12 + 0.11 / np.sqrt(n)) * ks_stat
-        if lam < 0.001:
-            p_value = 1.0
-        else:
-            p_value = 2 * sum(
-                (-1) ** (k - 1) * np.exp(-2 * k * k * lam * lam)
-                for k in range(1, 11)
-            )
-            p_value = max(0.0, min(1.0, p_value))
-
-        return ks_stat, p_value
+        result = ks_2samp(a, b)
+        return float(result.statistic), float(result.pvalue)
 
     def get_status(self) -> DriftStatus:
         return self._status

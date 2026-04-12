@@ -2,21 +2,31 @@
 
 Provides frame-level encoding from JPEG bytes to H.264 MP4,
 MP4 concatenation, and frame extraction.
+
+Encoding uses cv2.VideoWriter which manages PTS timestamps
+automatically — eliminates manual PTS bugs that caused playback
+issues with PyAV (too-fast or single-frame playback).
+
+Reading / seeking uses PyAV which has superior seeking performance.
 """
 
 from __future__ import annotations
 
-import struct
+import io
 from pathlib import Path
 
 import av
 import cv2
 import numpy as np
 import structlog
+from PIL import Image
 
 logger = structlog.get_logger()
 
 _BYTES_PER_MB = 1_048_576
+
+# Preferred H.264 fourcc codes in order of preference
+_H264_FOURCCS = ["avc1", "H264", "h264", "x264"]
 
 
 def decode_jpeg(jpeg_bytes: bytes) -> np.ndarray | None:
@@ -26,52 +36,91 @@ def decode_jpeg(jpeg_bytes: bytes) -> np.ndarray | None:
 
 
 def jpeg_dimensions(jpeg_bytes: bytes) -> tuple[int, int] | None:
-    """Parse JPEG header to extract (width, height) without full decode.
+    """Extract (width, height) from JPEG bytes without full decode.
 
-    Reads SOF0/SOF2 markers from the JPEG binary data.
-    Returns None if the header cannot be parsed.
+    Uses Pillow's lazy header parsing — only reads markers, no pixel decode.
     """
-    data = jpeg_bytes
-    if len(data) < 4 or data[0:2] != b"\xff\xd8":
+    try:
+        img = Image.open(io.BytesIO(jpeg_bytes))
+        return img.size  # (width, height)
+    except Exception:
         return None
-    i = 2
-    while i < len(data) - 1:
-        if data[i] != 0xFF:
-            break
-        marker = data[i + 1]
-        # SOF0 (0xC0) or SOF2 (0xC2) contain dimensions
-        if marker in (0xC0, 0xC2) and i + 9 < len(data):
-            height = struct.unpack(">H", data[i + 5: i + 7])[0]
-            width = struct.unpack(">H", data[i + 7: i + 9])[0]
-            if width > 0 and height > 0:
-                return (width, height)
-        if marker == 0xDA:  # Start of Scan — stop searching
-            break
-        if i + 3 < len(data):
-            seg_len = struct.unpack(">H", data[i + 2: i + 4])[0]
-            i += 2 + seg_len
-        else:
-            break
-    return None
 
 
-def _create_h264_output(
+def _create_video_writer(
     path: Path, fps: int, width: int, height: int,
-    crf: int = 23, preset: str = "veryfast",
-) -> tuple[av.container.OutputContainer, av.stream.Stream]:
-    """Create an H.264 MP4 output container + stream with standard settings."""
-    container = av.open(str(path), mode="w", options={"movflags": "+faststart"})
-    stream = container.add_stream("libx264", rate=fps)
-    stream.width = width
-    stream.height = height
-    stream.pix_fmt = "yuv420p"
-    stream.options = {"crf": str(crf), "preset": preset, "profile": "baseline"}
-    stream.gop_size = fps  # keyframe every 1 second
-    return container, stream
+) -> cv2.VideoWriter:
+    """Create a cv2.VideoWriter with H.264 codec, falling back to mp4v.
+
+    cv2.VideoWriter manages PTS automatically — no manual timestamp
+    management needed, eliminating the class of bugs where PyAV's
+    time_base negotiation with libx264 caused wrong playback speed.
+    """
+    for fourcc_str in _H264_FOURCCS:
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        writer = cv2.VideoWriter(str(path), fourcc, float(fps), (width, height))
+        if writer.isOpened():
+            return writer
+        writer.release()
+
+    # Fallback: MPEG-4 (universally supported)
+    logger.warning(
+        "video_encoder.h264_unavailable",
+        msg="H.264 codec not available in OpenCV build, falling back to mp4v",
+    )
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(path), fourcc, float(fps), (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"Failed to create VideoWriter at {path} — no usable codec found"
+        )
+    return writer
+
+
+def _remux_faststart(mp4_path: Path) -> None:
+    """Re-mux an MP4 file with moov atom at the front (faststart).
+
+    Required for HTTP Range seeking in browsers. Uses PyAV for
+    lossless remux (no re-encoding — just moves the moov atom).
+    Skips silently if the moov is already at the front.
+    """
+    try:
+        # Quick check: read first 32 bytes to see if moov is already at front
+        with open(mp4_path, "rb") as f:
+            header = f.read(32)
+        if b"moov" in header:
+            return  # already faststart
+
+        tmp_path = mp4_path.with_suffix(".faststart.mp4")
+        inp = av.open(str(mp4_path))
+        try:
+            out = av.open(str(tmp_path), mode="w", options={"movflags": "+faststart"})
+            try:
+                in_stream = inp.streams.video[0]
+                out_stream = out.add_stream(template=in_stream)
+                for packet in inp.demux(in_stream):
+                    if packet.dts is None:
+                        continue
+                    packet.stream = out_stream
+                    out.mux(packet)
+            finally:
+                out.close()
+        finally:
+            inp.close()
+
+        tmp_path.replace(mp4_path)
+    except Exception:
+        logger.debug("video_encoder.faststart_skip", path=str(mp4_path), exc_info=True)
+        tmp_path = mp4_path.with_suffix(".faststart.mp4")
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 class Mp4Encoder:
     """Encodes JPEG frames into an H.264 MP4 file.
+
+    Uses cv2.VideoWriter for encoding — PTS timestamps are managed
+    automatically by OpenCV/FFMPEG, eliminating manual PTS bugs.
 
     Usage::
 
@@ -95,16 +144,14 @@ class Mp4Encoder:
         self._fps = fps
         self._width = width
         self._height = height
-        self._crf = crf
-        self._preset = preset
         self._frame_count = 0
 
-        self._container, self._stream = _create_h264_output(
-            self._output_path, fps, width, height, crf, preset,
+        self._writer = _create_video_writer(
+            self._output_path, fps, width, height,
         )
 
     def write_jpeg_frame(self, jpeg_bytes: bytes) -> None:
-        """Decode a JPEG buffer and encode it as an H.264 frame."""
+        """Decode a JPEG buffer and write it as a video frame."""
         bgr = decode_jpeg(jpeg_bytes)
         if bgr is None:
             logger.warning("video_encoder.skip_corrupt_frame", index=self._frame_count)
@@ -114,19 +161,18 @@ class Mp4Encoder:
         if w != self._width or h != self._height:
             bgr = cv2.resize(bgr, (self._width, self._height), interpolation=cv2.INTER_AREA)
 
-        frame = av.VideoFrame.from_ndarray(bgr, format="bgr24")
-        frame.pts = self._frame_count
-        for packet in self._stream.encode(frame):
-            self._container.mux(packet)
+        self._writer.write(bgr)
         self._frame_count += 1
 
     def finalize(self) -> int:
-        """Flush encoder, close container. Returns file size in bytes."""
-        for packet in self._stream.encode():
-            self._container.mux(packet)
-        self._container.close()
+        """Flush encoder, close writer, apply faststart. Returns file size in bytes."""
+        self._writer.release()
 
-        size = self._output_path.stat().st_size
+        if self._output_path.exists():
+            # Re-mux with moov atom at front for browser seeking
+            _remux_faststart(self._output_path)
+
+        size = self._output_path.stat().st_size if self._output_path.exists() else 0
         logger.info(
             "video_encoder.finalized",
             path=str(self._output_path),
@@ -150,46 +196,46 @@ def concat_mp4(
 ) -> int:
     """Concatenate two MP4 files by re-encoding into a single output.
 
-    Both inputs are decoded and re-encoded into one continuous MP4.
+    Uses PyAV for decoding (superior seeking) and cv2.VideoWriter
+    for encoding (automatic PTS management).
     Returns the output file size in bytes.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     in_pre = av.open(str(pre_path))
     in_post = av.open(str(post_path))
-    output = None
+    writer = None
     try:
         pre_stream = in_pre.streams.video[0]
         post_stream = in_post.streams.video[0]
         if fps is None:
-            fps = int(pre_stream.average_rate)
+            fps = int(pre_stream.average_rate) if pre_stream.average_rate else 15
 
-        output, out_stream = _create_h264_output(
-            output_path, fps, pre_stream.width, pre_stream.height, crf, preset,
-        )
+        width, height = pre_stream.width, pre_stream.height
+        writer = _create_video_writer(output_path, fps, width, height)
 
-        frame_idx = 0
         for frame in in_pre.decode(pre_stream):
-            frame.pts = frame_idx
-            for packet in out_stream.encode(frame):
-                output.mux(packet)
-            frame_idx += 1
+            bgr = frame.to_ndarray(format="bgr24")
+            if bgr.shape[1] != width or bgr.shape[0] != height:
+                bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
+            writer.write(bgr)
 
         for frame in in_post.decode(post_stream):
-            frame.pts = frame_idx
-            for packet in out_stream.encode(frame):
-                output.mux(packet)
-            frame_idx += 1
-
-        for packet in out_stream.encode():
-            output.mux(packet)
+            bgr = frame.to_ndarray(format="bgr24")
+            if bgr.shape[1] != width or bgr.shape[0] != height:
+                bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
+            writer.write(bgr)
     finally:
         in_pre.close()
         in_post.close()
-        if output is not None:
-            output.close()
+        if writer is not None:
+            writer.release()
 
-    size = output_path.stat().st_size
+    # Apply faststart for browser seeking
+    if output_path.exists():
+        _remux_faststart(output_path)
+
+    size = output_path.stat().st_size if output_path.exists() else 0
     logger.info("video_encoder.concat", output=str(output_path), size_mb=round(size / _BYTES_PER_MB, 2))
     return size
 
@@ -276,8 +322,8 @@ def get_video_frame_count(mp4_path: Path) -> int | None:
 def repair_video_timestamps(mp4_path: Path, fps: int, crf: int = 23, preset: str = "veryfast") -> bool:
     """Re-encode an MP4 in-place with correct PTS timestamps.
 
-    Checks average_rate to decide if repair is needed, then streams
-    decode→encode (one frame at a time) to avoid buffering the whole video.
+    Uses PyAV for decoding and cv2.VideoWriter for encoding to ensure
+    correct PTS management. Checks average_rate to decide if repair is needed.
     Returns True if repaired, False if skipped or failed.
     """
     tmp_path = mp4_path.with_suffix(".tmp.mp4")
@@ -289,27 +335,25 @@ def repair_video_timestamps(mp4_path: Path, fps: int, crf: int = 23, preset: str
             if avg_rate > 0 and abs(avg_rate - fps) / fps < 0.5:
                 return False  # already correct
 
+            width, height = stream.width, stream.height
+            writer = _create_video_writer(tmp_path, fps, width, height)
             frame_count = 0
-            out_container, out_stream = _create_h264_output(
-                tmp_path, fps, stream.width, stream.height, crf, preset,
-            )
             try:
                 for frame in container.decode(video=0):
-                    frame.pts = frame_count
-                    for packet in out_stream.encode(frame):
-                        out_container.mux(packet)
+                    bgr = frame.to_ndarray(format="bgr24")
+                    writer.write(bgr)
                     frame_count += 1
-
-                for packet in out_stream.encode():
-                    out_container.mux(packet)
             finally:
-                out_container.close()
+                writer.release()
         finally:
             container.close()
 
         if frame_count == 0:
             tmp_path.unlink(missing_ok=True)
             return False
+
+        # Apply faststart
+        _remux_faststart(tmp_path)
 
         tmp_path.replace(mp4_path)
         logger.info("video_encoder.repaired", path=str(mp4_path), frames=frame_count, fps=fps)

@@ -316,6 +316,11 @@ class AlertFrameBuffer:
 
         duration = frames[-1].timestamp - frames[0].timestamp
         if duration <= 0:
+            logger.warning(
+                "ring_buffer.downsample_zero_duration",
+                frame_count=len(frames),
+                msg="All frames have same timestamp — returning single frame",
+            )
             return frames[:1]
 
         actual_fps = len(frames) / duration

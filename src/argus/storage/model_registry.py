@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from argus.storage.models import ModelRecord, ModelStage, ModelVersionEvent
@@ -27,8 +28,17 @@ class ModelRegistry:
 
     def __init__(self, session_factory):
         self._session_factory = session_factory
-        self._counter = 0
         self._counter_lock = threading.Lock()
+        self._counter = self._init_counter_from_db()
+
+    def _init_counter_from_db(self) -> int:
+        """Initialize counter from existing record count to avoid ID collisions on restart."""
+        try:
+            with self._session_factory() as session:
+                count = session.scalar(select(func.count(ModelRecord.id)))
+                return count or 0
+        except Exception:
+            return 0
 
     def register(
         self,

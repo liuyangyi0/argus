@@ -106,6 +106,7 @@ class FrameQualityFilter:
         self._blur_scores: list[float] = []
         self._person_detector = None
         self._person_detector_failed_at: float = 0.0
+        self._person_detect_consecutive_failures: int = 0
         self._enable_person_detection = enable_person_detection
         self._enable_duplicate_filter = enable_duplicate_filter
 
@@ -263,7 +264,19 @@ class FrameQualityFilter:
 
         try:
             result = self._person_detector.detect(frame)
+            if self._person_detect_consecutive_failures >= 3:
+                logger.info("quality.person_detection_recovered")
+            self._person_detect_consecutive_failures = 0
             return result.has_persons
         except Exception:
+            self._person_detect_consecutive_failures += 1
+            if self._person_detect_consecutive_failures == 3:
+                logger.error(
+                    "quality.person_detection_degraded",
+                    consecutive_failures=self._person_detect_consecutive_failures,
+                    msg="Person detection failing repeatedly — allowing frames through to prevent blocking baseline capture",
+                )
+            if self._person_detect_consecutive_failures >= 3:
+                return False  # allow frames through when detector is broken
             logger.warning("quality.person_detection_failed", exc_info=True)
-            return True  # conservative: assume person present
+            return True  # conservative for first 1-2 transient failures

@@ -72,6 +72,13 @@ def validate_hyperparameters(params: dict) -> list[str]:
             errors.append(f"{key}={value} above maximum {spec['max']}")
         if "allowed" in spec and value not in spec["allowed"]:
             errors.append(f"{key}={value!r} not in {spec['allowed']}")
+
+    # Cross-field validation
+    quantization = params.get("quantization")
+    export_format = params.get("export_format")
+    if quantization and quantization != "fp32" and export_format and export_format != "openvino":
+        errors.append(f"量化 ({quantization}) 仅支持 openvino 导出格式，当前为 {export_format}")
+
     return errors
 
 
