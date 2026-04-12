@@ -16,6 +16,7 @@ data/logs/
 data/alerts/
 data/inference_records/
 data/active_learning/
+data/recordings/
 
 # Environment
 .env
