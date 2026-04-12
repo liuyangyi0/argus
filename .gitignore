@@ -14,11 +14,16 @@ data/exports/
 data/db/
 data/logs/
 data/alerts/
+data/inference_records/
+data/active_learning/
+data/recordings/
 
 # Environment
 .env
 .venv/
 venv/
+
+web/package-lock.json
 
 # IDE
 .vscode/

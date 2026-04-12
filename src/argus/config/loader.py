@@ -64,7 +64,8 @@ def load_config(config_path: str | Path) -> ArgusConfig:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path) as f:
+    # 核心修复：添加 encoding="utf-8"
+    with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     if raw is None:

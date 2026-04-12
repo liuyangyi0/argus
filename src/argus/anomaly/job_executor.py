@@ -280,7 +280,8 @@ class TrainingJobExecutor:
         # Run training (trainer already has validation wired in)
         result = self._trainer.train(
             camera_id=camera_id,
-            zone_id=job.zone_id or "default",
+            #zone_id=job.zone_id or "default",
+            zone_id="default", # 基线采集图片默认存储路径是 baselines/{camera_id}/default，所以这里默认使用 default zone
             model_type=job.model_type or params.get("model_type", "patchcore"),
             image_size=params.get("image_size", 256),
             export_format=params.get("export_format", "openvino"),
