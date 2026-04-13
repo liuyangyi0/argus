@@ -7,6 +7,7 @@ camera but not corroborated by another is likely a false positive
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 
@@ -58,11 +59,13 @@ class CrossCameraCorrelator:
             self._pairs.setdefault(pair.camera_b, []).append((pair.camera_a, H_inv))
 
         self._recent_maps: dict[str, tuple[float, np.ndarray]] = {}
+        self._maps_lock = threading.Lock()
 
     def update(self, camera_id: str, anomaly_map: np.ndarray | None, timestamp: float) -> None:
         """Store the latest anomaly map for a camera."""
         if anomaly_map is not None:
-            self._recent_maps[camera_id] = (timestamp, anomaly_map)
+            with self._maps_lock:
+                self._recent_maps[camera_id] = (timestamp, anomaly_map)
 
     def check(
         self,
@@ -79,7 +82,8 @@ class CrossCameraCorrelator:
         src_point = np.array([[anomaly_location]], dtype=np.float64)
 
         for partner_id, H in partners:
-            partner_data = self._recent_maps.get(partner_id)
+            with self._maps_lock:
+                partner_data = self._recent_maps.get(partner_id)
             if partner_data is None:
                 continue
 

@@ -236,10 +236,11 @@ async def alert_detail(request: Request, alert_id: str):
     # Notes display
     notes_html = ""
     if alert.notes:
+        safe_notes = html.escape(alert.notes)
         notes_html = f"""
         <div class="card mt-16" style="border-left:3px solid var(--status-info);">
             <h3>备注</h3>
-            <p style="font-size:var(--text-sm);color:var(--text-secondary);">{alert.notes}</p>
+            <p style="font-size:var(--text-sm);color:var(--text-secondary);">{safe_notes}</p>
         </div>"""
 
     close_btn = (

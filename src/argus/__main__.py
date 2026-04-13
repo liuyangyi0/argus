@@ -509,6 +509,11 @@ def main():
                     logger.debug("shutdown.go2rtc_close_failed", exc_info=True)
         scheduler.stop()
         manager.stop_all()
+        # Stop continuous recording AFTER cameras (no more frames to push)
+        if recording_manager is not None:
+            recording_manager.stop_all()
+        if retention_manager is not None:
+            retention_manager.stop()
         record_store.stop()
         dispatcher.close()
         db.close()
