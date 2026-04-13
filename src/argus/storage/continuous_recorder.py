@@ -154,7 +154,14 @@ class ContinuousRecorder:
                     break
                 frame, timestamp = item
                 self._ensure_segment(timestamp)
-                self._write_frame(frame)
+                try:
+                    self._write_frame(frame)
+                except Exception:
+                    logger.warning(
+                        "continuous_recorder.write_frame_failed",
+                        camera_id=self._camera_id,
+                        exc_info=True,
+                    )
         except Exception:
             logger.exception(
                 "continuous_recorder.loop_error",

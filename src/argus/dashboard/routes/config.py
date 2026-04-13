@@ -736,7 +736,13 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
 
     Accepts key paths like 'imaging.enabled', 'physics.speed_enabled',
     'continuous_recording.enabled', 'classifier.enabled'.
+    Requires admin or engineer role.
     """
+    from argus.dashboard.auth import require_role
+    if not require_role(request, "admin", "engineer"):
+        from argus.dashboard.api_response import api_forbidden
+        return api_forbidden("需要管理员或工程师权限")
+
     config = request.app.state.config
     parts = req.key.split(".")
     if len(parts) != 2:

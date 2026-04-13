@@ -36,7 +36,6 @@ async def list_segments(
     return api_success([
         {
             "camera_id": s.camera_id,
-            "path": str(s.segment_path),
             "filename": s.segment_path.name,
             "start_time": s.start_time.isoformat() if s.start_time else None,
             "end_time": s.end_time.isoformat() if s.end_time else None,
@@ -100,7 +99,12 @@ async def storage_stats(request: Request) -> JSONResponse:
 
 @router.post("/cleanup")
 async def trigger_cleanup(request: Request) -> JSONResponse:
-    """Trigger manual retention cleanup."""
+    """Trigger manual retention cleanup. Requires admin role."""
+    from argus.dashboard.auth import require_role
+    from argus.dashboard.api_response import api_forbidden
+    if not require_role(request, "admin"):
+        return api_forbidden("需要管理员权限")
+
     retention = getattr(request.app.state, "retention_manager", None)
     if retention is None:
         return api_not_found("Retention manager not enabled")

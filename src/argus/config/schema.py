@@ -1093,6 +1093,12 @@ class ContinuousRecordingConfig(BaseModel):
         description="Hours between retention cleanup scans",
     )
 
+    @model_validator(mode="after")
+    def _validate_archive(self) -> ContinuousRecordingConfig:
+        if self.archive_enabled and self.archive_path is None:
+            raise ValueError("archive_path must be set when archive_enabled=True")
+        return self
+
 
 class ArgusConfig(BaseModel):
     """Top-level configuration for the Argus system."""
