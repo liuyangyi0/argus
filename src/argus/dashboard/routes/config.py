@@ -698,3 +698,61 @@ async def update_audio_alerts(request: Request):
         dashboard_cfg.audio_alerts = new_audio_cfg
 
     return api_success({"audio_alerts": new_audio_cfg.model_dump()})
+
+
+@router.get("/modules")
+async def get_module_states(request: Request):
+    """Return current state of all toggleable modules."""
+    config = request.app.state.config
+    if not config:
+        return api_success({})
+
+    def _safe_get(section: str, field: str) -> bool:
+        obj = getattr(config, section, None)
+        if obj is None:
+            return False
+        return bool(getattr(obj, field, False))
+
+    return api_success({
+        "imaging.enabled": _safe_get("imaging", "enabled"),
+        "imaging.polarization_processing": _safe_get("imaging", "polarization_processing"),
+        "classifier.enabled": _safe_get("classifier", "enabled"),
+        "physics.speed_enabled": _safe_get("physics", "speed_enabled"),
+        "physics.trajectory_enabled": _safe_get("physics", "trajectory_enabled"),
+        "physics.localization_enabled": _safe_get("physics", "localization_enabled"),
+        "physics.triangulation_enabled": _safe_get("physics", "triangulation_enabled"),
+        "continuous_recording.enabled": _safe_get("continuous_recording", "enabled"),
+    })
+
+
+class ModuleToggleRequest(BaseModel):
+    key: str
+    value: bool
+
+
+@router.post("/modules")
+async def update_module_toggle(request: Request, req: ModuleToggleRequest):
+    """Toggle a module on/off at runtime.
+
+    Accepts key paths like 'imaging.enabled', 'physics.speed_enabled',
+    'continuous_recording.enabled', 'classifier.enabled'.
+    """
+    config = request.app.state.config
+    parts = req.key.split(".")
+    if len(parts) != 2:
+        from argus.dashboard.api_response import api_validation_error
+        return api_validation_error(f"Invalid key format: {req.key}")
+
+    section, field = parts
+    section_obj = getattr(config, section, None)
+    if section_obj is None:
+        from argus.dashboard.api_response import api_validation_error
+        return api_validation_error(f"Unknown config section: {section}")
+
+    if not hasattr(section_obj, field):
+        from argus.dashboard.api_response import api_validation_error
+        return api_validation_error(f"Unknown field: {field} in {section}")
+
+    setattr(section_obj, field, req.value)
+    logger.info("config.module_toggled", key=req.key, value=req.value)
+    return api_success({"key": req.key, "value": req.value})

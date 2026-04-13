@@ -225,6 +225,15 @@ def create_app(
     from argus.dashboard.routes.labeling import router as labeling_router
     app.include_router(labeling_router, prefix="/api/labeling", tags=["labeling"])
 
+    from argus.dashboard.routes.recordings import router as recordings_router
+    app.include_router(recordings_router, prefix="/api/recordings", tags=["recordings"])
+
+    from argus.dashboard.routes.calibration import router as calibration_router
+    app.include_router(calibration_router, prefix="/api/calibration", tags=["calibration"])
+
+    from argus.dashboard.routes.physics import router as physics_router
+    app.include_router(physics_router, prefix="/api/physics", tags=["physics"])
+
     try:
         from argus.dashboard.routes.baseline import router as baseline_router
         app.include_router(baseline_router, prefix="/api/baseline", tags=["baseline"])
