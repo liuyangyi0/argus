@@ -44,11 +44,11 @@ const emit = defineEmits<{
 const borderStyle = computed(() => {
   if (props.camera.active_alert) {
     const sev = props.camera.active_alert.severity
-    if (sev === 'high') return { border: '3px solid #ef4444', animation: 'pulse-red 2s ease-in-out infinite' }
-    if (sev === 'medium') return { border: '2px solid #f97316' }
-    return { border: '2px solid #f59e0b' }
+    if (sev === 'high') return { border: '3px solid var(--red)', animation: 'pulse-red 2s ease-in-out infinite' }
+    if (sev === 'medium') return { border: '2px solid var(--amber)' }
+    return { border: '2px solid var(--amber)' }
   }
-  if (props.camera.current_score > 0.5) return { border: '2px solid #f59e0b' }
+  if (props.camera.current_score > 0.5) return { border: '2px solid var(--amber)' }
   return { border: '1px solid var(--line-2)' }
 })
 
@@ -158,7 +158,7 @@ function handleAlertBadgeClick(e: MouseEvent) {
           <BellOutlined
             class="text-xs cursor-pointer"
             :style="{
-              color: camera.active_alert.severity === 'high' ? '#ef4444' : '#f97316',
+              color: camera.active_alert.severity === 'high' ? 'var(--red)' : 'var(--amber)',
             }"
             @click="handleAlertBadgeClick"
           />
@@ -230,14 +230,14 @@ function handleAlertBadgeClick(e: MouseEvent) {
           :data="camera.score_sparkline"
           :width="0"
           :height="22"
-          :color="camera.current_score > 0.7 ? '#ef4444' : '#3b82f6'"
+          :color="camera.current_score > 0.7 ? '#e5484d' : '#2563eb'"
           class="w-full"
         />
       </div>
       <Badge
         v-if="camera.alert_count_today > 0"
         :count="camera.alert_count_today"
-        :number-style="{ backgroundColor: '#ef4444', fontSize: '10px', minWidth: '16px', height: '16px', lineHeight: '16px', padding: '0 4px', boxShadow: 'none' }"
+        :number-style="{ backgroundColor: '#e5484d', fontSize: '10px', minWidth: '16px', height: '16px', lineHeight: '16px', padding: '0 4px', boxShadow: 'none' }"
         class="shrink-0"
       />
       <Typography.Text v-else type="secondary" class="text-[10px] shrink-0">
@@ -249,7 +249,7 @@ function handleAlertBadgeClick(e: MouseEvent) {
 
 <style scoped>
 @keyframes pulse-red {
-  0%, 100% { border-color: #ef4444; }
+  0%, 100% { border-color: var(--red); }
   50% { border-color: #991b1b; }
 }
 </style>

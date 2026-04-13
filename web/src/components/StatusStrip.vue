@@ -37,8 +37,8 @@ const statusLabel = computed(() => {
   return m[systemStatus.value] || '未知'
 })
 const statusColor = computed(() => {
-  const m: Record<string, string> = { healthy: '#22c55e', degraded: '#f59e0b', unhealthy: '#ef4444' }
-  return m[systemStatus.value] || '#6b7280'
+  const m: Record<string, string> = { healthy: '#15a34a', degraded: '#d97706', unhealthy: '#e5484d' }
+  return m[systemStatus.value] || 'var(--ink-4)'
 })
 const uptimeFormatted = computed(() => {
   const s = props.health?.uptime_seconds ?? 0
@@ -53,7 +53,7 @@ const connectedCount = computed(() =>
 const totalCameras = computed(() =>
   props.health?.cameras?.length ?? 0)
 const cameraColor = computed(() =>
-  connectedCount.value === totalCameras.value && totalCameras.value > 0 ? '#22c55e' : '#f59e0b')
+  connectedCount.value === totalCameras.value && totalCameras.value > 0 ? '#15a34a' : '#d97706')
 
 // --- Today's Alerts ---
 const todayAlerts = computed(() =>
@@ -71,10 +71,10 @@ const severityBreakdown = computed(() => {
   return { high, medium, low }
 })
 const alertColor = computed(() => {
-  if (severityBreakdown.value.high > 0) return '#ef4444'
-  if (severityBreakdown.value.medium > 0) return '#f97316'
-  if (todayAlerts.value > 0) return '#f59e0b'
-  return '#22c55e'
+  if (severityBreakdown.value.high > 0) return '#e5484d'
+  if (severityBreakdown.value.medium > 0) return '#d97706'
+  if (todayAlerts.value > 0) return '#d97706'
+  return '#15a34a'
 })
 
 // --- Peak Anomaly ---
@@ -85,9 +85,9 @@ const peakAnomaly = computed(() => {
 })
 const anomalyColor = computed(() => {
   const s = peakAnomaly.value.score
-  if (s >= 0.7) return '#ef4444'
-  if (s >= 0.3) return '#f59e0b'
-  return '#22c55e'
+  if (s >= 0.7) return '#e5484d'
+  if (s >= 0.3) return '#d97706'
+  return '#15a34a'
 })
 
 // --- Avg Latency ---
@@ -97,9 +97,9 @@ const avgLatency = computed(() => {
   return cams.reduce((sum, c) => sum + (c.avg_latency_ms ?? 0), 0) / cams.length
 })
 const latencyColor = computed(() => {
-  if (avgLatency.value > 500) return '#ef4444'
-  if (avgLatency.value > 100) return '#f59e0b'
-  return '#22c55e'
+  if (avgLatency.value > 500) return '#e5484d'
+  if (avgLatency.value > 100) return '#d97706'
+  return '#15a34a'
 })
 
 // --- ECharts: shared gauge factory ---
@@ -226,7 +226,7 @@ const hasActiveAlerts = computed(() =>
             <Tag v-if="severityBreakdown.high" color="red" class="mini-tag">{{ severityBreakdown.high }} 高</Tag>
             <Tag v-if="severityBreakdown.medium" color="orange" class="mini-tag">{{ severityBreakdown.medium }} 中</Tag>
             <Tag v-if="severityBreakdown.low" color="gold" class="mini-tag">{{ severityBreakdown.low }} 低</Tag>
-            <span v-if="!severityBreakdown.high && !severityBreakdown.medium && !severityBreakdown.low" class="card-sub" style="color: #4a5568">无活跃告警</span>
+            <span v-if="!severityBreakdown.high && !severityBreakdown.medium && !severityBreakdown.low" class="card-sub" style="color: var(--ink-4)">无活跃告警</span>
           </div>
         </div>
       </Tooltip>
@@ -310,7 +310,7 @@ const hasActiveAlerts = computed(() =>
 
 .status-card:hover {
   border-color: var(--line-2);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--sh-2);
   transform: translateY(-1px);
 }
 
@@ -340,7 +340,7 @@ const hasActiveAlerts = computed(() =>
 
 .card-label {
   font-size: 11px;
-  color: #6b7280;
+  color: var(--ink-4);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   font-weight: 500;
@@ -348,7 +348,7 @@ const hasActiveAlerts = computed(() =>
 
 .uptime-badge {
   font-size: 10px;
-  color: #4a5568;
+  color: var(--ink-4);
   background: rgba(10, 10, 15, 0.05);
   padding: 1px 6px;
   border-radius: 3px;
@@ -373,7 +373,7 @@ const hasActiveAlerts = computed(() =>
 
 .card-unit {
   font-size: 12px;
-  color: #6b7280;
+  color: var(--ink-4);
   font-weight: 400;
 }
 
@@ -404,7 +404,7 @@ const hasActiveAlerts = computed(() =>
 
 .card-sub {
   font-size: 11px;
-  color: #6b7280;
+  color: var(--ink-4);
 }
 
 .severity-tags {
@@ -473,15 +473,4 @@ const hasActiveAlerts = computed(() =>
   }
 }
 
-/* ── Light theme overrides ── */
-:global(.light-theme) .status-card {
-  background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-  border-color: #e5e7eb;
-}
-:global(.light-theme) .status-card .card-label {
-  color: #6b7280;
-}
-:global(.light-theme) .status-card .card-value {
-  color: #111827;
-}
 </style>

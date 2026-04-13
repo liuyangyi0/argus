@@ -6,8 +6,6 @@ import type {
 } from '../types/api'
 
 // ── Models ──
-export const getModels = () => api.get('/baseline/models/json').then(u)
-export const deployModel = (data: Record<string, any>) => api.post('/baseline/deploy', data).then(u)
 export const getModelRegistry = (cameraId?: string): Promise<ModelRegistryResponse> =>
   api.get('/models/json', { params: cameraId ? { camera_id: cameraId } : {} }).then(u)
 export const activateModel = (versionId: string) =>
@@ -15,8 +13,6 @@ export const activateModel = (versionId: string) =>
 export const rollbackModel = (versionId: string) =>
   api.post(`/models/${versionId}/rollback`).then(u)
 export const deleteModel = (versionId: string) => api.delete(`/models/${versionId}`).then(u)
-export const deleteModelByPath = (modelPath: string) =>
-  api.delete('/baseline/models/by-path', { data: { model_path: modelPath } }).then(u)
 export const reexportModel = (versionId: string, data: { export_format?: string; quantization?: string }) =>
   api.post(`/models/${versionId}/reexport`, data, { timeout: 300000 }).then(u)
 export const recalibrateModel = (versionId: string) =>

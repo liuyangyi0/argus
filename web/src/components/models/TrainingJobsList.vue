@@ -204,7 +204,7 @@ defineExpose({ loadJobs })
           </template>
           <template v-else-if="column.key === 'duration_seconds'">
             <template v-if="record.status === 'running'">
-              <span style="color: #1890ff">{{ formatElapsed(record as TrainingJobInfo) }}</span>
+              <span style="color: #2563eb">{{ formatElapsed(record as TrainingJobInfo) }}</span>
             </template>
             <template v-else>
               {{ record.duration_seconds != null ? record.duration_seconds.toFixed(1) : '-' }}
@@ -272,7 +272,7 @@ defineExpose({ loadJobs })
             {{ detailJob.duration_seconds != null ? `${detailJob.duration_seconds.toFixed(1)}s` : '-' }}
           </Descriptions.Item>
           <Descriptions.Item v-if="detailJob.error" label="错误">
-            <span style="color: #ff4d4f">{{ detailJob.error }}</span>
+            <span style="color: #e5484d">{{ detailJob.error }}</span>
           </Descriptions.Item>
         </Descriptions>
 

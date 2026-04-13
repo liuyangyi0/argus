@@ -41,7 +41,7 @@ onMounted(loadAllModels)
       <Statistic title="模型总数" :value="totalModels" />
     </Card>
     <Card size="small" style="flex: 1; text-align: center">
-      <Statistic title="活跃模型" :value="activeModels" :value-style="{ color: '#52c41a' }" />
+      <Statistic title="活跃模型" :value="activeModels" :value-style="{ color: '#15a34a' }" />
     </Card>
     <Card size="small" style="flex: 1; text-align: center">
       <Statistic title="流水线中" :value="pipelineModels" :value-style="{ color: '#3b82f6' }" />

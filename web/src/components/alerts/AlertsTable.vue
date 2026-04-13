@@ -206,8 +206,8 @@ async function handleBulkDelete() {
   justify-content: space-between;
   align-items: center;
   padding: 12px 16px;
-  background: rgba(0, 0, 0, 0.2);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  background: var(--glass-strong);
+  border-bottom: 0.5px solid var(--line-2);
   flex-shrink: 0;
 }
 .select-all-wrap {
@@ -217,7 +217,7 @@ async function handleBulkDelete() {
 }
 .selection-count {
   font-size: 13px;
-  color: #fff;
+  color: var(--ink-3);
   font-weight: 500;
 }
 .custom-checkbox {
@@ -225,15 +225,15 @@ async function handleBulkDelete() {
   width: 16px;
   height: 16px;
   border-radius: 4px;
-  border: 1px solid rgba(255,255,255,0.3);
-  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--line-3);
+  background: #fff;
   cursor: pointer;
   position: relative;
   transition: all 0.2s;
 }
 .custom-checkbox:checked {
-  background: #1890ff;
-  border-color: #1890ff;
+  background: var(--accent);
+  border-color: var(--accent);
 }
 .custom-checkbox:checked::after {
   content: '';
@@ -247,8 +247,8 @@ async function handleBulkDelete() {
   transform: rotate(45deg);
 }
 .custom-checkbox:indeterminate {
-  background: #1890ff;
-  border-color: #1890ff;
+  background: var(--accent);
+  border-color: var(--accent);
 }
 .custom-checkbox:indeterminate::after {
   content: '';
@@ -265,9 +265,9 @@ async function handleBulkDelete() {
   gap: 8px;
 }
 .bulk-btn {
-  background: rgba(255,255,255,0.1);
-  border: none;
-  color: rgba(255,255,255,0.8);
+  background: rgba(10, 10, 15, 0.04);
+  border: 0.5px solid var(--line-2);
+  color: var(--ink-4);
   width: 32px;
   height: 32px;
   border-radius: 6px;
@@ -277,17 +277,17 @@ async function handleBulkDelete() {
   cursor: pointer;
   transition: all 0.2s;
 }
-.bulk-btn:hover { background: rgba(255,255,255,0.2); color: #fff; }
-.bulk-btn.ack:hover { background: rgba(16, 185, 129, 0.3); color: #10b981; }
-.bulk-btn.del:hover { background: rgba(239, 68, 68, 0.3); color: #ef4444; }
-.bulk-btn.fp:hover { background: rgba(245, 158, 11, 0.3); color: #fbbf24; }
+.bulk-btn:hover { background: rgba(10, 10, 15, 0.08); color: var(--ink-2); }
+.bulk-btn.ack:hover { background: rgba(21, 163, 74, 0.1); color: var(--green); }
+.bulk-btn.del:hover { background: rgba(229, 72, 77, 0.1); color: var(--red); }
+.bulk-btn.fp:hover { background: rgba(217, 119, 6, 0.1); color: var(--amber); }
 
 .empty-inbox {
   flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: rgba(255,255,255,0.3);
+  color: var(--ink-5);
   font-size: 14px;
   letter-spacing: 0.1em;
 }
@@ -305,28 +305,29 @@ async function handleBulkDelete() {
   display: flex;
   gap: 14px;
   padding: 14px;
-  background: rgba(255, 255, 255, 0.02);
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: var(--glass);
+  border-radius: var(--r-sm);
+  border: 0.5px solid var(--line);
   cursor: pointer;
-  transition: all 0.3s ease;
+  transition: all 0.2s ease;
   position: relative;
   align-items: center;
 }
 .inbox-item:hover {
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(255, 255, 255, 0.15);
+  background: var(--glass-strong);
+  border-color: var(--line-2);
+  box-shadow: var(--sh-1);
 }
 .inbox-item.active {
-  background: rgba(24, 144, 255, 0.1);
-  border-color: rgba(24, 144, 255, 0.4);
-  box-shadow: 0 0 0 1px rgba(24, 144, 255, 0.2);
+  background: #fff;
+  border-color: var(--line-3);
+  box-shadow: var(--sh-2);
 }
 .item-new {
-  border-left: 3px solid rgba(239, 68, 68, 0.8);
+  border-left: 3px solid var(--red);
 }
 .item-new:not(.active) {
-  background: linear-gradient(90deg, rgba(239, 68, 68, 0.05) 0%, rgba(255,255,255,0.02) 100%);
+  background: linear-gradient(90deg, rgba(229, 72, 77, 0.04) 0%, var(--glass) 100%);
 }
 
 .item-checkbox {
@@ -339,9 +340,9 @@ async function handleBulkDelete() {
   position: relative;
   width: 96px;
   height: 72px;
-  border-radius: 6px;
+  border-radius: var(--r-xs);
   overflow: hidden;
-  background: rgba(0,0,0,0.4);
+  background: rgba(10, 10, 15, 0.06);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -351,30 +352,30 @@ async function handleBulkDelete() {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  opacity: 0.9;
+  opacity: 0.95;
 }
 .inbox-item:hover .item-snapshot img { opacity: 1; }
 .no-img {
   font-size: 12px;
-  color: rgba(255,255,255,0.3);
+  color: var(--ink-5);
 }
 
 .group-badge {
   position: absolute;
   top: 4px;
   right: 4px;
-  background: rgba(0,0,0,0.65);
+  background: rgba(10, 10, 15, 0.7);
   backdrop-filter: blur(4px);
   color: #fff;
   font-size: 11px;
   font-weight: 600;
   padding: 2px 6px;
   border-radius: 12px;
-  border: 1px solid rgba(255,255,255,0.2);
+  border: 1px solid rgba(255, 255, 255, 0.2);
   cursor: pointer;
   pointer-events: auto;
 }
-.group-badge:hover { background: rgba(0,0,0,0.8); border-color: rgba(255,255,255,0.5); }
+.group-badge:hover { background: rgba(10, 10, 15, 0.85); }
 
 .item-meta {
   flex: 1;
@@ -400,24 +401,24 @@ async function handleBulkDelete() {
   height: 8px;
   border-radius: 50%;
 }
-.severity-dot.sev-high { background: #ef4444; box-shadow: 0 0 8px rgba(239,68,68,0.6); }
-.severity-dot.sev-medium { background: #f59e0b; }
-.severity-dot.sev-low { background: #3b82f6; }
-.severity-dot.sev-info { background: #6b7280; }
+.severity-dot.sev-high { background: var(--red); box-shadow: 0 0 6px rgba(229, 72, 77, 0.4); }
+.severity-dot.sev-medium { background: var(--amber); }
+.severity-dot.sev-low { background: var(--blue); }
+.severity-dot.sev-info { background: var(--ink-5); }
 .severity-text {
   font-size: 11px;
-  color: rgba(255,255,255,0.6);
+  color: var(--ink-4);
   font-weight: 500;
 }
 .time {
   font-size: 11px;
-  color: rgba(255,255,255,0.4);
+  color: var(--ink-5);
   font-family: 'JetBrains Mono', monospace;
 }
 
 .title {
   font-size: 14px;
-  color: rgba(255,255,255,0.9);
+  color: var(--ink-2);
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
@@ -425,7 +426,7 @@ async function handleBulkDelete() {
 }
 .subtitle {
   font-size: 12px;
-  color: rgba(255,255,255,0.5);
+  color: var(--ink-4);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -447,22 +448,22 @@ async function handleBulkDelete() {
 }
 .status-badge {
   font-size: 11px;
-  color: rgba(255,255,255,0.5);
+  color: var(--ink-4);
   padding: 2px 6px;
-  background: rgba(255,255,255,0.05);
+  background: rgba(10, 10, 15, 0.04);
   border-radius: 4px;
 }
-.status-badge.new { color: #fff; background: rgba(59, 130, 246, 0.4); }
-.status-badge.acknowledged { color: #10b981; background: rgba(16, 185, 129, 0.1); }
-.status-badge.false_positive { color: #f59e0b; background: rgba(245, 158, 11, 0.1); }
+.status-badge.new { color: var(--blue); background: rgba(37, 99, 235, 0.08); }
+.status-badge.acknowledged { color: var(--green); background: rgba(21, 163, 74, 0.08); }
+.status-badge.false_positive { color: var(--amber); background: rgba(217, 119, 6, 0.08); }
 
 .popover-list { width: 240px; }
-.popover-list-item { 
-  display: flex; 
-  justify-content: space-between; 
-  padding: 6px 4px; 
-  cursor: pointer; 
+.popover-list-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 4px;
+  cursor: pointer;
 }
-.popover-list-item:hover { background: rgba(0,0,0,0.05); }
+.popover-list-item:hover { background: rgba(10, 10, 15, 0.04); }
 .g-time { font-size: 12px; font-family: monospace; color: var(--ink-2); }
 </style>

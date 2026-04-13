@@ -246,10 +246,10 @@ const scoreChartOption = computed(() => {
         type: 'line',
         smooth: true,
         symbol: 'none',
-        lineStyle: { width: 2, color: '#52c41a' },
+        lineStyle: { width: 2, color: '#15a34a' },
         areaStyle: {
           color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: '#52c41a30' }, { offset: 1, color: '#52c41a05' }] },
+            colorStops: [{ offset: 0, color: '#15a34a30' }, { offset: 1, color: '#15a34a05' }] },
         },
         data: data.map((d: any) => d.production),
         markLine: {
@@ -263,10 +263,10 @@ const scoreChartOption = computed(() => {
         type: 'line',
         smooth: true,
         symbol: 'none',
-        lineStyle: { width: 2, color: '#1890ff' },
+        lineStyle: { width: 2, color: '#2563eb' },
         areaStyle: {
           color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: '#1890ff30' }, { offset: 1, color: '#1890ff05' }] },
+            colorStops: [{ offset: 0, color: '#2563eb30' }, { offset: 1, color: '#2563eb05' }] },
         },
         data: data.map((d: any) => d.shadow),
       },
@@ -317,13 +317,13 @@ const distChartOption = computed(() => {
         name: '生产模型',
         type: 'bar',
         barGap: '10%',
-        itemStyle: { color: '#52c41a', borderRadius: [2, 2, 0, 0] },
+        itemStyle: { color: '#15a34a', borderRadius: [2, 2, 0, 0] },
         data: dist.production_counts,
       },
       {
         name: '影子模型',
         type: 'bar',
-        itemStyle: { color: '#1890ff', borderRadius: [2, 2, 0, 0] },
+        itemStyle: { color: '#2563eb', borderRadius: [2, 2, 0, 0] },
         data: dist.shadow_counts,
       },
     ],
@@ -334,7 +334,7 @@ const distChartOption = computed(() => {
 
 // ── Computed helpers ──
 const fpDelta = computed(() => shadowReport.value?.false_positive_delta ?? 0)
-const fpDeltaColor = computed(() => fpDelta.value > 0 ? '#ff4d4f' : fpDelta.value < 0 ? '#52c41a' : '#8890a0')
+const fpDeltaColor = computed(() => fpDelta.value > 0 ? '#e5484d' : fpDelta.value < 0 ? '#15a34a' : '#8890a0')
 </script>
 
 <template>
@@ -421,7 +421,7 @@ const fpDeltaColor = computed(() => fpDelta.value > 0 ? '#ff4d4f' : fpDelta.valu
             <Statistic
               title="生产告警率"
               :value="shadowReport ? (shadowReport.production_alert_rate * 100).toFixed(1) + '%' : '-'"
-              :value-style="{ color: '#52c41a' }"
+              :value-style="{ color: '#15a34a' }"
               :loading="loadingReport"
             />
           </Card>
@@ -431,7 +431,7 @@ const fpDeltaColor = computed(() => fpDelta.value > 0 ? '#ff4d4f' : fpDelta.valu
             <Statistic
               title="影子告警率"
               :value="shadowReport ? (shadowReport.shadow_alert_rate * 100).toFixed(1) + '%' : '-'"
-              :value-style="{ color: '#1890ff' }"
+              :value-style="{ color: '#2563eb' }"
               :loading="loadingReport"
             />
           </Card>
@@ -657,7 +657,7 @@ const fpDeltaColor = computed(() => fpDelta.value > 0 ? '#ff4d4f' : fpDelta.valu
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #ff4d4f;
+  color: #e5484d;
   font-size: 13px;
   background: rgba(0, 0, 0, 0.6);
 }

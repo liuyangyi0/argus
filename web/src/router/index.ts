@@ -34,6 +34,12 @@ const router = createRouter({
           meta: { title: '告警' },
         },
         {
+          path: 'reports',
+          name: 'reports',
+          component: () => import('../views/Reports.vue'),
+          meta: { title: '报表' },
+        },
+        {
           path: 'models',
           name: 'models',
           component: () => import('../views/Models.vue'),

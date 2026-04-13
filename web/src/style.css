@@ -44,14 +44,24 @@
     height: 100%;
   }
 
-  body, button, input, textarea, select,
-  .ant-typography, .ant-table, .ant-btn, .ant-tag, .ant-tooltip-inner, .ant-popover-inner, .ant-list, .ant-menu, .ant-modal, .ant-drawer {
+  body {
     font-family: 'Inter', 'SF Pro Display', 'PingFang SC', -apple-system, sans-serif;
     color: var(--ink-2);
     background: var(--bg);
     overflow: hidden;
     letter-spacing: -0.011em;
     font-feature-settings: "cv11", "ss01", "cv02";
+  }
+
+  button, input, textarea, select {
+    font-family: inherit;
+    color: inherit;
+    letter-spacing: inherit;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--blue);
+    outline-offset: 2px;
   }
 
   body::before {

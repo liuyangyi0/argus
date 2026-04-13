@@ -18,7 +18,7 @@ const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFa
 
 // Global keyboard shortcuts
 const shortcutHelpVisible = ref(false)
-const navKeys: Record<string, string> = { '1': '/overview', '2': '/cameras', '3': '/alerts', '4': '/models', '5': '/system' }
+const navKeys: Record<string, string> = { '1': '/overview', '2': '/cameras', '3': '/alerts', '4': '/reports', '5': '/models', '6': '/system' }
 
 function handleKeyDown(e: KeyboardEvent) {
   // Ignore when typing in inputs
@@ -57,6 +57,9 @@ onUnmounted(() => {
           </router-link>
           <router-link to="/alerts" :class="{ active: isActive('/alerts') }">
             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>告警中心
+          </router-link>
+          <router-link to="/reports" :class="{ active: isActive('/reports') }">
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 16l4-8 4 4 4-6"/></svg>报表
           </router-link>
           <div class="nav-label">系统</div>
           <router-link to="/models" :class="{ active: isActive('/models') }">

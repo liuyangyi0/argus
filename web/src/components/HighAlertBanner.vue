@@ -15,11 +15,11 @@ const router = useRouter()
   <div class="high-alert-banner">
     <div class="high-alert-inner">
       <div class="high-alert-pulse" />
-      <BellOutlined style="color: #ef4444; font-size: 16px" />
-      <Typography.Text strong style="color: #dc2626; font-size: 13px">
+      <BellOutlined style="color: #e5484d; font-size: 16px" />
+      <Typography.Text strong style="color: #e5484d; font-size: 13px">
         {{ cameras.length }} 个高级告警需要立即处理
       </Typography.Text>
-      <Typography.Text type="secondary" class="alert-camera-list" style="font-size: 12px; color: #ef4444aa">
+      <Typography.Text type="secondary" class="alert-camera-list" style="font-size: 12px; color: #e5484daa">
         {{ cameras.map(c => c.name || c.camera_id).join(', ') }}
       </Typography.Text>
       <Button
