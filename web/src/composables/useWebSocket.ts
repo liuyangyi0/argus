@@ -44,7 +44,9 @@ let subscriberIdCounter = 0
 const subscribers = new Map<number, Subscriber>()
 let retryCount = 0
 let retryTimer: ReturnType<typeof setTimeout> | null = null
-const MAX_RETRIES = 3
+import { DEFAULT_WS_RETRY_MAX, DEFAULT_WS_FALLBACK_INTERVAL_MS } from '../config/constants'
+
+const MAX_RETRIES = DEFAULT_WS_RETRY_MAX
 const globalConnected = ref(false)
 const globalReconnecting = ref(false)
 const globalRetryCount = ref(0)
@@ -202,7 +204,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     topics,
     onMessage,
     fallbackPoll,
-    fallbackInterval = 15000,
+    fallbackInterval = DEFAULT_WS_FALLBACK_INTERVAL_MS,
   } = options
 
   const connected = globalConnected

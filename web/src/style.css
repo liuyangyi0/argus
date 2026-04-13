@@ -1,95 +1,132 @@
-/* Argus global styles — minimal, Ant Design handles components */
-body {
-  margin: 0;
-  background: #141414;
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+  
+  :root {
+    --bg: #f6f6f8;
+    --ink: #0a0a0c;
+    --ink-2: #18181c;
+    --ink-3: #3a3a42;
+    --ink-4: #65656e;
+    --ink-5: #95959f;
+    --ink-6: #c4c4cc;
+    --line: rgba(10, 10, 15, .055);
+    --line-2: rgba(10, 10, 15, .09);
+    --line-3: rgba(10, 10, 15, .14);
+    --glass: rgba(255, 255, 255, .66);
+    --glass-strong: rgba(255, 255, 255, .82);
+
+    --accent: #0a0a0c;
+    --blue: #2563eb;
+    --red: #e5484d;
+    --amber: #d97706;
+    --green: #15a34a;
+
+    --r-lg: 22px;
+    --r: 14px;
+    --r-sm: 10px;
+    --r-xs: 7px;
+
+    --sh-1: 0 1px 2px rgba(10, 10, 15, .04);
+    --sh-2: 0 1px 2px rgba(10, 10, 15, .04), 0 6px 16px -6px rgba(10, 10, 15, .08), 0 16px 36px -12px rgba(10, 10, 15, .08);
+    --sh-3: 0 1px 2px rgba(10, 10, 15, .04), 0 10px 24px -8px rgba(10, 10, 15, .10), 0 24px 56px -16px rgba(10, 10, 15, .12);
+  }
+
+  html, body {
+    height: 100%;
+  }
+
+  body, button, input, textarea, select,
+  .ant-typography, .ant-table, .ant-btn, .ant-tag, .ant-tooltip-inner, .ant-popover-inner, .ant-list, .ant-menu, .ant-modal, .ant-drawer {
+    font-family: 'Inter', 'SF Pro Display', 'PingFang SC', -apple-system, sans-serif;
+    color: var(--ink-2);
+    background: var(--bg);
+    overflow: hidden;
+    letter-spacing: -0.011em;
+    font-feature-settings: "cv11", "ss01", "cv02";
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: -15%;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(60% 50% at 8% 5%, rgba(180, 200, 240, .30), transparent 70%),
+      radial-gradient(50% 45% at 92% 8%, rgba(255, 220, 210, .22), transparent 70%),
+      radial-gradient(55% 50% at 88% 95%, rgba(220, 210, 240, .24), transparent 70%);
+  }
+
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    opacity: .5;
+    background-image: radial-gradient(rgba(10, 10, 15, .018) 1px, transparent 1px);
+    background-size: 20px 20px;
+    mask-image: radial-gradient(ellipse at center, #000 25%, transparent 80%);
+  }
 }
 
-#app {
-  min-height: 100vh;
+@layer components {
+  .mono {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+  }
+
+  .app {
+    display: flex;
+    height: 100vh;
+    position: relative;
+    z-index: 1;
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .glass {
+    background: var(--glass);
+    backdrop-filter: blur(48px) saturate(180%);
+    -webkit-backdrop-filter: blur(48px) saturate(180%);
+    border: 0.5px solid rgba(255, 255, 255, .65);
+    border-radius: var(--r-lg);
+    box-shadow:
+      var(--sh-2),
+      inset 0 1px 0 rgba(255, 255, 255, .95),
+      inset 0 -0.5px 0 rgba(10, 10, 15, .04),
+      inset 0.5px 0 0 rgba(255, 255, 255, .4);
+  }
+
+  @keyframes breathe {
+    50% {
+      box-shadow: 0 0 0 6px rgba(21, 163, 74, .04);
+    }
+  }
 }
 
-/* Scrollbar styling for dark theme */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #555; }
-
-/* ── CSS Variables for theme-aware components ── */
-:root, .dark-theme {
-  /* Spacing scale (4px grid) */
-  --argus-space-xs: 4px;
-  --argus-space-sm: 8px;
-  --argus-space-md: 12px;
-  --argus-space-lg: 16px;
-  --argus-space-xl: 24px;
-  /* Type scale */
-  --argus-font-caption: 11px;
-  --argus-font-small: 12px;
-  --argus-font-body: 13px;
-  --argus-font-subheading: 15px;
-  --argus-font-heading: 18px;
-  /* Colors */
-  --argus-card-bg: linear-gradient(135deg, #1a1a2e 0%, #16162a 100%);
-  --argus-card-bg-solid: #1a1a2e;
-  --argus-border: #2d2d4a;
-  --argus-text: #e2e8f0;
-  --argus-text-muted: #6b7280;
-  --argus-surface: #12121e;
-  --argus-header-bg: #141414;
-  --argus-footer-bg: #0f0f1a;
-  --argus-hover-bg: #1e1e36;
-  --argus-sidebar-border: #1f2937;
-  --argus-icon-muted: #2d2d4a;
-  --argus-font-mono: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
 }
-.light-theme {
-  --argus-card-bg: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-  --argus-card-bg-solid: #ffffff;
-  --argus-border: #e5e7eb;
-  --argus-text: #111827;
-  --argus-text-muted: #6b7280;
-  --argus-surface: #f1f5f9;
-  --argus-header-bg: #f1f5f9;
-  --argus-footer-bg: #f8fafc;
-  --argus-hover-bg: #e2e8f0;
-  --argus-sidebar-border: #e5e7eb;
-  --argus-icon-muted: #d1d5db;
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
 }
 
-/* ── Light theme overrides ── */
-.light-theme body,
-.light-theme #app { background: #f1f5f9; }
-.light-theme ::-webkit-scrollbar-thumb { background: #cbd5e1; }
-.light-theme ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
-
-/* ── Keyboard shortcut styling ── */
-kbd {
-  display: inline-block;
-  padding: 2px 8px;
-  font-size: 12px;
-  font-family: var(--argus-font-mono);
-  background: var(--argus-surface);
-  border: 1px solid var(--argus-border);
-  border-radius: 4px;
-  text-align: center;
-}
-
-/* ── Mobile responsive globals ── */
-@media (max-width: 768px) {
-  /* Ant Design tables: horizontal scroll */
-  .ant-table-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  .ant-table { min-width: 600px; }
-
-  /* Touch-friendly buttons */
-  .ant-btn { min-height: 36px; }
-
-  /* Sidebar overlay on mobile */
-  .ant-layout-sider-collapsed { position: absolute !important; z-index: 100; }
-
-  /* Cards: full width */
-  .ant-card { margin-bottom: 8px; }
-}
-
-@media (max-width: 480px) {
-  .ant-layout-content { padding: 8px !important; }
-}

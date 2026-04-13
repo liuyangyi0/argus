@@ -18,7 +18,14 @@ export interface CameraTileData {
   current_score: number
   score_sparkline: number[]
   alert_count_today: number
-  active_alert: { alert_id: string; severity: string } | null
+  active_alert: {
+    alert_id: string;
+    severity: string;
+    anomaly_score?: number;
+    timestamp?: number;
+    created_at?: number;
+    description?: string;
+  } | null
   degradation: string | null
   frames_dropped?: number
   backpressured?: boolean
@@ -42,7 +49,7 @@ const borderStyle = computed(() => {
     return { border: '2px solid #f59e0b' }
   }
   if (props.camera.current_score > 0.5) return { border: '2px solid #f59e0b' }
-  return { border: '1px solid var(--argus-border)' }
+  return { border: '1px solid var(--line-2)' }
 })
 
 // go2rtc WebRTC/MSE player
@@ -120,36 +127,36 @@ function handleAlertBadgeClick(e: MouseEvent) {
 <template>
   <div
     ref="tileRef"
-    class="tile-root"
+    class="rounded-md overflow-hidden bg-bg flex flex-col h-full"
     :style="borderStyle"
     @dblclick="emit('dblclick', camera.camera_id)"
   >
     <!-- Header: 20px status bar -->
-    <div class="tile-header">
-      <Typography.Text strong class="tile-name">
+    <div class="flex items-center gap-1.5 px-2.5 py-0.5 bg-transparent shrink-0 min-h-[20px]">
+      <Typography.Text strong class="text-xs flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
         {{ camera.name || camera.camera_id }}
       </Typography.Text>
-      <Typography.Text v-if="camera.model_version" type="secondary" class="tile-model-version">
+      <Typography.Text v-if="camera.model_version" type="secondary" class="text-[9px] shrink-0">
         {{ camera.model_version.slice(0, 8) }}
       </Typography.Text>
       <!-- Status icons cluster -->
-      <div class="tile-status-icons">
+      <div class="flex items-center gap-1 shrink-0">
         <!-- Online/offline -->
         <Tooltip :title="camera.status === 'online' ? '在线' : '离线'">
           <CheckCircleOutlined
             v-if="camera.status === 'online'"
-            class="icon-online"
+            class="text-xs text-green-500"
           />
-          <span v-else class="icon-offline" />
+          <span v-else class="inline-block w-2 h-2 rounded-full bg-slate-500" />
         </Tooltip>
         <!-- Degradation warning -->
         <Tooltip v-if="camera.degradation" :title="`降级: ${camera.degradation}`">
-          <WarningOutlined class="icon-degradation" />
+          <WarningOutlined class="text-xs text-amber-500" />
         </Tooltip>
         <!-- Active alert -->
         <Tooltip v-if="camera.active_alert" :title="`活跃告警 (${camera.active_alert.severity})`">
           <BellOutlined
-            class="icon-alert"
+            class="text-xs cursor-pointer"
             :style="{
               color: camera.active_alert.severity === 'high' ? '#ef4444' : '#f97316',
             }"
@@ -160,7 +167,7 @@ function handleAlertBadgeClick(e: MouseEvent) {
     </div>
 
     <!-- Video stream -->
-    <div class="tile-video">
+    <div class="flex-1 min-h-0 relative bg-black">
       <!-- WebRTC / MSE via go2rtc -->
       <video
         ref="videoRef"
@@ -168,72 +175,72 @@ function handleAlertBadgeClick(e: MouseEvent) {
         muted
         playsinline
         v-show="camera.status === 'online' && (streamStatus === 'playing' || streamStatus === 'connecting')"
-        class="tile-stream"
+        class="w-full h-full object-cover block"
       />
       <!-- MJPEG fallback -->
       <img
         ref="mjpegRef"
         v-if="camera.status === 'online' && streamStatus === 'fallback'"
         :src="mjpegUrl"
-        class="tile-stream"
+        class="w-full h-full object-cover block"
         :alt="camera.camera_id"
       />
       <!-- Offline state -->
       <div
         v-if="camera.status !== 'online'"
-        class="tile-offline"
+        class="w-full h-full flex items-center justify-center text-slate-600 text-[13px]"
       >
         {{ camera.degradation === 'rtsp_broken' ? '重连中...' : '离线' }}
       </div>
       <!-- Connecting indicator -->
       <div
         v-if="camera.status === 'online' && streamStatus === 'connecting'"
-        class="tile-connecting"
+        class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-500 text-xs"
       >
         连接中...
       </div>
       <!-- Error state: stream failed -->
       <div
         v-if="camera.status === 'online' && streamStatus === 'error'"
-        class="tile-error"
+        class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-center text-red-500 text-xs cursor-pointer"
         @click.stop="start()"
       >
-        <div class="tile-error__title">连接失败</div>
-        <div class="tile-error__hint">点击重试</div>
+        <div class="mb-1">连接失败</div>
+        <div class="text-[11px] text-slate-500">点击重试</div>
       </div>
       <!-- FPS label overlay -->
       <div
         v-if="camera.status === 'online'"
-        class="fps-overlay"
+        class="absolute top-1 right-1 bg-black/60 px-1.5 py-px rounded-[3px] text-[10px] text-gray-400 pointer-events-none"
       >
         {{ camera.fps || '--' }} FPS
       </div>
       <!-- Backpressure warning badge -->
       <Tooltip v-if="camera.frames_dropped && camera.frames_dropped > 0" :title="`丢帧: ${camera.frames_dropped}`">
-        <div class="backpressure-badge" :class="{ 'backpressure-badge--active': camera.backpressured }">
+        <div class="absolute top-1 left-1 px-1.5 py-px rounded-[3px] text-[10px] text-white pointer-events-none" :class="camera.backpressured ? 'bg-red-500/90 animate-[pulse-red_2s_ease-in-out_infinite]' : 'bg-amber-500/85'">
           {{ camera.frames_dropped }}
         </div>
       </Tooltip>
     </div>
 
     <!-- Footer: 28px status bar -->
-    <div class="tile-footer">
-      <div class="tile-sparkline-wrap">
+    <div class="flex items-center gap-2 px-2.5 py-1 bg-transparent shrink-0 min-h-[28px]">
+      <div class="flex-1 min-w-0">
         <Sparkline
           :data="camera.score_sparkline"
           :width="0"
           :height="22"
           :color="camera.current_score > 0.7 ? '#ef4444' : '#3b82f6'"
-          class="tile-sparkline"
+          class="w-full"
         />
       </div>
       <Badge
         v-if="camera.alert_count_today > 0"
         :count="camera.alert_count_today"
         :number-style="{ backgroundColor: '#ef4444', fontSize: '10px', minWidth: '16px', height: '16px', lineHeight: '16px', padding: '0 4px', boxShadow: 'none' }"
-        class="tile-alert-badge"
+        class="shrink-0"
       />
-      <Typography.Text v-else type="secondary" class="tile-alert-zero">
+      <Typography.Text v-else type="secondary" class="text-[10px] shrink-0">
         0
       </Typography.Text>
     </div>
@@ -244,182 +251,5 @@ function handleAlertBadgeClick(e: MouseEvent) {
 @keyframes pulse-red {
   0%, 100% { border-color: #ef4444; }
   50% { border-color: #991b1b; }
-}
-
-/* ── Tile root ── */
-.tile-root {
-  border-radius: 6px;
-  overflow: hidden;
-  background: var(--argus-card-bg-solid);
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-
-/* ── Header (20px status bar) ── */
-.tile-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 10px;
-  background: var(--argus-header-bg);
-  flex-shrink: 0;
-  min-height: 20px;
-}
-
-.tile-name {
-  font-size: 12px;
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tile-model-version {
-  font-size: 9px;
-  flex-shrink: 0;
-}
-
-.tile-status-icons {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-}
-
-.icon-online {
-  font-size: 12px;
-  color: #22c55e;
-}
-
-.icon-offline {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #6b7280;
-}
-
-.icon-degradation {
-  font-size: 12px;
-  color: #f59e0b;
-}
-
-.icon-alert {
-  font-size: 12px;
-  cursor: pointer;
-}
-
-/* ── Video area ── */
-.tile-video {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-  background: #000;
-}
-
-.tile-stream {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.tile-offline {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #4a5568;
-  font-size: 13px;
-}
-
-.tile-connecting {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  color: #64748b;
-  font-size: 12px;
-}
-
-.tile-error {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  text-align: center;
-  color: #ef4444;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.tile-error__title {
-  margin-bottom: 4px;
-}
-
-.tile-error__hint {
-  color: #64748b;
-  font-size: 11px;
-}
-
-.fps-overlay {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  background: rgba(0, 0, 0, 0.6);
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 10px;
-  color: #9ca3af;
-  pointer-events: none;
-}
-
-/* ── Footer (28px status bar) ── */
-.tile-footer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px;
-  background: var(--argus-footer-bg);
-  flex-shrink: 0;
-  min-height: 28px;
-}
-
-.tile-sparkline-wrap {
-  flex: 1;
-  min-width: 0;
-}
-
-.tile-sparkline {
-  width: 100%;
-}
-
-.tile-alert-badge {
-  flex-shrink: 0;
-}
-
-.tile-alert-zero {
-  font-size: 10px;
-  flex-shrink: 0;
-}
-
-/* ── Backpressure badge ── */
-.backpressure-badge {
-  position: absolute;
-  top: 4px;
-  left: 4px;
-  background: rgba(245, 158, 11, 0.85);
-  color: #fff;
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 3px;
-  pointer-events: none;
-}
-
-.backpressure-badge--active {
-  background: rgba(239, 68, 68, 0.9);
-  animation: pulse-red 2s ease-in-out infinite;
 }
 </style>
