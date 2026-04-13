@@ -105,7 +105,13 @@ class RetentionManager:
             "archived": 0,
             "archive_deleted": 0,
             "alert_deleted": 0,
+            "emergency_deleted": 0,
         }
+
+        # Emergency disk cleanup: if free space < 1 GB, aggressively delete oldest
+        emergency = self._emergency_cleanup_if_needed()
+        stats["emergency_deleted"] = emergency
+
         stats["local_deleted"] = self._cleanup_local()
         if self._archive_enabled:
             stats["archived"] = self._archive_recordings()
@@ -114,10 +120,79 @@ class RetentionManager:
         logger.info("retention.cleanup_complete", **stats)
         return stats
 
+    def _emergency_cleanup_if_needed(self, min_free_gb: float = 1.0) -> int:
+        """Delete oldest recordings if disk free space is critically low."""
+        try:
+            stat = shutil.disk_usage(str(self._cont_dir))
+            free_gb = stat.free / (1024 ** 3)
+            if free_gb >= min_free_gb:
+                return 0
+
+            logger.warning(
+                "retention.emergency_cleanup",
+                free_gb=round(free_gb, 2),
+                threshold_gb=min_free_gb,
+            )
+            # Delete oldest date directories until free space > threshold
+            deleted = 0
+            if not self._cont_dir.exists():
+                return 0
+            today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+            for date_dir in sorted(self._cont_dir.iterdir()):
+                if not date_dir.is_dir():
+                    continue
+                if self._parse_date_dir(date_dir.name) is None:
+                    continue
+                # Never delete today's recordings even in emergency
+                if date_dir.name == today:
+                    continue
+                try:
+                    shutil.rmtree(date_dir)
+                    deleted += 1
+                    logger.info("retention.emergency_deleted", path=str(date_dir))
+                    stat = shutil.disk_usage(str(self._cont_dir))
+                    if stat.free / (1024 ** 3) >= min_free_gb:
+                        break
+                except OSError:
+                    logger.warning("retention.emergency_delete_error", path=str(date_dir), exc_info=True)
+            return deleted
+        except OSError:
+            return 0
+
     def _cleanup_local(self) -> int:
-        """Delete local recordings older than retention period."""
+        """Delete local recordings older than retention period.
+
+        When archiving is enabled, only delete directories that have been
+        successfully archived (exist in archive_path) to prevent data loss.
+        """
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=self._local_days)
-        return self._delete_old_date_dirs(self._cont_dir, cutoff)
+        if not self._archive_enabled:
+            return self._delete_old_date_dirs(self._cont_dir, cutoff)
+
+        # Archive-safe mode: only delete local dirs that exist in archive
+        deleted = 0
+        if not self._cont_dir.exists():
+            return 0
+        for date_dir in sorted(self._cont_dir.iterdir()):
+            if not date_dir.is_dir():
+                continue
+            dir_date = self._parse_date_dir(date_dir.name)
+            if dir_date is None or dir_date >= cutoff:
+                continue
+            # Check that archive copy exists before deleting local
+            if self._archive_path and (self._archive_path / date_dir.name).exists():
+                try:
+                    shutil.rmtree(date_dir)
+                    deleted += 1
+                except OSError:
+                    logger.warning("retention.local_delete_error", path=str(date_dir), exc_info=True)
+            else:
+                logger.warning(
+                    "retention.skip_delete_no_archive",
+                    path=str(date_dir),
+                    msg="Local recording past retention but archive copy missing — keeping",
+                )
+        return deleted
 
     def _archive_recordings(self) -> int:
         """Move recordings past local retention to archive."""

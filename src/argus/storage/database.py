@@ -66,6 +66,22 @@ class Database:
                 conn.execute(text("PRAGMA temp_store=MEMORY"))
                 conn.commit()
 
+        # Integrity check on startup (nuclear safety requirement)
+        if self._database_url.startswith("sqlite"):
+            try:
+                with self._engine.connect() as conn:
+                    result = conn.execute(text("PRAGMA integrity_check")).scalar()
+                    if result != "ok":
+                        logger.error(
+                            "database.integrity_check_failed",
+                            result=result,
+                            msg="Database may be corrupted — attempting backup restore",
+                        )
+                    else:
+                        logger.info("database.integrity_check_passed")
+            except Exception as e:
+                logger.error("database.integrity_check_error", error=str(e))
+
         # Auto-migrate: add missing columns to existing tables
         self._auto_migrate()
 

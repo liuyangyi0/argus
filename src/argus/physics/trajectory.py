@@ -112,13 +112,19 @@ class TrajectoryAnalyzer:
         # Fit free-fall model
         ff_fit = self._fit_freefall(ts, xs, ys, zs)
 
-        # Fit projectile model
+        # Fit projectile model (parabolic, no drag)
         proj_fit = self._fit_projectile(ts, xs, ys, zs)
 
-        # Select the model with higher R²
+        # Fit drag-corrected model if enabled (for small objects where drag matters)
+        drag_fit = None
+        if self._use_drag and len(ts) >= 6:
+            drag_fit = self._fit_drag_projectile(ts, xs, ys, zs)
+
+        # Select the model with highest R²
         best = ff_fit
-        if proj_fit is not None and (best is None or proj_fit.r_squared > best.r_squared):
-            best = proj_fit
+        for candidate in (proj_fit, drag_fit):
+            if candidate is not None and (best is None or candidate.r_squared > best.r_squared):
+                best = candidate
 
         if best is not None:
             best.num_points = len(points)
@@ -295,6 +301,94 @@ class TrajectoryAnalyzer:
             origin=origin,
             landing=landing,
             initial_velocity_ms=(vx_ms, vy_ms, vz_ms),
+            mean_residual_mm=mean_res,
+        )
+
+    # ------------------------------------------------------------------
+    # Drag-corrected projectile: z(t) = z0 + (vt/k)(1 - e^{-kt}) - (g/k)t + (g/k²)(1-e^{-kt})
+    # where k = drag_coeff (1/s), vt = terminal velocity
+    # ------------------------------------------------------------------
+
+    def _fit_drag_projectile(
+        self,
+        ts: np.ndarray,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        zs: np.ndarray,
+    ) -> TrajectoryFit | None:
+        """Fit drag-corrected projectile for small objects where air resistance matters."""
+        try:
+            from scipy.optimize import curve_fit
+        except ImportError:
+            return None
+
+        if len(ts) < 6:
+            return None
+
+        g_mm = self._g * 1000.0  # mm/s²
+
+        # X and Y axes: linear (drag on horizontal assumed negligible for short falls)
+        n = len(ts)
+        A_x = np.column_stack([np.ones(n), ts])
+        coeff_x, _, _, _ = np.linalg.lstsq(A_x, xs, rcond=None)
+        x0, vx = float(coeff_x[0]), float(coeff_x[1])
+
+        A_y = np.column_stack([np.ones(n), ts])
+        coeff_y, _, _, _ = np.linalg.lstsq(A_y, ys, rcond=None)
+        y0, vy = float(coeff_y[0]), float(coeff_y[1])
+
+        # Z axis: drag model z(t) = z0 + vz0/k*(1 - e^{-kt}) - g/k*t + g/k²*(1-e^{-kt})
+        def z_drag(t: np.ndarray, z0_: float, vz0_: float, k_: float) -> np.ndarray:
+            k_ = max(k_, 0.01)  # prevent division by zero
+            exp_kt = np.exp(-k_ * t)
+            return z0_ + (vz0_ / k_) * (1 - exp_kt) - (g_mm / k_) * t + (g_mm / (k_ * k_)) * (1 - exp_kt)
+
+        try:
+            popt, _ = curve_fit(
+                z_drag, ts, zs,
+                p0=[zs[0], 0.0, 1.0],
+                maxfev=2000,
+                bounds=([zs[0] - 5000, -50000, 0.01], [zs[0] + 5000, 50000, 100.0]),
+            )
+        except (RuntimeError, ValueError):
+            return None
+
+        z0_fit, vz0_fit, k_fit = popt
+        z_pred = z_drag(ts, z0_fit, vz0_fit, k_fit)
+
+        ss_res = float(np.sum((zs - z_pred) ** 2))
+        ss_tot = float(np.sum((zs - np.mean(zs)) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
+
+        x_pred = x0 + vx * ts
+        y_pred = y0 + vy * ts
+        residuals = np.sqrt((xs - x_pred) ** 2 + (ys - y_pred) ** 2 + (zs - z_pred) ** 2)
+        mean_res = float(np.mean(residuals))
+
+        origin = TrajectoryPoint(timestamp=0.0, x_mm=x0, y_mm=y0, z_mm=z0_fit)
+
+        # Landing: numerically solve z_drag(t) = pool_z
+        from scipy.optimize import brentq
+        try:
+            t_land = brentq(lambda t: z_drag(np.array([t]), z0_fit, vz0_fit, k_fit)[0] - self._pool_z,
+                            0.001, 30.0)
+        except ValueError:
+            t_land = ts[-1]
+
+        landing = TrajectoryPoint(
+            timestamp=t_land,
+            x_mm=x0 + vx * t_land,
+            y_mm=y0 + vy * t_land,
+            z_mm=self._pool_z,
+        )
+
+        return TrajectoryFit(
+            model_type="projectile_drag",
+            r_squared=max(r_squared, 0.0),
+            origin=origin,
+            landing=landing,
+            initial_velocity_ms=(vx / 1000.0, vy / 1000.0, vz0_fit / 1000.0),
+            drag_coefficient=k_fit,
             mean_residual_mm=mean_res,
         )
 

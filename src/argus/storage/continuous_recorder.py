@@ -10,6 +10,8 @@ continuous recording.
 from __future__ import annotations
 
 import queue
+import shutil
+import subprocess
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -22,6 +24,61 @@ import structlog
 logger = structlog.get_logger()
 
 _SENTINEL = None  # pushed to queue to signal stop
+
+
+class _FFmpegWriter:
+    """H.264 encoder via FFmpeg subprocess with proper CRF control."""
+
+    def __init__(
+        self,
+        path: Path,
+        ffmpeg: str,
+        width: int,
+        height: int,
+        fps: int,
+        crf: int = 26,
+        preset: str = "veryfast",
+    ) -> None:
+        self._path = path
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}",
+            "-r", str(fps),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-crf", str(crf),
+            "-preset", preset,
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(path),
+        ]
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._proc.stdin is not None and self._proc.poll() is None:
+            try:
+                self._proc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                pass
+
+    def isOpened(self) -> bool:  # noqa: N802 — match cv2.VideoWriter API
+        return self._proc.poll() is None
+
+    def release(self) -> None:
+        if self._proc.stdin is not None:
+            try:
+                self._proc.stdin.close()
+            except Exception:
+                pass
+        try:
+            self._proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
 
 
 @dataclass
@@ -184,17 +241,20 @@ class ContinuousRecorder:
         filename = f"{self._camera_id}_{now.strftime('%H_%M')}.mp4"
         seg_path = date_dir / filename
 
-        # Try H.264 (avc1), fall back to mp4v
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
-        writer = cv2.VideoWriter(
-            str(seg_path), fourcc, self._fps, (self._width, self._height),
-        )
-        if not writer.isOpened():
-            writer.release()  # Release failed writer before fallback
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # Prefer FFmpeg subprocess for proper CRF control (3-5x smaller files)
+        writer = self._open_ffmpeg_writer(seg_path)
+        if writer is None:
+            # Fallback: cv2.VideoWriter (no CRF control, larger files)
+            fourcc = cv2.VideoWriter_fourcc(*"avc1")
             writer = cv2.VideoWriter(
                 str(seg_path), fourcc, self._fps, (self._width, self._height),
             )
+            if not writer.isOpened():
+                writer.release()
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(
+                    str(seg_path), fourcc, self._fps, (self._width, self._height),
+                )
 
         self._writer = writer
         self._segment_start_ts = timestamp
@@ -210,8 +270,34 @@ class ContinuousRecorder:
             path=str(seg_path),
         )
 
+    def _open_ffmpeg_writer(self, seg_path: Path) -> _FFmpegWriter | None:
+        """Try to open an FFmpeg subprocess writer with proper CRF control."""
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            return None
+        try:
+            return _FFmpegWriter(
+                path=seg_path,
+                ffmpeg=ffmpeg,
+                width=self._width,
+                height=self._height,
+                fps=self._fps,
+                crf=self._crf,
+                preset=self._preset,
+            )
+        except Exception as e:
+            logger.warning("continuous_recorder.ffmpeg_open_failed", error=str(e))
+            return None
+
     def _write_frame(self, frame: np.ndarray) -> None:
-        if self._writer is None or not self._writer.isOpened():
+        if self._writer is None:
+            return
+        if isinstance(self._writer, _FFmpegWriter):
+            self._writer.write(frame)
+            if self._current_segment is not None:
+                self._current_segment.frame_count += 1
+            return
+        if not self._writer.isOpened():
             return
         h, w = frame.shape[:2]
         if (w, h) != (self._width, self._height):
