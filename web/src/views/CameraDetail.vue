@@ -5,6 +5,8 @@ import { Steps, Button } from 'ant-design-vue'
 import { ArrowLeftOutlined } from '@ant-design/icons-vue'
 import { getCameraDetail } from '../api'
 import ZoneEditor from '../components/ZoneEditor.vue'
+import CalibrationWizard from '../components/calibration/CalibrationWizard.vue'
+import TrajectoryOverlay from '../components/trajectory/TrajectoryOverlay.vue'
 import { useGo2RTC } from '../composables/useGo2RTC'
 
 const route = useRoute()
@@ -223,6 +225,9 @@ const leftTab = ref<'live' | 'info' | 'zones'>('live')
           </div>
         </div>
       </section>
+
+      <!-- Calibration section (below main content area) -->
+      <CalibrationWizard :camera-id="cameraId" style="margin-top: 12px" />
 
       <!-- Right Metadata Sidebar -->
       <aside class="right glass">

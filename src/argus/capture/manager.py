@@ -101,6 +101,9 @@ class CameraManager:
         self._bp_lock = threading.Lock()
         self._last_bp_warn: dict[str, float] = {}  # rate-limit warnings
 
+        # M6: Continuous recording manager (injected from __main__.py)
+        self._continuous_recording_mgr = None
+
         # B1-5: Shared anomaly detector for dinomaly_multi_class mode
         self._shared_anomaly_detector = None
         self._shared_detector_lock = threading.Lock()
@@ -772,6 +775,14 @@ class CameraManager:
                     # reconnecting, or stream exhausted) to prevent busy-spin.
                     if alert is None and pipeline.stats.frames_captured == self._last_frame_counts.get(camera_id, 0):
                         self._stop_event.wait(0.05)
+
+                    # M6: Feed frame to continuous recorder (if active)
+                    if self._continuous_recording_mgr is not None:
+                        raw = pipeline.get_raw_frame()
+                        if raw is not None:
+                            self._continuous_recording_mgr.push_frame(
+                                camera_id, raw, time.time(),
+                            )
 
                     # C3: Feed anomaly map to cross-camera correlator
                     if self._correlator is not None:
