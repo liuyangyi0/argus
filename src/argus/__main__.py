@@ -293,6 +293,8 @@ def main():
         cross_camera_config=config.cross_camera,
         segmenter_config=config.segmenter,
         classifier_config=config.classifier,
+        physics_config=config.physics,
+        imaging_config=config.imaging,
         health_monitor=health,
         audit_logger=audit_log,
         record_store=record_store,
