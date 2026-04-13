@@ -144,6 +144,12 @@ class MOG2PreFilter:
         # Shadow pixels are marked as 127 by MOG2; treat only 255 as foreground
         binary_mask = (fg_mask == 255).astype(np.uint8) * 255
 
+        # Chromaticity-based shadow suppression: large foreground regions that
+        # preserve chromaticity (hue) are shadows, not real objects. This handles
+        # crane shadows that MOG2's built-in shadow model may miss.
+        if cv2.countNonZero(binary_mask) > 0 and len(frame.shape) == 3:
+            binary_mask = self._suppress_chromaticity_shadows(frame, binary_mask)
+
         # Morphological operations to reduce noise
         binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, self._kernel)
         binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, self._kernel)
@@ -159,6 +165,34 @@ class MOG2PreFilter:
             change_ratio=change_ratio,
             foreground_mask=binary_mask if has_change else None,
         )
+
+    @staticmethod
+    def _suppress_chromaticity_shadows(
+        frame: np.ndarray, mask: np.ndarray, hue_tolerance: int = 15,
+    ) -> np.ndarray:
+        """Suppress shadow regions that preserve hue (chromaticity).
+
+        Real shadows darken a region without changing its hue. Foreign objects
+        introduce new colours. By checking hue consistency in foreground regions,
+        we can filter crane shadows and Cherenkov glow fluctuations that only
+        change brightness.
+        """
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h_channel = hsv[:, :, 0]  # 0-179
+        s_channel = hsv[:, :, 1]  # 0-255
+
+        # Foreground regions with low saturation are likely shadows or glow changes
+        low_sat = s_channel < 40
+        # Suppress: foreground pixels that are low-saturation (grey/shadow)
+        shadow_suppress = mask.copy()
+        shadow_suppress[low_sat] = 0
+
+        # Also suppress blue-dominant regions (Cherenkov glow: peaked at 300-400nm → blue)
+        b, g, r = cv2.split(frame)
+        cherenkov_mask = (b.astype(np.int16) - np.maximum(g, r).astype(np.int16)) > 30
+        shadow_suppress[cherenkov_mask] = 0
+
+        return shadow_suppress
 
     def reset(self) -> None:
         """Reset the background model (e.g., after baseline update)."""

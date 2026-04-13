@@ -545,7 +545,8 @@ class DetectionPipeline:
 
         # Cached postprocessor for physics enrichment (avoid per-frame allocation)
         from argus.core.anomaly_postprocess import AnomalyMapProcessor
-        self._physics_postproc = AnomalyMapProcessor()
+        _min_contour = camera_config.anomaly.min_contour_area if hasattr(camera_config.anomaly, "min_contour_area") else 50
+        self._physics_postproc = AnomalyMapProcessor(min_contour_area=_min_contour)
 
         # Temporal anomaly tracker for physics enrichment
         from argus.core.temporal_tracker import TemporalAnomalyTracker

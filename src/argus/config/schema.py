@@ -179,7 +179,15 @@ class AnomalyConfig(BaseModel):
 
     model_type: Literal["patchcore", "efficient_ad", "fastflow", "padim", "dinomaly2"] = "patchcore"
     threshold: float = Field(default=0.7, ge=0.1, le=0.99)
-    image_size: tuple[int, int] = (256, 256)
+    image_size: tuple[int, int] = Field(
+        default=(256, 256),
+        description="Anomaly model input resolution. Must match training resolution. "
+        "512x512 recommended for new models targeting ≥8mm² detection at 5m.",
+    )
+    min_contour_area: int = Field(
+        default=50, ge=1, le=10000,
+        description="Minimum anomaly contour area in heatmap pixels. Lower for small objects.",
+    )
     enable_multiscale: bool = Field(
         default=False,
         description="Enable sliding window multi-scale detection for small objects",
