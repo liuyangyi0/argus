@@ -287,8 +287,8 @@ const hasActiveAlerts = computed(() =>
 
 .status-card {
   flex: 1;
-  background: var(--argus-card-bg);
-  border: 1px solid var(--argus-border);
+  background: var(--glass);
+  border: 1px solid var(--line-2);
   border-radius: 8px;
   padding: 10px 14px;
   min-width: 0;
@@ -309,7 +309,7 @@ const hasActiveAlerts = computed(() =>
 }
 
 .status-card:hover {
-  border-color: var(--argus-border);
+  border-color: var(--line-2);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   transform: translateY(-1px);
 }
@@ -320,7 +320,7 @@ const hasActiveAlerts = computed(() =>
 
 .card-shimmer {
   height: 100%;
-  background: linear-gradient(90deg, var(--argus-hover-bg) 25%, var(--argus-surface) 50%, var(--argus-hover-bg) 75%);
+  background: linear-gradient(90deg, rgba(10, 10, 15, 0.05) 25%, var(--glass) 50%, rgba(10, 10, 15, 0.05) 75%);
   background-size: 200% 100%;
   animation: shimmer 1.5s infinite;
   border-radius: 4px;
@@ -349,7 +349,7 @@ const hasActiveAlerts = computed(() =>
 .uptime-badge {
   font-size: 10px;
   color: #4a5568;
-  background: var(--argus-hover-bg);
+  background: rgba(10, 10, 15, 0.05);
   padding: 1px 6px;
   border-radius: 3px;
 }
@@ -429,7 +429,7 @@ const hasActiveAlerts = computed(() =>
 
 .spark-placeholder {
   height: 28px;
-  background: linear-gradient(90deg, var(--argus-hover-bg) 0%, var(--argus-surface) 50%, var(--argus-hover-bg) 100%);
+  background: linear-gradient(90deg, rgba(10, 10, 15, 0.05) 0%, var(--glass) 50%, rgba(10, 10, 15, 0.05) 100%);
   border-radius: 3px;
 }
 

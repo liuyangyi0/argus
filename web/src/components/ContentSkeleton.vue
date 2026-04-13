@@ -20,7 +20,7 @@ defineProps<{
 <style scoped>
 .skeleton-table {
   padding: 16px;
-  background: var(--argus-card-bg-solid);
+  background: var(--bg);
   border-radius: 8px;
 }
 </style>

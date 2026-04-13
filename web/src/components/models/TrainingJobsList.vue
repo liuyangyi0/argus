@@ -298,12 +298,12 @@ defineExpose({ loadJobs })
 
         <template v-if="detailJob.hyperparameters && typeof detailJob.hyperparameters === 'object'">
           <Typography.Title :level="5" style="margin-top: 24px">超参数</Typography.Title>
-          <pre style="background: var(--argus-surface); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto">{{ JSON.stringify(detailJob.hyperparameters, null, 2) }}</pre>
+          <pre style="background: var(--glass); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto">{{ JSON.stringify(detailJob.hyperparameters, null, 2) }}</pre>
         </template>
 
         <template v-if="detailJob.metrics && typeof detailJob.metrics === 'object'">
           <Typography.Title :level="5" style="margin-top: 24px">训练指标</Typography.Title>
-          <pre style="background: var(--argus-surface); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto">{{ JSON.stringify(detailJob.metrics, null, 2) }}</pre>
+          <pre style="background: var(--glass); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto">{{ JSON.stringify(detailJob.metrics, null, 2) }}</pre>
         </template>
       </template>
     </Drawer>

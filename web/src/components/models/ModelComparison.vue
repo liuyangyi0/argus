@@ -612,7 +612,7 @@ const fpDeltaColor = computed(() => fpDelta.value > 0 ? '#ff4d4f' : fpDelta.valu
 }
 
 .ab-panel {
-  background: var(--argus-card-bg-solid);
+  background: var(--bg);
   border-radius: 6px;
   overflow: hidden;
   border: 1px solid #2a2a3e;

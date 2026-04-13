@@ -7,28 +7,28 @@ export type ThemeMode = 'dark' | 'light'
 const STORAGE_KEY = 'argus-theme'
 
 const DARK_TOKENS = {
-  colorPrimary: '#3b82f6',
-  colorBgContainer: '#1a1a2e',
-  colorBgElevated: '#1e1e36',
-  colorBgLayout: '#0f0f1a',
-  borderRadius: 6,
+  colorPrimary: '#ffffff', // 极致极简白
+  colorBgContainer: '#121217', // 高级墨黑
+  colorBgElevated: '#1a1a24',
+  colorBgLayout: '#0a0a0c', 
+  colorTextBase: '#f1f5f9',
+  borderRadius: 8,
   fontSize: 14,
+  wireframe: false,
 }
 
 const LIGHT_TOKENS = {
-  colorPrimary: '#2563eb',
+  colorPrimary: '#0a0a0c', // SaaS极简黑
   colorBgContainer: '#ffffff',
-  colorBgElevated: '#f8fafc',
-  colorBgLayout: '#f1f5f9',
-  borderRadius: 6,
+  colorBgElevated: '#ffffff',
+  colorBgLayout: '#f6f6f8',
+  borderRadius: 8,
   fontSize: 14,
+  wireframe: false,
 }
 
 function detectSystemTheme(): ThemeMode {
-  if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: light)').matches) {
-    return 'light'
-  }
-  return 'dark'
+  return 'light' // Lock to light for Glassmorphism UI
 }
 
 function loadSaved(): ThemeMode | null {

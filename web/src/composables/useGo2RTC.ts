@@ -1,357 +1,75 @@
-/**
- * go2rtc WebRTC/MSE player composable.
- *
- * Negotiates the best available streaming protocol with go2rtc:
- *   1. WebRTC (preferred — lowest latency, H.264 passthrough)
- *   2. MSE / Media Source Extensions (fallback — wider compatibility)
- *   3. MJPEG via <img> (legacy fallback when go2rtc is unavailable)
- */
-
 import { ref, onUnmounted, type Ref } from 'vue'
-import axios from 'axios'
 import { logger } from '../utils/logger'
+import { StreamManager } from '../services/streaming/StreamManager'
+import { PlayerFactory, type PlayerInstance } from '../services/streaming/PlayerFactory'
 
 export type StreamStatus = 'idle' | 'connecting' | 'playing' | 'error' | 'fallback'
-
-const MAX_MSE_BUFFER_QUEUE = 30
-const MAX_RETRIES = 3
-const RETRY_BASE_MS = 2000
-const MAX_RECONNECT = 3
-
-// ── Connection budget ──
-// HTTP/1.1 allows ~6 concurrent connections per origin.  Reserve 2 for
-// API requests + WebSocket, leaving at most 4 for live video streams.
-const MAX_CONCURRENT_STREAMS = 4
-let _activeStreamCount = 0
-
-interface StreamInfo {
-  camera_id: string
-  go2rtc: boolean
-  webrtc_ws?: string
-  mse_ws?: string
-  fallback: string
-}
 
 export function useGo2RTC(cameraId: Ref<string> | string) {
   const videoRef = ref<HTMLVideoElement | null>(null)
   const mjpegRef = ref<HTMLImageElement | null>(null)
   const status = ref<StreamStatus>('idle')
 
-  let pc: RTCPeerConnection | null = null
-  let ws: WebSocket | null = null
-  let mseWs: WebSocket | null = null
-  let mediaSource: MediaSource | null = null
+  let playerInstance: PlayerInstance | null = null
   let generation = 0
-  let reconnectCount = 0
+  let _counted = false
 
   const getCameraId = () => typeof cameraId === 'string' ? cameraId : cameraId.value
 
-  async function fetchStreamInfo(): Promise<StreamInfo | null> {
-    try {
-      const resp = await axios.get(`/api/streaming/${getCameraId()}`)
-      return resp.data as StreamInfo
-    } catch (e) {
-      logger.debug(`[go2rtc] fetchStreamInfo failed for ${getCameraId()}:`, e)
-      return null
-    }
-  }
-
-  async function connectWebRTC(wsUrl: string): Promise<boolean> {
-    const cam = getCameraId()
-    return new Promise((resolve) => {
-      let settled = false
-      const settle = (ok: boolean) => { if (!settled) { settled = true; clearTimeout(timeout); resolve(ok) } }
-
-      const timeout = setTimeout(() => {
-        logger.debug(`[go2rtc] WebRTC timeout for ${cam}, pc state: ${pc?.connectionState}`)
-        cleanup()
-        settle(false)
-      }, 15_000)
-
-      try {
-        logger.debug(`[go2rtc] WebRTC connecting: ${wsUrl}`)
-        ws = new WebSocket(wsUrl)
-
-        ws.onopen = () => {
-          logger.debug(`[go2rtc] WebRTC ws open for ${cam}`)
-          pc = new RTCPeerConnection({
-            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-          })
-
-          pc.ontrack = (event) => {
-            logger.debug(`[go2rtc] WebRTC ontrack for ${cam}, videoRef=${!!videoRef.value}`)
-            if (videoRef.value && event.streams[0]) {
-              videoRef.value.srcObject = event.streams[0]
-              status.value = 'playing'
-              settle(true)
-            }
-          }
-
-          pc.onconnectionstatechange = () => {
-            logger.debug(`[go2rtc] WebRTC state: ${pc?.connectionState} for ${cam}`)
-            if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')) {
-              if (reconnectCount < MAX_RECONNECT) {
-                reconnectCount++
-                start()
-              } else {
-                status.value = 'error'
-              }
-            }
-          }
-
-          pc.onicecandidate = (event) => {
-            if (event.candidate && ws?.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: 'webrtc/candidate',
-                value: event.candidate.candidate,
-              }))
-            }
-          }
-
-          pc.addTransceiver('video', { direction: 'recvonly' })
-          pc.addTransceiver('audio', { direction: 'recvonly' })
-
-          pc.createOffer().then((offer) => {
-            pc!.setLocalDescription(offer).then(() => {
-              logger.debug(`[go2rtc] WebRTC offer sent for ${cam}`)
-              ws!.send(JSON.stringify({
-                type: 'webrtc/offer',
-                value: offer.sdp,
-              }))
-            })
-          })
-        }
-
-        ws.onmessage = (event) => {
-          const msg = JSON.parse(event.data)
-          logger.debug(`[go2rtc] WebRTC msg: ${msg.type} for ${cam}`)
-          if (msg.type === 'webrtc/answer' && pc) {
-            pc.setRemoteDescription(new RTCSessionDescription({
-              type: 'answer',
-              sdp: msg.value,
-            }))
-          } else if (msg.type === 'webrtc/candidate' && pc) {
-            pc.addIceCandidate(new RTCIceCandidate({ candidate: msg.value, sdpMid: '0' }))
-          }
-        }
-
-        ws.onerror = (ev) => {
-          logger.warn(`[go2rtc] WebRTC ws error for ${cam}:`, ev)
-          cleanup()
-          settle(false)
-        }
-
-        ws.onclose = (ev) => {
-          logger.debug(`[go2rtc] WebRTC ws close for ${cam}, code=${ev.code}`)
-          if (!settled) {
-            cleanup()
-            settle(false)
-          }
-        }
-      } catch {
-        settle(false)
-      }
-    })
-  }
-
-  async function connectMSE(wsUrl: string): Promise<boolean> {
-    if (!('MediaSource' in window)) return false
-
-    return new Promise((resolve) => {
-      let settled = false
-      const settle = (ok: boolean) => { if (!settled) { settled = true; clearTimeout(timeout); resolve(ok) } }
-
-      const timeout = setTimeout(() => {
-        logger.warn(`[go2rtc] MSE timeout for ${getCameraId()}`)
-        cleanupMSE()
-        settle(false)
-      }, 15_000)
-
-      try {
-        if (!videoRef.value) {
-          logger.warn(`[go2rtc] MSE: videoRef is null for ${getCameraId()}, skipping`)
-          settle(false)
-          return
-        }
-        mediaSource = new MediaSource()
-        videoRef.value.srcObject = null
-        videoRef.value.src = URL.createObjectURL(mediaSource)
-
-        mediaSource.addEventListener('sourceopen', () => {
-          logger.debug(`[go2rtc] MSE sourceopen for ${getCameraId()}, connecting: ${wsUrl}`)
-          mseWs = new WebSocket(wsUrl)
-          mseWs.binaryType = 'arraybuffer'
-
-          let sourceBuffer: SourceBuffer | null = null
-          const bufferQueue: ArrayBuffer[] = []
-
-          mseWs.onmessage = (event) => {
-            if (typeof event.data === 'string') {
-              const msg = JSON.parse(event.data)
-              if (msg.type === 'mse' && msg.value && mediaSource) {
-                try {
-                  sourceBuffer = mediaSource.addSourceBuffer(msg.value)
-                  sourceBuffer.mode = 'segments'
-                  sourceBuffer.addEventListener('updateend', () => {
-                    if (bufferQueue.length > 0 && sourceBuffer && !sourceBuffer.updating) {
-                      sourceBuffer.appendBuffer(bufferQueue.shift()!)
-                    }
-                  })
-                } catch {
-                  cleanupMSE()
-                  settle(false)
-                }
-              }
-            } else if (event.data instanceof ArrayBuffer && sourceBuffer) {
-              if (!settled) {
-                status.value = 'playing'
-                settle(true)
-              }
-              // Cap buffer queue to prevent unbounded memory growth
-              if (bufferQueue.length >= MAX_MSE_BUFFER_QUEUE) {
-                bufferQueue.splice(0, bufferQueue.length - MAX_MSE_BUFFER_QUEUE + 1)
-              }
-              if (sourceBuffer.updating) {
-                bufferQueue.push(event.data)
-              } else {
-                sourceBuffer.appendBuffer(event.data)
-              }
-            }
-          }
-
-          mseWs.onerror = (ev) => {
-            logger.warn(`[go2rtc] MSE ws error for ${getCameraId()}:`, ev)
-            cleanupMSE()
-            settle(false)
-          }
-
-          mseWs.onclose = (ev) => {
-            logger.debug(`[go2rtc] MSE ws close for ${getCameraId()}, code=${ev.code}`)
-            if (!settled) {
-              cleanupMSE()
-              settle(false)
-            } else if (status.value === 'playing') {
-              if (reconnectCount < MAX_RECONNECT) {
-                reconnectCount++
-                start()
-              } else {
-                status.value = 'error'
-              }
-            }
-          }
-        })
-      } catch {
-        settle(false)
-      }
-    })
-  }
-
-  let _counted = false  // whether this instance holds a stream budget slot
-
   function releaseBudget() {
     if (_counted) {
-      _activeStreamCount = Math.max(0, _activeStreamCount - 1)
+      StreamManager.releaseSlot()
       _counted = false
     }
   }
 
   async function start() {
-    stop()
-    if (_activeStreamCount >= MAX_CONCURRENT_STREAMS) {
-      logger.warn(`[go2rtc] connection budget exhausted (${_activeStreamCount}/${MAX_CONCURRENT_STREAMS})`)
+    stop() // internally increments generation
+    
+    // Request budget for WebRTC/MSE connection
+    if (!StreamManager.requestSlot()) {
+      logger.warn(`[go2rtc] connection budget exhausted limit(${StreamManager.MAX_STREAMS})`)
       status.value = 'error'
       return
     }
-    _activeStreamCount++
     _counted = true
     const thisGen = ++generation
     status.value = 'connecting'
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (thisGen !== generation) return  // stop() was called, budget already released
+    const isCancelled = () => thisGen !== generation
 
-      if (attempt > 0) {
-        await new Promise(r => setTimeout(r, RETRY_BASE_MS * Math.pow(2, attempt - 1)))
-        if (thisGen !== generation) return
+    playerInstance = await PlayerFactory.create(getCameraId(), videoRef.value, isCancelled)
+    
+    if (isCancelled()) return
+
+    if (playerInstance) {
+      status.value = playerInstance.status
+      playerInstance.onStatusChange = (newStatus) => {
+        if (isCancelled()) return
+        status.value = newStatus
       }
-
-      const info = await fetchStreamInfo()
-      if (thisGen !== generation) return
-
-      if (!info) {
-        if (attempt === MAX_RETRIES) {
-          releaseBudget()
-          status.value = 'error'
-          return
+      playerInstance.onReconnectRequest = () => {
+        if (!isCancelled()) {
+          start()
         }
-        continue
       }
-
-      if (info.go2rtc) {
-        if (info.webrtc_ws) {
-          const ok = await connectWebRTC(info.webrtc_ws)
-          if (thisGen !== generation) return
-          if (ok) { reconnectCount = 0; return }
-        }
-        if (info.mse_ws) {
-          const ok = await connectMSE(info.mse_ws)
-          if (thisGen !== generation) return
-          if (ok) { reconnectCount = 0; return }
-        }
-      } else {
-        // go2rtc not available, no point retrying
-        break
-      }
+    } else {
+      // Fallback
+      releaseBudget()
+      status.value = 'fallback'
     }
-
-    // Fallback to MJPEG — release budget since MJPEG uses <img> tag, not a
-    // WebRTC/MSE connection tracked by the budget counter.
-    releaseBudget()
-    status.value = 'fallback'
-  }
-
-  function cleanup() {
-    if (pc) {
-      pc.onconnectionstatechange = null
-      pc.ontrack = null
-      pc.onicecandidate = null
-      pc.close()
-      pc = null
-    }
-    if (ws) {
-      ws.onopen = null
-      ws.onclose = null
-      ws.onerror = null
-      ws.onmessage = null
-      ws.close()
-      ws = null
-    }
-  }
-
-  function cleanupMSE() {
-    if (mseWs) {
-      mseWs.onopen = null
-      mseWs.onclose = null
-      mseWs.onerror = null
-      mseWs.onmessage = null
-      mseWs.close()
-      mseWs = null
-    }
-    if (mediaSource && mediaSource.readyState === 'open') {
-      try { mediaSource.endOfStream() } catch { /* ignore */ }
-    }
-    mediaSource = null
   }
 
   function stop() {
-    generation++  // cancel any in-flight start()
-    cleanup()
-    cleanupMSE()
+    generation++
+    if (playerInstance) {
+      playerInstance.destroy()
+      playerInstance = null
+    }
     if (videoRef.value) {
       videoRef.value.srcObject = null
       videoRef.value.src = ''
     }
-    // Force-close any active MJPEG HTTP connection
     if (mjpegRef.value) {
       mjpegRef.value.src = ''
     }

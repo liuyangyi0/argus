@@ -1,7 +1,7 @@
 <template>
   <div class="timeline-container">
     <div class="timeline-header">
-      <a-typography-text strong style="color: var(--argus-text); font-size: 14px">24h 告警时间线</a-typography-text>
+      <a-typography-text strong style="color: var(--ink-2); font-size: 14px">24h 告警时间线</a-typography-text>
       <a-date-picker
         v-model:value="selectedDate"
         :allow-clear="false"
@@ -174,7 +174,7 @@ onUnmounted(() => clearInterval(timer))
 .track {
   flex: 1;
   height: 20px;
-  background: var(--argus-surface);
+  background: var(--glass);
   border-radius: 3px;
   position: relative;
   overflow: hidden;

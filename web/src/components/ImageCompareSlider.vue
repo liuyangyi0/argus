@@ -125,7 +125,7 @@ const zoomContentStyle = computed(() => {
   border-radius: 6px;
   cursor: col-resize;
   user-select: none;
-  background: var(--argus-surface);
+  background: var(--glass);
 }
 .compare-img {
   width: 100%;

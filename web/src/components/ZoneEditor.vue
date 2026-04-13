@@ -1,6 +1,6 @@
 <template>
   <div class="zone-editor">
-    <div class="editor-canvas-wrapper" :style="{ width: width + 'px', height: height + 'px' }">
+    <div class="editor-canvas-wrapper" :style="{ aspectRatio: `${width} / ${height}` }">
       <!-- Background image -->
       <img v-if="imageSrc" :src="imageSrc" class="editor-bg" draggable="false" />
       <div v-else class="editor-placeholder">摄像头快照加载中...</div>
@@ -79,42 +79,44 @@
 
     <!-- Controls -->
     <div class="editor-controls">
-      <a-space>
-        <a-button
-          :type="isDrawing ? 'primary' : 'default'"
-          size="small"
-          @click="toggleDrawing"
-        >
-          {{ isDrawing ? '完成绘制 (双击)' : '添加区域' }}
-        </a-button>
-        <a-select v-model:value="newZoneType" size="small" style="width: 90px">
-          <a-select-option value="include">包含区</a-select-option>
-          <a-select-option value="exclude">排除区</a-select-option>
-        </a-select>
-        <a-button
-          v-if="selectedZone"
-          size="small"
-          danger
-          @click="deleteSelected"
-        >
-          删除选中
-        </a-button>
-      </a-space>
+      <div style="display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap;">
+        <a-space>
+          <a-button
+            :type="isDrawing ? 'primary' : 'default'"
+            size="small"
+            @click="toggleDrawing"
+          >
+            {{ isDrawing ? '完成绘制 (双击)' : '添加区域' }}
+          </a-button>
+          <a-select v-model:value="newZoneType" size="small" style="width: 90px">
+            <a-select-option value="include">包含区</a-select-option>
+            <a-select-option value="exclude">排除区</a-select-option>
+          </a-select>
+          <a-button
+            v-if="selectedZone"
+            size="small"
+            danger
+            @click="deleteSelected"
+          >
+            删除选中
+          </a-button>
+        </a-space>
 
-      <!-- Zone list -->
-      <div class="zone-list">
-        <div
-          v-for="zone in zones"
-          :key="zone.zone_id"
-          class="zone-item"
-          :class="{ active: zone === selectedZone }"
-          @click="selectZone(zone)"
-        >
-          <span class="zone-dot" :style="{ background: zoneStroke(zone) }" />
-          <span>{{ zone.zone_id }}</span>
-          <a-tag :color="zone.zone_type === 'include' ? 'blue' : 'orange'" size="small">
-            {{ zone.zone_type === 'include' ? '包含' : '排除' }}
-          </a-tag>
+        <!-- Zone list -->
+        <div class="zone-list" style="display:flex; flex-wrap:wrap; gap:8px;">
+          <div
+            v-for="zone in zones"
+            :key="zone.zone_id"
+            class="zone-item"
+            :class="{ active: zone === selectedZone }"
+            @click="selectZone(zone)"
+          >
+            <span class="zone-dot" :style="{ background: zoneStroke(zone) }" />
+            <span>{{ zone.zone_id }}</span>
+            <a-tag :color="zone.zone_type === 'include' ? 'blue' : 'orange'" size="small" style="margin-left: 6px">
+              {{ zone.zone_type === 'include' ? '包含' : '排除' }}
+            </a-tag>
+          </div>
         </div>
       </div>
     </div>
@@ -192,10 +194,13 @@ function toggleDrawing() {
 }
 
 function addVertex(e: MouseEvent) {
-  const rect = (e.target as HTMLElement).getBoundingClientRect()
+  const el = e.target as HTMLElement
+  const rect = el.getBoundingClientRect()
+  const scaleX = props.width / rect.width
+  const scaleY = props.height / rect.height
   drawingVertices.value.push({
-    x: Math.round(e.clientX - rect.left),
-    y: Math.round(e.clientY - rect.top),
+    x: Math.round((e.clientX - rect.left) * scaleX),
+    y: Math.round((e.clientY - rect.top) * scaleY),
   })
 }
 
@@ -220,7 +225,20 @@ function deleteSelected() {
   emit('update:modelValue', zones.value)
 }
 
+let dragScaleX = 1
+let dragScaleY = 1
+
 function startDragVertex(zIdx: number, vIdx: number, e: MouseEvent) {
+  const svg = (e.target as HTMLElement).closest('svg')
+  if (svg) {
+    const rect = svg.getBoundingClientRect()
+    dragScaleX = props.width / rect.width
+    dragScaleY = props.height / rect.height
+  } else {
+    dragScaleX = 1
+    dragScaleY = 1
+  }
+
   dragZoneIdx = zIdx
   dragVertexIdx = vIdx
   dragStartX = e.clientX
@@ -231,8 +249,8 @@ function startDragVertex(zIdx: number, vIdx: number, e: MouseEvent) {
 
 function onDragVertex(e: MouseEvent) {
   if (dragZoneIdx < 0) return
-  const dx = e.clientX - dragStartX
-  const dy = e.clientY - dragStartY
+  const dx = (e.clientX - dragStartX) * dragScaleX
+  const dy = (e.clientY - dragStartY) * dragScaleY
   dragStartX = e.clientX
   dragStartY = e.clientY
   const v = zones.value[dragZoneIdx].vertices[dragVertexIdx]
@@ -252,14 +270,24 @@ function stopDragVertex() {
 <style scoped>
 .zone-editor {
   display: flex;
-  gap: 12px;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
 }
 .editor-canvas-wrapper {
   position: relative;
-  background: var(--argus-surface);
-  border-radius: 6px;
+  background: #000;
+  border-radius: 8px;
   overflow: hidden;
-  flex-shrink: 0;
+  box-shadow: 0 4px 20px rgba(0,0,0,.15);
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0 auto;
+  display: flex;
 }
 .editor-bg {
   width: 100%;
@@ -291,25 +319,28 @@ function stopDragVertex() {
   z-index: 5;
 }
 .editor-controls {
-  flex: 1;
-  min-width: 160px;
+  flex-shrink: 0;
+  width: 100%;
 }
 .zone-list {
-  margin-top: 12px;
+  margin-top: 0;
 }
 .zone-item {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  border-radius: 4px;
+  justify-content: space-between;
+  padding: 6px 12px;
+  border-radius: 6px;
   cursor: pointer;
-  font-size: 12px;
-  color: var(--argus-text);
-  margin-bottom: 4px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  margin-bottom: 0px;
+  background: var(--glass);
+  border: 1px solid var(--line-2);
+  transition: all .2s;
 }
-.zone-item:hover { background: var(--argus-hover-bg); }
-.zone-item.active { background: var(--argus-border); }
+.zone-item:hover { background: #fff; border-color: rgba(37,99,235,.2); }
+.zone-item.active { background: #fff; border-color: #3b82f6; box-shadow: 0 2px 8px rgba(37,99,235,.15); font-weight: 600; }
 .zone-dot {
   width: 8px;
   height: 8px;
