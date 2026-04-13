@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { Card, Descriptions, Table, Badge, Popconfirm, Button, message, Skeleton } from 'ant-design-vue'
-import { getHealth, getStorageInfo, cleanupAlerts } from '../../api'
+import { Card, Descriptions, Table, Badge, Tag, Popconfirm, Button, message, Skeleton, Tooltip } from 'ant-design-vue'
+import { WarningOutlined } from '@ant-design/icons-vue'
+import { getHealth, getStorageInfo, cleanupAlerts, getDriftStatus, getCameraHealth } from '../../api'
 import { useWebSocket } from '../../composables/useWebSocket'
 
 const health = ref<any>(null)
 const storageInfo = ref<any>(null)
 const cleanupLoading = ref(false)
+const driftData = ref<any[]>([])
+const healthCheckData = ref<any[]>([])
 
 async function loadStorageInfo() {
   try { storageInfo.value = await getStorageInfo() } catch { /* silent */ }
@@ -40,7 +43,21 @@ useWebSocket({
   fallbackInterval: 15000,
 })
 
-onMounted(() => { fetchHealth(); loadStorageInfo() })
+async function loadDrift() {
+  try {
+    const res = await getDriftStatus()
+    driftData.value = res?.cameras ?? []
+  } catch { /* silent */ }
+}
+
+async function loadCameraHealth() {
+  try {
+    const res = await getCameraHealth()
+    healthCheckData.value = res?.cameras ?? []
+  } catch { /* silent */ }
+}
+
+onMounted(() => { Promise.all([fetchHealth(), loadStorageInfo(), loadDrift(), loadCameraHealth()]) })
 </script>
 
 <template>
@@ -82,6 +99,60 @@ onMounted(() => { fetchHealth(); loadStorageInfo() })
           </template>
           <template v-if="column.key === 'latency'">
             {{ record.avg_latency_ms?.toFixed(1) }}ms
+          </template>
+        </template>
+      </Table>
+    </Card>
+
+    <!-- Drift Monitor -->
+    <Card title="漂移监控" style="margin-top: 16px" v-if="driftData.length">
+      <Table :data-source="driftData" :pagination="false" row-key="camera_id" size="small"
+        :columns="[
+          { title: '摄像头', dataIndex: 'camera_id', key: 'id' },
+          { title: '状态', key: 'drift_status', width: 100 },
+          { title: 'KS 统计量', dataIndex: 'ks_statistic', key: 'ks', width: 120 },
+          { title: 'p 值', dataIndex: 'p_value', key: 'p', width: 120 },
+          { title: '当前均值', dataIndex: 'current_mean', key: 'curr', width: 100 },
+          { title: '参考均值', dataIndex: 'reference_mean', key: 'ref', width: 100 },
+          { title: '样本数', dataIndex: 'samples_collected', key: 'samples', width: 80 },
+        ]">
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'drift_status'">
+            <Tag :color="record.is_drifted ? 'red' : 'green'">{{ record.is_drifted ? '已漂移' : '正常' }}</Tag>
+          </template>
+        </template>
+      </Table>
+    </Card>
+
+    <!-- Camera Health (5-check) -->
+    <Card title="摄像头健康检查" style="margin-top: 16px" v-if="healthCheckData.length">
+      <Table :data-source="healthCheckData" :pagination="false" row-key="camera_id" size="small"
+        :columns="[
+          { title: '摄像头', dataIndex: 'camera_id', key: 'id' },
+          { title: '冻结', key: 'frozen', width: 70 },
+          { title: '清晰度', dataIndex: 'sharpness_score', key: 'sharpness', width: 80 },
+          { title: '位移(px)', dataIndex: 'displacement_px', key: 'disp', width: 90 },
+          { title: '闪光', key: 'flash', width: 70 },
+          { title: '增益漂移', key: 'gain', width: 100 },
+          { title: '告警', key: 'warnings' },
+        ]">
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'frozen'">
+            <Tag :color="record.is_frozen ? 'red' : 'green'" size="small">{{ record.is_frozen ? '是' : '否' }}</Tag>
+          </template>
+          <template v-if="column.key === 'flash'">
+            <Tag :color="record.is_flash ? 'orange' : 'green'" size="small">{{ record.is_flash ? '是' : '否' }}</Tag>
+          </template>
+          <template v-if="column.key === 'gain'">
+            <span :style="{ color: Math.abs(record.gain_drift_pct) > 20 ? 'var(--red)' : 'inherit' }">
+              {{ record.gain_drift_pct }}%
+            </span>
+          </template>
+          <template v-if="column.key === 'warnings'">
+            <Tooltip v-for="w in record.warnings" :key="w" :title="w">
+              <Tag color="orange" size="small"><WarningOutlined /> {{ w }}</Tag>
+            </Tooltip>
+            <span v-if="!record.warnings?.length" style="color: var(--ink-4)">—</span>
           </template>
         </template>
       </Table>

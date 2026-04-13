@@ -1,7 +1,7 @@
 ﻿<script setup lang="ts">
 import { ref, computed } from 'vue'
 import { storeToRefs } from 'pinia'
-import { Tag, Button, Typography, Tooltip, Segmented, Steps } from 'ant-design-vue'
+import { Tag, Button, Tooltip, Segmented, Steps } from 'ant-design-vue'
 import { CloseOutlined, ExportOutlined, CheckCircleOutlined, StopOutlined, DeleteOutlined } from '@ant-design/icons-vue'
 import { useAlertStore } from '../../stores/useAlertStore'
 import { scoreColor } from '../../utils/colors'
@@ -60,13 +60,13 @@ const workflowStepIndex = computed(() => {
       </div>
 
       <div class="detail-header-actions">
-        <Tag :color="severityColor[selectedAlert.severity] || 'default'" style="margin: 0; background: rgba(255,255,255,0.1); border: none; backdrop-filter: blur(4px);">
+        <Tag :color="severityColor[selectedAlert.severity] || 'default'" style="margin: 0">
           {{ workflowLabel[selectedAlert.workflow_status] || '待处理' }}
         </Tag>
         <Tooltip title="导出证据包">
-          <Button size="small" type="text" style="color: rgba(255,255,255,0.8)"><ExportOutlined /></Button>
+          <Button size="small" type="text"><ExportOutlined /></Button>
         </Tooltip>
-        <Button size="small" type="text" style="color: rgba(255,255,255,0.8)" @click="closeDetail"><CloseOutlined /></Button>
+        <Button size="small" type="text" @click="closeDetail"><CloseOutlined /></Button>
       </div>
     </div>
 
@@ -126,7 +126,7 @@ const workflowStepIndex = computed(() => {
         <div class="fancy-dict-title">告警详情 / DETAILS <span>#{{ selectedAlert.alert_id?.slice(-8).toUpperCase() }}</span></div>
         <div class="fancy-dict">
             <div class="dict-row"><span class="dict-k">监控点位</span><span class="dict-v">{{ selectedAlert.camera_id }} {{ selectedAlert.zone_id ? `/ ${selectedAlert.zone_id}` : '' }}</span></div>
-            <div class="dict-row"><span class="dict-k">危险级别</span><span class="dict-v"><Tag :color="severityColor[selectedAlert.severity]" style="margin: 0; background: rgba(255,255,255,0.15); border: none;">{{ severityLabel[selectedAlert.severity] }}</Tag></span></div>
+            <div class="dict-row"><span class="dict-k">危险级别</span><span class="dict-v"><Tag :color="severityColor[selectedAlert.severity]" style="margin: 0">{{ severityLabel[selectedAlert.severity] }}</Tag></span></div>
             <div class="dict-row"><span class="dict-k">判定置信度</span><span class="dict-v" :style="{ color: scoreColor(selectedAlert.anomaly_score), fontWeight: 600 }">{{ selectedAlert.anomaly_score?.toFixed(4) }}</span></div>
             <div class="dict-row"><span class="dict-k">触发时间</span><span class="dict-v">{{ formatTimestamp(selectedAlert.timestamp || selectedAlert.created_at) }}</span></div>
             <div v-if="selectedAlert.assigned_to" class="dict-row"><span class="dict-k">指派人员</span><span class="dict-v">{{ selectedAlert.assigned_to }}</span></div>
@@ -167,14 +167,16 @@ const workflowStepIndex = computed(() => {
   overflow: hidden;
   background: var(--glass);
   backdrop-filter: blur(20px);
+  border: 0.5px solid var(--line);
+  border-radius: var(--r-lg);
 }
 .detail-header {
   display: flex;
   align-items: center;
   gap: 14px;
   padding: 12px 24px;
-  background: rgba(0, 0, 0, 0.4);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  background: var(--glass-strong);
+  border-bottom: 0.5px solid var(--line-2);
   flex-shrink: 0;
 }
 .sev-badge {
@@ -188,33 +190,33 @@ const workflowStepIndex = computed(() => {
   text-transform: uppercase;
   border-radius: 4px;
 }
-.sev-high { background: rgba(185, 28, 28, 0.8); }
-.sev-medium { background: rgba(217, 119, 6, 0.8); }
-.sev-low { background: rgba(37, 99, 235, 0.8); }
-.sev-info { background: rgba(75, 85, 99, 0.8); }
+.sev-high { background: var(--red); }
+.sev-medium { background: var(--amber); }
+.sev-low { background: var(--blue); }
+.sev-info { background: var(--ink-5); }
 .detail-crumb {
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
-  color: rgba(255,255,255,0.7);
+  color: var(--ink-4);
   display: flex;
   align-items: center;
 }
-.detail-crumb b { color: #fff; font-weight: 500; }
-.detail-crumb-sep { margin: 0 8px; color: rgba(255,255,255,0.3); }
+.detail-crumb b { color: var(--ink); font-weight: 500; }
+.detail-crumb-sep { margin: 0 8px; color: var(--ink-6); }
 .detail-header-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 
-.detail-content { 
-  flex: 1; 
-  overflow-y: auto; 
+.detail-content {
+  flex: 1;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
 }
 
 .media-edge {
   width: 100%;
-  background: #000;
+  background: #0a0a0c;
   position: relative;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  border-bottom: 0.5px solid var(--line-2);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -251,6 +253,7 @@ const workflowStepIndex = computed(() => {
   background: #111;
 }
 
+/* Glass overlays on dark media viewer — keep dark glass here */
 .image-mode-glass-bar {
   position: absolute;
   top: 16px;
@@ -263,22 +266,22 @@ const workflowStepIndex = computed(() => {
 }
 .image-mode-glass-bar > * { pointer-events: auto; }
 .glass-segmented {
-  background: rgba(0,0,0,0.6) !important;
+  background: rgba(10, 10, 15, 0.65) !important;
   backdrop-filter: blur(10px);
-  border: 1px solid rgba(255,255,255,0.1);
+  border: 1px solid rgba(255, 255, 255, 0.12);
 }
 .score-glass-display {
   display: flex;
   align-items: center;
   gap: 8px;
-  background: rgba(0,0,0,0.6);
+  background: rgba(10, 10, 15, 0.65);
   backdrop-filter: blur(10px);
   padding: 4px 12px;
   border-radius: 20px;
-  border: 1px solid rgba(255,255,255,0.1);
+  border: 1px solid rgba(255, 255, 255, 0.12);
 }
-.score-label { font-size: 11px; color: rgba(255,255,255,0.6); }
-.score-val { font-weight: 700; font-size: 14px; font-family: 'JetBrains Mono', monospace; }
+.score-label { font-size: 11px; color: rgba(255, 255, 255, 0.6); }
+.score-val { font-weight: 700; font-size: 14px; font-family: 'JetBrains Mono', monospace; color: #fff; }
 
 .image-action-glass-bar {
   position: absolute;
@@ -288,19 +291,19 @@ const workflowStepIndex = computed(() => {
   z-index: 10;
   display: flex;
   gap: 8px;
-  background: rgba(0,0,0,0.5);
+  background: rgba(10, 10, 15, 0.55);
   padding: 6px;
   border-radius: 8px;
   backdrop-filter: blur(10px);
-  border: 1px solid rgba(255,255,255,0.1);
+  border: 1px solid rgba(255, 255, 255, 0.12);
 }
 .glass-btn {
-  background: rgba(255,255,255,0.1) !important;
+  background: rgba(255, 255, 255, 0.1) !important;
   border-color: transparent !important;
   color: #fff !important;
 }
-.glass-btn:hover { background: rgba(255,255,255,0.2) !important; }
-.glass-btn.ant-btn-primary { background: rgba(24, 144, 255, 0.6) !important; }
+.glass-btn:hover { background: rgba(255, 255, 255, 0.2) !important; }
+.glass-btn.ant-btn-primary { background: rgba(37, 99, 235, 0.65) !important; }
 
 .no-image-edge {
   width: 100%;
@@ -308,10 +311,11 @@ const workflowStepIndex = computed(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(255,255,255,0.02);
+  background: rgba(10, 10, 15, 0.04);
 }
-.no-img-text { color: rgba(255,255,255,0.3); font-size: 14px; letter-spacing: 0.1em; }
+.no-img-text { color: var(--ink-5); font-size: 14px; letter-spacing: 0.1em; }
 
+/* Metadata section — light theme */
 .meta-section-padded {
   padding: 24px 32px;
   display: flex;
@@ -321,20 +325,20 @@ const workflowStepIndex = computed(() => {
 
 .fancy-dict-title {
   font-size: 12px;
-  color: rgba(255,255,255,0.5);
+  color: var(--ink-4);
   margin-bottom: 12px;
   letter-spacing: 0.05em;
   display: flex;
   justify-content: space-between;
 }
-.fancy-dict-title span { font-family: 'JetBrains Mono', monospace; color: rgba(255,255,255,0.3); }
+.fancy-dict-title span { font-family: 'JetBrains Mono', monospace; color: var(--ink-6); }
 
 .fancy-dict {
   display: flex;
   flex-direction: column;
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(10, 10, 15, 0.02);
+  border-radius: var(--r-sm);
+  border: 0.5px solid var(--line);
   padding: 8px 16px;
 }
 .dict-row {
@@ -342,13 +346,13 @@ const workflowStepIndex = computed(() => {
   justify-content: space-between;
   align-items: center;
   padding: 12px 0;
-  border-bottom: 1px dashed rgba(255, 255, 255, 0.1);
+  border-bottom: 0.5px dashed var(--line-2);
   font-size: 13px;
 }
 .dict-row:last-child { border-bottom: none; }
-.dict-k { color: rgba(255,255,255,0.5); }
-.dict-v { color: rgba(255,255,255,0.9); font-weight: 500; font-family: 'JetBrains Mono', monospace; }
-.dict-v-notes { font-family: inherit; font-weight: 400; max-width: 300px; text-align: right; line-height: 1.5; color: rgba(255,255,255,0.7); }
+.dict-k { color: var(--ink-4); }
+.dict-v { color: var(--ink-2); font-weight: 500; font-family: 'JetBrains Mono', monospace; }
+.dict-v-notes { font-family: inherit; font-weight: 400; max-width: 300px; text-align: right; line-height: 1.5; color: var(--ink-3); }
 
 .action-workflow-area {
   display: grid;
@@ -363,23 +367,23 @@ const workflowStepIndex = computed(() => {
 }
 .modern-btn {
   height: 40px;
-  border-radius: 20px;
+  border-radius: var(--r-sm);
   font-weight: 500;
-  letter-spacing: 0.05em;
-  border: none;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  letter-spacing: 0.02em;
+  border: 0.5px solid var(--line);
+  box-shadow: var(--sh-1);
 }
-.btn-confirm { background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #fff; }
-.btn-confirm:hover { background: linear-gradient(135deg, #34d399 0%, #10b981 100%); }
-.btn-fp { background: rgba(255,255,255,0.1); color: #fff; backdrop-filter: blur(10px); }
-.btn-fp:hover { background: rgba(255,255,255,0.15); }
-.btn-del { background: rgba(220, 38, 38, 0.2); color: #fca5a5; backdrop-filter: blur(10px); }
-.btn-del:hover { background: rgba(220, 38, 38, 0.3); color: #fff; }
+.btn-confirm { background: var(--green); color: #fff; border-color: var(--green); }
+.btn-confirm:hover { opacity: 0.9; }
+.btn-fp { background: rgba(10, 10, 15, 0.04); color: var(--ink-3); }
+.btn-fp:hover { background: rgba(10, 10, 15, 0.08); color: var(--ink-2); }
+.btn-del { background: rgba(229, 72, 77, 0.06); color: var(--red); border-color: rgba(229, 72, 77, 0.2); }
+.btn-del:hover { background: rgba(229, 72, 77, 0.12); }
 
 .workflow-modern-timeline {
-  background: rgba(255,255,255,0.02);
-  border: 1px solid rgba(255,255,255,0.05);
-  border-radius: 12px;
+  background: rgba(10, 10, 15, 0.02);
+  border: 0.5px solid var(--line);
+  border-radius: var(--r);
   padding: 16px 20px;
   display: flex;
   flex-direction: column;
@@ -387,25 +391,25 @@ const workflowStepIndex = computed(() => {
 }
 .timeline-title {
   font-size: 11px;
-  color: rgba(255,255,255,0.4);
+  color: var(--ink-5);
   margin-bottom: 20px;
   letter-spacing: 0.1em;
 }
-:deep(.ant-steps-item-title) { color: rgba(255,255,255,0.6) !important; font-size: 12px !important; }
-:deep(.ant-steps-item-finish .ant-steps-item-title) { color: rgba(255,255,255,0.9) !important; }
-:deep(.ant-steps-item-active .ant-steps-item-title) { color: #1890ff !important; font-weight: 600 !important; }
-:deep(.ant-steps-item-wait .ant-steps-item-icon) { background-color: rgba(255,255,255,0.1) !important; border-color: transparent !important; }
-:deep(.ant-steps-item-wait .ant-steps-item-icon > .ant-steps-icon) { color: rgba(255,255,255,0.3) !important; }
-:deep(.ant-steps-item-process .ant-steps-item-icon) { background-color: transparent !important; border-color: #1890ff !important; }
+:deep(.ant-steps-item-title) { color: var(--ink-4) !important; font-size: 12px !important; }
+:deep(.ant-steps-item-finish .ant-steps-item-title) { color: var(--ink-2) !important; }
+:deep(.ant-steps-item-active .ant-steps-item-title) { color: var(--blue) !important; font-weight: 600 !important; }
+:deep(.ant-steps-item-wait .ant-steps-item-icon) { background-color: rgba(10, 10, 15, 0.04) !important; border-color: var(--line-2) !important; }
+:deep(.ant-steps-item-wait .ant-steps-item-icon > .ant-steps-icon) { color: var(--ink-5) !important; }
+:deep(.ant-steps-item-process .ant-steps-item-icon) { background-color: transparent !important; border-color: var(--blue) !important; }
 
 .fp-badge {
   align-self: flex-start;
   padding: 6px 16px;
-  background: rgba(245, 158, 11, 0.2);
-  color: #fbbf24;
+  background: rgba(217, 119, 6, 0.08);
+  color: var(--amber);
   border-radius: 20px;
   font-size: 13px;
   font-weight: 500;
-  border: 1px solid rgba(245, 158, 11, 0.3);
+  border: 0.5px solid rgba(217, 119, 6, 0.2);
 }
 </style>

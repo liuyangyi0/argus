@@ -1,7 +1,6 @@
 import { api, u } from './client'
 
-// ── Training (legacy baseline endpoints) ──
-export const startTraining = (data: FormData) => api.post('/baseline/train', data).then(u)
+// ── Training ──
 export const getTrainingHistory = (params?: Record<string, any>) =>
   api.get('/baseline/training-history/json', { params }).then(u)
 export const compareModels = (data: { old_record_id: number; new_record_id: number }) =>

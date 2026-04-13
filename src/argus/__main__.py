@@ -23,6 +23,7 @@ from argus.core.health import HealthMonitor
 from argus.core.metrics import METRICS
 from argus.core.scheduler import (
     TaskScheduler,
+    create_backbone_retraining_task,
     create_job_processing_task,
     create_maintenance_tasks,
     create_retraining_task,
@@ -391,6 +392,11 @@ def main():
             trainer=model_trainer,
             model_registry=model_reg,
             baseline_manager=baseline_mgr,
+        )
+        create_backbone_retraining_task(
+            scheduler=scheduler,
+            config=config,
+            database=db,
         )
 
     # Scheduled automatic backup every 6 hours
