@@ -173,21 +173,34 @@ class AlertDispatcher:
                 )
 
         # Channel 3: WebSocket push (real-time dashboard notification)
+        # HIGH severity → priority dispatch (bypass queue, push directly)
+        ws_payload = self._alert_to_dict(alert, evidence_unavailable=evidence_unavailable)
         if self._on_alert_ws:
             try:
-                self._on_alert_ws(
-                    "alerts",
-                    self._alert_to_dict(alert, evidence_unavailable=evidence_unavailable),
-                )
+                self._on_alert_ws("alerts", ws_payload)
             except Exception as e:
                 logger.warning("dispatch.websocket_failed", alert_id=alert.alert_id, error=str(e))
 
+        # Channel 4: Audio alarm via WebSocket
+        if self._on_alert_ws:
+            try:
+                self._on_alert_ws("audio_alert", {
+                    "type": "audio_alert",
+                    "severity": ws_payload["severity"],
+                    "alert_id": ws_payload["alert_id"],
+                    "camera_id": ws_payload["camera_id"],
+                })
+            except Exception as e:
+                logger.warning("dispatch.audio_alert_failed", alert_id=alert.alert_id, error=str(e))
+
+        dispatch_latency_ms = (time.time() - alert.timestamp) * 1000
         logger.info(
             "alert.dispatched",
             alert_id=alert.alert_id,
             severity=alert.severity.value,
             camera_id=alert.camera_id,
             score=round(alert.anomaly_score, 3),
+            latency_ms=round(dispatch_latency_ms, 1),
         )
 
     def _dispatch_database(
@@ -206,6 +219,17 @@ class AlertDispatcher:
                 heatmap_path=heatmap_path,
                 event_group_id=getattr(alert, "event_group_id", None),
                 event_group_count=getattr(alert, "event_group_count", 1),
+                speed_ms=alert.speed_ms,
+                speed_px_per_sec=alert.speed_px_per_sec,
+                trajectory_model=alert.trajectory_model,
+                origin_x_mm=alert.origin_x_mm,
+                origin_y_mm=alert.origin_y_mm,
+                origin_z_mm=alert.origin_z_mm,
+                landing_x_mm=alert.landing_x_mm,
+                landing_y_mm=alert.landing_y_mm,
+                landing_z_mm=alert.landing_z_mm,
+                classification_label=alert.classification_label,
+                classification_confidence=alert.classification_confidence,
             )
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))

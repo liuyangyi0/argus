@@ -7,6 +7,7 @@ import SystemConfigPanel from '../components/system/SystemConfigPanel.vue'
 import SystemAuditPanel from '../components/system/SystemAuditPanel.vue'
 import SystemDegradationPanel from '../components/system/SystemDegradationPanel.vue'
 import SystemUserPanel from '../components/system/SystemUserPanel.vue'
+import ModuleTogglePanel from '../components/system/ModuleTogglePanel.vue'
 
 const activeTab = ref('overview')
 
@@ -37,6 +38,11 @@ function onTabChange(key: string | number) {
       <!-- Degradation History -->
       <Tabs.TabPane key="degradation" tab="降级事件">
         <SystemDegradationPanel v-if="activeTab === 'degradation'" />
+      </Tabs.TabPane>
+
+      <!-- Module Toggles -->
+      <Tabs.TabPane key="modules" tab="功能模块">
+        <ModuleTogglePanel v-if="activeTab === 'modules'" />
       </Tabs.TabPane>
 
       <!-- Users -->
