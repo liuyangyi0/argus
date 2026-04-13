@@ -74,6 +74,16 @@ class Alert:
     # Alert aggregation: alerts in same camera+zone within a window share this ID
     event_group_id: str | None = None
     event_group_count: int = 1
+    # Physics enrichment (phase 1: speed, phase 2: trajectory/localization)
+    speed_ms: float | None = None
+    speed_px_per_sec: float | None = None
+    trajectory_model: str | None = None  # "free_fall" or "projectile"
+    origin_x_mm: float | None = None
+    origin_y_mm: float | None = None
+    origin_z_mm: float | None = None
+    landing_x_mm: float | None = None
+    landing_y_mm: float | None = None
+    landing_z_mm: float | None = None
     # Set by pipeline after alert recording is solidified to disk
     _solidified_recording: SolidifiedRecording | None = None
 

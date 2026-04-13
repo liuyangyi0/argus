@@ -346,6 +346,43 @@ def main():
             app.state.baseline_lifecycle._audit = audit_logger
         app.state.backup_manager = backup_mgr
 
+        # M6: Continuous recording + retention (if enabled)
+        recording_manager = None
+        retention_manager = None
+        if config.continuous_recording.enabled:
+            from argus.storage.continuous_recorder import ContinuousRecordingManager
+            from argus.storage.retention import RetentionManager
+
+            recording_manager = ContinuousRecordingManager(
+                output_dir=config.continuous_recording.output_dir,
+                segment_duration_hours=config.continuous_recording.segment_duration_hours,
+                encoding_crf=config.continuous_recording.encoding_crf,
+                encoding_preset=config.continuous_recording.encoding_preset,
+                encoding_fps=config.continuous_recording.encoding_fps,
+            )
+            for cam_cfg in config.cameras:
+                recording_manager.start_camera(cam_cfg.camera_id, cam_cfg.resolution)
+            logger.info("main.continuous_recording_started", cameras=len(config.cameras))
+
+            retention_manager = RetentionManager(
+                continuous_recording_dir=config.continuous_recording.output_dir,
+                alert_recording_dir=Path("data/recordings"),
+                local_retention_days=config.continuous_recording.local_retention_days,
+                archive_enabled=config.continuous_recording.archive_enabled,
+                archive_path=config.continuous_recording.archive_path,
+                archive_retention_days=config.continuous_recording.archive_retention_days,
+                cleanup_interval_hours=config.continuous_recording.cleanup_interval_hours,
+            )
+            retention_manager.start()
+            logger.info("main.retention_manager_started")
+
+        app.state.recording_manager = recording_manager
+        app.state.retention_manager = retention_manager
+
+        # Wire continuous recorder into camera manager for frame feeding
+        if recording_manager is not None:
+            manager._continuous_recording_mgr = recording_manager
+
         def run_dashboard():
             import uvicorn
             uvicorn.run(

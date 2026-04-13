@@ -9,6 +9,7 @@ foreign objects more aggressively.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 import structlog
@@ -31,6 +32,9 @@ class TrackedAnomaly:
     velocity: tuple[float, float]  # (dx, dy) pixels per frame
     is_stationary: bool  # velocity magnitude < threshold
     persistence_seconds: float
+    trajectory_history: list[tuple[float, float, float]] = field(default_factory=list)
+    # Each entry: (timestamp_seconds, centroid_x, centroid_y)
+    area_px: int = 0  # Detected region area in pixels
 
 
 @dataclass
@@ -62,6 +66,9 @@ class _TrackState:
     score_sum: float
     score_count: int
     matched_this_frame: bool = False
+    trajectory_history: list[tuple[float, float, float]] = field(default_factory=list)
+    area_px: int = 0
+    max_history_length: int = 300
 
 
 class TemporalAnomalyTracker:
@@ -77,11 +84,13 @@ class TemporalAnomalyTracker:
         max_gap_frames: int = 5,
         stationary_threshold: float = 10.0,
         fps: float = 5.0,
+        trajectory_history_length: int = 300,
     ):
         self._match_distance = match_distance
         self._max_gap_frames = max_gap_frames
         self._stationary_threshold = stationary_threshold
         self._fps = fps
+        self._trajectory_history_length = trajectory_history_length
         self._tracks: dict[int, _TrackState] = {}
         self._next_id = 1
 
@@ -123,6 +132,9 @@ class TemporalAnomalyTracker:
                     best_dist = dist
                     best_track_id = tid
 
+            now = time.time()
+            region_area = getattr(region, "area_px", 0)
+
             if best_track_id is not None:
                 # Update existing track
                 track = self._tracks[best_track_id]
@@ -136,6 +148,13 @@ class TemporalAnomalyTracker:
                 track.score_sum += score
                 track.score_count += 1
                 track.matched_this_frame = True
+                track.area_px = region_area
+                # Append to trajectory history
+                track.trajectory_history.append((now, cx, cy))
+                if len(track.trajectory_history) > track.max_history_length:
+                    track.trajectory_history = track.trajectory_history[
+                        -track.max_history_length :
+                    ]
             else:
                 # Create new track
                 tid = self._next_id
@@ -153,6 +172,9 @@ class TemporalAnomalyTracker:
                     score_sum=score,
                     score_count=1,
                     matched_this_frame=True,
+                    trajectory_history=[(now, cx, cy)],
+                    area_px=region_area,
+                    max_history_length=self._trajectory_history_length,
                 )
                 new_tracks_count += 1
 
@@ -195,6 +217,8 @@ class TemporalAnomalyTracker:
                 velocity=velocity,
                 is_stationary=is_stationary,
                 persistence_seconds=persistence_seconds,
+                trajectory_history=list(track.trajectory_history),
+                area_px=track.area_px,
             )
             active.append(tracked)
 

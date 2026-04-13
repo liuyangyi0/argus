@@ -8,6 +8,7 @@ import { scoreColor } from '../../utils/colors'
 import ReplayPlayer from '../ReplayPlayer.vue'
 import ImageCompareSlider from '../ImageCompareSlider.vue'
 import AnnotationOverlay from '../AnnotationOverlay.vue'
+import AlertPhysicsPanel from './AlertPhysicsPanel.vue'
 
 const alertStore = useAlertStore()
 const { selectedAlert } = storeToRefs(alertStore)
@@ -132,6 +133,9 @@ const workflowStepIndex = computed(() => {
             <div v-if="selectedAlert.assigned_to" class="dict-row"><span class="dict-k">指派人员</span><span class="dict-v">{{ selectedAlert.assigned_to }}</span></div>
             <div v-if="selectedAlert.notes" class="dict-row"><span class="dict-k">备注内容</span><span class="dict-v dict-v-notes">{{ selectedAlert.notes }}</span></div>
         </div>
+
+        <!-- Physics Analysis Panel (speed, trajectory, origin, landing) -->
+        <AlertPhysicsPanel v-if="selectedAlert?.alert_id" :alert-id="selectedAlert.alert_id" />
 
         <div class="action-workflow-area">
           <div class="action-buttons-modern">
