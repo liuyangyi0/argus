@@ -25,6 +25,7 @@ from argus.dashboard.components import (
     tab_bar,
 )
 from argus.dashboard.api_response import (
+    api_forbidden,
     api_success,
     api_internal_error,
     api_not_found,
@@ -407,7 +408,11 @@ def storage_tab(request: Request):
 
 @router.post("/cleanup")
 def cleanup_data(request: Request):
-    """Cleanup old alert data."""
+    """Cleanup old alert data. Requires admin role."""
+    from argus.dashboard.auth import require_role
+    if not require_role(request, "admin"):
+        return api_forbidden("需要管理员权限")
+
     db = request.app.state.db
     config = request.app.state.config
     if not db:

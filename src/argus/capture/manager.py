@@ -67,6 +67,8 @@ class CameraManager:
         cross_camera_config: CrossCameraConfig | None = None,
         segmenter_config: SegmenterConfig | None = None,
         classifier_config: ClassifierConfig | None = None,
+        physics_config: object | None = None,
+        imaging_config: object | None = None,
         health_monitor: HealthMonitor | None = None,
         audit_logger: AuditLogger | None = None,
         record_store: InferenceRecordStore | None = None,
@@ -80,6 +82,8 @@ class CameraManager:
         self._on_status_change = on_status_change
         self._segmenter_config = segmenter_config
         self._classifier_config = classifier_config
+        self._physics_config = physics_config
+        self._imaging_config = imaging_config
         self._health_monitor = health_monitor
         self._audit_logger = audit_logger
         self._record_store = record_store
@@ -675,6 +679,8 @@ class CameraManager:
             on_drift=self._on_status_change,
             segmenter_config=self._segmenter_config,
             classifier_config=self._classifier_config,
+            physics_config=self._physics_config,
+            imaging_config=self._imaging_config,
             model_version_id=model_version_id,
             model_path=model_path,
             shared_anomaly_detector=shared_detector,
