@@ -95,6 +95,20 @@ class AlertRecord(Base):
     event_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     event_group_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
+    # Physics enrichment (phase 1: speed, phase 2: trajectory/localization)
+    speed_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speed_px_per_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trajectory_model: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    origin_x_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    origin_y_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    origin_z_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    landing_x_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    landing_y_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    landing_z_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Classification enrichment
+    classification_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    classification_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
@@ -119,6 +133,17 @@ class AlertRecord(Base):
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "event_group_id": self.event_group_id,
             "event_group_count": self.event_group_count,
+            "speed_ms": self.speed_ms,
+            "speed_px_per_sec": self.speed_px_per_sec,
+            "trajectory_model": self.trajectory_model,
+            "origin_x_mm": self.origin_x_mm,
+            "origin_y_mm": self.origin_y_mm,
+            "origin_z_mm": self.origin_z_mm,
+            "landing_x_mm": self.landing_x_mm,
+            "landing_y_mm": self.landing_y_mm,
+            "landing_z_mm": self.landing_z_mm,
+            "classification_label": self.classification_label,
+            "classification_confidence": self.classification_confidence,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -785,3 +810,23 @@ class ShadowInferenceLog(Base):
     shadow_would_alert: Mapped[bool] = mapped_column(Boolean, nullable=False)
     production_alerted: Mapped[bool] = mapped_column(Boolean, nullable=False)
     latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class ContinuousRecordingSegment(Base):
+    """A single continuous recording video segment."""
+
+    __tablename__ = "continuous_recording_segments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    camera_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    segment_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    start_time: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    end_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    frame_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    archive_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )

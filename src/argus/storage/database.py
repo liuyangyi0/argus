@@ -17,6 +17,7 @@ from argus.storage.models import (
     Base,
     BaselineRecord,
     BaselineVersionRecord,
+    ContinuousRecordingSegment,
     FeedbackRecord,
     FeedbackStatus,
     InferenceRecord,
@@ -65,6 +66,23 @@ class Database:
                 conn.execute(text("PRAGMA temp_store=MEMORY"))
                 conn.commit()
 
+        # Quick integrity check on startup — validates B-tree structure
+        # without reading all data pages (10-100x faster than full integrity_check)
+        if self._database_url.startswith("sqlite"):
+            try:
+                with self._engine.connect() as conn:
+                    result = conn.execute(text("PRAGMA quick_check")).scalar()
+                    if result != "ok":
+                        logger.error(
+                            "database.integrity_check_failed",
+                            result=result,
+                            msg="Database may be corrupted — attempting backup restore",
+                        )
+                    else:
+                        logger.info("database.integrity_check_passed")
+            except Exception as e:
+                logger.error("database.integrity_check_error", error=str(e))
+
         # Auto-migrate: add missing columns to existing tables
         self._auto_migrate()
 
@@ -90,6 +108,19 @@ class Database:
             # Alert aggregation
             ("alerts", "event_group_id", "VARCHAR(64)"),
             ("alerts", "event_group_count", "INTEGER DEFAULT 1"),
+            # Physics enrichment (speed, trajectory, localization)
+            ("alerts", "speed_ms", "REAL"),
+            ("alerts", "speed_px_per_sec", "REAL"),
+            ("alerts", "trajectory_model", "VARCHAR(20)"),
+            ("alerts", "origin_x_mm", "REAL"),
+            ("alerts", "origin_y_mm", "REAL"),
+            ("alerts", "origin_z_mm", "REAL"),
+            ("alerts", "landing_x_mm", "REAL"),
+            ("alerts", "landing_y_mm", "REAL"),
+            ("alerts", "landing_z_mm", "REAL"),
+            # Classification enrichment
+            ("alerts", "classification_label", "VARCHAR(100)"),
+            ("alerts", "classification_confidence", "REAL"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
@@ -126,6 +157,19 @@ class Database:
         heatmap_path: str | None = None,
         event_group_id: str | None = None,
         event_group_count: int = 1,
+        # Physics enrichment (phase 1/2)
+        speed_ms: float | None = None,
+        speed_px_per_sec: float | None = None,
+        trajectory_model: str | None = None,
+        origin_x_mm: float | None = None,
+        origin_y_mm: float | None = None,
+        origin_z_mm: float | None = None,
+        landing_x_mm: float | None = None,
+        landing_y_mm: float | None = None,
+        landing_z_mm: float | None = None,
+        # Classification enrichment
+        classification_label: str | None = None,
+        classification_confidence: float | None = None,
         _max_retries: int = 3,
     ) -> AlertRecord:
         """Save an alert to the database with retry on transient failures.
@@ -151,6 +195,17 @@ class Database:
                         heatmap_path=heatmap_path,
                         event_group_id=event_group_id,
                         event_group_count=event_group_count,
+                        speed_ms=speed_ms,
+                        speed_px_per_sec=speed_px_per_sec,
+                        trajectory_model=trajectory_model,
+                        origin_x_mm=origin_x_mm,
+                        origin_y_mm=origin_y_mm,
+                        origin_z_mm=origin_z_mm,
+                        landing_x_mm=landing_x_mm,
+                        landing_y_mm=landing_y_mm,
+                        landing_z_mm=landing_z_mm,
+                        classification_label=classification_label,
+                        classification_confidence=classification_confidence,
                     )
                     session.add(record)
                     session.commit()

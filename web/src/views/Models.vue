@@ -44,8 +44,8 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div>
-    <Typography.Title :level="3" style="margin-bottom: 24px">模型管理</Typography.Title>
+  <main class="glass" style="margin: 12px; padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
+    <Typography.Title :level="3" style="margin-bottom: 24px; color: var(--ink)">模型管理</Typography.Title>
 
     <Tabs :activeKey="activeTab" @change="onTabChange">
       <Tabs.TabPane key="baselines" tab="基线管理">
@@ -83,5 +83,5 @@ onMounted(async () => {
         <ThresholdPreview :cameras="cameras" />
       </Tabs.TabPane>
     </Tabs>
-  </div>
+  </main>
 </template>

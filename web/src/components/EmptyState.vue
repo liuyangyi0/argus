@@ -54,13 +54,13 @@ const iconMap = {
 
 .empty-state__icon {
   font-size: 48px;
-  color: var(--argus-icon-muted);
+  color: var(--ink-5);
   margin-bottom: 16px;
 }
 
 .empty-state__title {
   margin-bottom: 8px !important;
-  color: var(--argus-text-muted) !important;
+  color: var(--ink-4) !important;
 }
 
 .empty-state__desc {

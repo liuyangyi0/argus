@@ -23,6 +23,7 @@ from argus.core.health import HealthMonitor
 from argus.core.metrics import METRICS
 from argus.core.scheduler import (
     TaskScheduler,
+    create_backbone_retraining_task,
     create_job_processing_task,
     create_maintenance_tasks,
     create_retraining_task,
@@ -292,6 +293,8 @@ def main():
         cross_camera_config=config.cross_camera,
         segmenter_config=config.segmenter,
         classifier_config=config.classifier,
+        physics_config=config.physics,
+        imaging_config=config.imaging,
         health_monitor=health,
         audit_logger=audit_log,
         record_store=record_store,
@@ -345,6 +348,43 @@ def main():
             app.state.baseline_lifecycle._audit = audit_logger
         app.state.backup_manager = backup_mgr
 
+        # M6: Continuous recording + retention (if enabled)
+        recording_manager = None
+        retention_manager = None
+        if config.continuous_recording.enabled:
+            from argus.storage.continuous_recorder import ContinuousRecordingManager
+            from argus.storage.retention import RetentionManager
+
+            recording_manager = ContinuousRecordingManager(
+                output_dir=config.continuous_recording.output_dir,
+                segment_duration_hours=config.continuous_recording.segment_duration_hours,
+                encoding_crf=config.continuous_recording.encoding_crf,
+                encoding_preset=config.continuous_recording.encoding_preset,
+                encoding_fps=config.continuous_recording.encoding_fps,
+            )
+            for cam_cfg in config.cameras:
+                recording_manager.start_camera(cam_cfg.camera_id, cam_cfg.resolution)
+            logger.info("main.continuous_recording_started", cameras=len(config.cameras))
+
+            retention_manager = RetentionManager(
+                continuous_recording_dir=config.continuous_recording.output_dir,
+                alert_recording_dir=Path("data/recordings"),
+                local_retention_days=config.continuous_recording.local_retention_days,
+                archive_enabled=config.continuous_recording.archive_enabled,
+                archive_path=config.continuous_recording.archive_path,
+                archive_retention_days=config.continuous_recording.archive_retention_days,
+                cleanup_interval_hours=config.continuous_recording.cleanup_interval_hours,
+            )
+            retention_manager.start()
+            logger.info("main.retention_manager_started")
+
+        app.state.recording_manager = recording_manager
+        app.state.retention_manager = retention_manager
+
+        # Wire continuous recorder into camera manager for frame feeding
+        if recording_manager is not None:
+            manager._continuous_recording_mgr = recording_manager
+
         def run_dashboard():
             import uvicorn
             uvicorn.run(
@@ -391,6 +431,11 @@ def main():
             trainer=model_trainer,
             model_registry=model_reg,
             baseline_manager=baseline_mgr,
+        )
+        create_backbone_retraining_task(
+            scheduler=scheduler,
+            config=config,
+            database=db,
         )
 
     # Scheduled automatic backup every 6 hours
@@ -466,6 +511,11 @@ def main():
                     logger.debug("shutdown.go2rtc_close_failed", exc_info=True)
         scheduler.stop()
         manager.stop_all()
+        # Stop continuous recording AFTER cameras (no more frames to push)
+        if recording_manager is not None:
+            recording_manager.stop_all()
+        if retention_manager is not None:
+            retention_manager.stop()
         record_store.stop()
         dispatcher.close()
         db.close()

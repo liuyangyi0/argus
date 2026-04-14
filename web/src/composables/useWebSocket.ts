@@ -1,6 +1,61 @@
 import { ref, onUnmounted, type Ref } from 'vue'
 
-type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation' | 'heatmap'
+type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation' | 'heatmap' | 'audio_alert'
+
+// ── Audio Alert System ──
+const audioMuted = ref(false)
+let audioCtx: AudioContext | null = null
+
+function playAlertBeep(severity: string = 'medium'): void {
+  if (audioMuted.value) return
+  try {
+    if (!audioCtx) audioCtx = new AudioContext()
+    const ctx = audioCtx
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.connect(gain)
+    gain.connect(ctx.destination)
+
+    // Frequency varies by severity
+    const freqMap: Record<string, number> = {
+      high: 880,
+      medium: 660,
+      low: 440,
+      info: 330,
+    }
+    osc.frequency.value = freqMap[severity] || 660
+    osc.type = 'sine'
+
+    // Duration varies by severity
+    const durMap: Record<string, number> = { high: 0.4, medium: 0.25, low: 0.15, info: 0.1 }
+    const dur = durMap[severity] || 0.25
+
+    gain.gain.setValueAtTime(0.3, ctx.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur)
+    osc.start(ctx.currentTime)
+    osc.stop(ctx.currentTime + dur)
+
+    // HIGH severity: double beep
+    if (severity === 'high') {
+      const osc2 = ctx.createOscillator()
+      const gain2 = ctx.createGain()
+      osc2.connect(gain2)
+      gain2.connect(ctx.destination)
+      osc2.frequency.value = 880
+      osc2.type = 'sine'
+      gain2.gain.setValueAtTime(0.3, ctx.currentTime + dur + 0.1)
+      gain2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur + 0.1 + dur)
+      osc2.start(ctx.currentTime + dur + 0.1)
+      osc2.stop(ctx.currentTime + dur + 0.1 + dur)
+    }
+  } catch {
+    // Audio API may not be available
+  }
+}
+
+function toggleAudioMute(): void {
+  audioMuted.value = !audioMuted.value
+}
 
 interface WsMessage {
   topic: string
@@ -44,7 +99,9 @@ let subscriberIdCounter = 0
 const subscribers = new Map<number, Subscriber>()
 let retryCount = 0
 let retryTimer: ReturnType<typeof setTimeout> | null = null
-const MAX_RETRIES = 3
+import { DEFAULT_WS_RETRY_MAX, DEFAULT_WS_FALLBACK_INTERVAL_MS } from '../config/constants'
+
+const MAX_RETRIES = DEFAULT_WS_RETRY_MAX
 const globalConnected = ref(false)
 const globalReconnecting = ref(false)
 const globalRetryCount = ref(0)
@@ -96,6 +153,11 @@ function wsConnect() {
         ws?.send(JSON.stringify({ action: 'pong' }))
         return
       }
+      // Audio alert: play beep on audio_alert topic
+      if (msg.topic === 'audio_alert' && msg.data?.severity) {
+        playAlertBeep(msg.data.severity)
+      }
+
       // Dispatch to subscribers interested in this topic
       for (const sub of subscribers.values()) {
         if (sub.topics.has(msg.topic as Topic)) {
@@ -202,7 +264,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     topics,
     onMessage,
     fallbackPoll,
-    fallbackInterval = 15000,
+    fallbackInterval = DEFAULT_WS_FALLBACK_INTERVAL_MS,
   } = options
 
   const connected = globalConnected
@@ -236,5 +298,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     nextRetryIn: globalNextRetryIn,
     error,
     topicData,
+    audioMuted,
+    toggleAudioMute,
   }
 }

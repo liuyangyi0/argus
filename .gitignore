@@ -18,6 +18,12 @@ data/inference_records/
 data/active_learning/
 data/recordings/
 data/backups/
+
+data/.watchdog
+
+# Local model assets
+pre_trained/
+
 # Environment
 .env
 .venv/

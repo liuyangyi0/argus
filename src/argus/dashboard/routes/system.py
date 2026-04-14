@@ -358,6 +358,82 @@ async def system_details(request: Request):
     </div>""")
 
 
+def _collect_from_pipelines(camera_manager, attr_name: str, extractor, default_fn):
+    """Iterate pipelines and collect per-camera data with fallback defaults."""
+    result = []
+    for cam_id, pipeline in camera_manager._pipelines.items():
+        component = getattr(pipeline, attr_name, None)
+        extracted = extractor(component) if component else None
+        if extracted is not None:
+            extracted["camera_id"] = cam_id
+            result.append(extracted)
+        else:
+            d = default_fn()
+            d["camera_id"] = cam_id
+            result.append(d)
+    return result
+
+
+@router.get("/drift")
+async def drift_status(request: Request):
+    """Per-camera drift detection status."""
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    if not camera_manager:
+        return api_success({"cameras": []})
+
+    def _extract_drift(detector):
+        if not hasattr(detector, "get_status"):
+            return None
+        st = detector.get_status()
+        return {
+            "is_drifted": st.is_drifted,
+            "ks_statistic": round(st.ks_statistic, 4),
+            "p_value": round(st.p_value, 6),
+            "reference_mean": round(st.reference_mean, 4),
+            "current_mean": round(st.current_mean, 4),
+            "samples_collected": st.samples_collected,
+            "last_check_time": st.last_check_time,
+        }
+
+    result = _collect_from_pipelines(
+        camera_manager, "_drift_detector", _extract_drift,
+        lambda: {"is_drifted": False, "ks_statistic": 0, "p_value": 1,
+                 "reference_mean": 0, "current_mean": 0, "samples_collected": 0,
+                 "last_check_time": 0},
+    )
+    return api_success({"cameras": result})
+
+
+@router.get("/camera-health")
+async def camera_health(request: Request):
+    """Per-camera health check details (5-check analysis)."""
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    if not camera_manager:
+        return api_success({"cameras": []})
+
+    def _extract_health(analyzer):
+        hr = getattr(analyzer, "last_result", None)
+        if not hr:
+            return None
+        return {
+            "is_frozen": hr.is_frozen,
+            "sharpness_score": round(hr.sharpness_score, 2),
+            "displacement_px": round(hr.displacement_px, 1),
+            "is_flash": hr.is_flash,
+            "gain_drift_pct": round(hr.gain_drift_pct, 1),
+            "suppress_detection": hr.suppress_detection,
+            "warnings": hr.warnings,
+        }
+
+    result = _collect_from_pipelines(
+        camera_manager, "_health_analyzer", _extract_health,
+        lambda: {"is_frozen": False, "sharpness_score": 0, "displacement_px": 0,
+                 "is_flash": False, "gain_drift_pct": 0, "suppress_detection": False,
+                 "warnings": []},
+    )
+    return api_success({"cameras": result})
+
+
 @router.get("/metrics")
 def prometheus_metrics():
     """Prometheus-compatible metrics endpoint for scraping."""

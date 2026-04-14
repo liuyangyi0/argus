@@ -449,10 +449,10 @@ loadCameraGroups()
     >
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
         <Space>
-          <PauseCircleOutlined v-if="task.status === 'paused'" style="color: #faad14" />
+          <PauseCircleOutlined v-if="task.status === 'paused'" style="color: #d97706" />
           <LoadingOutlined v-else-if="task.status === 'running'" spin style="color: #3b82f6" />
-          <CheckCircleOutlined v-else-if="task.status === 'complete'" style="color: #52c41a" />
-          <CloseCircleOutlined v-else-if="task.status === 'failed'" style="color: #ff4d4f" />
+          <CheckCircleOutlined v-else-if="task.status === 'complete'" style="color: #15a34a" />
+          <CloseCircleOutlined v-else-if="task.status === 'failed'" style="color: #e5484d" />
           <StopOutlined v-else-if="task.status === 'aborted'" style="color: #8890a0" />
           <span style="font-weight: 500">{{ taskTitle(task) }}</span>
           <span v-if="task.camera_id" style="color: #8890a0">{{ task.camera_id }}</span>
@@ -478,7 +478,7 @@ loadCameraGroups()
       </div>
       <Progress :percent="task.progress" :status="taskProgressStatus(task)" size="small" />
       <div style="font-size: 12px; color: #8890a0; margin-top: 4px">{{ task.message }}</div>
-      <div v-if="task.error" style="font-size: 12px; color: #ff4d4f; margin-top: 4px">{{ task.error }}</div>
+      <div v-if="task.error" style="font-size: 12px; color: #e5484d; margin-top: 4px">{{ task.error }}</div>
     </Card>
   </div>
 

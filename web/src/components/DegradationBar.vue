@@ -45,10 +45,10 @@ useWebSocket({
 onMounted(fetchSummary)
 
 const levelColor: Record<string, string> = {
-  info: '#3b82f6',
-  warning: '#f59e0b',
-  moderate: '#f97316',
-  severe: '#ef4444',
+  info: '#2563eb',
+  warning: '#d97706',
+  moderate: '#d97706',
+  severe: '#e5484d',
 }
 
 const levelLabel: Record<string, string> = {
@@ -61,10 +61,10 @@ const levelLabel: Record<string, string> = {
 const barBackground = computed(() => {
   if (!maxLevel.value) return 'transparent'
   const colors: Record<string, string> = {
-    info: 'rgba(59, 130, 246, 0.15)',
-    warning: 'rgba(245, 158, 11, 0.15)',
-    moderate: 'rgba(249, 115, 22, 0.15)',
-    severe: 'rgba(239, 68, 68, 0.15)',
+    info: 'rgba(37, 99, 235, 0.05)',
+    warning: 'rgba(217, 119, 6, 0.05)',
+    moderate: 'rgba(217, 119, 6, 0.08)',
+    severe: 'rgba(229, 72, 77, 0.06)',
   }
   return colors[maxLevel.value] || 'transparent'
 })
@@ -99,10 +99,10 @@ const hasMore = computed(() => activeCount.value > 3)
       <!-- Title -->
       <Typography.Text strong style="flex-shrink: 0; font-size: 13px">{{ evt.title }}</Typography.Text>
       <!-- Affected camera -->
-      <Tag v-if="evt.camera_id" size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: var(--argus-border); flex-shrink: 0">
+      <Tag v-if="evt.camera_id" size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: var(--line-2); flex-shrink: 0">
         {{ evt.camera_id }}
       </Tag>
-      <Tag v-else size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: var(--argus-border); flex-shrink: 0">
+      <Tag v-else size="small" style="margin: 0; font-size: 10px; background: rgba(255,255,255,0.06); border-color: var(--line-2); flex-shrink: 0">
         全系统
       </Tag>
       <!-- Duration -->
@@ -133,7 +133,7 @@ const hasMore = computed(() => activeCount.value > 3)
   animation: degrade-pulse 2s ease-in-out infinite;
 }
 @keyframes degrade-pulse {
-  0%, 100% { border-bottom-color: #ef4444; }
-  50% { border-bottom-color: #991b1b; }
+  0%, 100% { border-bottom-color: rgba(229, 72, 77, 0.18); }
+  50% { border-bottom-color: rgba(229, 72, 77, 0.6); }
 }
 </style>

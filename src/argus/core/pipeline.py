@@ -185,6 +185,8 @@ class DetectionPipeline:
         on_drift: Callable[[str, dict], None] | None = None,
         classifier_config: ClassifierConfig | None = None,
         segmenter_config: SegmenterConfig | None = None,
+        physics_config: object | None = None,
+        imaging_config: object | None = None,
         model_version_id: str | None = None,
         model_path: Path | None = None,
         shared_anomaly_detector: object | None = None,
@@ -208,6 +210,8 @@ class DetectionPipeline:
         self.stats = PipelineStats()
         self._classifier_config = classifier_config
         self._segmenter_config = segmenter_config
+        self._physics_config = physics_config
+        self._imaging_config = imaging_config
 
         # Pre-cache Prometheus metric children (avoids per-frame .labels() lock)
         _cid = camera_config.camera_id
@@ -490,6 +494,129 @@ class DetectionPipeline:
                     error=str(e),
                 )
 
+        # P1: Physics speed estimator (optional)
+        self._speed_estimator = None
+        if self._physics_config and self._physics_config.speed_enabled:
+            try:
+                from argus.physics.speed import PixelSpeedEstimator
+
+                self._speed_estimator = PixelSpeedEstimator(
+                    fps=camera_config.fps_target,
+                    smoothing_window=self._physics_config.speed_smoothing_window,
+                    pixel_scale_mm_per_px=self._physics_config.pixel_scale_mm_per_px,
+                )
+                logger.info(
+                    "pipeline.speed_estimator_configured",
+                    camera_id=camera_config.camera_id,
+                    fps=camera_config.fps_target,
+                )
+            except Exception as e:
+                logger.warning(
+                    "pipeline.speed_estimator_init_failed",
+                    camera_id=camera_config.camera_id,
+                    error=str(e),
+                )
+
+        # Event camera trigger callback (reserved interface)
+        # When an event camera detects motion, it calls this to boost frame FPS
+        self._event_trigger_callback: Callable | None = None
+
+        # M1: Multi-modal imaging preprocessing (optional)
+        self._imaging_processor = None
+        if self._imaging_config and self._imaging_config.enabled and self._imaging_config.polarization_processing:
+            try:
+                from argus.imaging.polarization import PolarizationProcessor
+
+                self._imaging_processor = PolarizationProcessor(
+                    deglare_method=self._imaging_config.deglare_method,
+                    dolp_threshold=self._imaging_config.dolp_threshold,
+                )
+                logger.info(
+                    "pipeline.imaging_processor_configured",
+                    camera_id=camera_config.camera_id,
+                    method=imaging_config.deglare_method,
+                )
+            except Exception as e:
+                logger.warning(
+                    "pipeline.imaging_processor_init_failed",
+                    camera_id=camera_config.camera_id,
+                    error=str(e),
+                )
+
+        # Cached postprocessor for physics enrichment (avoid per-frame allocation)
+        from argus.core.anomaly_postprocess import AnomalyMapProcessor
+        self._physics_postproc = AnomalyMapProcessor(
+            min_contour_area=camera_config.anomaly.min_contour_area,
+        )
+
+        # Temporal anomaly tracker for physics enrichment
+        from argus.core.temporal_tracker import TemporalAnomalyTracker
+
+        self._physics_tracker = TemporalAnomalyTracker(
+            match_distance=camera_config.tracker_match_distance,
+            max_gap_frames=camera_config.tracker_max_gap_frames,
+            stationary_threshold=camera_config.tracker_stationary_threshold,
+            fps=camera_config.fps_target,
+            trajectory_history_length=(
+                self._physics_config.trajectory_history_length if self._physics_config else 300
+            ),
+        )
+
+        # P2: Trajectory analyzer (optional, phase 2)
+        self._trajectory_analyzer = None
+        self._camera_calibration = None
+        if self._physics_config and self._physics_config.trajectory_enabled:
+            try:
+                from argus.physics.trajectory import TrajectoryAnalyzer
+
+                self._trajectory_analyzer = TrajectoryAnalyzer(
+                    gravity_ms2=self._physics_config.gravity_ms2,
+                    pool_surface_z_mm=self._physics_config.pool_surface_z_mm,
+                    min_points=self._physics_config.min_trajectory_points,
+                    use_drag_model=self._physics_config.use_drag_model,
+                )
+                logger.info(
+                    "pipeline.trajectory_analyzer_configured",
+                    camera_id=camera_config.camera_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "pipeline.trajectory_analyzer_init_failed",
+                    camera_id=camera_config.camera_id,
+                    error=str(e),
+                )
+
+        # P3: Camera calibration for localization (optional, phase 2)
+        if self._physics_config and self._physics_config.localization_enabled and camera_config.calibration_file:
+            try:
+                from argus.physics.calibration import CameraCalibration
+
+                self._camera_calibration = CameraCalibration.from_file(
+                    camera_config.calibration_file,
+                    pool_surface_z_mm=self._physics_config.pool_surface_z_mm,
+                )
+                logger.info(
+                    "pipeline.calibration_loaded",
+                    camera_id=camera_config.camera_id,
+                    file=camera_config.calibration_file,
+                )
+            except Exception as e:
+                logger.warning(
+                    "pipeline.calibration_load_failed",
+                    camera_id=camera_config.camera_id,
+                    error=str(e),
+                )
+
+        # Wire calibration to speed estimator if both available
+        if self._speed_estimator and self._camera_calibration:
+            self._speed_estimator._calibration = self._camera_calibration
+
+        # Load custom classifier vocabulary if configured
+        if self._classifier and classifier_config:
+            custom_vocab_path = getattr(classifier_config, "custom_vocabulary_path", None)
+            if custom_vocab_path:
+                self._classifier.load_vocabulary(custom_vocab_path)
+
     @staticmethod
     def _find_model_in_dir(base: Path, camera_id: str) -> Path | None:
         """Find the best model file in a directory and its exports counterpart.
@@ -639,6 +766,20 @@ class DetectionPipeline:
         diag.stages.append(StageResult(
             stage_name="zone_mask", duration_ms=(time.monotonic() - t0) * 1000
         ))
+
+        # Stage 0.5: Multi-modal imaging preprocessing (if enabled)
+        if self._imaging_processor is not None:
+            try:
+                t_img = time.monotonic()
+                from argus.imaging.polarization import PolarizationProcessor
+                pol_result = self._imaging_processor.process(frame)
+                frame = pol_result.deglared  # Use reflection-removed image
+                diag.stages.append(StageResult(
+                    stage_name="imaging_deglare",
+                    duration_ms=(time.monotonic() - t_img) * 1000,
+                ))
+            except Exception as e:
+                logger.debug("pipeline.imaging_preprocessing_error", error=str(e))
 
         # Save latest frame reference — get_latest_frame() copies on read
         with self._latest_frame_lock:
@@ -1162,6 +1303,51 @@ class DetectionPipeline:
                     error=str(e),
                 )
 
+        # P1-P3: Physics enrichment (speed, trajectory, localization)
+        if alert is not None and anomaly_result.is_anomalous:
+            try:
+                regions = self._physics_postproc.extract_regions(
+                    anomaly_result.anomaly_map,
+                    threshold=0.3,
+                ) if anomaly_result.anomaly_map is not None else []
+                temporal = self._physics_tracker.update(regions, self._frame_counter)
+
+                # P1: Speed estimation
+                if self._speed_estimator and temporal.active_tracks:
+                    best_track = max(temporal.active_tracks, key=lambda t: t.max_score)
+                    speed_est = self._speed_estimator.estimate(best_track)
+                    alert.speed_px_per_sec = speed_est.speed_px_per_sec
+                    alert.speed_ms = speed_est.speed_ms
+
+                # P2: Trajectory fitting (phase 2)
+                if (
+                    self._trajectory_analyzer
+                    and self._camera_calibration
+                    and temporal.active_tracks
+                ):
+                    best_track = max(temporal.active_tracks, key=lambda t: t.max_score)
+                    if len(best_track.trajectory_history) >= 5:
+                        from argus.physics.trajectory import trajectory_points_from_pixel_history
+                        world_pts = trajectory_points_from_pixel_history(
+                            best_track.trajectory_history,
+                            self._camera_calibration,
+                        )
+                        fit = self._trajectory_analyzer.fit_trajectory(world_pts)
+                        if fit is not None:
+                            alert.trajectory_model = fit.model_type
+                            alert.origin_x_mm = fit.origin.x_mm
+                            alert.origin_y_mm = fit.origin.y_mm
+                            alert.origin_z_mm = fit.origin.z_mm
+                            alert.landing_x_mm = fit.landing.x_mm
+                            alert.landing_y_mm = fit.landing.y_mm
+                            alert.landing_z_mm = fit.landing.z_mm
+            except Exception as e:
+                logger.debug(
+                    "pipeline.physics_enrichment_error",
+                    camera_id=frame_data.camera_id,
+                    error=str(e),
+                )
+
         if alert is not None:
             alert.model_version_id = self._model_version_id
             self.stats.alerts_emitted += 1
@@ -1563,6 +1749,15 @@ class DetectionPipeline:
     def get_cusum_states(self) -> dict[str, CusumSnapshot]:
         """Return CUSUM evidence snapshots for all active zones."""
         return self._alert_grader.get_all_cusum_states()
+
+    def set_event_trigger(self, callback: Callable | None) -> None:
+        """Set event camera trigger callback (reserved interface).
+
+        When an event camera adapter detects a motion burst, it calls
+        this callback to signal the frame camera to boost its FPS.
+        The callback receives ``(camera_id: str, event_rate: int)``.
+        """
+        self._event_trigger_callback = callback
 
     @property
     def mode(self) -> PipelineMode:

@@ -113,7 +113,7 @@ tests/
 
 - FastAPI 后端负责 API、认证、WebSocket、配置重载和静态资源托管。
 - CameraManager 为每个摄像头维护独立运行上下文，避免单路故障拖垮全局。
-- TaskScheduler 与 TaskManager 负责维护任务、训练作业和后台维护流程。
+- TaskScheduler 负责周期维护任务与训练作业处理；TaskManager 负责前端可见的长任务状态与进度管理。
 - Database、ModelRegistry、InferenceRecordStore、AlertRecordingStore 提供持久化能力。
 - go2rtc 用于浏览器播放和 USB / RTSP 流重定向；不可用时回退到 MJPEG 路径。
 

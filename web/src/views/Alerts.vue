@@ -314,12 +314,13 @@ import { scoreColor } from '../utils/colors'
 
 // Table columns — adapt based on whether detail is open
 const columns = computed(() => {
-  const base = [
-    { title: '', key: 'thumbnail', width: 56 },
+  const isCompact = !!selectedAlert.value
+  const base: any[] = [
+    { title: '', key: 'thumbnail', width: 52 },
     {
       title: '严重度',
       key: 'severity',
-      width: 72,
+      width: isCompact ? 60 : 72,
       filters: [
         { text: '高', value: 'high' },
         { text: '中', value: 'medium' },
@@ -327,30 +328,29 @@ const columns = computed(() => {
         { text: '提示', value: 'info' },
       ],
     },
-    { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 100, ellipsis: true },
-    { title: '分数', key: 'score', width: 72 },
-    { title: '时间', key: 'time', width: 90 },
+    { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: isCompact ? 80 : 100, ellipsis: true },
+    { title: '分数', key: 'score', width: 64 },
+    { title: '时间', key: 'time', width: 80 },
   ]
-  // When detail is closed, show more columns
-  if (!selectedAlert.value) {
-    base.splice(3, 0, { title: '区域', dataIndex: 'zone_id', key: 'zone_id', width: 80, ellipsis: true } as any)
+  if (!isCompact) {
+    base.splice(3, 0, { title: '区域', dataIndex: 'zone_id', key: 'zone_id', width: 80, ellipsis: true })
     base.push(
-      { title: '状态', key: 'status', width: 90 } as any,
-      { title: '操作', key: 'action', width: 160 } as any,
+      { title: '状态', key: 'status', width: 90 },
+      { title: '操作', key: 'action', width: 160 },
     )
   } else {
-    base.push({ title: '状态', key: 'status', width: 80 } as any)
+    base.push({ title: '状态', key: 'status', width: 70 })
   }
   return base
 })
 </script>
 
 <template>
-  <div class="alerts-layout">
+  <main class="alerts-layout glass">
     <!-- Left: Alert List -->
     <div
       :style="{
-        width: selectedAlert ? '420px' : '100%',
+        width: selectedAlert ? '520px' : '100%',
         flexShrink: 0,
         display: 'flex',
         flexDirection: 'column',
@@ -363,13 +363,12 @@ const columns = computed(() => {
       <div class="alerts-header">
         <div class="alerts-header-top">
           <div>
-            <div class="alerts-eyebrow">// Surveillance · Live Feed</div>
-            <h2 class="alerts-title">告警<span class="alerts-accent">中心</span></h2>
+            <h2 class="alerts-title">告警中心</h2>
           </div>
           <div class="alerts-stats">
-            <span>ACTIVE <b>{{ String(activeCount).padStart(2, '0') }}</b></span>
-            <span>RESOLVED <b>{{ String(resolvedCount).padStart(2, '0') }}</b></span>
-            <span>TOTAL <b>{{ String(totalAlerts).padStart(2, '0') }}</b></span>
+            <span>活跃 <b>{{ String(activeCount).padStart(2, '0') }}</b></span>
+            <span>已解决 <b>{{ String(resolvedCount).padStart(2, '0') }}</b></span>
+            <span>总计 <b>{{ String(totalAlerts).padStart(2, '0') }}</b></span>
           </div>
         </div>
         <div class="alerts-filters">
@@ -386,7 +385,7 @@ const columns = computed(() => {
             </Select.Option>
           </Select>
           <div class="alerts-chip-group">
-            <button :class="['alerts-chip', { on: !filters.severity }]" @click="filters.severity = ''; fetchData()">All</button>
+            <button :class="['alerts-chip', { on: !filters.severity }]" @click="filters.severity = ''; fetchData()">全部</button>
             <button :class="['alerts-chip', { on: filters.severity === 'high' }]" @click="filters.severity = 'high'; fetchData()">高</button>
             <button :class="['alerts-chip', { on: filters.severity === 'medium' }]" @click="filters.severity = 'medium'; fetchData()">中</button>
             <button :class="['alerts-chip', { on: filters.severity === 'low' }]" @click="filters.severity = 'low'; fetchData()">低</button>
@@ -676,32 +675,32 @@ const columns = computed(() => {
           <!-- Left: Metadata -->
           <div class="meta-panel">
             <div class="meta-panel-hd">
-              <span>告警信息 · Metadata</span>
+              <span>告警信息</span>
               <b>{{ selectedAlert.alert_id?.slice(-8) }}</b>
             </div>
             <div class="meta-panel-bd">
               <div class="meta-row">
-                <span class="meta-k">CAMERA</span>
-                <span class="meta-v">{{ selectedAlert.camera_id }} / {{ selectedAlert.zone_id || 'Default' }}</span>
+                <span class="meta-k">摄像头</span>
+                <span class="meta-v">{{ selectedAlert.camera_id }} / {{ selectedAlert.zone_id || '默认' }}</span>
               </div>
               <div class="meta-row">
-                <span class="meta-k">SEVERITY</span>
+                <span class="meta-k">严重度</span>
                 <span class="meta-v"><Tag :color="severityColor[selectedAlert.severity]" style="margin: 0">{{ severityLabel[selectedAlert.severity] }}</Tag></span>
               </div>
               <div class="meta-row">
-                <span class="meta-k">CONFIDENCE</span>
+                <span class="meta-k">置信度</span>
                 <span class="meta-v" :style="{ color: scoreColor(selectedAlert.anomaly_score), fontWeight: 600 }">{{ selectedAlert.anomaly_score?.toFixed(4) }}</span>
               </div>
               <div class="meta-row">
-                <span class="meta-k">TRIGGER</span>
+                <span class="meta-k">触发时间</span>
                 <span class="meta-v">{{ formatTimestamp(selectedAlert.timestamp || selectedAlert.created_at) }}</span>
               </div>
               <div v-if="selectedAlert.assigned_to" class="meta-row">
-                <span class="meta-k">ASSIGN</span>
+                <span class="meta-k">指派</span>
                 <span class="meta-v">{{ selectedAlert.assigned_to }}</span>
               </div>
               <div v-if="selectedAlert.notes" class="meta-row">
-                <span class="meta-k">NOTES</span>
+                <span class="meta-k">备注</span>
                 <span class="meta-v meta-v--notes">{{ selectedAlert.notes }}</span>
               </div>
             </div>
@@ -710,8 +709,8 @@ const columns = computed(() => {
           <!-- Right: Actions -->
           <div class="meta-panel">
             <div class="meta-panel-hd">
-              <span>操作 · Actions</span>
-              <b>{{ (workflowLabel[selectedAlert.workflow_status] || '待处理').toUpperCase() }}</b>
+              <span>操作</span>
+              <b>{{ workflowLabel[selectedAlert.workflow_status] || '待处理' }}</b>
             </div>
             <div class="meta-panel-bd actions-panel-bd">
               <Button
@@ -752,7 +751,6 @@ const columns = computed(() => {
                   v-if="selectedAlert.workflow_status !== 'false_positive'"
                   :current="workflowStepIndex"
                   size="small"
-                  direction="vertical"
                   style="font-size: 11px"
                 >
                   <Steps.Step title="待处理" />
@@ -770,7 +768,7 @@ const columns = computed(() => {
         </div>
       </div>
     </div>
-  </div>
+  </main>
 </template>
 
 <style scoped>
@@ -786,35 +784,21 @@ const columns = computed(() => {
   align-items: flex-end;
   margin-bottom: 14px;
 }
-.alerts-eyebrow {
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
-  color: var(--argus-text-muted);
-  letter-spacing: .15em;
-  text-transform: uppercase;
-  margin-bottom: 2px;
-}
 .alerts-title {
-  font-size: 24px;
-  font-weight: 800;
+  font-size: 22px;
+  font-weight: 700;
   margin: 0;
-  letter-spacing: .04em;
   color: var(--argus-text);
-}
-.alerts-accent {
-  color: #3b82f6;
 }
 .alerts-stats {
   display: flex;
   gap: 16px;
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
+  font-size: 13px;
   color: var(--argus-text-muted);
-  letter-spacing: .1em;
 }
 .alerts-stats b {
   color: var(--argus-text);
-  margin-left: 2px;
+  margin-left: 4px;
 }
 
 /* ── Filter chips ── */
@@ -829,16 +813,14 @@ const columns = computed(() => {
   gap: 4px;
 }
 .alerts-chip {
-  padding: 4px 12px;
+  padding: 4px 14px;
   border: 1px solid var(--argus-border);
   background: transparent;
   color: var(--argus-text-muted);
-  font-family: var(--argus-font-mono);
-  font-size: 11px;
-  letter-spacing: .08em;
+  font-size: 13px;
   cursor: pointer;
   transition: all .15s;
-  border-radius: 0;
+  border-radius: 4px;
 }
 .alerts-chip:hover {
   border-color: #3b82f6;
@@ -850,7 +832,8 @@ const columns = computed(() => {
   background: rgba(59, 130, 246, .08);
 }
 .alerts-chip--export {
-  border-style: dashed;
+  border-radius: 4px;
+  background: var(--argus-card-bg-solid, rgba(255,255,255,0.6));
 }
 
 /* ── Thumbnail ── */
@@ -878,28 +861,22 @@ const columns = computed(() => {
 
 /* ── Score & Time ── */
 .alert-score {
-  font-family: var(--argus-font-mono);
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: -.02em;
+  font-size: 14px;
+  font-weight: 600;
 }
 .alert-time {
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
+  font-size: 13px;
   color: var(--argus-text-muted);
-  letter-spacing: .08em;
 }
 
 /* ── Severity badge (detail header) ── */
 .sev-badge {
   display: inline-block;
-  padding: 2px 8px;
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
+  padding: 2px 10px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: .12em;
   color: #fff;
-  text-transform: uppercase;
+  border-radius: 3px;
 }
 .sev-high { background: #b91c1c; }
 .sev-medium { background: #d97706; }
@@ -917,8 +894,7 @@ const columns = computed(() => {
   flex-shrink: 0;
 }
 .detail-crumb {
-  font-family: var(--argus-font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--argus-text-muted);
 }
 .detail-crumb b {
@@ -952,11 +928,9 @@ const columns = computed(() => {
 .meta-panel-hd {
   padding: 10px 14px;
   border-bottom: 1px solid var(--argus-border);
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--argus-text-muted);
-  letter-spacing: .15em;
-  text-transform: uppercase;
   display: flex;
   justify-content: space-between;
 }
@@ -970,9 +944,9 @@ const columns = computed(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 5px 0;
-  border-bottom: 1px dashed var(--argus-border);
-  font-size: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--argus-border);
+  font-size: 13px;
   line-height: 1.8;
 }
 .meta-row:last-child {
@@ -980,14 +954,12 @@ const columns = computed(() => {
 }
 .meta-k {
   color: var(--argus-text-muted);
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
-  letter-spacing: .1em;
-  min-width: 80px;
+  font-size: 13px;
+  min-width: 70px;
 }
 .meta-v {
   color: var(--argus-text);
-  font-size: 12px;
+  font-size: 13px;
 }
 .meta-v--notes {
   max-width: 180px;
@@ -997,9 +969,13 @@ const columns = computed(() => {
 /* ── Layout ── */
 .alerts-layout {
   display: flex;
-  height: calc(100vh - 72px);
-  margin: -24px;
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
+  margin: 12px;
+  border-radius: var(--r-lg, 12px);
+  background: var(--argus-surface, rgba(255,255,255,0.85));
+  backdrop-filter: blur(16px);
 }
 .alerts-chip-group--end {
   margin-left: auto;
@@ -1114,10 +1090,9 @@ const columns = computed(() => {
   padding-top: 10px;
 }
 .workflow-label {
-  font-size: 10px;
+  font-size: 13px;
   color: var(--argus-text-muted);
-  letter-spacing: .1em;
-  text-transform: uppercase;
+  font-weight: 500;
   margin-bottom: 8px;
 }
 .false-positive-display {
