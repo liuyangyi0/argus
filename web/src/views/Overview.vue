@@ -148,6 +148,12 @@ onMounted(() => {
           <template v-for="cam in cameras" :key="cam.camera_id">
             <div class="feed" :class="{ 'live': health?.cameras?.find((c: any) => c.camera_id === cam.camera_id)?.connected }">
               <div class="feed-bg"></div>
+              <img
+                :src="`/api/cameras/${cam.camera_id}/stream`"
+                class="feed-video"
+                loading="lazy"
+                @error="($event.target as HTMLImageElement).style.display = 'none'"
+              />
               <div v-if="cam.current_score && cam.current_score > 0.6" style="position: absolute; bottom: 0; left: 0; right: 0; height: 35%; z-index: 1; pointer-events: none; mix-blend-mode: multiply;">
                 <svg width="100%" height="100%" viewBox="0 0 100 40" preserveAspectRatio="none">
                   <path d="M0 30 Q 15 15, 30 25 T 60 20 T 100 25 L 100 50 L 0 50 Z" fill="rgba(229,72,77,.18)"/>
@@ -329,6 +335,7 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;gap:12px}
     linear-gradient(155deg,#e8ebf0,#dde0e8);
 }
 .feed-bg::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(0deg,rgba(255,255,255,.05) 0 1px,transparent 1px 4px)}
+.feed-video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}
 .feed-ov{position:absolute;inset:0;padding:14px;display:flex;flex-direction:column;justify-content:space-between;z-index:2}
 .chip{
   display:inline-flex;align-items:center;gap:6px;
