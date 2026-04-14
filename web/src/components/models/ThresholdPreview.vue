@@ -62,7 +62,7 @@ watch(previewData, (data) => {
       type: 'bar',
       data: counts.map((c: number, i: number) => ({
         value: c,
-        itemStyle: { color: i >= thresholdIdx ? '#ff4d4f' : '#1890ff' },
+        itemStyle: { color: i >= thresholdIdx ? '#e5484d' : '#2563eb' },
       })),
     }],
     markLine: {
@@ -119,7 +119,7 @@ watch(previewData, (data) => {
             <Statistic
               title="超过阈值"
               :value="previewData.above_threshold"
-              :value-style="{ color: '#ff4d4f' }"
+              :value-style="{ color: '#e5484d' }"
             />
           </Col>
           <Col :span="6">

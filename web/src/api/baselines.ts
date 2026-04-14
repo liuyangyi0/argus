@@ -14,7 +14,6 @@ export const startCapture = startCaptureJob
 export const pauseCaptureJob = (taskId: string) => api.post(`/baseline/job/${taskId}/pause`).then(u)
 export const resumeCaptureJob = (taskId: string) => api.post(`/baseline/job/${taskId}/resume`).then(u)
 export const abortCaptureJob = (taskId: string) => api.post(`/baseline/job/${taskId}/abort`).then(u)
-export const getCaptureJobStatus = (taskId: string) => api.get(`/baseline/job/${taskId}`).then(u)
 
 // ── False Positive Merge ──
 export const mergeFalsePositives = (data: { camera_id: string; zone_id?: string; max_fp_images?: number }) =>

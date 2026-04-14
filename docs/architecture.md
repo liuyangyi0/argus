@@ -1,145 +1,214 @@
 # Argus 系统架构文档
 
-> 最后更新：2026-04-11
+> 最后更新：2026-04-12
 
-本文档描述当前仓库已经落地的系统结构，而不是历史规划版本中的理想形态。
+本文档描述当前仓库已经落地的系统结构、运行时关系和主要边界，内容以实际代码路径为准，而不是历史规划中的理想版本。
 
 ## 1. 系统定位
 
-Argus 是面向固定摄像头场景的边缘侧视觉异常检测系统。当前仓库由两个主要应用组成：
+Argus 是面向固定摄像头场景的单节点边缘视觉异常检测系统，当前仓库包含两个主应用和一组长期运行的后台子系统：
 
-- Python 后端：负责采集、检测、告警、模型与数据管理。
+- Python 后端：负责采集、检测、告警、训练作业、存储和 API。
 - Vue 前端：负责监控、运维、回放、模型与基线操作。
+- 后台子系统：负责任务调度、流媒体代理、回放归档、推理记录、主动学习和降级管理。
 
-典型部署为单节点运行，使用 SQLite 存储业务数据，本地文件系统存储基线、模型、录制和推理记录。
+当前默认部署形态是单机运行：业务元数据存储在 SQLite，本地文件系统保存基线、模型、录像、推理记录和备份。
 
-## 2. 顶层架构
+## 2. 运行时拓扑
+
+当前进程内的主要运行关系如下：
 
 ```text
-摄像头 / 视频源
-  -> Capture Layer
-  -> Detection Pipeline
-  -> Alerting + Persistence
-  -> Dashboard API + WebSocket
-  -> Vue Dashboard
-
-辅助子系统
-  -> TaskScheduler / TaskManager
+argus CLI 进程
+  -> 配置加载与日志初始化
+  -> Database / Audit / Metrics
+  -> AlertDispatcher
+  -> InferenceRecordStore
+  -> AlertRecordingStore
   -> go2rtc
-  -> Database / ModelRegistry
-  -> AlertRecordingStore / InferenceRecordStore
+  -> EventBus + ActiveLearningSampler
+  -> CameraManager
+     -> 每路摄像头一个 DetectionPipeline / Runner
+  -> TaskScheduler
+  -> FastAPI App
+     -> REST API
+     -> WebSocket ConnectionManager
+     -> Vue SPA 静态托管
 ```
 
-## 3. 启动流程
+这里的关键点不是“模块有哪些”，而是“哪些对象在运行期长期持有状态”：
 
-当前启动入口为 `src/argus/__main__.py`，整体顺序如下：
+- `CameraManager` 持有所有摄像头的生命周期与状态。
+- 每路 `DetectionPipeline` 持有本摄像头的检测链、统计信息、锁定状态和诊断缓冲。
+- `TaskScheduler` 持有周期性维护任务与训练作业处理任务。
+- FastAPI `app.state` 持有数据库、摄像头管理器、健康监视器、任务管理器、go2rtc、降级管理器和回放存储等共享对象。
+
+## 3. 启动与关闭流程
+
+当前启动入口为 `src/argus/__main__.py`，实际顺序大致如下：
 
 1. 解析命令行参数并加载 YAML 配置。
-2. 初始化结构化日志、数据库、审计与指标。
-3. 初始化告警分发、推理记录存储和告警录像存储。
-4. 如果启用 go2rtc，则优先启动 go2rtc 并为摄像头准备流代理。
-5. 创建 CameraManager、HealthMonitor、TaskScheduler、TaskManager。
-6. 创建 FastAPI 应用并挂载 API、WebSocket 与前端静态资源。
-7. 启动摄像头检测线程与 Dashboard 服务。
+2. 初始化结构化日志、旋转文件日志和运行指标。
+3. 初始化 `Database` 并在首次启动时创建默认管理员。
+4. 初始化 `AlertDispatcher`、`InferenceRecordStore`、`AlertRecordingStore`。
+5. 如果启用 go2rtc，则优先启动 go2rtc，并对 USB 摄像头做源地址重定向。
+6. 初始化 `EventBus` 与 `ActiveLearningSampler`。
+7. 创建 `CameraManager`，将数据库、录制存储、分类器/分割器配置、跨摄像头配置等注入检测链。
+8. 创建 FastAPI 应用，把共享对象挂到 `app.state`。
+9. 启动 `TaskScheduler`，注册维护任务与训练作业处理任务。
+10. 启动全部摄像头检测线程。
+11. 主线程进入健康轮询、指标刷新和 go2rtc 存活检查循环。
 
-这个顺序很重要，因为 USB 摄像头在当前实现中优先交给 go2rtc 独占，再由检测管线消费重定向后的 RTSP 流。
+关闭时则按相反方向收缩：先关闭 go2rtc，再停止调度器、摄像头、记录存储、告警分发和数据库连接。
 
-## 4. 检测管线
+这个顺序很重要，因为当前实现依赖 go2rtc 尽早接管 USB 摄像头，随后检测链和浏览器都消费代理后的流地址。
 
-每个摄像头拥有独立运行上下文，核心处理链如下：
+## 4. 核心检测架构
+
+每路摄像头由独立的检测运行上下文承载，避免单路异常拖垮全局。主链路如下：
 
 ```text
-Frame
+Frame Source
+  -> CameraCapture
   -> Zone Mask
   -> MOG2 Prefilter
-  -> Person Filter
+  -> YOLO Person / Object Filter
   -> Anomaly Detector
   -> Simplex Safety Channel
   -> Postprocess / Temporal Tracker
   -> AlertGrader
-  -> Dispatcher / Storage
+  -> AlertDispatcher + Storage
 ```
 
 ### 4.1 Capture Layer
 
-- 支持 RTSP、USB、文件输入。
-- CameraManager 负责多摄像头生命周期管理。
-- 采集层包含重连、帧率控制、质量过滤、健康监控。
+- 支持 RTSP、USB、视频文件输入。
+- `CameraCapture` 负责单路采集、重连、帧率控制与基础统计。
+- `CameraManager` 统一负责多摄像头启动、停止、状态汇总和共享模型资源注入。
 
 ### 4.2 Zone Mask
 
-- 在检测早期应用 include / exclude 区域限制。
-- 区域配置来自 YAML 和 Dashboard API。
+- `ZoneMaskEngine` 在检测早期应用 include / exclude 区域裁剪。
+- 区域配置同时来自 YAML 和 Dashboard API。
+- 多 include zone 会被独立评估，最后再汇总到告警分级逻辑。
 
-### 4.3 MOG2 Prefilter
+### 4.3 Prefilter
 
-- 负责前景变化筛选，减少主检测链的算力消耗。
-- 支持去噪、相位相关稳定、heartbeat 强制放行和锁定旁路。
+- 当前主预筛是 `MOG2PreFilter`。
+- 设计目标是降低主检测器吞吐压力，而不是替代主检测器。
+- 当前实现包含 heartbeat 全帧旁路、稳定化和锁定区域旁路等机制，用来缓解静态异物被背景吸收的问题。
 
-### 4.4 Person Filter
+### 4.4 Person / Object Filter
 
-- 基于 Ultralytics YOLO 的人员或指定类别过滤。
-- 可选择遮罩或跳帧策略。
-- 跟踪能力和类别列表由配置控制。
+- 当前过滤器基于 Ultralytics YOLO。
+- 既可做人过滤，也支持按类别过滤。
+- 支持 tracking 与 SAHI 切片推理等可选路径，是否启用由摄像头配置控制。
 
 ### 4.5 Anomaly Detector
 
-- 当前代码路径支持 PatchCore、EfficientAD、Dinomaly 相关配置与模型管理流程。
-- 无模型场景下保留冷启动与兜底逻辑。
-- 训练、导出、发布、比较等能力位于 `src/argus/anomaly/`。
+- 当前代码路径覆盖 PatchCore、EfficientAD、Dinomaly 相关模型流程。
+- 检测器支持运行时模型自动发现、共享检测器、多尺度模式和校准选项。
+- 当模型不可用或需要降级时，检测链会进入兜底或恢复流程，而不是简单崩溃退出。
 
 ### 4.6 Simplex Safety Channel
 
-- 作为独立的传统 CV 安全通道，与主异常检测结果并行存在。
-- 主要职责是提供简单、稳定、低依赖的异常候选信号。
+- Simplex 是独立于主异常模型的传统 CV 安全通道。
+- 它与主检测结果并行存在，用来提供低依赖、低复杂度的兜底候选信号。
+- 当前默认配置启用该通道，因此它属于默认运行路径的一部分。
 
-### 4.7 Postprocess 与 Temporal Logic
+### 4.7 Postprocess / Temporal Logic
 
-- 包含异常图后处理、时序跟踪、自适应阈值、CUSUM 证据累积等逻辑。
-- 漂移检测、降级检测和推理记录也在这一层附近完成。
+- 包括异常图后处理、时序跟踪、自适应阈值、CUSUM 证据累积、锁定与清除逻辑。
+- `TemporalTracker`、`adaptive_threshold`、`anomaly_postprocess`、`correlation` 等模块位于这一层。
+- `frame_quality`、`diagnostics`、`circuit_breaker` 等支撑模块也在这里与主链相邻。
 
 ### 4.8 Alerting
 
-- AlertGrader 负责按分数、区域优先级和时序证据生成告警等级。
-- AlertDispatcher 负责落库与对外分发。
-- 环形缓冲和录像存储负责生成回放素材。
+- `AlertGrader` 负责把分数、时序证据、区域优先级和检测类型转换为最终告警等级。
+- `AlertDispatcher` 负责落库和对外分发。
+- 告警图像、录像、工作流状态和反馈队列都围绕这一阶段沉淀。
 
-## 5. 数据与存储
+## 5. 事件、反馈与主动学习
 
-### 5.1 数据库
+当前实现不只是“检测后直接告警”，还包含一条事件驱动的反馈回路：
 
-- 当前主存储为 SQLite。
-- ORM 模型位于 `src/argus/storage/models.py`。
-- 数据库存储告警、用户、审计、训练作业、模型记录等结构化数据。
+```text
+DetectionPipeline
+  -> EventBus.publish(FrameAnalyzed / AlertRaised / ...)
+  -> ActiveLearningSampler
+  -> Labeling Queue / data/active_learning
+  -> Training Jobs
+  -> New Model / Baseline Update
+```
 
-### 5.2 文件存储
+### 5.1 EventBus
 
-默认数据目录在 `data/`，当前主要子目录包括：
+- `EventBus` 用于在同步检测链和其他子系统之间传递事件。
+- 主要用途是降低检测链与主动学习、回放、诊断之间的直接耦合。
 
-- `alerts/`：告警相关数据。
-- `baselines/`：基线图像与版本目录。
-- `models/`：导出的异常检测模型。
-- `backbones/`：骨干网络产物。
-- `recordings/`：回放视频。
-- `inference_records/`：逐帧推理记录。
-- `logs/`：日志输出。
-- `backups/`：数据库备份文件。
+### 5.2 Active Learning
 
-### 5.3 运行期存储组件
+- `ActiveLearningSampler` 监听 `FrameAnalyzed` 事件。
+- 它基于异常分数和熵估计挑选不确定帧，保存到主动学习目录，并落库到标注队列。
+- 这条链路把“检测结果”转为“待人工标注样本”，是当前训练闭环的重要补充。
 
-- `Database`：SQLite 访问与迁移辅助。
-- `ModelRegistry`：模型版本与激活状态管理。
-- `InferenceRecordStore`：逐帧推理记录落盘。
-- `AlertRecordingStore`：告警回放素材归档与修复。
+### 5.3 Feedback 与 Labeling
 
-## 6. Dashboard 与 API
+- Dashboard 暴露标注队列相关 API 与模型页标签入口。
+- 反馈管理器挂在 `app.state.feedback_manager`，供反馈队列与基线目录协同使用。
+- 这部分能力已经落地，但更多体现为后端能力和模型页标签，而不是独立主路由。
 
-FastAPI 应用位于 `src/argus/dashboard/app.py`，当前职责包括：
+## 6. 健康检查、降级与可恢复性
 
-- 认证、会话、限流和安全响应头。
-- `/api/*` JSON API。
-- `/ws` WebSocket 实时推送。
-- 前端构建产物静态托管。
+### 6.1 HealthMonitor
+
+- `HealthMonitor` 汇总摄像头连接状态、帧数、延迟、告警数和进程运行时间。
+- 主线程持续更新健康信息，并同步刷新 Prometheus 指标。
+- 系统页中的“系统概览”和摄像头健康信息依赖这一层数据。
+
+### 6.2 降级状态机
+
+- `DegradationStateMachine` 负责单摄像头推理运行状态切换。
+- 状态包括 nominal、segmenter 降级、detector 降级、backbone 失败和 restarting。
+- 非法状态切换会被拒绝并记录日志。
+
+### 6.3 全局降级管理
+
+- `GlobalDegradationManager` 负责生成面向操作员的全局降级事件和中文文案。
+- Dashboard 顶部降级条与历史记录依赖该层。
+- 这意味着降级在当前系统中不是“内部日志概念”，而是用户可见的第一类运行状态。
+
+### 6.4 熔断与兜底
+
+- 对外告警分发链带有熔断思路，避免异常外部依赖拖垮主流程。
+- 模型、流媒体和分割器等子系统都有降级路径，目标是“功能降级但服务继续存活”。
+
+## 7. Dashboard 与 API 架构
+
+FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
+
+- HTTP API：配置、摄像头、告警、模型、训练作业、回放、系统管理等。
+- WebSocket：向前端广播 health、cameras、alerts、tasks、degradation 等主题消息。
+- SPA 托管：生产模式下直接托管 `web/dist`。
+
+### 7.1 App State 注入
+
+共享对象通过 `app.state` 暴露给路由和中间件，主要包括：
+
+- `db` / `database`
+- `camera_manager`
+- `health_monitor`
+- `task_manager`
+- `ws_manager`
+- `go2rtc`
+- `baseline_lifecycle`
+- `feedback_manager`
+- `degradation_manager`
+- `recording_store`
+
+这使得 Dashboard 层本质上是“HTTP/WebSocket 门面”，而不是独立业务核心。
+
+### 7.2 API 主题
 
 当前已装配的 API 主题包括：
 
@@ -162,7 +231,19 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前职责包括：
 - labeling
 - baseline
 
-## 7. 前端结构
+### 7.3 WebSocket
+
+- `ConnectionManager` 使用 janus 队列桥接同步线程和异步 WebSocket 客户端。
+- 广播主题目前包括 health、cameras、alerts、tasks、wall、degradation、heatmap。
+- 这层设计的目标是让摄像头线程、告警分发器和后台任务可以线程安全地向前端推送状态，而不直接依赖事件循环。
+
+### 7.4 中间件与安全
+
+- 当前中间件包括安全头、限流和认证。
+- 认证状态同时约束普通 API 和 WebSocket。
+- 项目明确避免使用会缓冲流式响应的 `BaseHTTPMiddleware`，相关中间件均应保持纯 ASGI 风格。
+
+## 8. 前端架构
 
 前端位于 `web/`，使用 Vue 3、TypeScript、Vite、Pinia、Ant Design Vue。
 
@@ -175,40 +256,113 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前职责包括：
 - `/models`
 - `/system`
 
-其中：
+另有 `/training` 重定向到 `/models?tab=training`，并不是独立页面。
 
-- 模型页通过 Tab 聚合基线、训练、模型发布、A/B 对比、标注和阈值预览。
-- 系统页通过 Tab 聚合系统概览、配置管理、用户、审计、降级历史、音频配置、备份与清理。
+### 8.1 页面职责
 
-## 8. 后台任务与调度
+- Overview：系统总览、状态聚合、摄像头概况。
+- Cameras / CameraDetail：摄像头清单、播放、诊断和控制。
+- Alerts：告警列表、筛选、工作流操作和回放详情。
+- Models：基线、训练与评估、模型发布、A/B 对比、标注队列、阈值预览。
+- System：系统概览、配置管理、备份、审计、降级历史、音频告警、用户管理、存储清理。
 
-- `TaskScheduler` 负责维护定时任务和训练作业处理。
-- `TaskManager` 负责前端可见的任务状态。
-- 训练作业通过 `training_jobs` API 创建、确认和查询，当前实现要求人工确认后再执行。
+### 8.2 前后端边界
 
-## 9. 流媒体路径
+- 前端只消费后端已经稳定提供的 API 与 WebSocket 主题。
+- “后端有 API”不等于“前端有独立主页面”。
+- 训练、标注、配置、审计等能力当前主要表现为模型页或系统页下的标签聚合。
 
-go2rtc 是当前视频访问链条中的关键组件：
+## 9. 数据与存储
 
-- 浏览器优先使用 go2rtc 提供的流协议。
-- 检测链可通过 go2rtc 重定向后的 RTSP 地址消费视频。
-- go2rtc 不可用时，Dashboard 会退回到 MJPEG 相关路径。
+### 9.1 结构化存储
 
-## 10. 可选能力与默认状态
+- 主数据库为 SQLite。
+- ORM 模型位于 `src/argus/storage/models.py`。
+- 数据库存储告警、用户、审计、训练作业、模型记录、标注队列等结构化数据。
 
-以下能力在代码与配置中存在，但默认配置通常关闭：
+### 9.2 文件存储
+
+默认数据目录位于 `data/`，主要包括：
+
+- `alerts/`：告警图像与相关数据。
+- `recordings/`：回放视频归档。
+- `inference_records/`：逐帧推理记录。
+- `baselines/`：基线图像与版本目录。
+- `models/`：已导出模型。
+- `backbones/`：骨干网络训练产物。
+- `exports/`：导出产物。
+- `logs/`：日志文件。
+- `backups/`：数据库与配置备份。
+
+### 9.3 运行期存储组件
+
+- `Database`：数据库访问与迁移辅助。
+- `ModelRegistry`：模型版本、激活状态和查询入口。
+- `InferenceRecordStore`：逐帧推理结果落盘。
+- `AlertRecordingStore`：录像归档、修复与回放素材管理。
+- `BackupManager`：备份创建与保留。
+
+## 10. 调度、训练与后台维护
+
+### 10.1 TaskScheduler
+
+- 当前调度器优先使用 APScheduler；缺失时会退化为禁用状态。
+- 调度器承载系统维护任务，而不是直接承载摄像头实时检测。
+
+### 10.2 维护任务
+
+当前已经注册的周期任务包括：
+
+- stale camera 检查
+- 旧告警清理
+- 推理记录清理
+- 磁盘空间检查
+- 训练作业处理
+- 自动备份
+- 条件启用的自动重训练
+
+此外，代码中已经定义了 backbone 重训练检查任务工厂，但当前启动链尚未注册它。
+
+### 10.3 训练作业模型
+
+- 训练作业先通过 API 创建为待确认状态。
+- 运营或工程人员确认后，调度器定期拉取 queued 作业并执行。
+- 这意味着训练链路在架构上是“异步后台任务”，而不是同步请求内执行。
+
+## 11. 流媒体路径
+
+go2rtc 是当前视频访问链条中的关键节点：
+
+- 浏览器优先走 go2rtc 提供的 WebRTC、MSE、HLS 能力。
+- 对 USB 摄像头，go2rtc 会先独占设备，再重定向成 RTSP 给检测链消费。
+- Dashboard-only 模式下，FastAPI 生命周期也可启动 go2rtc。
+- 当 go2rtc 不可用时，前端会回退到 MJPEG 相关路径。
+
+因此流媒体子系统不是单纯的“播放器配套”，而是同时影响浏览器访问和检测链视频来源。
+
+## 12. 可选能力与默认状态
+
+以下能力在代码或配置中存在，但默认配置通常关闭，应视为可选扩展能力：
 
 - 开放词汇分类器
-- SAM2 分割
+- 分割器
 - 跨摄像头关联
 - 自动重训练
 
-因此它们应被视为“可选扩展能力”，而不是默认运行路径。
+以下能力属于默认运行路径的一部分：
 
-## 11. 当前实现边界
+- go2rtc 集成
+- Simplex 安全通道
+- 健康检查
+- 漂移检测
+- 环形缓冲与录像回放链路
 
-为避免文档继续漂移，建议按以下原则理解仓库：
+## 13. 当前边界与维护原则
 
-- 以代码中已注册的路由、已存在的前端页面和默认配置为准。
-- 对于配置项已存在但默认关闭的模块，只描述为“支持接入”或“可选”。
-- 不再使用未经核实的模块数量、测试数量、页面数量等宣传式统计。
+为避免文档再次漂移，后续维护应遵循以下原则：
+
+- 以 `__main__.py` 的启动顺序和 `create_app()` 的装配结果为准。
+- 以实际注册的 API、WebSocket 主题和前端主路由为准。
+- 对默认关闭的模块只描述为“可选”或“支持接入”。
+- 对反馈、回放、训练、标注等能力，要明确区分“后端能力”“标签页入口”和“独立主页面”。
+- 不再使用未经核实的模块数量、测试数量或宣传式功能统计。

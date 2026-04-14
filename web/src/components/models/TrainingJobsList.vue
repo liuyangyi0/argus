@@ -204,7 +204,7 @@ defineExpose({ loadJobs })
           </template>
           <template v-else-if="column.key === 'duration_seconds'">
             <template v-if="record.status === 'running'">
-              <span style="color: #1890ff">{{ formatElapsed(record as TrainingJobInfo) }}</span>
+              <span style="color: #2563eb">{{ formatElapsed(record as TrainingJobInfo) }}</span>
             </template>
             <template v-else>
               {{ record.duration_seconds != null ? record.duration_seconds.toFixed(1) : '-' }}
@@ -272,7 +272,7 @@ defineExpose({ loadJobs })
             {{ detailJob.duration_seconds != null ? `${detailJob.duration_seconds.toFixed(1)}s` : '-' }}
           </Descriptions.Item>
           <Descriptions.Item v-if="detailJob.error" label="错误">
-            <span style="color: #ff4d4f">{{ detailJob.error }}</span>
+            <span style="color: #e5484d">{{ detailJob.error }}</span>
           </Descriptions.Item>
         </Descriptions>
 
@@ -298,12 +298,12 @@ defineExpose({ loadJobs })
 
         <template v-if="detailJob.hyperparameters && typeof detailJob.hyperparameters === 'object'">
           <Typography.Title :level="5" style="margin-top: 24px">超参数</Typography.Title>
-          <pre style="background: var(--argus-surface); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto">{{ JSON.stringify(detailJob.hyperparameters, null, 2) }}</pre>
+          <pre style="background: var(--glass); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto">{{ JSON.stringify(detailJob.hyperparameters, null, 2) }}</pre>
         </template>
 
         <template v-if="detailJob.metrics && typeof detailJob.metrics === 'object'">
           <Typography.Title :level="5" style="margin-top: 24px">训练指标</Typography.Title>
-          <pre style="background: var(--argus-surface); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto">{{ JSON.stringify(detailJob.metrics, null, 2) }}</pre>
+          <pre style="background: var(--glass); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto">{{ JSON.stringify(detailJob.metrics, null, 2) }}</pre>
         </template>
       </template>
     </Drawer>

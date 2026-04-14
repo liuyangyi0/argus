@@ -71,6 +71,19 @@ async def backup_list(request: Request):
     return HTMLResponse(_render_backup_table(backup_manager))
 
 
+@router.get("/list/json")
+async def backup_list_json(request: Request):
+    """List backups as JSON for Vue frontend."""
+    from argus.dashboard.api_response import api_success, api_unavailable
+
+    backup_manager = getattr(request.app.state, "backup_manager", None)
+    if not backup_manager:
+        return api_unavailable("备份管理器不可用")
+
+    backups = backup_manager.list_backups()
+    return api_success({"backups": backups})
+
+
 @router.post("/create")
 async def create_backup(request: Request):
     """Create a new backup (submitted as background task)."""

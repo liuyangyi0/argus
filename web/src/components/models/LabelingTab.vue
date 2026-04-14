@@ -171,17 +171,17 @@ onMounted(() => {
       </Col>
       <Col :span="4">
         <Card size="small">
-          <Statistic title="已标注" :value="stats.labeled || 0" :value-style="{ color: '#52c41a' }" />
+          <Statistic title="已标注" :value="stats.labeled || 0" :value-style="{ color: '#15a34a' }" />
         </Card>
       </Col>
       <Col :span="4">
         <Card size="small">
-          <Statistic title="标记正常" :value="stats.by_label?.normal || 0" :value-style="{ color: '#1890ff' }" />
+          <Statistic title="标记正常" :value="stats.by_label?.normal || 0" :value-style="{ color: '#2563eb' }" />
         </Card>
       </Col>
       <Col :span="4">
         <Card size="small">
-          <Statistic title="标记异常" :value="stats.by_label?.anomaly || 0" :value-style="{ color: '#ff4d4f' }" />
+          <Statistic title="标记异常" :value="stats.by_label?.anomaly || 0" :value-style="{ color: '#e5484d' }" />
         </Card>
       </Col>
       <Col :span="4">
@@ -263,7 +263,7 @@ onMounted(() => {
           <Progress
             :percent="Math.round((record.entropy || 0) * 100)"
             :size="'small'"
-            :stroke-color="record.entropy > 0.9 ? '#ff4d4f' : record.entropy > 0.7 ? '#faad14' : '#52c41a'"
+            :stroke-color="record.entropy > 0.9 ? '#e5484d' : record.entropy > 0.7 ? '#d97706' : '#15a34a'"
             :show-info="true"
             :format="() => record.entropy?.toFixed(2)"
             style="width: 80px"

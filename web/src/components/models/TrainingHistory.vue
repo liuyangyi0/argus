@@ -188,8 +188,8 @@ onMounted(loadHistory)
       <Descriptions.Item label="验证分数最大值">{{ historyDetail.val_score_max?.toFixed(4) ?? '-' }}</Descriptions.Item>
       <Descriptions.Item label="验证分数 P95">{{ historyDetail.val_score_p95?.toFixed(4) ?? '-' }}</Descriptions.Item>
       <Descriptions.Item label="预验证通过">
-        <CheckCircleOutlined v-if="historyDetail.pre_validation_passed" style="color: #52c41a" />
-        <CloseCircleOutlined v-else style="color: #ff4d4f" />
+        <CheckCircleOutlined v-if="historyDetail.pre_validation_passed" style="color: #15a34a" />
+        <CloseCircleOutlined v-else style="color: #e5484d" />
       </Descriptions.Item>
       <Descriptions.Item label="推理延迟">{{ historyDetail.inference_latency_ms != null ? `${historyDetail.inference_latency_ms.toFixed(1)}ms` : '-' }}</Descriptions.Item>
       <Descriptions.Item label="损坏率">
@@ -202,18 +202,18 @@ onMounted(loadHistory)
         {{ historyDetail.brightness_std != null ? historyDetail.brightness_std.toFixed(2) : '-' }}
       </Descriptions.Item>
       <Descriptions.Item label="检查点有效">
-        <CheckCircleOutlined v-if="historyDetail.checkpoint_valid" style="color: #52c41a" />
-        <CloseCircleOutlined v-else-if="historyDetail.checkpoint_valid === false" style="color: #ff4d4f" />
+        <CheckCircleOutlined v-if="historyDetail.checkpoint_valid" style="color: #15a34a" />
+        <CloseCircleOutlined v-else-if="historyDetail.checkpoint_valid === false" style="color: #e5484d" />
         <span v-else>-</span>
       </Descriptions.Item>
       <Descriptions.Item label="导出有效">
-        <CheckCircleOutlined v-if="historyDetail.export_valid" style="color: #52c41a" />
-        <CloseCircleOutlined v-else-if="historyDetail.export_valid === false" style="color: #ff4d4f" />
+        <CheckCircleOutlined v-if="historyDetail.export_valid" style="color: #15a34a" />
+        <CloseCircleOutlined v-else-if="historyDetail.export_valid === false" style="color: #e5484d" />
         <span v-else>-</span>
       </Descriptions.Item>
       <Descriptions.Item label="冒烟测试">
-        <CheckCircleOutlined v-if="historyDetail.smoke_test_passed" style="color: #52c41a" />
-        <CloseCircleOutlined v-else-if="historyDetail.smoke_test_passed === false" style="color: #ff4d4f" />
+        <CheckCircleOutlined v-if="historyDetail.smoke_test_passed" style="color: #15a34a" />
+        <CloseCircleOutlined v-else-if="historyDetail.smoke_test_passed === false" style="color: #e5484d" />
         <span v-else>-</span>
       </Descriptions.Item>
       <Descriptions.Item v-if="historyDetail.export_path" label="导出路径" :span="2">
@@ -223,7 +223,7 @@ onMounted(loadHistory)
         <span style="font-family: monospace; font-size: 12px; word-break: break-all">{{ historyDetail.model_path }}</span>
       </Descriptions.Item>
       <Descriptions.Item v-if="historyDetail.error" label="错误信息" :span="2">
-        <span style="color: #ff4d4f">{{ historyDetail.error }}</span>
+        <span style="color: #e5484d">{{ historyDetail.error }}</span>
       </Descriptions.Item>
     </Descriptions>
   </Modal>

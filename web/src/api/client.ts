@@ -2,6 +2,7 @@ import axios, { type AxiosResponse } from 'axios'
 import type { ApiResponse } from '../types/api'
 import { ApiError } from '../types/api'
 import { logger } from '../utils/logger'
+import { message } from 'ant-design-vue'
 
 export const api = axios.create({
   baseURL: '/api',
@@ -14,6 +15,7 @@ api.interceptors.response.use(
     const body = err.response?.data
     const msg = body?.msg ?? body?.error ?? err.message ?? '请求失败'
     logger.debug('[API]', msg)
+    message.error(msg)
     return Promise.reject(err)
   }
 )

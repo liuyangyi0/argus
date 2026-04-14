@@ -10,6 +10,16 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+def _default_foe_vocab() -> list[str]:
+    """Canonical FOE vocabulary — single source of truth.
+
+    Also exported as FOE_VOCAB from argus.anomaly.classifier.
+    """
+    from argus.anomaly.classifier import FOE_VOCAB
+
+    return list(FOE_VOCAB)
+
+
 class ZonePriority(str, Enum):
     CRITICAL = "critical"
     STANDARD = "standard"
@@ -169,7 +179,15 @@ class AnomalyConfig(BaseModel):
 
     model_type: Literal["patchcore", "efficient_ad", "fastflow", "padim", "dinomaly2"] = "patchcore"
     threshold: float = Field(default=0.7, ge=0.1, le=0.99)
-    image_size: tuple[int, int] = (256, 256)
+    image_size: tuple[int, int] = Field(
+        default=(256, 256),
+        description="Anomaly model input resolution. Must match training resolution. "
+        "512x512 recommended for new models targeting ≥8mm² detection at 5m.",
+    )
+    min_contour_area: int = Field(
+        default=50, ge=1, le=10000,
+        description="Minimum anomaly contour area in heatmap pixels. Lower for small objects.",
+    )
     enable_multiscale: bool = Field(
         default=False,
         description="Enable sliding window multi-scale detection for small objects",
@@ -279,19 +297,28 @@ class ClassifierConfig(BaseModel):
     enabled: bool = Field(default=False)
     model_name: str = Field(default="yolov8s-worldv2.pt")
     vocabulary: list[str] = Field(
-        default_factory=lambda: [
-            "wrench", "bolt", "nut", "screwdriver", "hammer",
-            "rag", "glove", "plastic bag", "tape", "wire",
-            "insulation", "debris", "paint chip",
-            "insect", "bird", "shadow", "reflection",
-        ]
+        default_factory=lambda: list(_default_foe_vocab()),
     )
     min_anomaly_score_to_classify: float = Field(default=0.5, ge=0.0, le=1.0)
     high_risk_labels: list[str] = Field(
-        default_factory=lambda: ["wrench", "bolt", "nut", "screwdriver", "hammer"]
+        default_factory=lambda: [
+            "wrench", "bolt", "nut", "screwdriver", "hammer",
+            "gasket", "o_ring", "cotter_pin", "safety_wire", "washer",
+            "hose_clamp", "concrete_chip", "metal_shaving",
+            "graphite_gasket", "rubber_seal", "electrode_fragment",
+            "bearing_ball", "lens_piece",
+        ]
     )
     low_risk_labels: list[str] = Field(
         default_factory=lambda: ["insect", "shadow", "reflection"]
+    )
+    suppress_labels: list[str] = Field(
+        default_factory=lambda: ["crane", "overhead_bridge", "scaffold"],
+        description="Objects that suppress anomaly detection in their region",
+    )
+    custom_vocabulary_path: str | None = Field(
+        default=None,
+        description="Path to custom vocabulary JSON file (overrides default vocabulary)",
     )
 
 
@@ -391,7 +418,7 @@ class RingBufferConfig(BaseModel):
         description="libx264 encoding preset (ultrafast/veryfast/fast/medium/slow)",
     )
     max_recording_age_days: int = Field(
-        default=30, ge=7, le=90,
+        default=30, ge=7, le=365,
         description="Days to keep full recordings before archiving to trigger-frame-only",
     )
     archive_dir: str = Field(
@@ -436,6 +463,35 @@ class LowLightConfig(BaseModel):
     )
 
 
+class EventCameraConfig(BaseModel):
+    """Event camera (neuromorphic sensor) configuration.
+
+    Reserved interface for future Prophesee/iniVation event camera integration.
+    Not implemented — SDK stubs only.
+    """
+
+    sdk: Literal["metavision", "dv", "none"] = Field(
+        default="none",
+        description="Event camera SDK: metavision (Prophesee), dv (iniVation), none (disabled)",
+    )
+    accumulation_window_ms: float = Field(
+        default=33.0, ge=1.0, le=500.0,
+        description="Time window (ms) for accumulating events into a frame-equivalent",
+    )
+    event_rate_threshold: int = Field(
+        default=1000, ge=100, le=1000000,
+        description="Events/second above which a trigger is generated",
+    )
+    trigger_frame_camera: bool = Field(
+        default=True,
+        description="When event burst detected, trigger frame camera to boost FPS",
+    )
+    trigger_fps_boost: int = Field(
+        default=120, ge=30, le=240,
+        description="Target FPS for frame camera when triggered by event camera",
+    )
+
+
 class CameraConfig(BaseModel):
     """Configuration for a single camera."""
 
@@ -451,8 +507,8 @@ class CameraConfig(BaseModel):
             )
         return v
     source: str  # RTSP URL, USB device index, or file path
-    protocol: Literal["rtsp", "usb", "file"] = "rtsp"
-    fps_target: int = Field(default=5, ge=1, le=30)
+    protocol: Literal["rtsp", "usb", "file", "event"] = "rtsp"
+    fps_target: int = Field(default=5, ge=1, le=120)
     resolution: tuple[int, int] = (1920, 1080)
     zones: list[ZoneConfig] = Field(default_factory=list)
     reconnect_delay: float = Field(default=5.0, ge=1.0, le=300.0)
@@ -470,6 +526,27 @@ class CameraConfig(BaseModel):
     degradation: DegradationConfig = Field(default_factory=DegradationConfig)
     ring_buffer: RingBufferConfig = Field(default_factory=RingBufferConfig)
     low_light: LowLightConfig = Field(default_factory=LowLightConfig)
+    event: EventCameraConfig = Field(
+        default_factory=EventCameraConfig,
+        description="Event camera (neuromorphic) config — reserved interface",
+    )
+    calibration_file: str | None = Field(
+        default=None,
+        description="Path to camera calibration JSON (intrinsic/extrinsic parameters)",
+    )
+    tracker_match_distance: float = Field(
+        default=50.0, ge=10.0, le=1000.0,
+        description="Max pixel distance for centroid matching between frames "
+        "(increase for high-speed objects: 500+ at 25m/s)",
+    )
+    tracker_max_gap_frames: int = Field(
+        default=5, ge=1, le=30,
+        description="Max consecutive frames without match before track is lost",
+    )
+    tracker_stationary_threshold: float = Field(
+        default=10.0, ge=1.0, le=100.0,
+        description="Velocity magnitude below which an object is considered stationary (px/frame)",
+    )
 
 
 class CameraGroupConfig(BaseModel):
@@ -862,6 +939,175 @@ class BaselineCaptureConfig(BaseModel):
     )
 
 
+class ImagingConfig(BaseModel):
+    """Multi-modal imaging: DoFP polarization + NIR strobe (M1).
+
+    Enables polarization-based water surface reflection removal and
+    NIR strobed illumination for high-speed capture without motion blur.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable multi-modal imaging pipeline",
+    )
+    mode: Literal["visible_only", "polarization", "polarization_nir"] = Field(
+        default="visible_only",
+        description="Imaging modality: visible_only (standard), polarization (DoFP deglare), "
+        "polarization_nir (DoFP + NIR strobe)",
+    )
+    camera_sdk: Literal["opencv", "arena", "spinnaker"] = Field(
+        default="opencv",
+        description="Camera acquisition SDK: opencv (standard), arena (LUCID), spinnaker (FLIR)",
+    )
+    nir_strobe_enabled: bool = Field(
+        default=False,
+        description="Enable NIR 850nm strobe synchronized via ExposureActive GPIO",
+    )
+    polarization_processing: bool = Field(
+        default=False,
+        description="Enable DoFP polarization demosaicing and deglare processing",
+    )
+    fusion_channels: int = Field(
+        default=3, ge=1, le=5,
+        description="Number of fused input channels: 1=gray, 3=RGB, 4=RGB+DoLP, 5=RGB+DoLP+NIR",
+    )
+    deglare_method: Literal["stokes", "min_intensity", "polafree"] = Field(
+        default="stokes",
+        description="Reflection removal method: stokes (classical Stokes-based), "
+        "min_intensity (fast I_min approximation), polafree (deep learning)",
+    )
+    dolp_threshold: float = Field(
+        default=0.3, ge=0.0, le=1.0,
+        description="DoLP threshold above which a pixel is considered specular reflection",
+    )
+
+
+class PhysicsConfig(BaseModel):
+    """Physics-based speed monitoring and trajectory analysis (M5/M8-M10).
+
+    Phase 1: pixel-level speed estimation (no calibration required).
+    Phase 2: calibrated speed, trajectory fitting, origin/landing estimation.
+    """
+
+    speed_enabled: bool = Field(
+        default=False,
+        description="Enable speed monitoring (phase 1: pixel speed, phase 2: calibrated m/s)",
+    )
+    trajectory_enabled: bool = Field(
+        default=False,
+        description="Enable trajectory fitting and physics model analysis (phase 2)",
+    )
+    localization_enabled: bool = Field(
+        default=False,
+        description="Enable origin/landing point estimation (phase 2)",
+    )
+    triangulation_enabled: bool = Field(
+        default=False,
+        description="Enable multi-camera 3D triangulation (phase 2)",
+    )
+    calibration_dir: Path = Field(
+        default=Path("data/calibration"),
+        description="Directory for per-camera calibration files",
+    )
+    pool_surface_z_mm: float = Field(
+        default=0.0,
+        description="Z coordinate of water surface in world frame (mm)",
+    )
+    gravity_ms2: float = Field(
+        default=9.81, ge=9.0, le=10.0,
+        description="Local gravitational acceleration (m/s^2)",
+    )
+    trajectory_history_length: int = Field(
+        default=300, ge=30, le=1000,
+        description="Maximum trajectory points per track (30fps * 10s = 300)",
+    )
+    speed_smoothing_window: int = Field(
+        default=5, ge=1, le=30,
+        description="Frames for moving-average speed smoothing",
+    )
+    min_trajectory_points: int = Field(
+        default=5, ge=3, le=50,
+        description="Minimum tracked points before trajectory fitting",
+    )
+    origin_accuracy_target_mm: float = Field(
+        default=200.0, ge=50.0, le=1000.0,
+        description="Target accuracy for origin point estimation (mm)",
+    )
+    landing_accuracy_target_mm: float = Field(
+        default=500.0, ge=100.0, le=2000.0,
+        description="Target accuracy for water surface landing estimation (mm)",
+    )
+    pixel_scale_mm_per_px: float | None = Field(
+        default=None,
+        description="Simple pixel-to-mm scale factor (phase 1 quick calibration). "
+        "Set to None to use full calibration file.",
+    )
+    use_drag_model: bool = Field(
+        default=True,
+        description="Use air-drag corrected trajectory model instead of pure free-fall",
+    )
+
+
+class ContinuousRecordingConfig(BaseModel):
+    """Continuous 24/7 video recording with segmented storage (M6).
+
+    Records all camera feeds to disk in fixed-duration segments
+    for compliance with 180-day local + 360-day archive retention.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable continuous recording for all cameras",
+    )
+    segment_duration_hours: float = Field(
+        default=4.0, ge=0.5, le=8.0,
+        description="Maximum segment duration in hours before rotation",
+    )
+    local_retention_days: int = Field(
+        default=180, ge=30, le=365,
+        description="Days to retain recordings on local storage",
+    )
+    archive_enabled: bool = Field(
+        default=False,
+        description="Enable archival to external storage after local retention",
+    )
+    archive_path: Path | None = Field(
+        default=None,
+        description="External storage mount point for archived recordings",
+    )
+    archive_retention_days: int = Field(
+        default=360, ge=30, le=730,
+        description="Days to retain recordings on archive storage",
+    )
+    encoding_crf: int = Field(
+        default=26, ge=18, le=35,
+        description="H.264 CRF for continuous recording (higher = smaller, lower quality)",
+    )
+    encoding_preset: str = Field(
+        default="veryfast",
+        pattern=r"^(ultrafast|superfast|veryfast|faster|fast|medium)$",
+        description="libx264 encoding preset for continuous recording",
+    )
+    encoding_fps: int = Field(
+        default=10, ge=1, le=30,
+        description="Target FPS for continuous recording (lower than detection FPS to save space)",
+    )
+    output_dir: Path = Field(
+        default=Path("data/continuous_recordings"),
+        description="Directory for continuous recording segments",
+    )
+    cleanup_interval_hours: float = Field(
+        default=6.0, ge=1.0, le=24.0,
+        description="Hours between retention cleanup scans",
+    )
+
+    @model_validator(mode="after")
+    def _validate_archive(self) -> ContinuousRecordingConfig:
+        if self.archive_enabled and self.archive_path is None:
+            raise ValueError("archive_path must be set when archive_enabled=True")
+        return self
+
+
 class ArgusConfig(BaseModel):
     """Top-level configuration for the Argus system."""
 
@@ -880,6 +1126,11 @@ class ArgusConfig(BaseModel):
     retraining: RetrainingConfig = Field(default_factory=RetrainingConfig)
     feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
     baseline_capture: BaselineCaptureConfig = Field(default_factory=BaselineCaptureConfig)
+    imaging: ImagingConfig = Field(default_factory=ImagingConfig)
+    physics: PhysicsConfig = Field(default_factory=PhysicsConfig)
+    continuous_recording: ContinuousRecordingConfig = Field(
+        default_factory=ContinuousRecordingConfig,
+    )
     camera_groups: list[CameraGroupConfig] = Field(
         default_factory=list,
         description="Camera groups for shared baselines and models",

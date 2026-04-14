@@ -501,7 +501,7 @@ const columns = [
       <Descriptions.Item label="影子告警率">{{ (shadowReport.shadow_alert_rate * 100).toFixed(1) }}%</Descriptions.Item>
       <Descriptions.Item label="生产告警率">{{ (shadowReport.production_alert_rate * 100).toFixed(1) }}%</Descriptions.Item>
       <Descriptions.Item label="误报差异">
-        <span :style="{ color: shadowReport.false_positive_delta > 0 ? '#ff4d4f' : '#52c41a' }">
+        <span :style="{ color: shadowReport.false_positive_delta > 0 ? '#e5484d' : '#15a34a' }">
           {{ shadowReport.false_positive_delta > 0 ? '+' : '' }}{{ shadowReport.false_positive_delta }}
         </span>
       </Descriptions.Item>
@@ -526,7 +526,7 @@ const columns = [
       <div
         v-for="(event, idx) in stageHistory"
         :key="idx"
-        style="padding: 12px; margin-bottom: 8px; background: var(--argus-hover-bg); border-radius: 6px"
+        style="padding: 12px; margin-bottom: 8px; background: rgba(10, 10, 15, 0.05); border-radius: 6px"
       >
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px">
           <Space>
