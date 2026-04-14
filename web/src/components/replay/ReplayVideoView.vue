@@ -3,6 +3,7 @@ import { inject } from 'vue'
 import type { useReplayController } from '../../composables/useReplayController'
 
 const ctrl = inject<ReturnType<typeof useReplayController>>('replayCtrl')!
+const videoRef = ctrl.videoEl
 
 import VideoOverlayCanvas from './VideoOverlayCanvas.vue'
 
