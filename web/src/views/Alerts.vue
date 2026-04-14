@@ -793,14 +793,12 @@ const columns = computed(() => {
 .alerts-stats {
   display: flex;
   gap: 16px;
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
+  font-size: 13px;
   color: var(--argus-text-muted);
-  letter-spacing: .1em;
 }
 .alerts-stats b {
   color: var(--argus-text);
-  margin-left: 2px;
+  margin-left: 4px;
 }
 
 /* ── Filter chips ── */
@@ -815,16 +813,14 @@ const columns = computed(() => {
   gap: 4px;
 }
 .alerts-chip {
-  padding: 4px 12px;
+  padding: 4px 14px;
   border: 1px solid var(--argus-border);
   background: transparent;
   color: var(--argus-text-muted);
-  font-family: var(--argus-font-mono);
-  font-size: 11px;
-  letter-spacing: .08em;
+  font-size: 13px;
   cursor: pointer;
   transition: all .15s;
-  border-radius: 0;
+  border-radius: 4px;
 }
 .alerts-chip:hover {
   border-color: #3b82f6;
@@ -865,28 +861,22 @@ const columns = computed(() => {
 
 /* ── Score & Time ── */
 .alert-score {
-  font-family: var(--argus-font-mono);
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: -.02em;
+  font-size: 14px;
+  font-weight: 600;
 }
 .alert-time {
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
+  font-size: 13px;
   color: var(--argus-text-muted);
-  letter-spacing: .08em;
 }
 
 /* ── Severity badge (detail header) ── */
 .sev-badge {
   display: inline-block;
-  padding: 2px 8px;
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
+  padding: 2px 10px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: .12em;
   color: #fff;
-  text-transform: uppercase;
+  border-radius: 3px;
 }
 .sev-high { background: #b91c1c; }
 .sev-medium { background: #d97706; }
@@ -904,8 +894,7 @@ const columns = computed(() => {
   flex-shrink: 0;
 }
 .detail-crumb {
-  font-family: var(--argus-font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--argus-text-muted);
 }
 .detail-crumb b {
@@ -939,11 +928,9 @@ const columns = computed(() => {
 .meta-panel-hd {
   padding: 10px 14px;
   border-bottom: 1px solid var(--argus-border);
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--argus-text-muted);
-  letter-spacing: .15em;
-  text-transform: uppercase;
   display: flex;
   justify-content: space-between;
 }
@@ -957,9 +944,9 @@ const columns = computed(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 5px 0;
-  border-bottom: 1px dashed var(--argus-border);
-  font-size: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--argus-border);
+  font-size: 13px;
   line-height: 1.8;
 }
 .meta-row:last-child {
@@ -967,14 +954,12 @@ const columns = computed(() => {
 }
 .meta-k {
   color: var(--argus-text-muted);
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
-  letter-spacing: .1em;
-  min-width: 80px;
+  font-size: 13px;
+  min-width: 70px;
 }
 .meta-v {
   color: var(--argus-text);
-  font-size: 12px;
+  font-size: 13px;
 }
 .meta-v--notes {
   max-width: 180px;
@@ -1105,10 +1090,9 @@ const columns = computed(() => {
   padding-top: 10px;
 }
 .workflow-label {
-  font-size: 10px;
+  font-size: 13px;
   color: var(--argus-text-muted);
-  letter-spacing: .1em;
-  text-transform: uppercase;
+  font-weight: 500;
   margin-bottom: 8px;
 }
 .false-positive-display {
