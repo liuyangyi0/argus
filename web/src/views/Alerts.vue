@@ -314,12 +314,13 @@ import { scoreColor } from '../utils/colors'
 
 // Table columns — adapt based on whether detail is open
 const columns = computed(() => {
-  const base = [
-    { title: '', key: 'thumbnail', width: 56 },
+  const isCompact = !!selectedAlert.value
+  const base: any[] = [
+    { title: '', key: 'thumbnail', width: 52 },
     {
       title: '严重度',
       key: 'severity',
-      width: 72,
+      width: isCompact ? 60 : 72,
       filters: [
         { text: '高', value: 'high' },
         { text: '中', value: 'medium' },
@@ -327,19 +328,18 @@ const columns = computed(() => {
         { text: '提示', value: 'info' },
       ],
     },
-    { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 100, ellipsis: true },
-    { title: '分数', key: 'score', width: 72 },
-    { title: '时间', key: 'time', width: 90 },
+    { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: isCompact ? 80 : 100, ellipsis: true },
+    { title: '分数', key: 'score', width: 64 },
+    { title: '时间', key: 'time', width: 80 },
   ]
-  // When detail is closed, show more columns
-  if (!selectedAlert.value) {
-    base.splice(3, 0, { title: '区域', dataIndex: 'zone_id', key: 'zone_id', width: 80, ellipsis: true } as any)
+  if (!isCompact) {
+    base.splice(3, 0, { title: '区域', dataIndex: 'zone_id', key: 'zone_id', width: 80, ellipsis: true })
     base.push(
-      { title: '状态', key: 'status', width: 90 } as any,
-      { title: '操作', key: 'action', width: 160 } as any,
+      { title: '状态', key: 'status', width: 90 },
+      { title: '操作', key: 'action', width: 160 },
     )
   } else {
-    base.push({ title: '状态', key: 'status', width: 80 } as any)
+    base.push({ title: '状态', key: 'status', width: 70 })
   }
   return base
 })
@@ -350,7 +350,7 @@ const columns = computed(() => {
     <!-- Left: Alert List -->
     <div
       :style="{
-        width: selectedAlert ? '420px' : '100%',
+        width: selectedAlert ? '520px' : '100%',
         flexShrink: 0,
         display: 'flex',
         flexDirection: 'column',
@@ -850,7 +850,8 @@ const columns = computed(() => {
   background: rgba(59, 130, 246, .08);
 }
 .alerts-chip--export {
-  border-style: dashed;
+  border-radius: 4px;
+  background: var(--argus-card-bg-solid, rgba(255,255,255,0.6));
 }
 
 /* ── Thumbnail ── */
