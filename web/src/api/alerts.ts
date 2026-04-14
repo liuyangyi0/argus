@@ -15,8 +15,6 @@ export const bulkFalsePositive = (ids: string[]) =>
 export const deleteAlert = (id: string) => api.delete(`/alerts/${id}`).then(u)
 export const bulkDeleteAlerts = (ids: string[]) =>
   api.post('/alerts/bulk-delete', { alert_ids: ids }).then(u)
-export const getAlertTimeline = (date?: string) =>
-  api.get('/alerts/timeline', { params: date ? { date } : {} }).then(u)
 export const saveAnnotations = (alertId: string, annotations: any[]) =>
   api.post(`/alerts/${alertId}/annotations`, { annotations }).then(u)
 export const getAlertGroup = (eventGroupId: string) =>

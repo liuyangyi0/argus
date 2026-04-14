@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 
 defineOptions({ name: 'AlertsPage' })
@@ -14,7 +15,8 @@ import {
   ExportOutlined,
   DeleteOutlined,
 } from '@ant-design/icons-vue'
-import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive, deleteAlert, bulkDeleteAlerts, bulkAcknowledge, bulkFalsePositive, getAlertGroup } from '../api'
+import { getAlertGroup } from '../api'
+import { useAlertStore } from '../stores/useAlertStore'
 import { formatRelativeTime } from '../utils/time'
 import { useWebSocket } from '../composables/useWebSocket'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
@@ -24,14 +26,10 @@ import ImageCompareSlider from '../components/ImageCompareSlider.vue'
 const route = useRoute()
 const router = useRouter()
 
-const alerts = ref<any[]>([])
-const cameras = ref<any[]>([])
-const totalAlerts = ref(0)
-const loading = ref(true)
-const filters = ref({ camera_id: '', severity: '' })
+const store = useAlertStore()
+const { alerts, cameras, totalAlerts, loading, filters, selectedAlert, activeCount, resolvedCount } = storeToRefs(store)
 
 // Detail panel state
-const selectedAlert = ref<any>(null)
 const imageMode = ref<'composite' | 'snapshot' | 'heatmap' | 'compare'>('composite')
 const annotationMode = ref(false)
 
@@ -65,19 +63,7 @@ function toggleGroupPopover(eventGroupId: string) {
 // Bulk selection
 const selectedRowKeys = ref<(string | number)[]>([])
 
-async function fetchData() {
-  try {
-    const params: Record<string, any> = { limit: 100 }
-    if (filters.value.camera_id) params.camera_id = filters.value.camera_id
-    if (filters.value.severity) params.severity = filters.value.severity
-    const [a, c] = await Promise.all([getAlerts(params), getCameras()])
-    alerts.value = a.alerts
-    totalAlerts.value = a.total ?? a.alerts.length
-    cameras.value = c.cameras || []
-  } finally {
-    loading.value = false
-  }
-}
+const fetchData = () => store.fetchData()
 
 let _filterTimer: ReturnType<typeof setTimeout> | null = null
 function debouncedFetchData() {
@@ -88,22 +74,7 @@ function debouncedFetchData() {
 useWebSocket({
   topics: ['alerts'],
   onMessage(topic, data) {
-    if (topic === 'alerts') {
-      if (data && typeof data === 'object' && !Array.isArray(data) && data.alert_id) {
-        const idx = alerts.value.findIndex((a: any) => a.alert_id === data.alert_id)
-        if (idx >= 0) {
-          alerts.value[idx] = { ...alerts.value[idx], ...data }
-          // Update detail if viewing this alert
-          if (selectedAlert.value?.alert_id === data.alert_id) {
-            selectedAlert.value = { ...selectedAlert.value, ...data }
-          }
-        } else {
-          alerts.value.unshift(data)
-        }
-      } else if (Array.isArray(data)) {
-        alerts.value = data
-      }
-    }
+    if (topic === 'alerts') store.updateFromWebSocket(data)
   },
   fallbackPoll: fetchData,
   fallbackInterval: 15000,
@@ -156,12 +127,8 @@ function closeDetail() {
 
 async function handleAcknowledge(id: string) {
   try {
-    await acknowledgeAlert(id)
+    await store.ackAlert(id)
     message.success('已确认')
-    fetchData()
-    if (selectedAlert.value?.alert_id === id) {
-      selectedAlert.value = { ...selectedAlert.value, workflow_status: 'acknowledged' }
-    }
   } catch (e: any) {
     message.error(e.response?.data?.error || '确认失败')
   }
@@ -169,12 +136,8 @@ async function handleAcknowledge(id: string) {
 
 async function handleFalsePositive(id: string) {
   try {
-    await markFalsePositive(id)
+    await store.fpAlert(id)
     message.success('已标记误报')
-    fetchData()
-    if (selectedAlert.value?.alert_id === id) {
-      selectedAlert.value = { ...selectedAlert.value, workflow_status: 'false_positive' }
-    }
   } catch (e: any) {
     message.error(e.response?.data?.error || '标记失败')
   }
@@ -189,12 +152,12 @@ function handleDelete(id: string) {
     cancelText: '取消',
     async onOk() {
       try {
-        await deleteAlert(id)
+        const wasViewing = selectedAlert.value?.alert_id === id
+        await store.delAlert(id)
         message.success('已删除')
-        if (selectedAlert.value?.alert_id === id) {
+        if (wasViewing) {
           closeDetail()
         }
-        fetchData()
       } catch (e: any) {
         message.error(e.response?.data?.error || '删除失败')
       }
@@ -213,13 +176,14 @@ function handleBulkDelete() {
     cancelText: '取消',
     async onOk() {
       try {
-        const res = await bulkDeleteAlerts(selectedRowKeys.value as string[])
+        const keys = selectedRowKeys.value as string[]
+        const wasViewing = !!selectedAlert.value && keys.includes(selectedAlert.value.alert_id)
+        const res = await store.bulkDel(keys)
         message.success(res.message || `已删除 ${res.count} 条`)
         selectedRowKeys.value = []
-        if (selectedAlert.value && !alerts.value.some(a => a.alert_id === selectedAlert.value.alert_id)) {
+        if (wasViewing) {
           closeDetail()
         }
-        fetchData()
       } catch (e: any) {
         message.error(e.response?.data?.error || '批量删除失败')
       }
@@ -230,10 +194,9 @@ function handleBulkDelete() {
 async function handleBulkAcknowledge() {
   if (!selectedRowKeys.value.length) return
   try {
-    const res = await bulkAcknowledge(selectedRowKeys.value as string[])
+    const res = await store.bulkAck(selectedRowKeys.value as string[])
     message.success(res.message || `已确认 ${res.count} 条`)
     selectedRowKeys.value = []
-    fetchData()
   } catch (e: any) {
     message.error(e.response?.data?.error || '批量确认失败')
   }
@@ -242,10 +205,9 @@ async function handleBulkAcknowledge() {
 async function handleBulkFalsePositive() {
   if (!selectedRowKeys.value.length) return
   try {
-    const res = await bulkFalsePositive(selectedRowKeys.value as string[])
+    const res = await store.bulkFp(selectedRowKeys.value as string[])
     message.success(res.message || `已标记 ${res.count} 条为误报`)
     selectedRowKeys.value = []
-    fetchData()
   } catch (e: any) {
     message.error(e.response?.data?.error || '批量标记失败')
   }
@@ -280,10 +242,6 @@ const workflowColor: Record<string, string> = {
   new: 'default', acknowledged: 'green', investigating: 'blue',
   resolved: 'cyan', closed: 'default', false_positive: 'orange', uncertain: 'gold',
 }
-
-// Header stats (computed to avoid re-filtering on every render)
-const activeCount = computed(() => alerts.value.filter(a => a.workflow_status === 'new').length)
-const resolvedCount = computed(() => alerts.value.filter(a => ['resolved', 'closed'].includes(a.workflow_status)).length)
 
 // Workflow steps for timeline
 const workflowSteps = ['new', 'acknowledged', 'investigating', 'resolved', 'closed']

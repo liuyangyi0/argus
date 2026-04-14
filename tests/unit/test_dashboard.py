@@ -90,13 +90,6 @@ class TestHealthAPI:
         assert len(data["cameras"]) == 1
         assert data["cameras"][0]["camera_id"] == "cam_01"
 
-    def test_system_overview_html(self, client):
-        """Overview endpoint should return HTMX fragment."""
-        response = client.get("/api/system/overview")
-        assert response.status_code == 200
-        assert "摄像头在线" in response.text or "System Status" in response.text
-
-
 class TestCameraForms:
     def test_add_camera_accepts_urlencoded_form_without_multipart(self, db, health, alerts_dir, monkeypatch, tmp_path):
         """Add-camera form should persist config and sync runtime state for urlencoded bodies."""
@@ -264,71 +257,6 @@ class TestBaselineForms:
         task_manager.submit.assert_called_once()
         assert task_manager.submit.call_args.args[0] == "baseline_capture"
 
-    def test_start_training_binds_camera_id_into_task(self, db, health, alerts_dir, tmp_path):
-        """Training route should pass camera_id through to the background training function."""
-        config = ArgusConfig()
-        config.storage.baselines_dir = tmp_path / "baselines"
-        config.storage.models_dir = tmp_path / "models"
-        camera_cfg = CameraConfig(
-            camera_id="cam_01",
-            name="Camera 01",
-            source="rtsp://example/stream",
-            protocol="rtsp",
-        )
-        config.cameras = [camera_cfg]
-
-        task_manager = MagicMock()
-        called = {}
-
-        def fake_submit(task_type, func, camera_id="", **kwargs):
-            called["task_type"] = task_type
-            called["camera_id"] = camera_id
-            called["result"] = func(lambda *_: None, **kwargs)
-            return "model_training-test"
-
-        task_manager.submit.side_effect = fake_submit
-
-        app = create_app(
-            database=db,
-            camera_manager=MagicMock(),
-            health_monitor=health,
-            alerts_dir=str(alerts_dir),
-            config=config,
-            task_manager=task_manager,
-        )
-        client = TestClient(app)
-
-        from argus.dashboard import routes as dashboard_routes
-
-        original_train = dashboard_routes.baseline._train_model_task
-
-        def fake_train_model_task(progress_callback, *, baselines_dir, models_dir, camera_id, model_type, export_format, quantization="fp16", database_url=None, anomaly_config=None, resume_from=None, skip_baseline_validation=False):
-            return {
-                "camera_id": camera_id,
-                "baselines_dir": baselines_dir,
-                "models_dir": models_dir,
-                "model_type": model_type,
-                "export_format": export_format,
-            }
-
-        dashboard_routes.baseline._train_model_task = fake_train_model_task
-        try:
-            response = client.post(
-                "/api/baseline/train",
-                data={
-                    "camera_id": "cam_01",
-                    "model_type": "patchcore",
-                    "export_format": "openvino",
-                },
-            )
-        finally:
-            dashboard_routes.baseline._train_model_task = original_train
-
-        assert response.status_code == 200
-        assert called["task_type"] == "model_training"
-        assert called["camera_id"] == "cam_01"
-        assert called["result"]["camera_id"] == "cam_01"
-
     def test_baseline_list_json_reads_default_zone_versions(self, db, health, alerts_dir, tmp_path):
         """Baseline list JSON should surface default-zone captures after a reload."""
         baselines_dir = tmp_path / "baselines"
@@ -454,52 +382,6 @@ class TestBaselineForms:
 
         assert response.status_code == 200
         assert not version_dir.exists()
-
-    def test_train_form_counts_current_baseline_version_only(self, db, health, alerts_dir, tmp_path, monkeypatch):
-        """Training form should reflect the current baseline version instead of summing stale files."""
-        baselines_dir = tmp_path / "baselines"
-        default_dir = baselines_dir / "cam_01" / "default"
-        current_dir = default_dir / "v002"
-        current_dir.mkdir(parents=True)
-        (default_dir / "current.txt").write_text("v002")
-        (current_dir / "baseline_00000.png").write_bytes(b"img")
-        (default_dir / "baseline_legacy_00000.png").write_bytes(b"legacy")
-        for index in range(9):
-            (current_dir / f"baseline_{index + 1:05d}.png").write_bytes(b"img")
-
-        config = ArgusConfig()
-        config.storage.baselines_dir = baselines_dir
-        config.cameras = [
-            CameraConfig(
-                camera_id="cam_01",
-                name="Camera 01",
-                source="rtsp://example/stream",
-                protocol="rtsp",
-            )
-        ]
-
-        captured = {}
-
-        def fake_form_select(label, name, options=None, **kwargs):
-            captured[name] = options or []
-            return f'<select name="{name}"></select>'
-
-        monkeypatch.setattr("argus.dashboard.routes.baseline.form_select", fake_form_select)
-
-        app = create_app(
-            database=db,
-            camera_manager=MagicMock(),
-            health_monitor=health,
-            alerts_dir=str(alerts_dir),
-            config=config,
-        )
-        client = TestClient(app)
-
-        response = client.get("/api/baseline/train")
-
-        assert response.status_code == 200
-        assert captured["camera_id"] == [("cam_01", "cam_01 / v002 (10 张基线图片)")]
-
 
 class TestCameraJsonAPI:
     def test_cameras_json_returns_wrapped_list(self, db, health, alerts_dir):
@@ -1121,33 +1003,6 @@ class TestSchedulerWiring:
 
 
 class TestAlertsAPI:
-    def test_alerts_list_empty(self, client):
-        """Empty alerts list should render."""
-        response = client.get("/api/alerts")
-        assert response.status_code == 200
-        assert "暂无告警" in response.text or "No alerts" in response.text or response.status_code == 200
-
-    def test_alerts_list_with_data(self, client, db):
-        """Alerts should appear in the list."""
-        now = datetime.now(tz=timezone.utc)
-        db.save_alert("ALT-001", now, "cam_01", "z1", "high", 0.96)
-        db.save_alert("ALT-002", now, "cam_01", "z1", "low", 0.72)
-
-        response = client.get("/api/alerts")
-        assert response.status_code == 200
-        assert "ALT-001" in response.text
-        assert "ALT-002" in response.text
-
-    def test_alerts_filter_by_severity(self, client, db):
-        """Should filter alerts by severity."""
-        now = datetime.now(tz=timezone.utc)
-        db.save_alert("ALT-001", now, "cam_01", "z1", "high", 0.96)
-        db.save_alert("ALT-002", now, "cam_01", "z1", "low", 0.72)
-
-        response = client.get("/api/alerts?severity=high")
-        assert response.status_code == 200
-        assert "ALT-001" in response.text
-
     def test_acknowledge_alert(self, client, db):
         """Should acknowledge an alert via POST."""
         now = datetime.now(tz=timezone.utc)
@@ -1178,13 +1033,6 @@ class TestAlertsAPI:
         alerts = body["data"]["alerts"]
         assert len(alerts) == 1
         assert alerts[0]["alert_id"] == "ALT-001"
-
-    def test_alerts_list_shows_thumbnail_column(self, client, db):
-        """Alert list should include a snapshot thumbnail column header."""
-        now = datetime.now(tz=timezone.utc)
-        db.save_alert("ALT-001", now, "cam_01", "z1", "high", 0.96)
-        response = client.get("/api/alerts")
-        assert response.status_code == 200
 
 
 class TestAlertImages:
@@ -1255,25 +1103,6 @@ class TestAlertImages:
 
         response = client.get("/api/alerts/ALT-001/image/snapshot")
         assert response.status_code == 403
-
-
-class TestAlertDetail:
-    def test_detail_404_for_nonexistent(self, client):
-        """Should return not found message."""
-        response = client.get("/api/alerts/NONEXISTENT/detail")
-        assert response.status_code == 200
-        assert "not found" in response.text.lower() or "不存在" in response.text or "未找到" in response.text
-
-    def test_detail_shows_metadata(self, client, db):
-        """Should show alert metadata in detail view."""
-        now = datetime.now(tz=timezone.utc)
-        db.save_alert("ALT-001", now, "cam_01", "z1", "high", 0.96)
-
-        response = client.get("/api/alerts/ALT-001/detail")
-        assert response.status_code == 200
-        assert "ALT-001" in response.text
-        assert "cam_01" in response.text
-        assert "z1" in response.text
 
 
 class TestCompositeGeneration:

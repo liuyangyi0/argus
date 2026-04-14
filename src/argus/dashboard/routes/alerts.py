@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import csv
 import io
-from collections import defaultdict
-from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -24,12 +23,33 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.components import empty_state, page_header, status_badge
 from argus.dashboard.forms import parse_request_form
+
+if TYPE_CHECKING:
+    from argus.storage.alert_recording import AlertRecordingStore
 
 logger = structlog.get_logger()
 
 router = APIRouter()
+
+# Database/CSV-friendly timestamp format used in exports and audit fields.
+_TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _cleanup_alert_images(
+    alert_id: str,
+    image_paths: list[str],
+    recording_store: AlertRecordingStore | None,
+) -> None:
+    """Remove on-disk image files and recording directory tied to a deleted alert."""
+    for path_str in image_paths:
+        try:
+            Path(path_str).unlink(missing_ok=True)
+        except OSError:
+            logger.debug("alerts.image_delete_failed", path=path_str, exc_info=True)
+
+    if recording_store is not None:
+        recording_store.delete_recording(alert_id)
 
 
 def _generate_composite(
@@ -120,359 +140,6 @@ _FEEDBACK_CATEGORIES = [
     ("other", "其他"),
 ]
 
-
-@router.get("/{alert_id}/detail", response_class=HTMLResponse)
-async def alert_detail(request: Request, alert_id: str):
-    """Alert detail view with evidence, baseline comparison, and feedback workflow."""
-    db = request.app.state.db
-    if not db:
-        return HTMLResponse('<p style="color:var(--status-critical);">数据库不可用</p>')
-
-    alert = db.get_alert(alert_id)
-    if alert is None:
-        return HTMLResponse('<p style="color:var(--status-critical);">告警不存在</p>')
-
-    ts = alert.timestamp.strftime("%Y-%m-%d %H:%M:%S") if alert.timestamp else "N/A"
-
-    # Image toggle buttons
-    has_snapshot = bool(alert.snapshot_path)
-    has_heatmap = bool(alert.heatmap_path)
-    has_composite = has_snapshot and has_heatmap
-    default_type = "composite" if has_composite else ("snapshot" if has_snapshot else "")
-    img_url = f"/api/alerts/{alert_id}/image/{default_type}" if default_type else ""
-
-    toggles = []
-    if has_snapshot:
-        toggles.append(
-            f'<span class="img-toggle" '
-            f'onclick="document.getElementById(\'detail-img\').src='
-            f"'/api/alerts/{alert_id}/image/snapshot';"
-            f'document.querySelectorAll(\'.img-toggle\').forEach(t=>t.classList.remove(\'active\'));this.classList.add(\'active\')">原图</span>'
-        )
-    if has_heatmap:
-        toggles.append(
-            f'<span class="img-toggle" '
-            f'onclick="document.getElementById(\'detail-img\').src='
-            f"'/api/alerts/{alert_id}/image/heatmap';"
-            f'document.querySelectorAll(\'.img-toggle\').forEach(t=>t.classList.remove(\'active\'));this.classList.add(\'active\')">热力图</span>'
-        )
-    if has_composite:
-        toggles.append(
-            f'<span class="img-toggle active" '
-            f'onclick="document.getElementById(\'detail-img\').src='
-            f"'/api/alerts/{alert_id}/image/composite';"
-            f'document.querySelectorAll(\'.img-toggle\').forEach(t=>t.classList.remove(\'active\'));this.classList.add(\'active\')">叠加图</span>'
-        )
-    toggle_html = f'<div style="margin-bottom:var(--space-3);">{"".join(toggles)}</div>' if toggles else ""
-
-    img_html = (
-        f'<img id="detail-img" src="{img_url}" '
-        f'style="max-width:100%;border-radius:var(--radius-md);border:1px solid var(--border-subtle);" />'
-        if img_url
-        else '<div class="empty-state"><div class="message">暂无图片</div></div>'
-    )
-
-    # Workflow status
-    wf_status = getattr(alert, "workflow_status", "new") or "new"
-    wf_label, wf_color = _WF_LABELS.get(wf_status, ("未知", "var(--text-tertiary)"))
-
-    # Evidence section
-    score_pct = f"{alert.anomaly_score * 100:.1f}%" if alert.anomaly_score else "—"
-
-    # Action buttons based on current workflow state
-    actions_html = ""
-    if wf_status == "new":
-        actions_html = f"""
-        <div class="flex gap-8" style="flex-wrap:wrap;">
-            <button class="btn btn-primary"
-                    hx-post="/api/alerts/{alert_id}/workflow" hx-vals='{{"status":"acknowledged"}}'
-                    hx-target="#alert-modal-content" hx-swap="innerHTML">确认真实</button>
-            <button class="btn btn-ghost"
-                    onclick="document.getElementById('fp-form-{alert_id}').style.display='block'">标记误报</button>
-            <button class="btn btn-ghost"
-                    hx-post="/api/alerts/{alert_id}/workflow" hx-vals='{{"status":"investigating","assigned_to":"班组长"}}'
-                    hx-target="#alert-modal-content" hx-swap="innerHTML">升级给班组长</button>
-        </div>"""
-    elif wf_status == "acknowledged":
-        actions_html = f"""
-        <div class="flex gap-8">
-            <button class="btn btn-success btn-sm"
-                    hx-post="/api/alerts/{alert_id}/workflow" hx-vals='{{"status":"resolved"}}'
-                    hx-target="#alert-modal-content" hx-swap="innerHTML">标记已解决</button>
-        </div>"""
-    elif wf_status == "investigating":
-        actions_html = f"""
-        <div class="flex gap-8">
-            <button class="btn btn-success btn-sm"
-                    hx-post="/api/alerts/{alert_id}/workflow" hx-vals='{{"status":"resolved"}}'
-                    hx-target="#alert-modal-content" hx-swap="innerHTML">标记已解决</button>
-        </div>"""
-
-    # False positive feedback form (hidden by default)
-    fp_options = "".join(
-        f'<option value="{val}">{label}</option>' for val, label in _FEEDBACK_CATEGORIES
-    )
-    fp_form = f"""
-    <div id="fp-form-{alert_id}" class="card mt-16" style="display:none;border:1px solid var(--status-warn);">
-        <h3 style="color:var(--status-warn-text);">标记为误报</h3>
-        <form hx-post="/api/alerts/{alert_id}/workflow" hx-target="#alert-modal-content" hx-swap="innerHTML">
-            <input type="hidden" name="status" value="false_positive">
-            <div class="form-group">
-                <label class="form-label">误报分类</label>
-                <select name="category" class="form-select">{fp_options}</select>
-            </div>
-            <div class="form-group">
-                <label class="form-label">备注（可选）</label>
-                <textarea name="notes" class="form-textarea" rows="2" placeholder="简要描述误报原因..."></textarea>
-            </div>
-            <div class="flex gap-8">
-                <button type="submit" class="btn btn-warning">确认标记误报</button>
-                <button type="button" class="btn btn-ghost"
-                        onclick="this.closest('[id^=fp-form]').style.display='none'">取消</button>
-            </div>
-        </form>
-    </div>"""
-
-    # Notes display
-    notes_html = ""
-    if alert.notes:
-        safe_notes = html.escape(alert.notes)
-        notes_html = f"""
-        <div class="card mt-16" style="border-left:3px solid var(--status-info);">
-            <h3>备注</h3>
-            <p style="font-size:var(--text-sm);color:var(--text-secondary);">{safe_notes}</p>
-        </div>"""
-
-    close_btn = (
-        '<button class="modal-close" '
-        "onclick=\"document.getElementById('alert-modal').classList.remove('active')\">"
-        "&times;</button>"
-    )
-
-    return HTMLResponse(f"""
-    {close_btn}
-    <div style="display:flex;gap:var(--space-5);flex-wrap:wrap;">
-        <div style="flex:1;min-width:400px;">
-            {toggle_html}
-            {img_html}
-        </div>
-        <div style="flex:0 0 320px;">
-            <div class="flex-between mb-16">
-                <h3 style="color:var(--status-info-text);">告警详情</h3>
-                <span style="color:{wf_color};font-size:var(--text-sm);font-weight:var(--font-semibold);">{wf_label}</span>
-            </div>
-            <table>
-                <tr><td style="color:var(--text-secondary);">告警ID</td>
-                    <td class="mono" style="font-size:var(--text-xs);">{alert.alert_id}</td></tr>
-                <tr><td style="color:var(--text-secondary);">时间</td><td>{ts}</td></tr>
-                <tr><td style="color:var(--text-secondary);">摄像头</td><td>{alert.camera_id}</td></tr>
-                <tr><td style="color:var(--text-secondary);">区域</td><td>{alert.zone_id}</td></tr>
-                <tr><td style="color:var(--text-secondary);">严重度</td><td>{status_badge(alert.severity)}</td></tr>
-                <tr><td style="color:var(--text-secondary);">异常分数</td><td>{alert.anomaly_score:.4f} ({score_pct})</td></tr>
-            </table>
-
-            <div style="margin-top:var(--space-5);">{actions_html}</div>
-        </div>
-    </div>
-    {fp_form}
-    {notes_html}""")
-
-
-# ── Main alerts list ──
-
-@router.get("", response_class=HTMLResponse)
-async def alerts_list(
-    request: Request,
-    camera_id: str | None = Query(None),
-    severity: str | None = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
-    """Alert list page with filtering, pagination, bulk actions, and thumbnails."""
-    db = request.app.state.db
-    if not db:
-        return HTMLResponse(empty_state("数据库不可用"))
-
-    offset = (page - 1) * page_size
-    alerts = db.get_alerts(camera_id=camera_id, severity=severity, limit=page_size, offset=offset)
-    total = db.get_alert_count(camera_id=camera_id, severity=severity)
-
-    # Statistics
-    stats_html = ""
-    try:
-        total_all = db.get_alert_count()
-        cnt_high = db.get_alert_count(severity="high")
-        cnt_medium = db.get_alert_count(severity="medium")
-        cnt_low = db.get_alert_count(severity="low")
-        cnt_info = db.get_alert_count(severity="info")
-        stats_html = f"""
-        <div class="flex gap-16 mb-16" style="font-size:var(--text-sm);color:var(--text-secondary);">
-            <span>总计: <strong style="color:var(--text-primary);">{total_all}</strong></span>
-            <span>{status_badge("high")} {cnt_high}</span>
-            <span>{status_badge("medium")} {cnt_medium}</span>
-            <span>{status_badge("low")} {cnt_low}</span>
-            <span>{status_badge("info")} {cnt_info}</span>
-        </div>"""
-    except Exception:
-        logger.warning("alerts.stats_query_failed", exc_info=True)
-
-    # Filter controls
-    severity_options = ""
-    for sev, label in [("", "全部"), ("info", "提示"), ("low", "低"), ("medium", "中"), ("high", "高")]:
-        selected = "selected" if sev == (severity or "") else ""
-        severity_options += f'<option value="{sev}" {selected}>{label}</option>'
-
-    camera_manager = request.app.state.camera_manager
-    cam_options = '<option value="">全部摄像头</option>'
-    if camera_manager:
-        for s in camera_manager.get_status():
-            sel = "selected" if s.camera_id == camera_id else ""
-            cam_options += f'<option value="{s.camera_id}" {sel}>{s.camera_id}</option>'
-
-    sev_param = f"&severity={severity}" if severity else ""
-    cam_param = f"&camera_id={camera_id}" if camera_id else ""
-    base_url = "/alerts?"
-
-    filters_html = f"""
-    <div class="flex gap-12 mb-16" style="flex-wrap:wrap;align-items:center;">
-        <select class="form-select" style="width:auto;"
-                onchange="window.location.href='{base_url}camera_id='+this.value+'{sev_param}'">
-            {cam_options}
-        </select>
-        <select class="form-select" style="width:auto;"
-                onchange="window.location.href='{base_url}severity='+this.value+'{cam_param}'">
-            {severity_options}
-        </select>
-        <span style="color:var(--text-secondary);font-size:var(--text-sm);">共 {total} 条告警</span>
-        <div style="margin-left:auto;">
-            <a href="/api/alerts/export-csv?{cam_param.lstrip('&')}{sev_param}" class="btn btn-ghost btn-sm" download>导出CSV</a>
-        </div>
-    </div>"""
-
-    # Alert table with checkboxes
-    rows = ""
-    for a in alerts:
-        ts = a.timestamp.strftime("%Y-%m-%d %H:%M:%S") if a.timestamp else ""
-
-        thumb = '<span style="color:var(--text-tertiary);font-size:var(--text-xs);">—</span>'
-        if a.snapshot_path:
-            img_type = "composite" if a.heatmap_path else "snapshot"
-            thumb = (
-                f'<img src="/api/alerts/{a.alert_id}/image/{img_type}" '
-                f'class="alert-thumb" alt="" loading="lazy" '
-                f'hx-get="/api/alerts/{a.alert_id}/detail" '
-                f'hx-target="#alert-modal-content" hx-swap="innerHTML" '
-                f"onclick=\"document.getElementById('alert-modal').classList.add('active')\" />"
-            )
-
-        ack_html = (
-            '<span style="color:var(--status-ok-text);font-size:var(--text-xs);">已确认</span>'
-            if a.acknowledged else
-            f'<button class="btn btn-sm btn-primary" '
-            f'hx-post="/api/alerts/{a.alert_id}/acknowledge" hx-swap="outerHTML">确认</button>'
-        )
-        fp_html = (
-            '<span style="color:var(--status-warn-text);font-size:var(--text-xs);">误报</span>'
-            if a.false_positive else
-            f'<button class="btn btn-sm btn-ghost" '
-            f'hx-post="/api/alerts/{a.alert_id}/false-positive" hx-swap="outerHTML">标记</button>'
-        )
-
-        rows += f"""
-        <tr>
-            <td class="checkbox-cell"><input type="checkbox" name="alert_ids" value="{a.alert_id}" onchange="updateBulkBar()"></td>
-            <td>{thumb}</td>
-            <td class="mono" style="font-size:var(--text-xs);">{a.alert_id[:24]}</td>
-            <td>{ts}</td>
-            <td>{a.camera_id}</td>
-            <td>{a.zone_id}</td>
-            <td>{status_badge(a.severity)}</td>
-            <td>{a.anomaly_score:.3f}</td>
-            <td>{ack_html}</td>
-            <td>{fp_html}</td>
-        </tr>"""
-
-    if not rows:
-        rows = '<tr><td colspan="10" style="color:var(--text-tertiary);text-align:center;padding:var(--space-5);">暂无告警记录</td></tr>'
-
-    # Pagination
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    pagination = ""
-    if total_pages > 1:
-        prev_cls = ' style="opacity:0.3;pointer-events:none;"' if page <= 1 else ""
-        next_cls = ' style="opacity:0.3;pointer-events:none;"' if page >= total_pages else ""
-        params = sev_param + cam_param
-        pagination = f"""
-        <div style="display:flex;justify-content:center;gap:12px;margin-top:16px;align-items:center;">
-            <a href="/alerts?page={page-1}{params}" class="btn btn-sm btn-ghost"{prev_cls}>上一页</a>
-            <span style="color:var(--text-secondary);font-size:var(--text-sm);">第 {page}/{total_pages} 页</span>
-            <a href="/alerts?page={page+1}{params}" class="btn btn-sm btn-ghost"{next_cls}>下一页</a>
-        </div>"""
-
-    header = page_header("告警中心", f"监控与管理异常检测告警")
-
-    # Bulk action bar JS
-    bulk_js = """
-    <script>
-    function updateBulkBar() {
-        var checked = document.querySelectorAll('input[name="alert_ids"]:checked');
-        var bar = document.getElementById('bulk-bar');
-        var count = document.getElementById('bulk-count');
-        if (checked.length > 0) {
-            bar.classList.add('active');
-            count.textContent = checked.length + ' 条已选';
-        } else {
-            bar.classList.remove('active');
-        }
-    }
-    function selectAll(cb) {
-        document.querySelectorAll('input[name="alert_ids"]').forEach(function(c) { c.checked = cb.checked; });
-        updateBulkBar();
-    }
-    function bulkAction(action) {
-        var ids = Array.from(document.querySelectorAll('input[name="alert_ids"]:checked')).map(function(c) { return c.value; });
-        if (ids.length === 0) return;
-        fetch('/api/alerts/bulk-' + action, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({alert_ids: ids})
-        }).then(function(r) { return r.json(); }).then(function(d) {
-            window.showToast(d.message || '操作完成', 'success');
-            htmx.ajax('GET', '/api/alerts', {target: '#content', swap: 'innerHTML'});
-        });
-    }
-    </script>"""
-
-    return HTMLResponse(f"""
-    {header}
-    {stats_html}
-    {filters_html}
-    <div class="card">
-        <form id="alerts-form">
-            <table>
-                <thead>
-                    <tr>
-                        <th class="checkbox-cell"><input type="checkbox" onchange="selectAll(this)"></th>
-                        <th>快照</th><th>告警ID</th><th>时间</th><th>摄像头</th>
-                        <th>区域</th><th>严重度</th><th>分数</th><th>确认</th><th>误报</th>
-                    </tr>
-                </thead>
-                <tbody>{rows}</tbody>
-            </table>
-        </form>
-        {pagination}
-    </div>
-    <div id="bulk-bar" class="bulk-bar">
-        <span id="bulk-count" class="count">0 条已选</span>
-        <div class="flex gap-8">
-            <button class="btn btn-sm btn-primary" onclick="bulkAction('acknowledge')">批量确认</button>
-            <button class="btn btn-sm btn-warning" onclick="bulkAction('false-positive')">批量标记误报</button>
-        </div>
-    </div>
-    {bulk_js}""")
-
-
-# ── Workflow transition ──
 
 @router.post("/{alert_id}/workflow")
 async def alert_workflow_transition(request: Request, alert_id: str):
@@ -659,20 +326,7 @@ async def bulk_delete(request: Request):
         success, image_paths = db.delete_alert(aid)
         if success:
             count += 1
-            # Clean up image files
-            for path_str in image_paths:
-                try:
-                    p = Path(path_str)
-                    if p.exists():
-                        p.unlink()
-                except OSError:
-                    logger.debug("alerts.image_delete_failed", path=path_str, exc_info=True)
-            # Clean up recording directory
-            if recording_store:
-                rec_dir = recording_store._find_recording_dir(aid)
-                if rec_dir and rec_dir.exists():
-                    import shutil
-                    shutil.rmtree(rec_dir, ignore_errors=True)
+            _cleanup_alert_images(aid, image_paths, recording_store)
 
     audit = getattr(request.app.state, "audit_logger", None)
     client_ip = request.client.host if request.client else ""
@@ -741,7 +395,7 @@ def export_csv(
     writer.writerow(["告警ID", "时间", "摄像头", "区域", "严重度", "异常分数", "已确认", "误报", "备注"])
 
     for a in alerts:
-        ts = a.timestamp.strftime("%Y-%m-%d %H:%M:%S") if a.timestamp else ""
+        ts = a.timestamp.strftime(_TIMESTAMP_FMT) if a.timestamp else ""
         writer.writerow([
             a.alert_id, ts, a.camera_id, a.zone_id,
             a.severity, f"{a.anomaly_score:.4f}",
@@ -776,7 +430,7 @@ def export_pdf_report(
 
     rows_html = ""
     for i, a in enumerate(alerts, 1):
-        ts = a.timestamp.strftime("%Y-%m-%d %H:%M:%S") if a.timestamp else ""
+        ts = a.timestamp.strftime(_TIMESTAMP_FMT) if a.timestamp else ""
         sev = severity_cn.get(a.severity, a.severity)
         status = "已确认" if a.acknowledged else ("误报" if a.false_positive else "待处理")
         rows_html += f"""<tr>
@@ -881,22 +535,8 @@ def delete_alert(request: Request, alert_id: str):
     if not success:
         return api_not_found("告警不存在")
 
-    # Clean up image files from disk
-    for path_str in image_paths:
-        try:
-            p = Path(path_str)
-            if p.exists():
-                p.unlink()
-        except OSError:
-            logger.debug("alerts.image_delete_failed", path=path_str, exc_info=True)
-
-    # Clean up recording directory if exists
     recording_store = getattr(request.app.state, "recording_store", None)
-    if recording_store:
-        rec_dir = recording_store._find_recording_dir(alert_id)
-        if rec_dir and rec_dir.exists():
-            import shutil
-            shutil.rmtree(rec_dir, ignore_errors=True)
+    _cleanup_alert_images(alert_id, image_paths, recording_store)
 
     audit = getattr(request.app.state, "audit_logger", None)
     client_ip = request.client.host if request.client else ""
@@ -1039,113 +679,6 @@ def _add_fp_snapshot_to_baseline(request: Request, alert_id: str) -> None:
         zone_id=zone_id,
         dest=str(dest),
     )
-
-
-@router.get("/timeline")
-def alerts_timeline(
-    request: Request,
-    date: str = Query(None, description="Date in YYYY-MM-DD format, defaults to today"),
-):
-    """24h timeline: per-camera horizontal bars with alert segments colored by severity.
-
-    Merges adjacent alerts within a 60-second window into segments for clean display.
-    """
-    db = request.app.state.db
-    if not db:
-        return api_unavailable("数据库不可用")
-
-    if date:
-        try:
-            day = datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
-            return api_validation_error("日期格式错误，请使用 YYYY-MM-DD")
-    else:
-        day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-
-    day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = day_start + timedelta(days=1)
-
-    # Fetch alerts for the day using SQL time-range filter
-    from sqlalchemy import select
-    from argus.storage.models import AlertRecord
-
-    with db.get_session() as session:
-        stmt = (
-            select(AlertRecord)
-            .where(AlertRecord.timestamp >= day_start)
-            .where(AlertRecord.timestamp < day_end)
-            .order_by(AlertRecord.timestamp.asc())
-        )
-        day_alerts = list(session.scalars(stmt).all())
-
-    # Group by camera
-    by_camera: dict[str, list] = defaultdict(list)
-    for a in day_alerts:
-        by_camera[a.camera_id].append(a)
-
-    # Build camera names from app state
-    camera_names: dict[str, str] = {}
-    manager = getattr(request.app.state, "camera_manager", None)
-    if manager and hasattr(manager, "cameras"):
-        for cam_id, pipeline in manager.cameras.items():
-            camera_names[cam_id] = getattr(pipeline, "camera_config", None)
-            if camera_names[cam_id]:
-                camera_names[cam_id] = camera_names[cam_id].name
-            else:
-                camera_names[cam_id] = cam_id
-
-    merge_window = 60  # seconds
-    severity_order = {"high": 3, "medium": 2, "low": 1, "info": 0}
-
-    cameras = []
-    for cam_id, cam_alerts in by_camera.items():
-        cam_alerts.sort(key=lambda a: a.timestamp)
-        segments = []
-        current_seg = None
-
-        for a in cam_alerts:
-            ts = a.timestamp if isinstance(a.timestamp, datetime) else datetime.fromtimestamp(a.timestamp)
-            sev = a.severity.value if hasattr(a.severity, "value") else str(a.severity)
-            aid = a.alert_id
-
-            if current_seg is None:
-                current_seg = {
-                    "start": ts.isoformat(),
-                    "end": (ts + timedelta(seconds=30)).isoformat(),
-                    "severity": sev,
-                    "alert_count": 1,
-                    "first_alert_id": aid,
-                }
-            elif (ts - datetime.fromisoformat(current_seg["end"])).total_seconds() <= merge_window:
-                # Merge: extend end time and use highest severity
-                current_seg["end"] = (ts + timedelta(seconds=30)).isoformat()
-                current_seg["alert_count"] += 1
-                if severity_order.get(sev, 0) > severity_order.get(current_seg["severity"], 0):
-                    current_seg["severity"] = sev
-                    current_seg["first_alert_id"] = aid  # use highest-severity alert
-            else:
-                segments.append(current_seg)
-                current_seg = {
-                    "start": ts.isoformat(),
-                    "end": (ts + timedelta(seconds=30)).isoformat(),
-                    "severity": sev,
-                    "alert_count": 1,
-                    "first_alert_id": aid,
-                }
-
-        if current_seg:
-            segments.append(current_seg)
-
-        cameras.append({
-            "camera_id": cam_id,
-            "name": camera_names.get(cam_id, cam_id),
-            "segments": segments,
-        })
-
-    return api_success({
-        "date": day_start.strftime("%Y-%m-%d"),
-        "cameras": cameras,
-    })
 
 
 @router.post("/{alert_id}/annotations")
