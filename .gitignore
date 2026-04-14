@@ -17,7 +17,7 @@ data/alerts/
 data/inference_records/
 data/active_learning/
 data/recordings/
-
+data/backups/
 # Environment
 .env
 .venv/
