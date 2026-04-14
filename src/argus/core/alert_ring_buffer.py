@@ -201,7 +201,13 @@ class AlertFrameBuffer:
         if policy.target_fps > 0 and policy.target_fps < self._fps:
             pre_frames = self._downsample(pre_frames, policy.target_fps)
 
-        effective_fps = policy.target_fps if policy.target_fps > 0 else self._fps
+        # Compute actual FPS from frame timestamps (not config target)
+        if len(pre_frames) >= 2:
+            duration = pre_frames[-1].timestamp - pre_frames[0].timestamp
+            actual_fps = (len(pre_frames) - 1) / duration if duration > 0 else self._fps
+            effective_fps = max(1, round(actual_fps))
+        else:
+            effective_fps = policy.target_fps if policy.target_fps > 0 else self._fps
 
         # Find trigger frame index in the downsampled list
         trigger_idx = len(pre_frames) - 1
