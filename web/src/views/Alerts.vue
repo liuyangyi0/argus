@@ -363,13 +363,12 @@ const columns = computed(() => {
       <div class="alerts-header">
         <div class="alerts-header-top">
           <div>
-            <div class="alerts-eyebrow">// Surveillance · Live Feed</div>
-            <h2 class="alerts-title">告警<span class="alerts-accent">中心</span></h2>
+            <h2 class="alerts-title">告警中心</h2>
           </div>
           <div class="alerts-stats">
-            <span>ACTIVE <b>{{ String(activeCount).padStart(2, '0') }}</b></span>
-            <span>RESOLVED <b>{{ String(resolvedCount).padStart(2, '0') }}</b></span>
-            <span>TOTAL <b>{{ String(totalAlerts).padStart(2, '0') }}</b></span>
+            <span>活跃 <b>{{ String(activeCount).padStart(2, '0') }}</b></span>
+            <span>已解决 <b>{{ String(resolvedCount).padStart(2, '0') }}</b></span>
+            <span>总计 <b>{{ String(totalAlerts).padStart(2, '0') }}</b></span>
           </div>
         </div>
         <div class="alerts-filters">
@@ -386,7 +385,7 @@ const columns = computed(() => {
             </Select.Option>
           </Select>
           <div class="alerts-chip-group">
-            <button :class="['alerts-chip', { on: !filters.severity }]" @click="filters.severity = ''; fetchData()">All</button>
+            <button :class="['alerts-chip', { on: !filters.severity }]" @click="filters.severity = ''; fetchData()">全部</button>
             <button :class="['alerts-chip', { on: filters.severity === 'high' }]" @click="filters.severity = 'high'; fetchData()">高</button>
             <button :class="['alerts-chip', { on: filters.severity === 'medium' }]" @click="filters.severity = 'medium'; fetchData()">中</button>
             <button :class="['alerts-chip', { on: filters.severity === 'low' }]" @click="filters.severity = 'low'; fetchData()">低</button>
@@ -676,32 +675,32 @@ const columns = computed(() => {
           <!-- Left: Metadata -->
           <div class="meta-panel">
             <div class="meta-panel-hd">
-              <span>告警信息 · Metadata</span>
+              <span>告警信息</span>
               <b>{{ selectedAlert.alert_id?.slice(-8) }}</b>
             </div>
             <div class="meta-panel-bd">
               <div class="meta-row">
-                <span class="meta-k">CAMERA</span>
-                <span class="meta-v">{{ selectedAlert.camera_id }} / {{ selectedAlert.zone_id || 'Default' }}</span>
+                <span class="meta-k">摄像头</span>
+                <span class="meta-v">{{ selectedAlert.camera_id }} / {{ selectedAlert.zone_id || '默认' }}</span>
               </div>
               <div class="meta-row">
-                <span class="meta-k">SEVERITY</span>
+                <span class="meta-k">严重度</span>
                 <span class="meta-v"><Tag :color="severityColor[selectedAlert.severity]" style="margin: 0">{{ severityLabel[selectedAlert.severity] }}</Tag></span>
               </div>
               <div class="meta-row">
-                <span class="meta-k">CONFIDENCE</span>
+                <span class="meta-k">置信度</span>
                 <span class="meta-v" :style="{ color: scoreColor(selectedAlert.anomaly_score), fontWeight: 600 }">{{ selectedAlert.anomaly_score?.toFixed(4) }}</span>
               </div>
               <div class="meta-row">
-                <span class="meta-k">TRIGGER</span>
+                <span class="meta-k">触发时间</span>
                 <span class="meta-v">{{ formatTimestamp(selectedAlert.timestamp || selectedAlert.created_at) }}</span>
               </div>
               <div v-if="selectedAlert.assigned_to" class="meta-row">
-                <span class="meta-k">ASSIGN</span>
+                <span class="meta-k">指派</span>
                 <span class="meta-v">{{ selectedAlert.assigned_to }}</span>
               </div>
               <div v-if="selectedAlert.notes" class="meta-row">
-                <span class="meta-k">NOTES</span>
+                <span class="meta-k">备注</span>
                 <span class="meta-v meta-v--notes">{{ selectedAlert.notes }}</span>
               </div>
             </div>
@@ -710,8 +709,8 @@ const columns = computed(() => {
           <!-- Right: Actions -->
           <div class="meta-panel">
             <div class="meta-panel-hd">
-              <span>操作 · Actions</span>
-              <b>{{ (workflowLabel[selectedAlert.workflow_status] || '待处理').toUpperCase() }}</b>
+              <span>操作</span>
+              <b>{{ workflowLabel[selectedAlert.workflow_status] || '待处理' }}</b>
             </div>
             <div class="meta-panel-bd actions-panel-bd">
               <Button
@@ -752,7 +751,6 @@ const columns = computed(() => {
                   v-if="selectedAlert.workflow_status !== 'false_positive'"
                   :current="workflowStepIndex"
                   size="small"
-                  direction="vertical"
                   style="font-size: 11px"
                 >
                   <Steps.Step title="待处理" />
@@ -786,23 +784,11 @@ const columns = computed(() => {
   align-items: flex-end;
   margin-bottom: 14px;
 }
-.alerts-eyebrow {
-  font-family: var(--argus-font-mono);
-  font-size: 10px;
-  color: var(--argus-text-muted);
-  letter-spacing: .15em;
-  text-transform: uppercase;
-  margin-bottom: 2px;
-}
 .alerts-title {
-  font-size: 24px;
-  font-weight: 800;
+  font-size: 22px;
+  font-weight: 700;
   margin: 0;
-  letter-spacing: .04em;
   color: var(--argus-text);
-}
-.alerts-accent {
-  color: #3b82f6;
 }
 .alerts-stats {
   display: flex;
