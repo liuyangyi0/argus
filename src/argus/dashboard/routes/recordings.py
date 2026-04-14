@@ -46,12 +46,12 @@ async def list_segments(
     ])
 
 
-@router.get("/{camera_id}/segment/{filename}/video")
+@router.get("/{camera_id}/segment/{filename}/video", response_model=None)
 async def serve_segment_video(
     request: Request,
     camera_id: str,
     filename: str,
-) -> FileResponse | JSONResponse:
+):
     """Serve a recording segment MP4 with HTTP Range support."""
     manager = getattr(request.app.state, "recording_manager", None)
     if manager is None:
