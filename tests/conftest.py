@@ -27,10 +27,15 @@ def noisy_frame():
 
 
 @pytest.fixture
-def frame_with_white_patch(blank_frame):
-    """A black frame with a white rectangle (simulates anomaly)."""
+def frame_with_anomaly_patch(blank_frame):
+    """A black frame with a saturated red rectangle (simulates anomaly).
+
+    Pure white (BGR=255,255,255) is HSV saturation=0 and gets filtered out by
+    the prefilter's chromaticity-based shadow suppression. Use a saturated
+    color so the patch survives shadow filtering.
+    """
     frame = blank_frame.copy()
-    frame[100:200, 150:300] = 255  # white patch
+    frame[100:200, 150:300] = (0, 0, 255)
     return frame
 
 

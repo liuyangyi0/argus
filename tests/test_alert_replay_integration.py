@@ -63,14 +63,16 @@ class TestAlertReplayRoundtrip:
 
     def test_solidify_save_load(self, tmp_path: Path):
         """Solidify recording -> save as MP4 -> load back and verify."""
-        buf = AlertFrameBuffer(fps=5, pre_seconds=10, post_seconds=5)
+        # MEDIUM retention policy uses target_fps=10, so buffer must run at 10 FPS
+        # for the recording to come out at 10 FPS without downsampling.
+        buf = AlertFrameBuffer(fps=10, pre_seconds=10, post_seconds=5)
         store = AlertRecordingStore(archive_dir=str(tmp_path / "recordings"))
 
-        # Simulate 10 seconds of frames (50 frames at 5 FPS)
+        # Simulate 10 seconds of frames (100 frames at 10 FPS)
         base_ts = time.time() - 10
-        for i in range(50):
-            ts = base_ts + i * 0.2  # 5 FPS
-            score = 0.3 + (i / 50) * 0.6
+        for i in range(100):
+            ts = base_ts + i * 0.1  # 10 FPS
+            score = 0.3 + (i / 100) * 0.6
             snap = _make_snapshot(
                 ts=ts,
                 score=score,
@@ -80,7 +82,7 @@ class TestAlertReplayRoundtrip:
             )
             buf.append(snap)
 
-        trigger_ts = base_ts + 49 * 0.2
+        trigger_ts = base_ts + 99 * 0.1
         recording = buf.solidify(
             alert_id="ALT-TEST-001",
             camera_id="CAM-01",

@@ -482,6 +482,15 @@ class AlertRecordingStore:
             logger.info("alert_recording.reindex_moov_done", count=count)
         return count
 
+    def delete_recording(self, alert_id: str) -> bool:
+        """Delete the recording directory for an alert. Returns True if it existed."""
+        rec_dir = self._find_recording_dir(alert_id)
+        if rec_dir is None:
+            return False
+        shutil.rmtree(rec_dir, ignore_errors=True)
+        self._path_cache.pop(alert_id, None)
+        return True
+
     def cleanup_old(self, max_age_days: int = 30) -> int:
         """Remove recordings older than max_age_days.
 

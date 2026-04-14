@@ -75,22 +75,6 @@ class MOG2Config(BaseModel):
     )
 
 
-class CameraHealthConfig(BaseModel):
-    """Camera hardware health monitoring."""
-
-    enabled: bool = Field(default=True)
-    freeze_detection: bool = Field(default=True)
-    lens_contamination_detection: bool = Field(default=True)
-    displacement_detection: bool = Field(default=True)
-    flash_suppression: bool = Field(default=True)
-    gain_drift_detection: bool = Field(default=True)
-    freeze_window_frames: int = Field(default=10, ge=5, le=30)
-    sharpness_drop_pct: float = Field(default=0.3, ge=0.1, le=0.8)
-    displacement_threshold_px: float = Field(default=20.0, ge=5.0, le=100.0)
-    flash_sigma: float = Field(default=3.0, ge=2.0, le=5.0)
-    gain_drift_threshold_pct: float = Field(default=20.0, ge=5.0, le=50.0)
-
-
 class SimplexConfig(BaseModel):
     """Simplex safety channel: formally verifiable frame-difference detector."""
 
@@ -521,7 +505,6 @@ class CameraConfig(BaseModel):
     person_filter: PersonFilterConfig = Field(default_factory=PersonFilterConfig)
     anomaly: AnomalyConfig = Field(default_factory=AnomalyConfig)
     simplex: SimplexConfig = Field(default_factory=SimplexConfig)
-    health: CameraHealthConfig = Field(default_factory=CameraHealthConfig)
     drift: DriftConfig = Field(default_factory=DriftConfig)
     degradation: DegradationConfig = Field(default_factory=DegradationConfig)
     ring_buffer: RingBufferConfig = Field(default_factory=RingBufferConfig)

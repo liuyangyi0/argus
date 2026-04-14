@@ -5,25 +5,15 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import shutil
 from pathlib import Path
 
 import structlog
-import yaml
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from argus.core.model_discovery import resolve_runtime_model_path
-from argus.dashboard.components import (
-    confirm_button,
-    empty_state,
-    form_group,
-    form_select,
-    page_header,
-    tab_bar,
-)
 from argus.dashboard.api_response import (
     api_forbidden,
     api_success,
@@ -39,14 +29,6 @@ logger = structlog.get_logger()
 
 router = APIRouter()
 
-_TABS = [
-    ("detection", "检测参数", "/api/config/detection"),
-    ("notifications", "通知设置", "/api/config/notifications"),
-    ("storage", "存储与维护", "/api/config/storage"),
-    ("logs", "日志查看", "/api/config/logs"),
-    ("cameras", "摄像头控制", "/api/config/cameras-tab"),
-]
-
 
 class ThresholdUpdateRequest(BaseModel):
     anomaly_threshold: float | None = None
@@ -59,113 +41,6 @@ class ThresholdUpdateRequest(BaseModel):
 class ModelReloadRequest(BaseModel):
     camera_id: str
     model_path: str
-
-
-@router.get("", response_class=HTMLResponse)
-async def config_page(request: Request):
-    """Configuration page with tabbed interface."""
-    # When loaded as HTMX fragment (e.g. inside system page tab), skip page header
-    is_htmx = request.headers.get("HX-Request") == "true"
-    header = "" if is_htmx else page_header(
-        "系统设置",
-        "调整检测参数、通知设置和系统维护",
-        '<button class="btn btn-primary" hx-post="/api/config/save" hx-swap="none">保存到配置文件</button>',
-    )
-    tabs = tab_bar(_TABS, "detection")
-    return HTMLResponse(f"""
-    {header}
-    {tabs}
-    <div hx-get="/api/config/detection" hx-trigger="load" hx-target="#tab-content" hx-swap="innerHTML"></div>""")
-
-
-@router.get("/detection", response_class=HTMLResponse)
-async def detection_params(request: Request):
-    """Detection parameters form."""
-    config = request.app.state.config
-    if not config:
-        return HTMLResponse(empty_state("配置不可用"))
-
-    # Get first camera's config for defaults
-    cam = config.cameras[0] if config.cameras else None
-    mog2 = cam.mog2 if cam else None
-    anomaly = cam.anomaly if cam else None
-    alert = config.alerts
-    st = alert.severity_thresholds
-    temp = alert.temporal
-    supp = alert.suppression
-
-    mog2_html = ""
-    if mog2:
-        mog2_html = f"""
-        <div class="card">
-            <h3>MOG2 背景建模</h3>
-            <div class="form-row">
-                {form_group("背景历史帧数", "mog2_history", str(mog2.history), "number", "10-5000", min_val="10", max_val="5000")}
-                {form_group("方差阈值", "mog2_var_threshold", str(mog2.var_threshold), "number", "1.0-500.0", min_val="1", max_val="500", step="0.5")}
-            </div>
-            <div class="form-row">
-                {form_group("变化检测阈值", "mog2_change_pct", str(mog2.change_pct_threshold), "number", "像素变化百分比", min_val="0.0001", max_val="0.5", step="0.0001")}
-                {form_group("心跳帧间隔", "mog2_heartbeat", str(mog2.heartbeat_frames), "number", "强制全帧检测间隔", min_val="10", max_val="3000")}
-            </div>
-            <div class="form-row">
-                {form_group("锁定阈值", "lock_score", str(mog2.lock_score_threshold), "number", "触发异常锁定的分数", min_val="0.5", max_val="0.99", step="0.01")}
-                {form_group("锁定解除帧数", "lock_clear", str(mog2.lock_clear_frames), "number", "连续正常帧数解除锁定", min_val="1", max_val="100")}
-            </div>
-        </div>"""
-
-    anomaly_html = ""
-    if anomaly:
-        anomaly_html = f"""
-        <div class="card">
-            <h3>异常检测模型</h3>
-            <div class="form-row">
-                {form_group("异常阈值", "anomaly_threshold", str(anomaly.threshold), "number", "0.1-0.99", min_val="0.1", max_val="0.99", step="0.01")}
-                {form_select("模型类型", "model_type", [("patchcore","PatchCore"),("efficient_ad","EfficientAD"),("anomalydino","AnomalyDINO")], anomaly.model_type)}
-            </div>
-            <div class="form-row">
-                {form_group("SSIM基线帧数", "ssim_frames", str(anomaly.ssim_baseline_frames), "number", "无模型时的基线采集帧数", min_val="5", max_val="100")}
-                {form_group("SSIM灵敏度", "ssim_sensitivity", str(anomaly.ssim_sensitivity), "number", "Sigmoid灵敏度系数", min_val="1", max_val="200", step="1")}
-            </div>
-        </div>"""
-
-    severity_html = f"""
-    <div class="card">
-        <h3>告警阈值</h3>
-        <p style="color:#8890a0;font-size:13px;margin-bottom:12px;">分数从低到高依次为：提示 &lt; 低 &lt; 中 &lt; 高</p>
-        <div class="form-row">
-            {form_group("提示 (INFO)", "sev_info", str(st.info), "number", min_val="0.1", max_val="0.99", step="0.01")}
-            {form_group("低 (LOW)", "sev_low", str(st.low), "number", min_val="0.1", max_val="0.99", step="0.01")}
-        </div>
-        <div class="form-row">
-            {form_group("中 (MEDIUM)", "sev_medium", str(st.medium), "number", min_val="0.1", max_val="0.99", step="0.01")}
-            {form_group("高 (HIGH)", "sev_high", str(st.high), "number", min_val="0.1", max_val="0.99", step="0.01")}
-        </div>
-    </div>"""
-
-    temporal_html = f"""
-    <div class="card">
-        <h3>时间确认与抑制</h3>
-        <div class="form-row">
-            {form_group("最少连续帧数", "temp_frames", str(temp.min_consecutive_frames), "number", "异常需持续N帧才触发告警", min_val="1", max_val="30")}
-            {form_group("最大间隔（秒）", "temp_gap", str(temp.max_gap_seconds), "number", "帧间最大时间间隔", min_val="1", max_val="120", step="0.5")}
-        </div>
-        <div class="form-row">
-            {form_group("最小空间重叠(IoU)", "temp_overlap", str(temp.min_spatial_overlap), "number", "连续帧异常区域IoU阈值", min_val="0", max_val="1", step="0.05")}
-            {form_group("同区域抑制（秒）", "supp_zone", str(supp.same_zone_window_seconds), "number", "同区域告警去重窗口", min_val="10", max_val="3600")}
-        </div>
-    </div>"""
-
-    return HTMLResponse(f"""
-    <form hx-post="/api/config/detection-params" hx-swap="none">
-        {mog2_html}
-        {anomaly_html}
-        {severity_html}
-        {temporal_html}
-        <div class="form-actions">
-            <button type="submit" class="btn btn-primary">应用参数</button>
-            <span class="form-hint" style="line-height:36px;">修改将立即生效，但需手动保存到配置文件</span>
-        </div>
-    </form>""")
 
 
 @router.post("/detection-params")
@@ -231,34 +106,6 @@ async def update_detection_params(request: Request):
         {"pipelines_updated": updated},
         headers=htmx_toast_headers("检测参数已更新"),
     )
-
-
-@router.get("/notifications", response_class=HTMLResponse)
-async def notifications_tab(request: Request):
-    """Email and webhook notification settings."""
-    config = request.app.state.config
-    if not config:
-        return HTMLResponse(empty_state("配置不可用"))
-
-    webhook = config.alerts.webhook
-
-    webhook_html = f"""
-    <div class="card">
-        <h3>Webhook 推送</h3>
-        <form hx-post="/api/config/notifications" hx-swap="none">
-            <div class="form-row">
-                {form_select("启用", "webhook_enabled", [("true","启用"),("false","禁用")], str(webhook.enabled).lower())}
-                {form_group("超时（秒）", "webhook_timeout", str(webhook.timeout), "number", min_val="1", max_val="30")}
-            </div>
-            {form_group("Webhook URL", "webhook_url", webhook.url, placeholder="http://plant-dcs:8080/foe-alerts")}
-            <div class="form-actions">
-                <button type="submit" class="btn btn-primary">保存 Webhook 设置</button>
-                <button type="button" class="btn btn-ghost" hx-post="/api/config/test-webhook" hx-swap="none">发送测试消息</button>
-            </div>
-        </form>
-    </div>"""
-
-    return HTMLResponse(webhook_html)
 
 
 @router.post("/notifications")
@@ -348,64 +195,6 @@ def storage_info_json(request: Request):
     return api_success(result)
 
 
-@router.get("/storage", response_class=HTMLResponse)
-def storage_tab(request: Request):
-    """Storage usage and maintenance."""
-    config = request.app.state.config
-    db = request.app.state.db
-
-    # Disk usage
-    disk_html = ""
-    try:
-        usage = shutil.disk_usage("data")
-        total_gb = usage.total / (1024**3)
-        used_gb = usage.used / (1024**3)
-        free_gb = usage.free / (1024**3)
-        pct = usage.used / usage.total * 100
-
-        bar_color = "#4caf50" if pct < 80 else "#ff9800" if pct < 95 else "#f44336"
-        disk_html = f"""
-        <div class="card">
-            <h3>磁盘使用</h3>
-            <div style="margin-bottom:12px;">
-                <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px;">
-                    <span>已使用 {used_gb:.1f} GB / {total_gb:.0f} GB</span>
-                    <span>可用 {free_gb:.1f} GB ({100-pct:.0f}%)</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width:{pct:.0f}%;background:{bar_color};"></div>
-                </div>
-            </div>
-        </div>"""
-    except OSError:
-        logger.debug("config.disk_usage_render_failed", exc_info=True)
-
-    # Retention & cleanup
-    retention_days = config.storage.alert_retention_days if config else 90
-    alert_count = 0
-    if db:
-        try:
-            alert_count = db.get_alert_count()
-        except Exception:
-            logger.warning("config.alert_count_query_failed", exc_info=True)
-
-    cleanup_html = f"""
-    <div class="card">
-        <h3>数据维护</h3>
-        <table>
-            <tr><td style="color:#8890a0;width:160px;">告警记录总数</td><td>{alert_count}</td></tr>
-            <tr><td style="color:#8890a0;">告警保留天数</td><td>{retention_days} 天</td></tr>
-        </table>
-        <div class="form-actions">
-            <button class="btn btn-warning" hx-post="/api/config/cleanup" hx-swap="none"
-                    hx-confirm="确定清理超过 {retention_days} 天的旧告警数据？此操作不可撤销。">
-                清理旧告警</button>
-        </div>
-    </div>"""
-
-    return HTMLResponse(disk_html + cleanup_html)
-
-
 @router.post("/cleanup")
 def cleanup_data(request: Request):
     """Cleanup old alert data. Requires admin role."""
@@ -435,81 +224,6 @@ def cleanup_data(request: Request):
         headers=htmx_toast_headers(f"已清理 {deleted} 条旧告警"),
     )
 
-
-@router.get("/logs", response_class=HTMLResponse)
-def logs_tab(request: Request):
-    """Tail log file."""
-    config = request.app.state.config
-    log_dir = Path(config.logging.log_dir) if config else Path("data/logs")
-    log_file = log_dir / "argus.log"
-
-    if not log_file.exists():
-        return HTMLResponse(empty_state("暂无日志文件", f"日志路径: {log_file}"))
-
-    try:
-        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        tail = lines[-50:]  # Last 50 lines
-    except Exception as e:
-        return HTMLResponse(empty_state(f"读取日志失败: {e}"))
-
-    log_content = html.escape("".join(tail))
-    return HTMLResponse(f"""
-    <div class="card" hx-get="/api/config/logs" hx-trigger="every 5s" hx-swap="outerHTML">
-        <h3>最近日志（最后 50 行）</h3>
-        <pre style="background:#12141c;padding:12px;border-radius:6px;font-size:12px;
-                    overflow-x:auto;max-height:500px;overflow-y:auto;line-height:1.6;
-                    color:#a0a8b8;font-family:'Consolas','Courier New',monospace;">
-{log_content}</pre>
-    </div>""")
-
-
-@router.get("/cameras-tab", response_class=HTMLResponse)
-async def cameras_control_tab(request: Request):
-    """Camera control panel (restart, lock clear)."""
-    camera_manager = request.app.state.camera_manager
-    if not camera_manager:
-        return HTMLResponse(empty_state("摄像头管理器不可用"))
-
-    controls = ""
-    for status in camera_manager.get_status():
-        cam_id = status.camera_id
-        dot = "status-healthy" if status.connected else "status-offline"
-        running_text = "运行中" if status.running else "已停止"
-
-        pipeline = camera_manager._pipelines.get(cam_id)
-        locked = pipeline._locked if pipeline else False
-        lock_html = ""
-        if locked:
-            lock_html = (
-                f'<button class="btn btn-warning btn-sm" '
-                f'hx-post="/api/config/clear-lock/{cam_id}" hx-swap="outerHTML">'
-                f'解除异常锁定</button>'
-            )
-
-        controls += f"""
-        <div class="card" style="margin-bottom:8px;">
-            <div class="flex-between">
-                <span><span class="status-dot {dot}"></span>{cam_id} — {running_text}</span>
-                <div class="flex gap-8">
-                    {lock_html}
-                    <button class="btn btn-ghost btn-sm"
-                        hx-post="/api/config/camera/{cam_id}/restart" hx-swap="none">重启</button>
-                </div>
-            </div>
-        </div>"""
-
-    return HTMLResponse(f"""
-    <div class="card">
-        <h3>摄像头控制</h3>
-        {controls if controls else '<p style="color:#616161;">暂无摄像头</p>'}
-        <div class="form-actions">
-            <button class="btn btn-primary" hx-post="/api/config/reload" hx-swap="none">重新加载配置</button>
-        </div>
-    </div>""")
-
-
-# ── Existing endpoints (preserved) ──
 
 @router.post("/thresholds")
 async def update_thresholds(request: Request, req: ThresholdUpdateRequest):

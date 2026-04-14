@@ -67,18 +67,6 @@ cameras:
     min_static_seconds: 30.0
     morph_kernel_size: 5
     match_radius_px: 50
-  health:
-    enabled: true
-    freeze_detection: true
-    lens_contamination_detection: true
-    displacement_detection: true
-    flash_suppression: true
-    gain_drift_detection: true
-    freeze_window_frames: 10
-    sharpness_drop_pct: 0.3
-    displacement_threshold_px: 20.0
-    flash_sigma: 3.0
-    gain_drift_threshold_pct: 20.0
   drift:
     enabled: true
     reference_window: 500

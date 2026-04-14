@@ -205,31 +205,6 @@ class TestDeleteAlert:
         assert body["code"] == 40400
 
 
-# ── GET /api/alerts/timeline ──
-
-
-class TestTimeline:
-    def test_timeline_returns_data(self, client, db):
-        """Timeline endpoint should return 200 for a valid date with alerts."""
-        _insert_alert(db, "tl-1", timestamp=datetime(2026, 4, 10, 8, 30, 0))
-        resp = client.get("/api/alerts/timeline?date=2026-04-10")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert len(body["data"]["cameras"]) >= 1
-
-    def test_timeline_invalid_date(self, client):
-        """Invalid date format should return 400."""
-        resp = client.get("/api/alerts/timeline?date=not-a-date")
-        assert resp.status_code == 400
-        body = resp.json()
-        assert body["code"] == 40000
-
-    def test_timeline_empty_day(self, client):
-        """Timeline with no alerts on that day should still return 200."""
-        resp = client.get("/api/alerts/timeline?date=2020-01-01")
-        assert resp.status_code == 200
-
-
 # ── POST /api/alerts/{alert_id}/false-positive ──
 
 

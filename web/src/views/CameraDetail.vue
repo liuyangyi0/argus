@@ -6,7 +6,6 @@ import { ArrowLeftOutlined } from '@ant-design/icons-vue'
 import { getCameraDetail } from '../api'
 import ZoneEditor from '../components/ZoneEditor.vue'
 import CalibrationWizard from '../components/calibration/CalibrationWizard.vue'
-import TrajectoryOverlay from '../components/trajectory/TrajectoryOverlay.vue'
 import { useGo2RTC } from '../composables/useGo2RTC'
 
 const route = useRoute()

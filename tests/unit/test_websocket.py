@@ -221,36 +221,3 @@ class TestDashboardWithWebSocket:
         assert response.status_code == 200
         assert '<div id="app">' in response.text
 
-    def test_overview_has_ws_topic_attribute(self, client, health):
-        """Overview endpoint should have data-ws-topic attribute."""
-        health.update_camera("cam_01", connected=True)
-        response = client.get("/api/system/overview")
-        assert response.status_code == 200
-        assert 'data-ws-topic="health"' in response.text
-
-    def test_cameras_page_has_ws_topic_attribute(self, db, health):
-        """Cameras page should have data-ws-topic attribute."""
-        from argus.capture.manager import CameraManager
-        from argus.config.schema import AlertConfig, CameraConfig
-        # Create a minimal app with camera_manager
-        app = create_app(database=db, health_monitor=health)
-        client = TestClient(app)
-        # Without camera_manager, page shows empty state
-        response = client.get("/api/cameras")
-        assert response.status_code == 200
-
-    def test_tasks_page_has_ws_topic_attribute(self, db, health):
-        """Tasks endpoint should have data-ws-topic attribute when task_manager is present."""
-        task_manager = TaskManager()
-        app = create_app(database=db, health_monitor=health, task_manager=task_manager)
-        client = TestClient(app)
-        response = client.get("/api/tasks")
-        assert response.status_code == 200
-        assert 'data-ws-topic="tasks"' in response.text
-
-    def test_polling_fallback_interval_increased(self, client, health):
-        """Polling interval should be 30s (fallback) instead of 3-5s."""
-        health.update_camera("cam_01", connected=True)
-        response = client.get("/api/system/overview")
-        assert 'hx-trigger="every 30s"' in response.text
-        assert 'hx-trigger="every 3s"' not in response.text
