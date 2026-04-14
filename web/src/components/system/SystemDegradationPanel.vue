@@ -11,7 +11,7 @@ async function loadDegradation() {
   degradationLoading.value = true
   try {
     const res = await getDegradationHistory(degradationDays.value)
-    degradationEvents.value = res || []
+    degradationEvents.value = Array.isArray(res) ? res : (res?.items || [])
   } catch { /* silent */ }
   finally { degradationLoading.value = false }
 }
