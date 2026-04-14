@@ -290,14 +290,7 @@ class ContinuousRecorder:
             return None
 
     def _write_frame(self, frame: np.ndarray) -> None:
-        if self._writer is None:
-            return
-        if isinstance(self._writer, _FFmpegWriter):
-            self._writer.write(frame)
-            if self._current_segment is not None:
-                self._current_segment.frame_count += 1
-            return
-        if not self._writer.isOpened():
+        if self._writer is None or not self._writer.isOpened():
             return
         h, w = frame.shape[:2]
         if (w, h) != (self._width, self._height):

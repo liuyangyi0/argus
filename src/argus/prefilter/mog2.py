@@ -167,21 +167,17 @@ class MOG2PreFilter:
         )
 
     @staticmethod
-    def _suppress_chromaticity_shadows(
-        frame: np.ndarray, mask: np.ndarray, hue_tolerance: int = 15,
-    ) -> np.ndarray:
+    def _suppress_chromaticity_shadows(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Suppress shadow regions that preserve hue (chromaticity).
 
         Real shadows darken a region without changing its hue. Foreign objects
-        introduce new colours. By checking hue consistency in foreground regions,
-        we can filter crane shadows and Cherenkov glow fluctuations that only
-        change brightness.
+        introduce new colours. Low-saturation foreground pixels are treated as
+        shadows or lighting changes. Blue-dominant pixels are treated as
+        Cherenkov glow fluctuations.
         """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        h_channel = hsv[:, :, 0]  # 0-179
-        s_channel = hsv[:, :, 1]  # 0-255
+        s_channel = hsv[:, :, 1]
 
-        # Foreground regions with low saturation are likely shadows or glow changes
         low_sat = s_channel < 40
         # Suppress: foreground pixels that are low-saturation (grey/shadow)
         shadow_suppress = mask.copy()

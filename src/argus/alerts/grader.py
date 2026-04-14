@@ -77,7 +77,7 @@ class Alert:
     # Physics enrichment (phase 1: speed, phase 2: trajectory/localization)
     speed_ms: float | None = None
     speed_px_per_sec: float | None = None
-    trajectory_model: str | None = None  # "free_fall" or "projectile"
+    trajectory_model: str | None = None  # "free_fall", "projectile", or "projectile_drag"
     origin_x_mm: float | None = None
     origin_y_mm: float | None = None
     origin_z_mm: float | None = None

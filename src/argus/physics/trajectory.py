@@ -304,11 +304,6 @@ class TrajectoryAnalyzer:
             mean_residual_mm=mean_res,
         )
 
-    # ------------------------------------------------------------------
-    # Drag-corrected projectile: z(t) = z0 + (vt/k)(1 - e^{-kt}) - (g/k)t + (g/k²)(1-e^{-kt})
-    # where k = drag_coeff (1/s), vt = terminal velocity
-    # ------------------------------------------------------------------
-
     def _fit_drag_projectile(
         self,
         ts: np.ndarray,
@@ -316,7 +311,14 @@ class TrajectoryAnalyzer:
         ys: np.ndarray,
         zs: np.ndarray,
     ) -> TrajectoryFit | None:
-        """Fit drag-corrected projectile for small objects where air resistance matters."""
+        """Fit drag-corrected projectile for small objects where air resistance matters.
+
+        z(t) = z₀ + (vz₀/k)(1 − e^{−kt}) − (g/k)t + (g/k²)(1 − e^{−kt})
+
+        where k = drag_coeff (1/s), fitted via nonlinear least squares.
+        Horizontal axes use drag-free linear fit (drag negligible for short falls).
+        Requires scipy; returns None if unavailable.
+        """
         try:
             from scipy.optimize import curve_fit
         except ImportError:
