@@ -346,7 +346,7 @@ const columns = computed(() => {
 </script>
 
 <template>
-  <div class="alerts-layout">
+  <main class="alerts-layout glass">
     <!-- Left: Alert List -->
     <div
       :style="{
@@ -770,7 +770,7 @@ const columns = computed(() => {
         </div>
       </div>
     </div>
-  </div>
+  </main>
 </template>
 
 <style scoped>
@@ -998,9 +998,13 @@ const columns = computed(() => {
 /* ── Layout ── */
 .alerts-layout {
   display: flex;
-  height: calc(100vh - 72px);
-  margin: -24px;
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
+  margin: 12px;
+  border-radius: var(--r-lg, 12px);
+  background: var(--argus-surface, rgba(255,255,255,0.85));
+  backdrop-filter: blur(16px);
 }
 .alerts-chip-group--end {
   margin-left: auto;
