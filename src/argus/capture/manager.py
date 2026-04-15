@@ -357,6 +357,29 @@ class CameraManager:
         """Get the DetectionPipeline for a camera, or None."""
         return self._pipelines.get(camera_id)
 
+    def update_classifier_vocabulary(self, vocabulary: list[str]) -> int:
+        """Hot-swap the classifier vocabulary on every live pipeline.
+
+        Returns the number of pipelines that had a classifier attached and
+        accepted the update. Pipelines without a classifier are skipped
+        silently. Used by the dashboard "分类器" panel so operators can edit
+        the FOE list without restarting the service.
+        """
+        updated = 0
+        for pipeline in self._pipelines.values():
+            classifier = getattr(pipeline, "_classifier", None)
+            if classifier is None:
+                continue
+            try:
+                classifier.update_vocabulary(vocabulary)
+                updated += 1
+            except Exception:
+                logger.warning(
+                    "camera_manager.classifier_vocabulary_push_failed",
+                    exc_info=True,
+                )
+        return updated
+
     def get_latest_frame(self, camera_id: str) -> np.ndarray | None:
         """Get the latest processed frame from a camera for live preview."""
         pipeline = self._pipelines.get(camera_id)

@@ -49,6 +49,16 @@ export interface ClassifierConfigPayload {
 export const getClassifierConfig = () =>
   api.get<ApiResponse<ClassifierConfigPayload>>('/config/classifier').then(unwrap)
 
+export interface ClassifierVocabularyUpdate {
+  vocabulary: string[]
+  high_risk_labels?: string[]
+  low_risk_labels?: string[]
+  suppress_labels?: string[]
+}
+
+export const updateClassifierVocabulary = (payload: ClassifierVocabularyUpdate) =>
+  api.put('/config/classifier/vocabulary', payload).then(u)
+
 export const toggleModule = (key: string, value: boolean) =>
   api.post('/config/modules', { key, value }).then(u)
 
