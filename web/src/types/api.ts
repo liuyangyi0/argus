@@ -75,6 +75,12 @@ export interface AlertSummary {
   // True when the classifier's label promoted severity (e.g. a "gun"
   // detected in a low-severity anomaly bumps it to high).
   severity_adjusted_by_classifier?: boolean
+  // Cross-camera corroboration (stage 2.7). ``corroborated`` is true when
+  // another camera with overlapping FoV confirmed the anomaly at the
+  // transformed location, false when the partner camera rejected it, and
+  // null when cross-camera correlation was disabled for this pipeline.
+  corroborated?: boolean | null
+  correlation_partner?: string | null
   // SAM2 instance segmentation results (stage 2.4). `segmentation_objects`
   // is a list of per-object dicts (bbox / area_px / centroid / confidence)
   // — the raw masks are never persisted. All three fields are null when the

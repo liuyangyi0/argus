@@ -237,6 +237,8 @@ class AlertDispatcher:
                 landing_z_mm=alert.landing_z_mm,
                 classification_label=alert.classification_label,
                 classification_confidence=alert.classification_confidence,
+                corroborated=getattr(alert, "corroborated", None),
+                correlation_partner=getattr(alert, "correlation_partner", None),
                 segmentation_count=seg_count if has_segmentation else None,
                 segmentation_total_area_px=seg_total_area if has_segmentation else None,
                 segmentation_objects=seg_objects if has_segmentation else None,
