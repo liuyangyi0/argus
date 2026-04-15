@@ -75,6 +75,20 @@ export interface AlertSummary {
   // True when the classifier's label promoted severity (e.g. a "gun"
   // detected in a low-severity anomaly bumps it to high).
   severity_adjusted_by_classifier?: boolean
+  // SAM2 instance segmentation results (stage 2.4). `segmentation_objects`
+  // is a list of per-object dicts (bbox / area_px / centroid / confidence)
+  // — the raw masks are never persisted. All three fields are null when the
+  // segmenter is disabled or returned an empty result.
+  segmentation_count?: number | null
+  segmentation_total_area_px?: number | null
+  segmentation_objects?: SegmentationObject[] | null
+}
+
+export interface SegmentationObject {
+  bbox: [number, number, number, number]  // x, y, w, h
+  area_px: number
+  centroid: [number, number]
+  confidence: number
 }
 
 export interface TaskInfo {

@@ -121,6 +121,12 @@ class Database:
             # Classification enrichment
             ("alerts", "classification_label", "VARCHAR(100)"),
             ("alerts", "classification_confidence", "REAL"),
+            # Segmentation enrichment (D2 — SAM2 instance segmentation).
+            # segmentation_objects stores JSON text: bbox/area/centroid/conf
+            # per object, masks are NOT persisted.
+            ("alerts", "segmentation_count", "INTEGER"),
+            ("alerts", "segmentation_total_area_px", "INTEGER"),
+            ("alerts", "segmentation_objects", "TEXT"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
@@ -170,6 +176,13 @@ class Database:
         # Classification enrichment
         classification_label: str | None = None,
         classification_confidence: float | None = None,
+        # Segmentation enrichment — segmentation_objects comes in as a
+        # python list[dict] from pipeline.py and is JSON-encoded before
+        # hitting the DB. Pass None (or leave default) when the segmenter
+        # is disabled or emitted zero objects.
+        segmentation_count: int | None = None,
+        segmentation_total_area_px: int | None = None,
+        segmentation_objects: list[dict] | None = None,
         _max_retries: int = 3,
     ) -> AlertRecord:
         """Save an alert to the database with retry on transient failures.
@@ -177,7 +190,20 @@ class Database:
         Uses a threading.Event for non-blocking retry delays so the calling
         thread can be interrupted during shutdown.
         """
+        import json as _json
         import threading
+
+        seg_objects_json: str | None = None
+        if segmentation_objects:
+            try:
+                seg_objects_json = _json.dumps(segmentation_objects, ensure_ascii=False)
+            except Exception:
+                logger.warning(
+                    "database.seg_objects_json_failed",
+                    alert_id=alert_id,
+                    exc_info=True,
+                )
+                seg_objects_json = None
 
         last_error = None
         retry_event = threading.Event()
@@ -206,6 +232,9 @@ class Database:
                         landing_z_mm=landing_z_mm,
                         classification_label=classification_label,
                         classification_confidence=classification_confidence,
+                        segmentation_count=segmentation_count,
+                        segmentation_total_area_px=segmentation_total_area_px,
+                        segmentation_objects=seg_objects_json,
                     )
                     session.add(record)
                     session.commit()
