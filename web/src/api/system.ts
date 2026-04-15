@@ -29,6 +29,29 @@ export const updateAudioAlerts = (data: any) => api.put('/config/audio-alerts', 
 export const getDriftStatus = () => api.get('/system/drift').then(u)
 export const getCameraHealth = () => api.get('/system/camera-health').then(u)
 
+// ── Classifier (open-vocabulary detector) ──
+export interface ClassifierConfigPayload {
+  enabled: boolean
+  model_name: string
+  min_anomaly_score_to_classify: number
+  vocabulary: string[]
+  high_risk_labels: string[]
+  low_risk_labels: string[]
+  suppress_labels: string[]
+  custom_vocabulary_path: string | null
+  runtime: {
+    total_pipelines: number
+    pipelines_attached: number
+    pipelines_loaded: number
+  }
+}
+
+export const getClassifierConfig = () =>
+  api.get<ApiResponse<ClassifierConfigPayload>>('/config/classifier').then(unwrap)
+
+export const toggleModule = (key: string, value: boolean) =>
+  api.post('/config/modules', { key, value }).then(u)
+
 // ── Config management ──
 export const saveConfig = () => api.post('/config/save').then(u)
 export const updateThresholds = (data: any) => api.post('/config/thresholds', data).then(u)

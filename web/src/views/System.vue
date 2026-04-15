@@ -8,6 +8,7 @@ import SystemAuditPanel from '../components/system/SystemAuditPanel.vue'
 import SystemDegradationPanel from '../components/system/SystemDegradationPanel.vue'
 import SystemUserPanel from '../components/system/SystemUserPanel.vue'
 import ModuleTogglePanel from '../components/system/ModuleTogglePanel.vue'
+import ClassifierPanel from '../components/system/ClassifierPanel.vue'
 
 const activeTab = ref('overview')
 
@@ -43,6 +44,11 @@ function onTabChange(key: string | number) {
       <!-- Module Toggles -->
       <Tabs.TabPane key="modules" tab="功能模块">
         <ModuleTogglePanel v-if="activeTab === 'modules'" />
+      </Tabs.TabPane>
+
+      <!-- AI Classifier -->
+      <Tabs.TabPane key="classifier" tab="分类器">
+        <ClassifierPanel v-if="activeTab === 'classifier'" />
       </Tabs.TabPane>
 
       <!-- Users -->
