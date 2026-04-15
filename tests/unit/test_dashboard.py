@@ -1290,6 +1290,82 @@ class TestClassifierConfigRoutes:
         assert cfg.classifier.low_risk_labels == ["wrench"]
 
 
+class TestSegmenterConfigRoutes:
+    """GET /api/config/segmenter behind the System → 分割器 panel (stage 2.5)."""
+
+    @pytest.fixture
+    def segmenter_client(self, db, health, alerts_dir):
+        from argus.config.schema import SegmenterConfig
+        config = ArgusConfig()
+        config.segmenter = SegmenterConfig(
+            enabled=False,
+            model_size="small",
+            max_points=5,
+            min_anomaly_score=0.7,
+            min_mask_area_px=100,
+            timeout_seconds=10.0,
+        )
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = []
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        return TestClient(app), config, camera_manager
+
+    def test_get_segmenter_config_returns_full_payload(self, segmenter_client):
+        client, _cfg, _cm = segmenter_client
+        res = client.get("/api/config/segmenter")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["code"] == 0
+        data = body["data"]
+        assert data["enabled"] is False
+        assert data["model_size"] == "small"
+        assert data["max_points"] == 5
+        assert data["min_anomaly_score"] == 0.7
+        assert data["min_mask_area_px"] == 100
+        assert data["timeout_seconds"] == 10.0
+        assert data["runtime"] == {
+            "total_pipelines": 0,
+            "pipelines_attached": 0,
+            "pipelines_loaded": 0,
+        }
+
+    def test_modules_endpoint_exposes_segmenter_enabled(self, segmenter_client):
+        """ModuleTogglePanel reads /api/config/modules — segmenter.enabled must
+        be in the dict so the toggle on the 功能模块 tab can reflect state."""
+        client, _cfg, _cm = segmenter_client
+        res = client.get("/api/config/modules")
+        assert res.status_code == 200
+        data = res.json()["data"]
+        assert "segmenter.enabled" in data
+        assert data["segmenter.enabled"] is False
+
+    def test_get_segmenter_config_counts_attached_pipelines(self, segmenter_client):
+        """When a pipeline has _segmenter set and _loaded=True, counters reflect it."""
+        client, cfg, cm = segmenter_client
+        cfg.segmenter.enabled = True
+
+        cam_status = SimpleNamespace(camera_id="cam_a")
+        fake_segmenter = MagicMock()
+        fake_segmenter._loaded = True
+        fake_pipeline = SimpleNamespace(_segmenter=fake_segmenter)
+
+        cm.get_status.return_value = [cam_status]
+        cm.get_pipeline.return_value = fake_pipeline
+
+        res = client.get("/api/config/segmenter")
+        data = res.json()["data"]
+        assert data["enabled"] is True
+        assert data["runtime"]["total_pipelines"] == 1
+        assert data["runtime"]["pipelines_attached"] == 1
+        assert data["runtime"]["pipelines_loaded"] == 1
+
+
 class TestCameraManagerClassifierBroadcast:
     """CameraManager.update_classifier_vocabulary hot-swap fanout (stage 2.3)."""
 
