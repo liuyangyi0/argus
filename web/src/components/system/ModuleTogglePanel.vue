@@ -30,6 +30,12 @@ const modules = ref<ModuleToggle[]>([
     enabled: false,
   },
   {
+    key: 'cross_camera.enabled',
+    label: '跨相机关联',
+    description: '多摄像头重叠视野下的相互证实（切换后需要重启已运行的摄像头）',
+    enabled: false,
+  },
+  {
     key: 'physics.speed_enabled',
     label: '速度监测',
     description: '异物坠落速度实时监测',
