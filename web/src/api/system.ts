@@ -49,6 +49,24 @@ export interface ClassifierConfigPayload {
 export const getClassifierConfig = () =>
   api.get<ApiResponse<ClassifierConfigPayload>>('/config/classifier').then(unwrap)
 
+// ── Segmenter (SAM2 instance segmentation) ──
+export interface SegmenterConfigPayload {
+  enabled: boolean
+  model_size: string
+  max_points: number
+  min_anomaly_score: number
+  min_mask_area_px: number
+  timeout_seconds: number
+  runtime: {
+    total_pipelines: number
+    pipelines_attached: number
+    pipelines_loaded: number
+  }
+}
+
+export const getSegmenterConfig = () =>
+  api.get<ApiResponse<SegmenterConfigPayload>>('/config/segmenter').then(unwrap)
+
 export interface ClassifierVocabularyUpdate {
   vocabulary: string[]
   high_risk_labels?: string[]
