@@ -68,6 +68,13 @@ export interface AlertSummary {
   recording_status: string | null
   workflow_status: string
   notes: string
+  // Open-vocabulary classifier output (null when classifier is disabled
+  // or when the region's score fell below the classify threshold).
+  classification_label?: string | null
+  classification_confidence?: number | null
+  // True when the classifier's label promoted severity (e.g. a "gun"
+  // detected in a low-severity anomaly bumps it to high).
+  severity_adjusted_by_classifier?: boolean
 }
 
 export interface TaskInfo {
