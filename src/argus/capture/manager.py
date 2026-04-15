@@ -357,6 +357,48 @@ class CameraManager:
         """Get the DetectionPipeline for a camera, or None."""
         return self._pipelines.get(camera_id)
 
+    def update_segmenter_params(
+        self,
+        *,
+        max_points: int | None = None,
+        min_anomaly_score: float | None = None,
+        min_mask_area_px: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> int:
+        """Hot-patch SAM2 runtime params across every live pipeline.
+
+        Returns the number of pipelines that had a segmenter attached and
+        accepted the update. ``max_points`` and ``min_anomaly_score`` are
+        stored on the pipeline object itself (they gate the peak-extraction
+        step, which lives in pipeline.py, not in the segmenter class).
+        ``min_mask_area_px`` and ``timeout_seconds`` are delegated to
+        ``InstanceSegmenter.update_runtime_params`` so the values take
+        effect on the very next call. ``model_size`` is intentionally NOT
+        tunable at runtime — changing it would require re-downloading the
+        checkpoint and can only happen via a pipeline restart.
+        """
+        updated = 0
+        for pipeline in self._pipelines.values():
+            segmenter = getattr(pipeline, "_segmenter", None)
+            if segmenter is None:
+                continue
+            try:
+                if max_points is not None:
+                    pipeline._segmenter_max_points = int(max_points)
+                if min_anomaly_score is not None:
+                    pipeline._segmenter_min_score = float(min_anomaly_score)
+                segmenter.update_runtime_params(
+                    min_mask_area_px=min_mask_area_px,
+                    timeout_seconds=timeout_seconds,
+                )
+                updated += 1
+            except Exception:
+                logger.warning(
+                    "camera_manager.segmenter_params_push_failed",
+                    exc_info=True,
+                )
+        return updated
+
     def update_classifier_vocabulary(self, vocabulary: list[str]) -> int:
         """Hot-swap the classifier vocabulary on every live pipeline.
 

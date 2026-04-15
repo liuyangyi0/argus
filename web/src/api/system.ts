@@ -67,6 +67,16 @@ export interface SegmenterConfigPayload {
 export const getSegmenterConfig = () =>
   api.get<ApiResponse<SegmenterConfigPayload>>('/config/segmenter').then(unwrap)
 
+export interface SegmenterParamsUpdate {
+  max_points?: number
+  min_anomaly_score?: number
+  min_mask_area_px?: number
+  timeout_seconds?: number
+}
+
+export const updateSegmenterParams = (payload: SegmenterParamsUpdate) =>
+  api.put('/config/segmenter/params', payload).then(u)
+
 export interface ClassifierVocabularyUpdate {
   vocabulary: string[]
   high_risk_labels?: string[]
