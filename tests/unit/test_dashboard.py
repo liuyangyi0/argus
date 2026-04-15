@@ -1176,3 +1176,155 @@ class TestPathSafety:
         safe_root.mkdir()
         traversal = str(safe_root / ".." / "secret.txt")
         assert _is_safe_path(traversal, safe_root) is False
+
+
+class TestClassifierConfigRoutes:
+    """GET/PUT routes behind the System → 分类器 panel (stage 2.2 + 2.3)."""
+
+    @pytest.fixture
+    def classifier_client(self, db, health, alerts_dir):
+        from argus.config.schema import ClassifierConfig
+        config = ArgusConfig()
+        config.classifier = ClassifierConfig(
+            enabled=False,
+            model_name="yolov8s-worldv2.pt",
+            vocabulary=["wrench", "bolt", "bird"],
+            high_risk_labels=["wrench", "bolt"],
+            low_risk_labels=["bird"],
+            suppress_labels=[],
+            min_anomaly_score_to_classify=0.5,
+        )
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = []
+        camera_manager.update_classifier_vocabulary.return_value = 0
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        # Stub auth.require_role so the PUT route doesn't 403 in tests where
+        # we aren't carrying a session cookie.
+        from argus.dashboard import auth as dashboard_auth
+        _orig_require_role = dashboard_auth.require_role
+        dashboard_auth.require_role = lambda request, *roles: True
+        try:
+            yield TestClient(app), config, camera_manager
+        finally:
+            dashboard_auth.require_role = _orig_require_role
+
+    def test_get_classifier_config_returns_full_payload(self, classifier_client):
+        client, _cfg, _cm = classifier_client
+        res = client.get("/api/config/classifier")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["code"] == 0
+        data = body["data"]
+        assert data["enabled"] is False
+        assert data["model_name"] == "yolov8s-worldv2.pt"
+        assert data["vocabulary"] == ["wrench", "bolt", "bird"]
+        assert data["high_risk_labels"] == ["wrench", "bolt"]
+        assert data["low_risk_labels"] == ["bird"]
+        # Runtime counters default to zero when no pipelines are alive
+        assert data["runtime"] == {
+            "total_pipelines": 0,
+            "pipelines_attached": 0,
+            "pipelines_loaded": 0,
+        }
+
+    def test_put_vocabulary_rejects_empty_list(self, classifier_client):
+        client, _cfg, _cm = classifier_client
+        res = client.put(
+            "/api/config/classifier/vocabulary",
+            json={"vocabulary": ["  ", ""]},
+        )
+        assert res.status_code == 400
+        assert "词表" in res.json()["msg"]
+
+    def test_put_vocabulary_rejects_high_risk_not_in_vocab(self, classifier_client):
+        client, _cfg, _cm = classifier_client
+        res = client.put(
+            "/api/config/classifier/vocabulary",
+            json={
+                "vocabulary": ["wrench"],
+                "high_risk_labels": ["hammer"],
+            },
+        )
+        assert res.status_code == 400
+        assert "hammer" in res.json()["msg"]
+
+    def test_put_vocabulary_dedupes_and_trims(self, classifier_client):
+        client, cfg, _cm = classifier_client
+        res = client.put(
+            "/api/config/classifier/vocabulary",
+            json={
+                "vocabulary": [" wrench ", "wrench", "bolt", "", "bolt"],
+                "high_risk_labels": ["wrench"],
+            },
+        )
+        assert res.status_code == 200
+        data = res.json()["data"]
+        assert data["vocabulary"] == ["wrench", "bolt"]
+        # Config mutation happens in-place on the injected ClassifierConfig
+        assert cfg.classifier.vocabulary == ["wrench", "bolt"]
+        assert cfg.classifier.high_risk_labels == ["wrench"]
+
+    def test_put_vocabulary_pushes_to_pipelines(self, classifier_client):
+        client, cfg, cm = classifier_client
+        cm.update_classifier_vocabulary.return_value = 3
+        res = client.put(
+            "/api/config/classifier/vocabulary",
+            json={
+                "vocabulary": ["wrench", "hammer"],
+                "high_risk_labels": ["hammer"],
+                "low_risk_labels": ["wrench"],
+            },
+        )
+        assert res.status_code == 200
+        data = res.json()["data"]
+        assert data["pipelines_updated"] == 3
+        cm.update_classifier_vocabulary.assert_called_once_with(["wrench", "hammer"])
+        assert cfg.classifier.vocabulary == ["wrench", "hammer"]
+        assert cfg.classifier.high_risk_labels == ["hammer"]
+        assert cfg.classifier.low_risk_labels == ["wrench"]
+
+
+class TestCameraManagerClassifierBroadcast:
+    """CameraManager.update_classifier_vocabulary hot-swap fanout (stage 2.3)."""
+
+    def test_update_hits_every_pipeline_with_classifier(self):
+        manager = CameraManager.__new__(CameraManager)
+        manager._pipelines = {}
+
+        classifier_a = MagicMock()
+        classifier_b = MagicMock()
+        pipeline_a = SimpleNamespace(_classifier=classifier_a)
+        pipeline_b = SimpleNamespace(_classifier=classifier_b)
+        pipeline_c = SimpleNamespace(_classifier=None)  # no classifier attached
+
+        manager._pipelines = {"a": pipeline_a, "b": pipeline_b, "c": pipeline_c}
+
+        updated = manager.update_classifier_vocabulary(["x", "y"])
+
+        assert updated == 2
+        classifier_a.update_vocabulary.assert_called_once_with(["x", "y"])
+        classifier_b.update_vocabulary.assert_called_once_with(["x", "y"])
+
+    def test_update_swallows_per_pipeline_errors(self):
+        manager = CameraManager.__new__(CameraManager)
+        manager._pipelines = {}
+
+        ok = MagicMock()
+        broken = MagicMock()
+        broken.update_vocabulary.side_effect = RuntimeError("boom")
+
+        manager._pipelines = {
+            "ok": SimpleNamespace(_classifier=ok),
+            "broken": SimpleNamespace(_classifier=broken),
+        }
+
+        # Broken pipeline must not take down the whole operation.
+        updated = manager.update_classifier_vocabulary(["x"])
+        assert updated == 1  # only the healthy one counted
+        ok.update_vocabulary.assert_called_once_with(["x"])
