@@ -67,6 +67,28 @@ export interface SegmenterConfigPayload {
 export const getSegmenterConfig = () =>
   api.get<ApiResponse<SegmenterConfigPayload>>('/config/segmenter').then(unwrap)
 
+// ── Cross-camera correlation ──
+export interface CrossCameraOverlapPair {
+  camera_a: string
+  camera_b: string
+  homography: number[][]  // 3x3
+}
+
+export interface CrossCameraConfigPayload {
+  enabled: boolean
+  corroboration_threshold: number
+  max_age_seconds: number
+  uncorroborated_severity_downgrade: number
+  overlap_pairs: CrossCameraOverlapPair[]
+  runtime: {
+    total_pipelines: number
+    correlator_present: boolean
+  }
+}
+
+export const getCrossCameraConfig = () =>
+  api.get<ApiResponse<CrossCameraConfigPayload>>('/config/cross-camera').then(unwrap)
+
 export interface SegmenterParamsUpdate {
   max_points?: number
   min_anomaly_score?: number
