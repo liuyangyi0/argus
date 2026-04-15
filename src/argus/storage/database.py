@@ -121,6 +121,9 @@ class Database:
             # Classification enrichment
             ("alerts", "classification_label", "VARCHAR(100)"),
             ("alerts", "classification_confidence", "REAL"),
+            # Cross-camera corroboration
+            ("alerts", "corroborated", "BOOLEAN"),
+            ("alerts", "correlation_partner", "VARCHAR(50)"),
             # Segmentation enrichment (D2 — SAM2 instance segmentation).
             # segmentation_objects stores JSON text: bbox/area/centroid/conf
             # per object, masks are NOT persisted.
@@ -176,6 +179,12 @@ class Database:
         # Classification enrichment
         classification_label: str | None = None,
         classification_confidence: float | None = None,
+        # Cross-camera corroboration (stage 2.7) — populated by
+        # CrossCameraCorrelator when a partner camera with overlapping
+        # FoV either confirms or rejects the anomaly at the transformed
+        # location. Stays None when cross-camera correlation is disabled.
+        corroborated: bool | None = None,
+        correlation_partner: str | None = None,
         # Segmentation enrichment — segmentation_objects comes in as a
         # python list[dict] from pipeline.py and is JSON-encoded before
         # hitting the DB. Pass None (or leave default) when the segmenter
@@ -232,6 +241,8 @@ class Database:
                         landing_z_mm=landing_z_mm,
                         classification_label=classification_label,
                         classification_confidence=classification_confidence,
+                        corroborated=corroborated,
+                        correlation_partner=correlation_partner,
                         segmentation_count=segmentation_count,
                         segmentation_total_area_px=segmentation_total_area_px,
                         segmentation_objects=seg_objects_json,
