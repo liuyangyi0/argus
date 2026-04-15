@@ -9,6 +9,7 @@ import SystemDegradationPanel from '../components/system/SystemDegradationPanel.
 import SystemUserPanel from '../components/system/SystemUserPanel.vue'
 import ModuleTogglePanel from '../components/system/ModuleTogglePanel.vue'
 import ClassifierPanel from '../components/system/ClassifierPanel.vue'
+import SegmenterPanel from '../components/system/SegmenterPanel.vue'
 
 const activeTab = ref('overview')
 
@@ -49,6 +50,11 @@ function onTabChange(key: string | number) {
       <!-- AI Classifier -->
       <Tabs.TabPane key="classifier" tab="分类器">
         <ClassifierPanel v-if="activeTab === 'classifier'" />
+      </Tabs.TabPane>
+
+      <!-- SAM2 Segmenter -->
+      <Tabs.TabPane key="segmenter" tab="分割器">
+        <SegmenterPanel v-if="activeTab === 'segmenter'" />
       </Tabs.TabPane>
 
       <!-- Users -->
