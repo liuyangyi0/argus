@@ -437,6 +437,7 @@ async def get_module_states(request: Request):
         "imaging.polarization_processing": _safe_get("imaging", "polarization_processing"),
         "classifier.enabled": _safe_get("classifier", "enabled"),
         "segmenter.enabled": _safe_get("segmenter", "enabled"),
+        "cross_camera.enabled": _safe_get("cross_camera", "enabled"),
         "physics.speed_enabled": _safe_get("physics", "speed_enabled"),
         "physics.trajectory_enabled": _safe_get("physics", "trajectory_enabled"),
         "physics.localization_enabled": _safe_get("physics", "localization_enabled"),
@@ -554,6 +555,61 @@ async def get_segmenter_config(request: Request):
             "total_pipelines": total_pipelines,
             "pipelines_attached": pipelines_attached,
             "pipelines_loaded": pipelines_loaded,
+        },
+    })
+
+
+@router.get("/cross-camera")
+async def get_cross_camera_config(request: Request):
+    """Return the full cross-camera correlation config + runtime readiness.
+
+    Mirror of the segmenter panel. Runtime counters tell the UI how many
+    live pipelines were *constructed with* a cross-camera correlator
+    (``attached``) — similar to segmenter, toggling ``enabled`` at runtime
+    only affects NEW pipelines, so the UI should show a restart warning.
+    """
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    cfg = getattr(config, "cross_camera", None)
+    if cfg is None:
+        return api_unavailable("跨相机配置不可用")
+
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    total_pipelines = 0
+    correlator_present = False
+    if camera_manager is not None:
+        try:
+            for cam_status in camera_manager.get_status():
+                pipeline = camera_manager.get_pipeline(cam_status.camera_id)
+                if pipeline is None:
+                    continue
+                total_pipelines += 1
+            # The correlator lives on the CameraManager, not on each pipeline —
+            # a single instance is shared across all cameras for this manager.
+            correlator_present = getattr(camera_manager, "_correlator", None) is not None
+        except Exception:
+            logger.debug("cross_camera.pipeline_status_failed", exc_info=True)
+
+    # Serialize the overlap pairs (homography is a list of 3 lists of 3 floats)
+    pairs_payload = []
+    for p in cfg.overlap_pairs:
+        pairs_payload.append({
+            "camera_a": p.camera_a,
+            "camera_b": p.camera_b,
+            "homography": [list(row) for row in p.homography],
+        })
+
+    return api_success({
+        "enabled": cfg.enabled,
+        "corroboration_threshold": cfg.corroboration_threshold,
+        "max_age_seconds": cfg.max_age_seconds,
+        "uncorroborated_severity_downgrade": cfg.uncorroborated_severity_downgrade,
+        "overlap_pairs": pairs_payload,
+        "runtime": {
+            "total_pipelines": total_pipelines,
+            "correlator_present": correlator_present,
         },
     })
 
