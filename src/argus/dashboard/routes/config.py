@@ -558,6 +558,93 @@ async def get_segmenter_config(request: Request):
     })
 
 
+class SegmenterParamsRequest(BaseModel):
+    max_points: int | None = None
+    min_anomaly_score: float | None = None
+    min_mask_area_px: int | None = None
+    timeout_seconds: float | None = None
+
+
+@router.put("/segmenter/params")
+async def update_segmenter_params_route(
+    request: Request, req: SegmenterParamsRequest,
+):
+    """Patch the segmenter's runtime-tunable parameters.
+
+    Four knobs accepted: ``max_points`` / ``min_anomaly_score`` (pipeline
+    peak-extraction), ``min_mask_area_px`` / ``timeout_seconds`` (segmenter
+    itself). Writes to the in-memory ``config.segmenter`` so subsequent
+    reads of the "分割器" panel show the new values, and then fans the
+    update out to every live pipeline via
+    ``camera_manager.update_segmenter_params()``. ``enabled`` and
+    ``model_size`` are **not** tunable here — they require a pipeline
+    restart.
+
+    Validation: max_points in [1, 32], min_anomaly_score in [0, 1],
+    min_mask_area_px ≥ 0, timeout_seconds in (0, 120].
+    """
+    from argus.dashboard.auth import require_role
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("需要管理员或工程师权限")
+
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    cfg = getattr(config, "segmenter", None)
+    if cfg is None:
+        return api_unavailable("分割器配置不可用")
+
+    # Validate — all four are optional, only validate the ones provided.
+    if req.max_points is not None and not (1 <= req.max_points <= 32):
+        return api_validation_error("max_points 必须在 [1, 32] 范围内")
+    if req.min_anomaly_score is not None and not (0.0 <= req.min_anomaly_score <= 1.0):
+        return api_validation_error("min_anomaly_score 必须在 [0, 1] 范围内")
+    if req.min_mask_area_px is not None and req.min_mask_area_px < 0:
+        return api_validation_error("min_mask_area_px 不能为负数")
+    if req.timeout_seconds is not None and not (0.0 < req.timeout_seconds <= 120.0):
+        return api_validation_error("timeout_seconds 必须在 (0, 120] 范围内")
+
+    if req.max_points is not None:
+        cfg.max_points = req.max_points
+    if req.min_anomaly_score is not None:
+        cfg.min_anomaly_score = req.min_anomaly_score
+    if req.min_mask_area_px is not None:
+        cfg.min_mask_area_px = req.min_mask_area_px
+    if req.timeout_seconds is not None:
+        cfg.timeout_seconds = req.timeout_seconds
+
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    pushed = 0
+    if camera_manager is not None:
+        try:
+            pushed = camera_manager.update_segmenter_params(
+                max_points=req.max_points,
+                min_anomaly_score=req.min_anomaly_score,
+                min_mask_area_px=req.min_mask_area_px,
+                timeout_seconds=req.timeout_seconds,
+            )
+        except Exception:
+            logger.warning("config.segmenter_params_push_failed", exc_info=True)
+
+    logger.info(
+        "config.segmenter_params_updated",
+        max_points=cfg.max_points,
+        min_anomaly_score=cfg.min_anomaly_score,
+        min_mask_area_px=cfg.min_mask_area_px,
+        timeout_seconds=cfg.timeout_seconds,
+        pipelines_updated=pushed,
+    )
+
+    return api_success({
+        "max_points": cfg.max_points,
+        "min_anomaly_score": cfg.min_anomaly_score,
+        "min_mask_area_px": cfg.min_mask_area_px,
+        "timeout_seconds": cfg.timeout_seconds,
+        "pipelines_updated": pushed,
+    })
+
+
 class ClassifierVocabularyRequest(BaseModel):
     vocabulary: list[str]
     high_risk_labels: list[str] | None = None

@@ -1366,6 +1366,151 @@ class TestSegmenterConfigRoutes:
         assert data["runtime"]["pipelines_loaded"] == 1
 
 
+class TestSegmenterParamsRoute:
+    """PUT /api/config/segmenter/params (stage 2.6)."""
+
+    @pytest.fixture
+    def client_with_cfg(self, db, health, alerts_dir):
+        from argus.config.schema import SegmenterConfig
+        config = ArgusConfig()
+        config.segmenter = SegmenterConfig(
+            enabled=True,
+            model_size="small",
+            max_points=5,
+            min_anomaly_score=0.7,
+            min_mask_area_px=100,
+            timeout_seconds=10.0,
+        )
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = []
+        camera_manager.update_segmenter_params.return_value = 0
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        from argus.dashboard import auth as dashboard_auth
+        _orig_require_role = dashboard_auth.require_role
+        dashboard_auth.require_role = lambda request, *roles: True
+        try:
+            yield TestClient(app), config, camera_manager
+        finally:
+            dashboard_auth.require_role = _orig_require_role
+
+    def test_put_updates_config_in_place(self, client_with_cfg):
+        client, cfg, _cm = client_with_cfg
+        res = client.put(
+            "/api/config/segmenter/params",
+            json={"max_points": 8, "min_anomaly_score": 0.6},
+        )
+        assert res.status_code == 200
+        data = res.json()["data"]
+        assert data["max_points"] == 8
+        assert data["min_anomaly_score"] == 0.6
+        # untouched fields keep their defaults
+        assert data["min_mask_area_px"] == 100
+        assert cfg.segmenter.max_points == 8
+        assert cfg.segmenter.min_anomaly_score == 0.6
+
+    def test_put_pushes_to_camera_manager(self, client_with_cfg):
+        client, _cfg, cm = client_with_cfg
+        cm.update_segmenter_params.return_value = 2
+        res = client.put(
+            "/api/config/segmenter/params",
+            json={
+                "max_points": 6,
+                "min_anomaly_score": 0.65,
+                "min_mask_area_px": 200,
+                "timeout_seconds": 15.0,
+            },
+        )
+        assert res.status_code == 200
+        assert res.json()["data"]["pipelines_updated"] == 2
+        cm.update_segmenter_params.assert_called_once_with(
+            max_points=6,
+            min_anomaly_score=0.65,
+            min_mask_area_px=200,
+            timeout_seconds=15.0,
+        )
+
+    @pytest.mark.parametrize("payload,expected_msg_frag", [
+        ({"max_points": 0}, "max_points"),
+        ({"max_points": 99}, "max_points"),
+        ({"min_anomaly_score": -0.1}, "min_anomaly_score"),
+        ({"min_anomaly_score": 1.5}, "min_anomaly_score"),
+        ({"min_mask_area_px": -5}, "min_mask_area_px"),
+        ({"timeout_seconds": 0}, "timeout_seconds"),
+        ({"timeout_seconds": 500}, "timeout_seconds"),
+    ])
+    def test_put_rejects_out_of_range(self, client_with_cfg, payload, expected_msg_frag):
+        client, _cfg, _cm = client_with_cfg
+        res = client.put("/api/config/segmenter/params", json=payload)
+        assert res.status_code == 400
+        assert expected_msg_frag in res.json()["msg"]
+
+    def test_put_empty_body_is_noop(self, client_with_cfg):
+        """All fields optional — empty body should succeed and change nothing."""
+        client, cfg, _cm = client_with_cfg
+        before = cfg.segmenter.max_points
+        res = client.put("/api/config/segmenter/params", json={})
+        assert res.status_code == 200
+        assert cfg.segmenter.max_points == before
+
+
+class TestCameraManagerSegmenterBroadcast:
+    """CameraManager.update_segmenter_params hot-swap fanout (stage 2.6)."""
+
+    def test_updates_attached_pipelines_only(self):
+        manager = CameraManager.__new__(CameraManager)
+        manager._pipelines = {}
+
+        seg_a = MagicMock()
+        seg_b = MagicMock()
+        pipe_a = SimpleNamespace(_segmenter=seg_a, _segmenter_max_points=5, _segmenter_min_score=0.7)
+        pipe_b = SimpleNamespace(_segmenter=seg_b, _segmenter_max_points=5, _segmenter_min_score=0.7)
+        pipe_c = SimpleNamespace(_segmenter=None)  # no segmenter attached
+
+        manager._pipelines = {"a": pipe_a, "b": pipe_b, "c": pipe_c}
+
+        updated = manager.update_segmenter_params(
+            max_points=8,
+            min_anomaly_score=0.5,
+            min_mask_area_px=150,
+            timeout_seconds=12.0,
+        )
+
+        assert updated == 2
+        assert pipe_a._segmenter_max_points == 8
+        assert pipe_a._segmenter_min_score == 0.5
+        assert pipe_b._segmenter_max_points == 8
+        assert pipe_b._segmenter_min_score == 0.5
+        seg_a.update_runtime_params.assert_called_once_with(
+            min_mask_area_px=150,
+            timeout_seconds=12.0,
+        )
+        seg_b.update_runtime_params.assert_called_once_with(
+            min_mask_area_px=150,
+            timeout_seconds=12.0,
+        )
+
+    def test_swallows_per_pipeline_errors(self):
+        manager = CameraManager.__new__(CameraManager)
+        manager._pipelines = {}
+
+        ok = MagicMock()
+        broken = MagicMock()
+        broken.update_runtime_params.side_effect = RuntimeError("boom")
+        manager._pipelines = {
+            "ok": SimpleNamespace(_segmenter=ok, _segmenter_max_points=5, _segmenter_min_score=0.7),
+            "broken": SimpleNamespace(_segmenter=broken, _segmenter_max_points=5, _segmenter_min_score=0.7),
+        }
+        updated = manager.update_segmenter_params(timeout_seconds=20.0)
+        assert updated == 1
+        ok.update_runtime_params.assert_called_once()
+
+
 class TestCameraManagerClassifierBroadcast:
     """CameraManager.update_classifier_vocabulary hot-swap fanout (stage 2.3)."""
 
