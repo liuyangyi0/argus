@@ -108,6 +108,12 @@ class AlertRecord(Base):
     # Classification enrichment
     classification_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
     classification_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Cross-camera corroboration (C3-4 — see src/argus/core/correlation.py).
+    # ``corroborated`` is False when the corroborator ran but the partner
+    # camera could not confirm the anomaly at the transformed location, and
+    # None when cross-camera correlation is disabled for this pipeline.
+    corroborated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    correlation_partner: Mapped[str | None] = mapped_column(String(50), nullable=True)
     # Segmentation enrichment (D2 — SAM2 instance segmentation).
     # ``segmentation_objects`` is a JSON array of per-object dicts
     # (bbox/area_px/centroid/confidence); the raw masks are dropped
@@ -158,6 +164,8 @@ class AlertRecord(Base):
             "landing_z_mm": self.landing_z_mm,
             "classification_label": self.classification_label,
             "classification_confidence": self.classification_confidence,
+            "corroborated": self.corroborated,
+            "correlation_partner": self.correlation_partner,
             "segmentation_count": self.segmentation_count,
             "segmentation_total_area_px": self.segmentation_total_area_px,
             "segmentation_objects": segmentation_objects_parsed,
