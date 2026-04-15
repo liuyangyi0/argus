@@ -229,11 +229,25 @@ function handleDelete() {
             </div>
             <div class="meta-row">
               <span class="meta-k">严重度</span>
-              <span class="meta-v"><Tag :color="severityColor[selectedAlert.severity]" style="margin: 0">{{ severityLabel[selectedAlert.severity] }}</Tag></span>
+              <span class="meta-v">
+                <Tag :color="severityColor[selectedAlert.severity]" style="margin: 0">{{ severityLabel[selectedAlert.severity] }}</Tag>
+                <Tooltip v-if="selectedAlert.severity_adjusted_by_classifier" title="严重度已被 AI 分类器根据识别标签上调">
+                  <Tag color="purple" style="margin-left: 4px; font-size: 10px">AI↑</Tag>
+                </Tooltip>
+              </span>
             </div>
             <div class="meta-row">
               <span class="meta-k">置信度</span>
               <span class="meta-v" :style="{ color: scoreColor(selectedAlert.anomaly_score), fontWeight: 600 }">{{ selectedAlert.anomaly_score?.toFixed(4) }}</span>
+            </div>
+            <div v-if="selectedAlert.classification_label" class="meta-row">
+              <span class="meta-k">AI 分类</span>
+              <span class="meta-v meta-v--classification">
+                <Tag color="geekblue" style="margin: 0">{{ selectedAlert.classification_label }}</Tag>
+                <span v-if="selectedAlert.classification_confidence != null" class="classification-conf">
+                  {{ (selectedAlert.classification_confidence * 100).toFixed(1) }}%
+                </span>
+              </span>
             </div>
             <div class="meta-row">
               <span class="meta-k">触发时间</span>
@@ -464,6 +478,16 @@ function handleDelete() {
 .meta-v--notes {
   max-width: 180px;
   text-align: right;
+}
+.meta-v--classification {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.classification-conf {
+  font-size: 11px;
+  color: var(--argus-text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .actions-panel-bd {
