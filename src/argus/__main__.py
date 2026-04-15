@@ -255,21 +255,14 @@ def main():
     _go2rtc = None
     dashboard_cfg = getattr(config, "dashboard", None)
     if dashboard_cfg and dashboard_cfg.go2rtc_enabled:
-        from argus.streaming.go2rtc_manager import Go2RTCManager
+        from argus.streaming.go2rtc_manager import Go2RTCManager, start_and_register_cameras
         _go2rtc = Go2RTCManager(
             api_port=dashboard_cfg.go2rtc_api_port,
             rtsp_port=dashboard_cfg.go2rtc_rtsp_port,
             binary_path=dashboard_cfg.go2rtc_binary,
         )
         try:
-            _go2rtc.start()
-            for cam in cameras:
-                rtsp_url = _go2rtc.register_camera(cam.camera_id, cam.source, cam.protocol)
-                if rtsp_url and cam.protocol == "usb":
-                    logger.info("go2rtc.usb_redirect", camera_id=cam.camera_id,
-                                original=cam.source, redirected=rtsp_url)
-                    cam.source = rtsp_url
-                    cam.protocol = "rtsp"
+            start_and_register_cameras(_go2rtc, cameras)
         except Exception as exc:
             logger.warning("go2rtc.start_failed", error=str(exc))
             _go2rtc = None

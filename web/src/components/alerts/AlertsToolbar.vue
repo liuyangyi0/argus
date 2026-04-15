@@ -3,16 +3,23 @@ import { Select } from 'ant-design-vue'
 import { storeToRefs } from 'pinia'
 import { useAlertStore } from '../../stores/useAlertStore'
 
-const alertStore = useAlertStore()
-const { activeCount, resolvedCount, totalAlerts, filters, cameras } = storeToRefs(alertStore)
+defineOptions({ name: 'AlertsToolbar' })
+
+const store = useAlertStore()
+const { cameras, filters, totalAlerts, activeCount, resolvedCount } = storeToRefs(store)
 
 let _filterTimer: ReturnType<typeof setTimeout> | null = null
 function debouncedFetchData() {
   if (_filterTimer) clearTimeout(_filterTimer)
-  _filterTimer = setTimeout(() => alertStore.fetchData(), 300)
+  _filterTimer = setTimeout(() => store.fetchData(), 300)
 }
 
-function buildExportParams() {
+function setSeverity(value: string) {
+  filters.value.severity = value
+  store.fetchData()
+}
+
+function buildExportParams(): string {
   const params = new URLSearchParams()
   if (filters.value.camera_id) params.set('camera_id', filters.value.camera_id)
   if (filters.value.severity) params.set('severity', filters.value.severity)
@@ -32,49 +39,46 @@ function handleExportPDF() {
   <div class="alerts-header">
     <div class="alerts-header-top">
       <div>
-        <h2 class="alerts-title">告警<span class="alerts-accent">中心</span></h2>
+        <h2 class="alerts-title">告警中心</h2>
       </div>
       <div class="alerts-stats">
-        <span>待处理活跃 <b class="mono">{{ String(activeCount).padStart(2, '0') }}</b></span>
-        <span>今日已解决 <b class="mono">{{ String(resolvedCount).padStart(2, '0') }}</b></span>
-        <span>历史总计 <b class="mono">{{ String(totalAlerts).padStart(2, '0') }}</b></span>
+        <span>活跃 <b>{{ String(activeCount).padStart(2, '0') }}</b></span>
+        <span>已解决 <b>{{ String(resolvedCount).padStart(2, '0') }}</b></span>
+        <span>总计 <b>{{ String(totalAlerts).padStart(2, '0') }}</b></span>
       </div>
     </div>
     <div class="alerts-filters">
       <Select
         v-model:value="filters.camera_id"
-        placeholder="全部点位"
+        placeholder="全部摄像头"
         allow-clear
         size="small"
-        style="width: 140px; border-radius: 6px;"
+        style="width: 130px"
         @change="debouncedFetchData"
       >
         <Select.Option v-for="cam in cameras" :key="cam.camera_id" :value="cam.camera_id">
           {{ cam.camera_id }}
         </Select.Option>
       </Select>
-      
-      <div class="alerts-segment">
-        <button :class="['alerts-segment-btn', { on: !filters.severity }]" @click="filters.severity = ''; alertStore.fetchData()">全部等级</button>
-        <button :class="['alerts-segment-btn', { on: filters.severity === 'high' }]" @click="filters.severity = 'high'; alertStore.fetchData()">高危</button>
-        <button :class="['alerts-segment-btn', { on: filters.severity === 'medium' }]" @click="filters.severity = 'medium'; alertStore.fetchData()">中危</button>
-        <button :class="['alerts-segment-btn', { on: filters.severity === 'low' }]" @click="filters.severity = 'low'; alertStore.fetchData()">低危</button>
+      <div class="alerts-chip-group">
+        <button :class="['alerts-chip', { on: !filters.severity }]" @click="setSeverity('')">全部</button>
+        <button :class="['alerts-chip', { on: filters.severity === 'high' }]" @click="setSeverity('high')">高</button>
+        <button :class="['alerts-chip', { on: filters.severity === 'medium' }]" @click="setSeverity('medium')">中</button>
+        <button :class="['alerts-chip', { on: filters.severity === 'low' }]" @click="setSeverity('low')">低</button>
       </div>
-
-      <div class="alerts-actions-end">
-        <button class="alerts-btn" @click="handleExportCSV">导出 CSV ⭳</button>
-        <button class="alerts-btn" @click="handleExportPDF">导出 PDF ⭳</button>
+      <div class="alerts-chip-group alerts-chip-group--end">
+        <button class="alerts-chip alerts-chip--export" @click="handleExportCSV">CSV ↓</button>
+        <button class="alerts-chip alerts-chip--export" @click="handleExportPDF">PDF ↓</button>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* ── Header ── */
 .alerts-header {
   padding: 18px 20px 0;
   flex-shrink: 0;
-  border-bottom: 1px solid var(--line-2);
+  border-bottom: 1px solid var(--argus-border);
 }
 .alerts-header-top {
   display: flex;
@@ -82,97 +86,57 @@ function handleExportPDF() {
   align-items: flex-end;
   margin-bottom: 14px;
 }
-.alerts-eyebrow {
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--ink-4);
-  letter-spacing: .08em;
-  margin-bottom: 4px;
-}
 .alerts-title {
-  font-size: 24px;
-  font-weight: 800;
+  font-size: 22px;
+  font-weight: 700;
   margin: 0;
-  letter-spacing: .04em;
-  color: var(--ink-2);
-}
-.alerts-accent {
-  color: #3b82f6;
+  color: var(--argus-text);
 }
 .alerts-stats {
   display: flex;
   gap: 16px;
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--ink-4);
+  font-size: 13px;
+  color: var(--argus-text-muted);
 }
 .alerts-stats b {
-  color: var(--ink-2);
-  margin-left: 6px;
-  font-size: 14px;
+  color: var(--argus-text);
+  margin-left: 4px;
 }
 
-/* ── Filter & Actions ── */
 .alerts-filters {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 8px;
   padding: 10px 0;
-  flex-wrap: nowrap;
 }
-
-.alerts-segment {
-  display: inline-flex;
-  background: rgba(10, 10, 15, .04);
-  padding: 4px;
-  border-radius: 8px;
+.alerts-chip-group {
+  display: flex;
   gap: 4px;
 }
-.alerts-segment-btn {
-  padding: 4px 16px;
-  border: none;
-  background: transparent;
-  border-radius: 6px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--ink-4);
-  cursor: pointer;
-  white-space: nowrap;
-  transition: all .2s cubic-bezier(0.4, 0, 0.2, 1);
-}
-.alerts-segment-btn:hover:not(.on) {
-  color: var(--ink-2);
-}
-.alerts-segment-btn.on {
-  background: #fff;
-  color: var(--ink-2);
-  box-shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 0 rgba(0,0,0,.02);
-}
-
-.alerts-actions-end {
+.alerts-chip-group--end {
   margin-left: auto;
-  display: flex;
-  gap: 8px;
 }
-
-.alerts-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 14px;
-  border: 1px solid var(--line-2);
-  background: rgba(255, 255, 255, 0.6);
-  border-radius: 6px;
-  font-size: 12px;
-  font-weight: 500;
-  white-space: nowrap;
+.alerts-chip {
+  padding: 4px 14px;
+  border: 1px solid var(--argus-border);
+  background: transparent;
+  color: var(--argus-text-muted);
+  font-size: 13px;
   cursor: pointer;
-  color: var(--ink-4);
-  transition: all .2s;
+  transition: all .15s;
+  border-radius: 4px;
 }
-.alerts-btn:hover {
-  background: #fff;
-  border-color: #cbd5e1;
-  color: var(--ink-2);
+.alerts-chip:hover {
+  border-color: #3b82f6;
+  color: var(--argus-text);
+}
+.alerts-chip.on {
+  border-color: #3b82f6;
+  color: #3b82f6;
+  background: rgba(59, 130, 246, .08);
+}
+.alerts-chip--export {
+  border-radius: 4px;
+  background: var(--argus-card-bg-solid, rgba(255,255,255,0.6));
 }
 </style>
