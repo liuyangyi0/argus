@@ -212,6 +212,30 @@ class TestDatabase:
         assert d["segmentation_total_area_px"] is None
         assert d["segmentation_objects"] is None
 
+    def test_save_alert_with_cross_camera_fields_roundtrip(self, db):
+        """Cross-camera enrichment (stage 2.7) should round-trip through DB."""
+        now = datetime.now(tz=timezone.utc)
+        db.save_alert(
+            "XC-1", now, "cam_01", "z1", "high", 0.85,
+            corroborated=True,
+            correlation_partner="cam_02",
+        )
+        record = db.get_alert("XC-1")
+        assert record is not None
+        d = record.to_dict()
+        assert d["corroborated"] is True
+        assert d["correlation_partner"] == "cam_02"
+
+    def test_save_alert_without_cross_camera_leaves_columns_null(self, db):
+        """Default path — columns stay NULL when fields aren't passed."""
+        now = datetime.now(tz=timezone.utc)
+        db.save_alert("NO-XC", now, "cam_01", "z1", "low", 0.6)
+        record = db.get_alert("NO-XC")
+        assert record is not None
+        d = record.to_dict()
+        assert d["corroborated"] is None
+        assert d["correlation_partner"] is None
+
     def test_get_wall_status_batch_empty_camera_list(self, db):
         """Empty ``camera_ids`` should return an empty dict without querying."""
         now = datetime.now(tz=timezone.utc)

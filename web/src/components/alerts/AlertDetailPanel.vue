@@ -258,6 +258,24 @@ function handleDelete() {
                 </span>
               </span>
             </div>
+            <div v-if="selectedAlert.corroborated !== undefined && selectedAlert.corroborated !== null" class="meta-row">
+              <span class="meta-k">
+                <Tooltip title="跨相机相关性：另一个视野重叠的相机是否在同一位置确认了异常。未证实的告警严重度会被自动降级。">
+                  <span>跨相机验证</span>
+                </Tooltip>
+              </span>
+              <span class="meta-v meta-v--corroboration">
+                <Tag v-if="selectedAlert.corroborated" color="green" style="margin: 0">
+                  已证实
+                </Tag>
+                <Tag v-else color="volcano" style="margin: 0">
+                  未证实 (已降级)
+                </Tag>
+                <span v-if="selectedAlert.correlation_partner" class="correlation-partner">
+                  via {{ selectedAlert.correlation_partner }}
+                </span>
+              </span>
+            </div>
             <div v-if="selectedAlert.segmentation_count" class="meta-row">
               <span class="meta-k">
                 <Tooltip title="SAM2 实例分割 — 从异常热力图峰值反推每个物体的精确边界。主图上的红框就是分割结果。">
@@ -511,6 +529,16 @@ function handleDelete() {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+.meta-v--corroboration {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.correlation-partner {
+  font-size: 11px;
+  color: var(--argus-text-muted);
+  font-variant-numeric: tabular-nums;
 }
 .classification-conf,
 .segmentation-area {
