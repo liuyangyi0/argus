@@ -81,21 +81,17 @@ def create_app(
 
         await ws_manager.start()
 
-        # Start go2rtc if not already running.  When launched via __main__,
+        # Start go2rtc if not already running. When launched via __main__,
         # go2rtc is started earlier so USB cameras can be redirected before
-        # the pipeline opens them.  The dashboard-only mode still needs this.
+        # the pipeline opens them — the guard below makes this a no-op in
+        # that path. Dashboard-only mode (tests, standalone) still needs to
+        # run the full start-and-register sequence.
         if go2rtc is not None and not go2rtc.running:
-            cameras_cfg = getattr(config, "cameras", [])
-            rtsp_streams: dict[str, str] = {}
-            for cam in cameras_cfg:
-                protocol = getattr(cam, "protocol", None) or (cam.get("protocol") if isinstance(cam, dict) else None) or "rtsp"
-                cam_id = getattr(cam, "camera_id", None) or (cam.get("camera_id") if isinstance(cam, dict) else None)
-                source = getattr(cam, "source", None) or (cam.get("source") if isinstance(cam, dict) else None)
-                if cam_id and source and protocol == "rtsp":
-                    rtsp_streams[cam_id] = source
+            from argus.streaming.go2rtc_manager import start_and_register_cameras
+            cameras_cfg = list(getattr(config, "cameras", []) or [])
             try:
-                await asyncio.to_thread(go2rtc.start, rtsp_streams)
-            except (FileNotFoundError, TimeoutError, Exception) as exc:
+                await asyncio.to_thread(start_and_register_cameras, go2rtc, cameras_cfg)
+            except Exception as exc:
                 logger.warning(
                     "go2rtc.start_failed",
                     error=str(exc),
