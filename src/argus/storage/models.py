@@ -108,12 +108,26 @@ class AlertRecord(Base):
     # Classification enrichment
     classification_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
     classification_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Segmentation enrichment (D2 — SAM2 instance segmentation).
+    # ``segmentation_objects`` is a JSON array of per-object dicts
+    # (bbox/area_px/centroid/confidence); the raw masks are dropped
+    # because they are far too large to persist per-alert.
+    segmentation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    segmentation_total_area_px: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    segmentation_objects: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
 
     def to_dict(self) -> dict:
+        import json as _json
+        segmentation_objects_parsed: list | None = None
+        if self.segmentation_objects:
+            try:
+                segmentation_objects_parsed = _json.loads(self.segmentation_objects)
+            except Exception:
+                segmentation_objects_parsed = None
         return {
             "id": self.id,
             "alert_id": self.alert_id,
@@ -144,6 +158,9 @@ class AlertRecord(Base):
             "landing_z_mm": self.landing_z_mm,
             "classification_label": self.classification_label,
             "classification_confidence": self.classification_confidence,
+            "segmentation_count": self.segmentation_count,
+            "segmentation_total_area_px": self.segmentation_total_area_px,
+            "segmentation_objects": segmentation_objects_parsed,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
