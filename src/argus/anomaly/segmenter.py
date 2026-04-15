@@ -129,6 +129,38 @@ class InstanceSegmenter:
         self._sam2_available = False
         self._executor = None  # lazy init for SAM2 timeout
 
+    # ------------------------------------------------------------------
+    # Runtime parameter updates (D2 hot-reload, stage 2.6)
+    # ------------------------------------------------------------------
+
+    def update_runtime_params(
+        self,
+        *,
+        min_mask_area_px: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        """Patch runtime-tunable parameters in place.
+
+        Only ``min_mask_area_px`` and ``timeout_seconds`` are reload-safe
+        here — ``model_size`` would require re-downloading weights and
+        resetting the predictor, which we intentionally do NOT support at
+        runtime (operators should restart the pipeline for that).
+
+        Note that ``max_points`` and ``min_anomaly_score`` belong to the
+        **pipeline's** peak-extraction step, not to this class, so they
+        are pushed onto the pipeline separately (see
+        ``CameraManager.update_segmenter_params``).
+        """
+        if min_mask_area_px is not None:
+            self._min_mask_area_px = int(min_mask_area_px)
+        if timeout_seconds is not None:
+            self._timeout_seconds = float(timeout_seconds)
+        logger.info(
+            "segmenter.runtime_params_updated",
+            min_mask_area_px=self._min_mask_area_px,
+            timeout_seconds=self._timeout_seconds,
+        )
+
     def load(self) -> None:
         """Load SAM 2 model (lazy initialisation)."""
         if self._loaded:
