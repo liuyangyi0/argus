@@ -1366,6 +1366,83 @@ class TestSegmenterConfigRoutes:
         assert data["runtime"]["pipelines_loaded"] == 1
 
 
+class TestCrossCameraConfigRoutes:
+    """GET /api/config/cross-camera behind the System → 跨相机 panel (stage 2.8)."""
+
+    @pytest.fixture
+    def cross_camera_client(self, db, health, alerts_dir):
+        import numpy as np
+        from argus.config.schema import CrossCameraConfig, CameraOverlapConfig
+        config = ArgusConfig()
+        config.cross_camera = CrossCameraConfig(
+            enabled=False,
+            corroboration_threshold=0.3,
+            max_age_seconds=5.0,
+            uncorroborated_severity_downgrade=1,
+            overlap_pairs=[
+                CameraOverlapConfig(
+                    camera_a="cam_01",
+                    camera_b="cam_02",
+                    homography=np.eye(3),
+                ),
+            ],
+        )
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = []
+        # The correlator attribute on CameraManager is `_correlator`
+        camera_manager._correlator = None
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        return TestClient(app), config, camera_manager
+
+    def test_get_cross_camera_config_returns_full_payload(self, cross_camera_client):
+        client, _cfg, _cm = cross_camera_client
+        res = client.get("/api/config/cross-camera")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["code"] == 0
+        data = body["data"]
+        assert data["enabled"] is False
+        assert data["corroboration_threshold"] == 0.3
+        assert data["max_age_seconds"] == 5.0
+        assert data["uncorroborated_severity_downgrade"] == 1
+        assert len(data["overlap_pairs"]) == 1
+        pair = data["overlap_pairs"][0]
+        assert pair["camera_a"] == "cam_01"
+        assert pair["camera_b"] == "cam_02"
+        # Identity 3x3 matrix
+        assert pair["homography"] == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        assert data["runtime"]["total_pipelines"] == 0
+        assert data["runtime"]["correlator_present"] is False
+
+    def test_modules_endpoint_exposes_cross_camera_enabled(self, cross_camera_client):
+        client, _cfg, _cm = cross_camera_client
+        res = client.get("/api/config/modules")
+        assert res.status_code == 200
+        data = res.json()["data"]
+        assert "cross_camera.enabled" in data
+        assert data["cross_camera.enabled"] is False
+
+    def test_get_cross_camera_config_detects_correlator_presence(self, cross_camera_client):
+        """When a correlator is actually attached to the manager, runtime reports it."""
+        client, cfg, cm = cross_camera_client
+        cfg.cross_camera.enabled = True
+        cm._correlator = MagicMock()
+        cam_status = SimpleNamespace(camera_id="cam_a")
+        cm.get_status.return_value = [cam_status]
+        cm.get_pipeline.return_value = SimpleNamespace()
+        res = client.get("/api/config/cross-camera")
+        data = res.json()["data"]
+        assert data["enabled"] is True
+        assert data["runtime"]["total_pipelines"] == 1
+        assert data["runtime"]["correlator_present"] is True
+
+
 class TestSegmenterParamsRoute:
     """PUT /api/config/segmenter/params (stage 2.6)."""
 
