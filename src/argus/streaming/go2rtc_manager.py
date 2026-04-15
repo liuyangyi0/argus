@@ -453,3 +453,43 @@ class Go2RTCManager:
             self.close()
         except Exception:
             logger.debug("go2rtc.destructor_close_failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Single entry point for application bootstrap (shared by __main__ and the
+# dashboard lifespan). Keeps the "start + register cameras + USB redirect"
+# sequence in one place so the two startup paths cannot drift apart.
+# ---------------------------------------------------------------------------
+
+
+def start_and_register_cameras(manager: Go2RTCManager, cameras: list) -> None:
+    """Start go2rtc (if not already running) and register every camera.
+
+    Mutates ``cameras`` in place: for USB cameras, rewrites ``source`` and
+    ``protocol`` so the pipeline reads the RTSP re-stream exposed by go2rtc
+    instead of opening the USB device directly (which would conflict with
+    go2rtc's exclusive hold).
+
+    Idempotent: safe to call multiple times. ``Go2RTCManager.start()``
+    short-circuits when the process is already running, and registering a
+    stream that already exists is a no-op on the go2rtc side.
+    """
+    if not manager.running:
+        manager.start()
+
+    for cam in cameras:
+        cam_id = getattr(cam, "camera_id", None)
+        source = getattr(cam, "source", None)
+        protocol = getattr(cam, "protocol", None) or "rtsp"
+        if not cam_id or not source:
+            continue
+        rtsp_url = manager.register_camera(cam_id, source, protocol)
+        if rtsp_url and protocol == "usb":
+            logger.info(
+                "go2rtc.usb_redirect",
+                camera_id=cam_id,
+                original=source,
+                redirected=rtsp_url,
+            )
+            cam.source = rtsp_url
+            cam.protocol = "rtsp"

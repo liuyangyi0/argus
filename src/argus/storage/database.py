@@ -324,6 +324,7 @@ class Database:
         self,
         camera_id: str | None = None,
         severity: str | None = None,
+        since: datetime | None = None,
     ) -> int:
         """Get total alert count with optional filters."""
         with self.get_session() as session:
@@ -332,7 +333,78 @@ class Database:
                 stmt = stmt.where(AlertRecord.camera_id == camera_id)
             if severity:
                 stmt = stmt.where(AlertRecord.severity == severity)
+            if since is not None:
+                stmt = stmt.where(AlertRecord.timestamp >= since)
             return session.scalar(stmt) or 0
+
+    def get_wall_status_batch(
+        self,
+        camera_ids: list[str],
+        since: datetime,
+        active_statuses: tuple[str, ...] = ("new", "acknowledged", "investigating"),
+    ) -> dict[str, dict]:
+        """Batch-fetch today's count + latest-alert-if-active for multiple cameras.
+
+        Replaces the previous 2*N per-camera query pattern in the wall_status
+        endpoint. Returns ``{camera_id: {"count": int, "active": dict | None}}``
+        for every camera in ``camera_ids`` (missing cameras get zero/None).
+
+        Semantics match the previous per-camera ``get_alerts(..., limit=1)``
+        behaviour: the latest alert for each camera is fetched, and is only
+        reported under ``active`` if its workflow status is still in one of
+        the live states. A resolved/closed latest alert hides older active
+        alerts for that camera, by design.
+        """
+        result: dict[str, dict] = {
+            cam_id: {"count": 0, "active": None} for cam_id in camera_ids
+        }
+        if not camera_ids:
+            return result
+
+        with self.get_session() as session:
+            count_rows = session.execute(
+                select(AlertRecord.camera_id, sa_func.count())
+                .where(AlertRecord.camera_id.in_(camera_ids))
+                .where(AlertRecord.timestamp >= since)
+                .group_by(AlertRecord.camera_id)
+            ).all()
+            for cam_id, cnt in count_rows:
+                if cam_id in result:
+                    result[cam_id]["count"] = int(cnt or 0)
+
+            rn_col = sa_func.row_number().over(
+                partition_by=AlertRecord.camera_id,
+                order_by=AlertRecord.timestamp.desc(),
+            ).label("rn")
+            subq = (
+                select(
+                    AlertRecord.camera_id.label("camera_id"),
+                    AlertRecord.alert_id.label("alert_id"),
+                    AlertRecord.severity.label("severity"),
+                    AlertRecord.workflow_status.label("workflow_status"),
+                    rn_col,
+                )
+                .where(AlertRecord.camera_id.in_(camera_ids))
+                .subquery()
+            )
+            latest_rows = session.execute(
+                select(
+                    subq.c.camera_id,
+                    subq.c.alert_id,
+                    subq.c.severity,
+                    subq.c.workflow_status,
+                ).where(subq.c.rn == 1)
+            ).all()
+            for cam_id, alert_id, severity, workflow_status in latest_rows:
+                if cam_id not in result:
+                    continue
+                if workflow_status in active_statuses:
+                    result[cam_id]["active"] = {
+                        "alert_id": alert_id,
+                        "severity": severity,
+                    }
+
+        return result
 
     def delete_alert(self, alert_id: str) -> tuple[bool, list[str]]:
         """Delete a single alert by ID. Returns (success, image_paths)."""
