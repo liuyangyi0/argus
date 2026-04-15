@@ -58,6 +58,15 @@ function formatTimestamp(ts: string | number | undefined): string {
   return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+// Pixels are hard to eyeball — kilo-pixels give a more scannable magnitude
+// for the 分割结果 row. We intentionally don't convert to % of frame area,
+// because the frame dimensions aren't persisted on the alert record.
+function formatArea(px: number): string {
+  if (px < 1000) return `${px} px`
+  if (px < 1_000_000) return `${(px / 1000).toFixed(1)} K px`
+  return `${(px / 1_000_000).toFixed(2)} M px`
+}
+
 async function handleAcknowledge() {
   if (!selectedAlert.value) return
   try {
@@ -246,6 +255,24 @@ function handleDelete() {
                 <Tag color="geekblue" style="margin: 0">{{ selectedAlert.classification_label }}</Tag>
                 <span v-if="selectedAlert.classification_confidence != null" class="classification-conf">
                   {{ (selectedAlert.classification_confidence * 100).toFixed(1) }}%
+                </span>
+              </span>
+            </div>
+            <div v-if="selectedAlert.segmentation_count" class="meta-row">
+              <span class="meta-k">
+                <Tooltip title="SAM2 实例分割 — 从异常热力图峰值反推每个物体的精确边界。主图上的红框就是分割结果。">
+                  <span>分割结果</span>
+                </Tooltip>
+              </span>
+              <span class="meta-v meta-v--segmentation">
+                <Tag color="magenta" style="margin: 0">
+                  {{ selectedAlert.segmentation_count }} 个对象
+                </Tag>
+                <span
+                  v-if="selectedAlert.segmentation_total_area_px != null"
+                  class="segmentation-area"
+                >
+                  总面积 {{ formatArea(selectedAlert.segmentation_total_area_px) }}
                 </span>
               </span>
             </div>
@@ -479,12 +506,14 @@ function handleDelete() {
   max-width: 180px;
   text-align: right;
 }
-.meta-v--classification {
+.meta-v--classification,
+.meta-v--segmentation {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
-.classification-conf {
+.classification-conf,
+.segmentation-area {
   font-size: 11px;
   color: var(--argus-text-muted);
   font-variant-numeric: tabular-nums;

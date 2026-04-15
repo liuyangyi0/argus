@@ -208,6 +208,13 @@ class AlertDispatcher:
     ) -> None:
         """Persist alert to database."""
         try:
+            # Only forward segmentation fields when the segmenter actually
+            # produced objects — keeps the DB column NULL for alerts where
+            # the segmenter is off or returned an empty result.
+            seg_count = getattr(alert, "segmentation_count", 0)
+            seg_total_area = getattr(alert, "segmentation_total_area_px", 0)
+            seg_objects = getattr(alert, "segmentation_objects", None)
+            has_segmentation = bool(seg_count)
             self._db.save_alert(
                 alert_id=alert.alert_id,
                 timestamp=datetime.fromtimestamp(alert.timestamp, tz=timezone.utc),
@@ -230,6 +237,9 @@ class AlertDispatcher:
                 landing_z_mm=alert.landing_z_mm,
                 classification_label=alert.classification_label,
                 classification_confidence=alert.classification_confidence,
+                segmentation_count=seg_count if has_segmentation else None,
+                segmentation_total_area_px=seg_total_area if has_segmentation else None,
+                segmentation_objects=seg_objects if has_segmentation else None,
             )
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))

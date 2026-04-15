@@ -170,6 +170,48 @@ class TestDatabase:
         assert result["cam_05"]["count"] == 2
         assert result["cam_05"]["active"] is None
 
+    def test_save_alert_with_segmentation_fields_roundtrip(self, db):
+        """Segmentation enrichment (stage 2.4) should round-trip through the DB.
+
+        Regression target: before stage 2.4 the columns didn't exist, pipeline
+        wrote segmentation fields onto the in-memory Alert but they were
+        silently dropped by save_alert(). Now the row stores count/area/JSON
+        objects and to_dict() deserializes the JSON back into a list.
+        """
+        now = datetime.now(tz=timezone.utc)
+        objects = [
+            {"bbox": [10, 20, 30, 40], "area_px": 5000, "centroid": [25, 40], "confidence": 0.91},
+            {"bbox": [100, 120, 50, 60], "area_px": 4500, "centroid": [125, 150], "confidence": 0.77},
+        ]
+        db.save_alert(
+            "SEG-1", now, "cam_01", "z1", "high", 0.88,
+            segmentation_count=2,
+            segmentation_total_area_px=9500,
+            segmentation_objects=objects,
+        )
+
+        record = db.get_alert("SEG-1")
+        assert record is not None
+        d = record.to_dict()
+        assert d["segmentation_count"] == 2
+        assert d["segmentation_total_area_px"] == 9500
+        assert isinstance(d["segmentation_objects"], list)
+        assert len(d["segmentation_objects"]) == 2
+        assert d["segmentation_objects"][0]["bbox"] == [10, 20, 30, 40]
+        assert d["segmentation_objects"][0]["confidence"] == 0.91
+
+    def test_save_alert_without_segmentation_leaves_columns_null(self, db):
+        """Alerts where the segmenter was off or returned empty stay NULL."""
+        now = datetime.now(tz=timezone.utc)
+        db.save_alert("NO-SEG", now, "cam_01", "z1", "low", 0.65)
+
+        record = db.get_alert("NO-SEG")
+        assert record is not None
+        d = record.to_dict()
+        assert d["segmentation_count"] is None
+        assert d["segmentation_total_area_px"] is None
+        assert d["segmentation_objects"] is None
+
     def test_get_wall_status_batch_empty_camera_list(self, db):
         """Empty ``camera_ids`` should return an empty dict without querying."""
         now = datetime.now(tz=timezone.utc)
