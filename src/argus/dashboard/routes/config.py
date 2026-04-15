@@ -444,6 +444,63 @@ async def get_module_states(request: Request):
     })
 
 
+@router.get("/classifier")
+async def get_classifier_config(request: Request):
+    """Return the full classifier config + runtime readiness.
+
+    The System "分类器" panel uses this to show operators what the
+    classifier is configured to detect before they flip the enable
+    switch. Runtime state is derived by introspecting live pipelines:
+    ``total_pipelines`` is how many camera pipelines exist, and
+    ``pipelines_loaded`` is how many of them have the classifier
+    already warmed up. When the toggle is off, both should be zero
+    (except the total, which reflects how many cameras are running).
+    """
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    cfg = getattr(config, "classifier", None)
+    if cfg is None:
+        return api_unavailable("分类器配置不可用")
+
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    total_pipelines = 0
+    pipelines_loaded = 0
+    pipelines_attached = 0
+    if camera_manager is not None:
+        try:
+            for cam_status in camera_manager.get_status():
+                pipeline = camera_manager.get_pipeline(cam_status.camera_id)
+                if pipeline is None:
+                    continue
+                total_pipelines += 1
+                classifier = getattr(pipeline, "_classifier", None)
+                if classifier is None:
+                    continue
+                pipelines_attached += 1
+                if getattr(classifier, "_loaded", False):
+                    pipelines_loaded += 1
+        except Exception:
+            logger.debug("classifier.pipeline_status_failed", exc_info=True)
+
+    return api_success({
+        "enabled": cfg.enabled,
+        "model_name": cfg.model_name,
+        "min_anomaly_score_to_classify": cfg.min_anomaly_score_to_classify,
+        "vocabulary": list(cfg.vocabulary),
+        "high_risk_labels": list(cfg.high_risk_labels),
+        "low_risk_labels": list(cfg.low_risk_labels),
+        "suppress_labels": list(cfg.suppress_labels),
+        "custom_vocabulary_path": cfg.custom_vocabulary_path,
+        "runtime": {
+            "total_pipelines": total_pipelines,
+            "pipelines_attached": pipelines_attached,
+            "pipelines_loaded": pipelines_loaded,
+        },
+    })
+
+
 class ModuleToggleRequest(BaseModel):
     key: str
     value: bool
