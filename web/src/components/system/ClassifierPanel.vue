@@ -2,17 +2,36 @@
 import { computed, onMounted, ref } from 'vue'
 import {
   Card, Tag, Switch, Button, Tooltip, Space, Typography, message, Alert, Empty,
+  Input, Segmented, Popconfirm,
 } from 'ant-design-vue'
-import { ReloadOutlined } from '@ant-design/icons-vue'
+import { ReloadOutlined, EditOutlined, SaveOutlined, CloseOutlined, PlusOutlined } from '@ant-design/icons-vue'
 
-import { getClassifierConfig, toggleModule, type ClassifierConfigPayload } from '../../api'
+import {
+  getClassifierConfig,
+  toggleModule,
+  updateClassifierVocabulary,
+  type ClassifierConfigPayload,
+} from '../../api'
 
 defineOptions({ name: 'ClassifierPanel' })
+
+type Bucket = 'high' | 'low' | 'suppress' | 'neutral'
+
+interface DraftEntry {
+  label: string
+  bucket: Bucket
+}
 
 const cfg = ref<ClassifierConfigPayload | null>(null)
 const loading = ref(false)
 const toggling = ref(false)
+const saving = ref(false)
 const error = ref<string | null>(null)
+
+// Edit mode state
+const editing = ref(false)
+const draft = ref<DraftEntry[]>([])
+const newLabel = ref('')
 
 async function load() {
   loading.value = true
@@ -49,7 +68,7 @@ async function handleToggle(checked: string | number | boolean) {
 // in the neutral middle. A label may appear in at most one bucket —
 // the precedence order is high → low → suppressed → neutral.
 interface LabelBucket {
-  key: 'high' | 'low' | 'suppress' | 'neutral'
+  key: Bucket
   label: string
   color: string
   labels: string[]
@@ -70,8 +89,6 @@ const buckets = computed<LabelBucket[]>(() => {
     else if (suppress.has(label)) suppressList.push(label)
     else neutral.push(label)
   }
-  // Include any labels in the role lists that aren't in the main vocabulary
-  // either (operator curation drift) so nothing is silently hidden.
   for (const label of high) if (!cfg.value.vocabulary.includes(label)) highList.push(label)
   for (const label of low) if (!cfg.value.vocabulary.includes(label)) lowList.push(label)
   for (const label of suppress) if (!cfg.value.vocabulary.includes(label)) suppressList.push(label)
@@ -97,6 +114,81 @@ const runtimeSummary = computed(() => {
   }
   return `${r.total_pipelines} 路管线已附加分类器，尚未触发首次加载`
 })
+
+const BUCKET_OPTIONS: { label: string; value: Bucket }[] = [
+  { label: '高风险', value: 'high' },
+  { label: '低风险', value: 'low' },
+  { label: '抑制', value: 'suppress' },
+  { label: '中性', value: 'neutral' },
+]
+
+function enterEdit() {
+  if (!cfg.value) return
+  // Preserve the visual order: high / low / suppress / neutral, then by
+  // insertion order within each bucket.
+  const ordered: DraftEntry[] = []
+  for (const bucket of buckets.value) {
+    for (const label of bucket.labels) {
+      ordered.push({ label, bucket: bucket.key })
+    }
+  }
+  draft.value = ordered
+  newLabel.value = ''
+  editing.value = true
+}
+
+function cancelEdit() {
+  editing.value = false
+  draft.value = []
+  newLabel.value = ''
+}
+
+function addLabel() {
+  const label = newLabel.value.trim()
+  if (!label) return
+  if (draft.value.some(d => d.label === label)) {
+    message.warning(`"${label}" 已在词表中`)
+    return
+  }
+  draft.value.push({ label, bucket: 'neutral' })
+  newLabel.value = ''
+}
+
+function removeLabel(label: string) {
+  draft.value = draft.value.filter(d => d.label !== label)
+}
+
+function setBucket(label: string, bucket: Bucket) {
+  const entry = draft.value.find(d => d.label === label)
+  if (entry) entry.bucket = bucket
+}
+
+async function saveDraft() {
+  if (draft.value.length === 0) {
+    message.warning('词表不能为空')
+    return
+  }
+  saving.value = true
+  try {
+    const vocabulary = draft.value.map(d => d.label)
+    const high_risk_labels = draft.value.filter(d => d.bucket === 'high').map(d => d.label)
+    const low_risk_labels = draft.value.filter(d => d.bucket === 'low').map(d => d.label)
+    const suppress_labels = draft.value.filter(d => d.bucket === 'suppress').map(d => d.label)
+    const result: any = await updateClassifierVocabulary({
+      vocabulary, high_risk_labels, low_risk_labels, suppress_labels,
+    })
+    const pushed = result?.pipelines_updated ?? 0
+    message.success(pushed > 0
+      ? `词表已保存，已推送到 ${pushed} 路管线`
+      : '词表已保存（当前无运行中管线）')
+    editing.value = false
+    await load()
+  } catch (e: any) {
+    message.error(e?.response?.data?.msg || e?.message || '保存失败')
+  } finally {
+    saving.value = false
+  }
+}
 
 onMounted(load)
 </script>
@@ -162,30 +254,97 @@ onMounted(load)
         </div>
       </div>
 
-      <!-- Vocabulary buckets -->
+      <!-- Vocabulary -->
       <div class="panel-section">
-        <Typography.Text strong>识别词表 ({{ cfg.vocabulary.length }} 词)</Typography.Text>
-        <Typography.Text type="secondary" style="font-size: 12px; display: block; margin-bottom: 8px">
-          词表编辑能力将在下一阶段上线，这里仅作展示。
-        </Typography.Text>
-        <div v-for="bucket in buckets" :key="bucket.key" class="bucket">
-          <div class="bucket-hd">
-            <Tag :color="bucket.color">{{ bucket.label }}</Tag>
-            <span class="bucket-count">{{ bucket.labels.length }}</span>
+        <div class="vocab-header">
+          <Typography.Text strong>
+            识别词表 ({{ editing ? draft.length : cfg.vocabulary.length }} 词)
+          </Typography.Text>
+          <Space v-if="!editing">
+            <Button size="small" @click="enterEdit">
+              <template #icon><EditOutlined /></template>
+              编辑
+            </Button>
+          </Space>
+          <Space v-else>
+            <Button size="small" @click="cancelEdit" :disabled="saving">
+              <template #icon><CloseOutlined /></template>
+              取消
+            </Button>
+            <Button size="small" type="primary" :loading="saving" @click="saveDraft">
+              <template #icon><SaveOutlined /></template>
+              保存并热推送
+            </Button>
+          </Space>
+        </div>
+
+        <!-- View mode: bucketed tags -->
+        <div v-if="!editing">
+          <div v-for="bucket in buckets" :key="bucket.key" class="bucket">
+            <div class="bucket-hd">
+              <Tag :color="bucket.color">{{ bucket.label }}</Tag>
+              <span class="bucket-count">{{ bucket.labels.length }}</span>
+            </div>
+            <div v-if="bucket.labels.length > 0" class="bucket-labels">
+              <Tag
+                v-for="label in bucket.labels"
+                :key="bucket.key + ':' + label"
+                :color="bucket.color"
+                class="bucket-tag"
+              >{{ label }}</Tag>
+            </div>
+            <span
+              v-else
+              class="bucket-empty"
+            >（无{{ bucket.label.split('（')[0] }}标签）</span>
           </div>
-          <div v-if="bucket.labels.length > 0" class="bucket-labels">
-            <Tag
-              v-for="label in bucket.labels"
-              :key="bucket.key + ':' + label"
-              :color="bucket.color"
-              class="bucket-tag"
-            >{{ label }}</Tag>
+        </div>
+
+        <!-- Edit mode: one row per label with bucket selector + delete -->
+        <div v-else class="edit-list">
+          <Typography.Text type="secondary" style="font-size: 12px; display: block; margin-bottom: 8px">
+            保存后立刻通过 PUT /api/config/classifier/vocabulary 推送到所有运行中管线，无需重启。本次修改仅作用于内存配置，持久化需要额外的"保存配置"操作。
+          </Typography.Text>
+          <div
+            v-for="entry in draft"
+            :key="entry.label"
+            class="edit-row"
+          >
+            <Tag class="edit-row-label">{{ entry.label }}</Tag>
+            <Segmented
+              :options="BUCKET_OPTIONS"
+              :value="entry.bucket"
+              @update:value="(v: string | number | boolean) => setBucket(entry.label, v as Bucket)"
+              size="small"
+            />
+            <Popconfirm
+              title="从词表移除该标签？"
+              ok-text="移除"
+              cancel-text="取消"
+              @confirm="removeLabel(entry.label)"
+            >
+              <Button size="small" type="text" danger>
+                <template #icon><CloseOutlined /></template>
+              </Button>
+            </Popconfirm>
+          </div>
+          <div class="edit-add-row">
+            <Input
+              v-model:value="newLabel"
+              placeholder="新增标签，如 wrench / pipe_fragment"
+              size="small"
+              @pressEnter="addLabel"
+              style="max-width: 280px"
+            />
+            <Button size="small" type="dashed" @click="addLabel" :disabled="!newLabel.trim()">
+              <template #icon><PlusOutlined /></template>
+              添加
+            </Button>
           </div>
           <Empty
-            v-else
-            :image="null"
-            :description="`（无${bucket.label.split('（')[0]}标签）`"
-            style="padding: 4px 0; margin: 0"
+            v-if="draft.length === 0"
+            description="词表为空，请至少添加一个标签"
+            style="padding: 16px"
           />
         </div>
       </div>
@@ -267,5 +426,47 @@ onMounted(load)
 .bucket-tag {
   margin: 0 !important;
   font-size: 11px;
+}
+.bucket-empty {
+  font-size: 11px;
+  color: var(--argus-text-muted);
+  padding: 2px 0;
+}
+
+.vocab-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.edit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.edit-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  transition: background .15s;
+}
+.edit-row:hover {
+  background: rgba(59, 130, 246, 0.04);
+}
+.edit-row-label {
+  min-width: 140px;
+  margin: 0 !important;
+  font-family: var(--argus-mono, monospace);
+  font-size: 12px;
+}
+.edit-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 8px 0;
+  border-top: 1px dashed var(--argus-border, #f0f0f0);
+  margin-top: 8px;
 }
 </style>

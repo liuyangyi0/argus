@@ -501,6 +501,113 @@ async def get_classifier_config(request: Request):
     })
 
 
+class ClassifierVocabularyRequest(BaseModel):
+    vocabulary: list[str]
+    high_risk_labels: list[str] | None = None
+    low_risk_labels: list[str] | None = None
+    suppress_labels: list[str] | None = None
+
+
+@router.put("/classifier/vocabulary")
+async def update_classifier_vocabulary(
+    request: Request, req: ClassifierVocabularyRequest,
+):
+    """Replace the classifier vocabulary + risk-bucket assignments.
+
+    Writes to the in-memory ``config.classifier`` object and pushes the new
+    vocabulary to every live pipeline's classifier via
+    ``camera_manager.update_classifier_vocabulary()`` — so operators can
+    iterate on the FOE list without restarting Argus. Changes are NOT
+    persisted to YAML; ``POST /api/config/save`` is a separate step.
+
+    Validation rules: vocabulary must be non-empty, each label a non-empty
+    string (trimmed). high/low/suppress lists, if provided, must be subsets
+    of the vocabulary — otherwise operators risk labelling things that the
+    detector will never emit.
+    """
+    from argus.dashboard.auth import require_role
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("需要管理员或工程师权限")
+
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    cfg = getattr(config, "classifier", None)
+    if cfg is None:
+        return api_unavailable("分类器配置不可用")
+
+    vocab_clean: list[str] = []
+    seen: set[str] = set()
+    for raw in req.vocabulary:
+        if not isinstance(raw, str):
+            return api_validation_error("vocabulary 必须是字符串列表")
+        label = raw.strip()
+        if not label:
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        vocab_clean.append(label)
+    if not vocab_clean:
+        return api_validation_error("词表不能为空")
+
+    def _validate_subset(labels: list[str] | None, field_name: str) -> list[str] | None:
+        if labels is None:
+            return None
+        result: list[str] = []
+        for raw in labels:
+            if not isinstance(raw, str):
+                raise ValueError(f"{field_name} 必须是字符串列表")
+            label = raw.strip()
+            if not label:
+                continue
+            if label not in seen:
+                raise ValueError(f"{field_name} 包含词表之外的标签: {label}")
+            result.append(label)
+        return result
+
+    try:
+        high = _validate_subset(req.high_risk_labels, "high_risk_labels")
+        low = _validate_subset(req.low_risk_labels, "low_risk_labels")
+        suppress = _validate_subset(req.suppress_labels, "suppress_labels")
+    except ValueError as e:
+        return api_validation_error(str(e))
+
+    cfg.vocabulary = vocab_clean
+    if high is not None:
+        cfg.high_risk_labels = high
+    if low is not None:
+        cfg.low_risk_labels = low
+    if suppress is not None:
+        cfg.suppress_labels = suppress
+
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    pushed = 0
+    if camera_manager is not None:
+        try:
+            pushed = camera_manager.update_classifier_vocabulary(vocab_clean)
+        except Exception:
+            logger.warning("config.classifier_vocab_push_failed", exc_info=True)
+
+    logger.info(
+        "config.classifier_vocabulary_updated",
+        vocab_size=len(vocab_clean),
+        high_count=len(high) if high is not None else None,
+        low_count=len(low) if low is not None else None,
+        suppress_count=len(suppress) if suppress is not None else None,
+        pipelines_updated=pushed,
+    )
+
+    return api_success({
+        "vocabulary": vocab_clean,
+        "high_risk_labels": list(cfg.high_risk_labels),
+        "low_risk_labels": list(cfg.low_risk_labels),
+        "suppress_labels": list(cfg.suppress_labels),
+        "pipelines_updated": pushed,
+    })
+
+
 class ModuleToggleRequest(BaseModel):
     key: str
     value: bool
