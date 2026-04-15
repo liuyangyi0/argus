@@ -24,6 +24,12 @@ const modules = ref<ModuleToggle[]>([
     enabled: false,
   },
   {
+    key: 'segmenter.enabled',
+    label: 'SAM2 实例分割',
+    description: '精确分割异常区域边界（切换后需要重启已运行的摄像头）',
+    enabled: false,
+  },
+  {
     key: 'physics.speed_enabled',
     label: '速度监测',
     description: '异物坠落速度实时监测',

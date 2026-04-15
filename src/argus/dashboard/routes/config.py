@@ -436,6 +436,7 @@ async def get_module_states(request: Request):
         "imaging.enabled": _safe_get("imaging", "enabled"),
         "imaging.polarization_processing": _safe_get("imaging", "polarization_processing"),
         "classifier.enabled": _safe_get("classifier", "enabled"),
+        "segmenter.enabled": _safe_get("segmenter", "enabled"),
         "physics.speed_enabled": _safe_get("physics", "speed_enabled"),
         "physics.trajectory_enabled": _safe_get("physics", "trajectory_enabled"),
         "physics.localization_enabled": _safe_get("physics", "localization_enabled"),
@@ -493,6 +494,62 @@ async def get_classifier_config(request: Request):
         "low_risk_labels": list(cfg.low_risk_labels),
         "suppress_labels": list(cfg.suppress_labels),
         "custom_vocabulary_path": cfg.custom_vocabulary_path,
+        "runtime": {
+            "total_pipelines": total_pipelines,
+            "pipelines_attached": pipelines_attached,
+            "pipelines_loaded": pipelines_loaded,
+        },
+    })
+
+
+@router.get("/segmenter")
+async def get_segmenter_config(request: Request):
+    """Return the full segmenter config + runtime readiness.
+
+    Mirror of the classifier panel but for SAM2 instance segmentation.
+    ``runtime.attached/loaded`` counters tell the UI how many live
+    pipelines already have the segmenter warmed up — zero is expected
+    whenever the toggle is off (pipelines are only *created* with a
+    segmenter when the config had it enabled at startup, which means
+    toggling enabled ON here does NOT retroactively attach segmenters
+    to running pipelines; that's a "needs restart" warning we show in
+    the UI).
+    """
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    cfg = getattr(config, "segmenter", None)
+    if cfg is None:
+        return api_unavailable("分割器配置不可用")
+
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    total_pipelines = 0
+    pipelines_attached = 0
+    pipelines_loaded = 0
+    if camera_manager is not None:
+        try:
+            for cam_status in camera_manager.get_status():
+                pipeline = camera_manager.get_pipeline(cam_status.camera_id)
+                if pipeline is None:
+                    continue
+                total_pipelines += 1
+                segmenter = getattr(pipeline, "_segmenter", None)
+                if segmenter is None:
+                    continue
+                pipelines_attached += 1
+                if getattr(segmenter, "_loaded", False):
+                    pipelines_loaded += 1
+        except Exception:
+            logger.debug("segmenter.pipeline_status_failed", exc_info=True)
+
+    return api_success({
+        "enabled": cfg.enabled,
+        "model_size": cfg.model_size,
+        "max_points": cfg.max_points,
+        "min_anomaly_score": cfg.min_anomaly_score,
+        "min_mask_area_px": cfg.min_mask_area_px,
+        "timeout_seconds": cfg.timeout_seconds,
         "runtime": {
             "total_pipelines": total_pipelines,
             "pipelines_attached": pipelines_attached,
