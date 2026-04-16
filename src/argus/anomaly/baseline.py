@@ -43,7 +43,12 @@ class BaselineManager:
 
     @staticmethod
     def _resolve_current_version(base: Path) -> Path:
-        """Resolve the current version directory from a base path."""
+        """Resolve the current version directory from a base path.
+
+        Returns the versioned subdirectory (e.g. ``base/v001``), never
+        the bare *base* directory itself — that would cause the trainer
+        to scan the wrong location and report misleading "图片不足" errors.
+        """
         current_marker = base / "current.txt"
         if current_marker.exists():
             version = current_marker.read_text().strip()
@@ -53,7 +58,10 @@ class BaselineManager:
         versions = sorted(base.glob("v*"), reverse=True)
         if versions:
             return versions[0]
-        return base
+        v001 = base / "v001"
+        if not v001.exists():
+            v001.mkdir(parents=True, exist_ok=True)
+        return v001
 
     @staticmethod
     def _create_version_dir(base: Path) -> tuple[Path, str]:
@@ -86,6 +94,7 @@ class BaselineManager:
     def set_current_version(self, camera_id: str, zone_id: str, version: str) -> None:
         """Set the current active baseline version."""
         base = self.baselines_dir / camera_id / zone_id
+        base.mkdir(parents=True, exist_ok=True)
         marker = base / "current.txt"
         tmp = marker.with_suffix(".tmp")
         tmp.write_text(version)

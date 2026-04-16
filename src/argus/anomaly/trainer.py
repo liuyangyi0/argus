@@ -235,6 +235,50 @@ class ModelTrainer:
     def last_result(self) -> TrainingResult | None:
         return self._last_result
 
+    @staticmethod
+    def _free_gpu_for_training() -> None:
+        """Move inference models off GPU to free VRAM for training.
+
+        On a 12GB GPU (e.g. RTX 3060), YOLO + anomaly inference can
+        consume 10GB+, leaving no room for training.  Moving them to
+        CPU temporarily frees the VRAM.  Models are reloaded on demand
+        the next time inference runs after training completes.
+        """
+        import gc
+        import torch
+
+        freed = 0
+
+        # Move shared YOLO models to CPU
+        try:
+            from argus.person.detector import _shared_yolo_registry
+            for name, model in _shared_yolo_registry.items():
+                if hasattr(model, "to"):
+                    model.to("cpu")
+                    freed += 1
+                    logger.info("trainer.gpu_freed", model=f"yolo:{name}")
+        except Exception:
+            pass
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("trainer.gpu_memory_freed", models_moved=freed)
+
+    @staticmethod
+    def _restore_gpu_after_training() -> None:
+        """Move inference models back to GPU after training completes."""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return
+            from argus.person.detector import _shared_yolo_registry
+            for name, model in _shared_yolo_registry.items():
+                if hasattr(model, "to"):
+                    model.to("cuda:0")
+                    logger.info("trainer.gpu_restored", model=f"yolo:{name}")
+        except Exception:
+            pass
+
     def _fail(self, start: float, **kwargs) -> TrainingResult:
         """Build a FAILED TrainingResult and update internal state."""
         kwargs.setdefault("duration_seconds", time.monotonic() - start)
@@ -431,6 +475,13 @@ class ModelTrainer:
             # Release training artifacts to free memory — runs on ALL exit paths
             del engine, model
             gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self._restore_gpu_after_training()
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         # Output validation + smoke test (TRN-006)
         # Returns (validation_dict, loaded_detector_or_None)
@@ -812,13 +863,18 @@ class ModelTrainer:
         """
         images = _list_images(baseline_dir)
 
+        if len(images) < 5:
+            raise ValueError(
+                f"基线图片太少，无法拆分训练/验证集: {len(images)} 张 (至少需要 5 张)"
+            )
+
         rng = random.Random(seed)
         shuffled = list(images)
         rng.shuffle(shuffled)
 
-        split_idx = int(len(shuffled) * 0.8)
+        split_idx = max(2, int(len(shuffled) * 0.8))  # train 至少 2 张
         train_images = shuffled[:split_idx]
-        val_images = shuffled[split_idx:]
+        val_images = shuffled[split_idx:] or shuffled[-1:]  # val 至少 1 张
 
         split_dir = output_dir / "_split"
         train_dir = split_dir / "train" / "normal"
@@ -1144,6 +1200,11 @@ class ModelTrainer:
         from anomalib.engine import Engine
         from torchvision.transforms.v2 import Compose, Resize, ToDtype, ToImage
         import torch
+
+        # Free GPU memory used by inference models (YOLO, anomaly detector)
+        # so training has enough VRAM. Models are reloaded after training.
+        if torch.cuda.is_available():
+            self._free_gpu_for_training()
 
         resize_transform = Compose([
             ToImage(),
