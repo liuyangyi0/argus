@@ -500,6 +500,30 @@ class EventCameraConfig(BaseModel):
     )
 
 
+class GigEConfig(BaseModel):
+    """GigE Vision camera-specific parameters."""
+
+    exposure: float = Field(
+        default=0,
+        ge=0,
+        description="Exposure time in microseconds (0 = auto)",
+    )
+    gain: float = Field(
+        default=0,
+        ge=0,
+        description="Gain in dB (0 = auto)",
+    )
+    pixel_format: Literal["Mono8", "BayerBG8", "BayerGB8", "BayerGR8", "BayerRG8"] = Field(
+        default="Mono8",
+        description="SDK pixel format for GigE camera sensor output",
+    )
+    capture_script: str | None = Field(
+        default=None,
+        description="Path to GStreamer capture script for browser preview "
+        "(go2rtc exec source).  If None, preview is disabled for this camera.",
+    )
+
+
 class CameraConfig(BaseModel):
     """Configuration for a single camera."""
 
@@ -514,8 +538,8 @@ class CameraConfig(BaseModel):
                 f"camera_id must contain only letters, digits, hyphens and underscores, got {v!r}"
             )
         return v
-    source: str  # RTSP URL, USB device index, or file path
-    protocol: Literal["rtsp", "usb", "file", "event"] = "rtsp"
+    source: str  # RTSP URL, USB device index, file path, or GigE camera IP
+    protocol: Literal["rtsp", "usb", "file", "event", "gige"] = "rtsp"
     fps_target: int = Field(default=5, ge=1, le=120)
     resolution: tuple[int, int] = (1920, 1080)
     zones: list[ZoneConfig] = Field(default_factory=list)
@@ -533,6 +557,10 @@ class CameraConfig(BaseModel):
     degradation: DegradationConfig = Field(default_factory=DegradationConfig)
     ring_buffer: RingBufferConfig = Field(default_factory=RingBufferConfig)
     low_light: LowLightConfig = Field(default_factory=LowLightConfig)
+    gige: GigEConfig = Field(
+        default_factory=GigEConfig,
+        description="GigE Vision camera parameters (exposure, gain, pixel format, capture script)",
+    )
     event: EventCameraConfig = Field(
         default_factory=EventCameraConfig,
         description="Event camera (neuromorphic) config — reserved interface",

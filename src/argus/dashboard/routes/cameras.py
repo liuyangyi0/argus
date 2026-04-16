@@ -10,8 +10,6 @@ import cv2
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel
-
 from argus.dashboard.api_response import (
     api_conflict,
     api_internal_error,
@@ -101,15 +99,6 @@ def _ensure_go2rtc_stream(request: Request, cam_config) -> None:
     if rtsp_url and original_protocol == "usb":
         cam_config.source = rtsp_url
         cam_config.protocol = "rtsp"
-
-
-class AddCameraRequest(BaseModel):
-    camera_id: str
-    name: str
-    source: str
-    protocol: str = "rtsp"
-    fps_target: int = 5
-    resolution: list[int] = [1920, 1080]
 
 
 _STAGE_IDS = ["capture", "review", "training", "deploy", "inference"]
@@ -238,8 +227,17 @@ async def add_camera(request: Request):
     except (ValueError, IndexError):
         resolution = (1920, 1080)
 
-    # Create camera config
-    from argus.config.schema import CameraConfig
+    # Build GigE config if applicable
+    from argus.config.schema import CameraConfig, GigEConfig
+    gige_kwargs = {}
+    if protocol == "gige":
+        gige_kwargs["gige"] = GigEConfig(
+            exposure=float(form.get("gige_exposure", 0)),
+            gain=float(form.get("gige_gain", 0)),
+            pixel_format=form.get("gige_pixel_format", "Mono8"),
+            capture_script=form.get("gige_capture_script") or None,
+        )
+
     cam_config = CameraConfig(
         camera_id=camera_id,
         name=name,
@@ -247,6 +245,7 @@ async def add_camera(request: Request):
         protocol=protocol,
         fps_target=fps_target,
         resolution=resolution,
+        **gige_kwargs,
     )
 
     config.cameras.append(cam_config)
@@ -320,6 +319,106 @@ async def delete_camera(request: Request, camera_id: str):
 
     logger.info("camera.deleted", camera_id=camera_id)
     return api_success({"camera_id": camera_id, "message": "已删除"})
+
+
+@router.get("/{camera_id}/config")
+async def get_camera_config(request: Request, camera_id: str):
+    """Return the full configuration for a single camera (for edit form)."""
+    cam_config = _find_camera_config(request, camera_id)
+    if cam_config is None:
+        return api_not_found(f"摄像头 {camera_id} 不存在")
+
+    gige = cam_config.gige
+    return api_success({
+        "camera_id": cam_config.camera_id,
+        "name": cam_config.name,
+        "source": cam_config.source,
+        "protocol": cam_config.protocol,
+        "fps_target": cam_config.fps_target,
+        "resolution": list(cam_config.resolution),
+        "gige_exposure": gige.exposure,
+        "gige_gain": gige.gain,
+        "gige_pixel_format": gige.pixel_format,
+        "gige_capture_script": gige.capture_script or "",
+    })
+
+
+@router.put("/{camera_id}")
+async def update_camera(request: Request, camera_id: str):
+    """Update an existing camera's configuration."""
+    camera_manager = request.app.state.camera_manager
+    config = request.app.state.config
+    if not camera_manager or not config:
+        return api_unavailable("不可用")
+
+    cam_config = next((c for c in config.cameras if c.camera_id == camera_id), None)
+    if cam_config is None:
+        return api_not_found(f"摄像头 {camera_id} 不存在")
+
+    form = await parse_request_form(request)
+
+    # Update fields (only if provided)
+    if form.get("name"):
+        cam_config.name = form["name"].strip()
+    if form.get("source"):
+        cam_config.source = form["source"].strip()
+    if form.get("protocol"):
+        cam_config.protocol = form["protocol"]
+    if form.get("fps_target"):
+        cam_config.fps_target = int(form["fps_target"])
+    if form.get("resolution"):
+        try:
+            parts = form["resolution"].split(",")
+            cam_config.resolution = (int(parts[0]), int(parts[1]))
+        except (ValueError, IndexError):
+            pass
+
+    # GigE parameters (protocol already updated above if changed)
+    from argus.config.schema import GigEConfig
+    if cam_config.protocol == "gige":
+        cam_config.gige = GigEConfig(
+            exposure=float(form.get("gige_exposure", cam_config.gige.exposure)),
+            gain=float(form.get("gige_gain", cam_config.gige.gain)),
+            pixel_format=form.get("gige_pixel_format", cam_config.gige.pixel_format),
+            capture_script=form.get("gige_capture_script") or cam_config.gige.capture_script,
+        )
+
+    # Sync the manager's runtime copy under its lock
+    lock = getattr(camera_manager, "_lock", None)
+    if lock:
+        with lock:
+            manager_cam = next(
+                (c for c in getattr(camera_manager, "_cameras", []) if c.camera_id == camera_id),
+                None,
+            )
+            if manager_cam is not None and manager_cam is not cam_config:
+                manager_cam.name = cam_config.name
+                manager_cam.source = cam_config.source
+                manager_cam.protocol = cam_config.protocol
+                manager_cam.fps_target = cam_config.fps_target
+                manager_cam.resolution = cam_config.resolution
+                manager_cam.gige = cam_config.gige
+
+    # Persist
+    config_path = getattr(request.app.state, "config_path", None)
+    if config_path:
+        try:
+            from argus.config.loader import save_config as _save_config
+            _save_config(config, config_path)
+        except Exception:
+            logger.exception("camera.update_save_failed", camera_id=camera_id)
+            return api_internal_error("保存失败")
+
+    # Check if camera is running — changes take effect after restart
+    statuses = camera_manager.get_status() if hasattr(camera_manager, "get_status") else []
+    is_running = any(s.camera_id == camera_id and s.running for s in statuses)
+
+    logger.info("camera.updated", camera_id=camera_id)
+    return api_success({
+        "camera_id": camera_id,
+        "needs_restart": is_running,
+        "message": "配置已更新" + ("，重启摄像头后生效" if is_running else ""),
+    })
 
 
 @router.post("/{camera_id}/start")

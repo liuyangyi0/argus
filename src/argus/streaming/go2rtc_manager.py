@@ -55,6 +55,23 @@ def usb_to_go2rtc_source(device_index: str | int) -> str:
     return f"ffmpeg:device?video={idx}#video=h264"
 
 
+def gige_to_go2rtc_source(script_path: str) -> str:
+    """Convert a GigE camera capture script path to a go2rtc exec source.
+
+    The script captures from the GigE camera (via GStreamer aravissrc or
+    Hikrobot MVS SDK), encodes to H.264, and pushes back to go2rtc via
+    RTSP using the ``{output}`` placeholder URL.
+
+    exec sources with ``{output}`` use go2rtc's RTSP pushback mode:
+    go2rtc passes a temporary RTSP URL as ``$1`` to the script, and the
+    script pushes encoded video back to that URL.
+    """
+    return (
+        f"exec:{script_path} {{output}}"
+        f"#killsignal=sigkill#video=h264#starttimeout=30"
+    )
+
+
 def _find_go2rtc_binary() -> Path | None:
     """Locate the go2rtc binary on the system.
 
@@ -132,8 +149,8 @@ class Go2RTCManager:
     # Config generation
     # ------------------------------------------------------------------
 
-    def _write_config(self, streams: dict[str, str] | None = None) -> Path:
-        """Write a minimal ``go2rtc.yaml`` and return its path."""
+    def _write_config(self, streams: dict[str, str | list[str]] | None = None) -> Path:
+        """Write a minimal ``go2rtc.json`` and return its path."""
         cfg: dict[str, Any] = {
             "api": {
                 "listen": f":{self.api_port}",
@@ -147,7 +164,11 @@ class Go2RTCManager:
             },
         }
         if streams:
-            cfg["streams"] = streams
+            # go2rtc expects stream sources as arrays in JSON config.
+            cfg["streams"] = {
+                k: v if isinstance(v, list) else [v]
+                for k, v in streams.items()
+            }
 
         config_path = self._config_dir / "go2rtc.json"
         config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
@@ -318,6 +339,10 @@ class Go2RTCManager:
             go2rtc_source = source
         elif protocol == "usb":
             go2rtc_source = usb_to_go2rtc_source(source)
+        elif protocol == "gige":
+            # GigE exec sources are pre-registered in the initial config
+            # file (go2rtc rejects exec sources added via REST API).
+            return f"rtsp://127.0.0.1:{self.rtsp_port}/{camera_id}"
         else:
             return None
         try:
@@ -465,17 +490,31 @@ class Go2RTCManager:
 def start_and_register_cameras(manager: Go2RTCManager, cameras: list) -> None:
     """Start go2rtc (if not already running) and register every camera.
 
-    Mutates ``cameras`` in place: for USB cameras, rewrites ``source`` and
-    ``protocol`` so the pipeline reads the RTSP re-stream exposed by go2rtc
-    instead of opening the USB device directly (which would conflict with
-    go2rtc's exclusive hold).
+    Mutates ``cameras`` in place: for USB and GigE cameras, rewrites
+    ``source`` and ``protocol`` so the pipeline reads the RTSP re-stream
+    exposed by go2rtc instead of opening the device directly.
+
+    GigE cameras use go2rtc's ``exec:`` source with RTSP pushback
+    (``{output}`` placeholder).  Because go2rtc rejects exec sources
+    added via REST API, they are included in the initial config file
+    passed to ``manager.start()``.
 
     Idempotent: safe to call multiple times. ``Go2RTCManager.start()``
     short-circuits when the process is already running, and registering a
     stream that already exists is a no-op on the go2rtc side.
     """
+    # Collect GigE exec sources — must be in initial config, not via API.
+    initial_streams: dict[str, str] = {}
+    for cam in cameras:
+        cam_id = getattr(cam, "camera_id", None)
+        protocol = getattr(cam, "protocol", None) or "rtsp"
+        if cam_id and protocol == "gige":
+            script = getattr(getattr(cam, "gige", None), "capture_script", None)
+            if script:
+                initial_streams[cam_id] = gige_to_go2rtc_source(script)
+
     if not manager.running:
-        manager.start()
+        manager.start(initial_streams=initial_streams or None)
 
     for cam in cameras:
         cam_id = getattr(cam, "camera_id", None)
@@ -486,10 +525,17 @@ def start_and_register_cameras(manager: Go2RTCManager, cameras: list) -> None:
         rtsp_url = manager.register_camera(cam_id, source, protocol)
         if rtsp_url and protocol == "usb":
             logger.info(
-                "go2rtc.usb_redirect",
+                "go2rtc.device_redirect",
                 camera_id=cam_id,
+                protocol=protocol,
                 original=source,
                 redirected=rtsp_url,
             )
             cam.source = rtsp_url
             cam.protocol = "rtsp"
+        elif rtsp_url and protocol == "gige":
+            logger.info(
+                "go2rtc.gige_preview_registered",
+                camera_id=cam_id,
+                preview_url=rtsp_url,
+            )
