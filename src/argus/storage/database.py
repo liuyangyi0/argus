@@ -97,7 +97,7 @@ class Database:
             ("training_records", "group_id", "VARCHAR(100)"),
             ("models", "backbone_version_id", "VARCHAR(128)"),
             # Model release pipeline
-            ("models", "stage", "VARCHAR(20) DEFAULT 'production'"),
+            ("models", "stage", "VARCHAR(20) DEFAULT 'candidate'"),
             ("models", "component_type", "VARCHAR(20) DEFAULT 'full'"),
             ("models", "model_path", "VARCHAR(500)"),
             ("models", "canary_camera_id", "VARCHAR(50)"),
@@ -130,6 +130,12 @@ class Database:
             ("alerts", "segmentation_count", "INTEGER"),
             ("alerts", "segmentation_total_area_px", "INTEGER"),
             ("alerts", "segmentation_objects", "TEXT"),
+            # Inference record enrichment (deployment stage + zone)
+            ("inference_records", "deployment_stage", "VARCHAR(20)"),
+            ("inference_records", "zone_id", "VARCHAR(50) DEFAULT 'default' NOT NULL"),
+            # Baseline version enrichment (secondary verifier + group)
+            ("baseline_versions", "verified_by_secondary", "VARCHAR(100)"),
+            ("baseline_versions", "group_id", "VARCHAR(100)"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:

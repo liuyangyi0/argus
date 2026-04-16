@@ -71,6 +71,65 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
     )
 
 
+class ZoneBulkItem(BaseModel):
+    zone_id: str
+    zone_type: str = "include"
+    vertices: list[dict]
+    priority: str = "standard"
+    anomaly_threshold: float = 0.7
+
+
+@router.put("/{camera_id}")
+async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkItem]):
+    """Replace all zones for a camera with the provided list."""
+    from argus.config.schema import ZoneConfig, ZonePriority
+
+    camera_manager = request.app.state.camera_manager
+    if not camera_manager:
+        return JSONResponse({"error": "摄像头管理器不可用"}, status_code=503)
+
+    pipeline = camera_manager._pipelines.get(camera_id)
+    if not pipeline:
+        return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
+
+    priority_map = {
+        "critical": ZonePriority.CRITICAL,
+        "standard": ZonePriority.STANDARD,
+        "low_priority": ZonePriority.LOW_PRIORITY,
+    }
+
+    new_zones = []
+    for item in payload:
+        polygon = [(v.get("x", 0), v.get("y", 0)) for v in item.vertices]
+        new_zones.append(ZoneConfig(
+            zone_id=item.zone_id,
+            name=item.zone_id,
+            polygon=polygon,
+            zone_type=item.zone_type,
+            priority=priority_map.get(item.priority, ZonePriority.STANDARD),
+            anomaly_threshold=item.anomaly_threshold,
+        ))
+
+    pipeline.update_zones(new_zones)
+
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="update_zone",
+            target_type="zone",
+            target_id=camera_id,
+            detail=f"批量更新区域 ({len(new_zones)} 个)",
+            ip_address=client_ip,
+        )
+
+    return JSONResponse(
+        {"status": "ok", "count": len(new_zones)},
+        headers=htmx_toast_headers("区域配置已保存"),
+    )
+
+
 @router.delete("/{camera_id}/{zone_id}")
 async def delete_zone(request: Request, camera_id: str, zone_id: str):
     """Remove a zone from a camera's pipeline."""

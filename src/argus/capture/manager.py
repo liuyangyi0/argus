@@ -399,6 +399,38 @@ class CameraManager:
                 )
         return updated
 
+    def update_cross_camera_pairs(
+        self,
+        pairs: list[CameraOverlapPair],
+        corroboration_threshold: float | None = None,
+    ) -> bool:
+        """Hot-update cross-camera correlation pairs at runtime.
+
+        If the correlator already exists, delegates to its ``update_pairs``
+        method. If no correlator is present but pairs are supplied, creates
+        a new one. Returns True when the correlator was updated or created.
+        """
+        try:
+            if self._correlator is not None:
+                self._correlator.update_pairs(pairs, corroboration_threshold)
+                return True
+            if pairs:
+                self._correlator = CrossCameraCorrelator(
+                    pairs=pairs,
+                    corroboration_threshold=corroboration_threshold or 0.3,
+                )
+                logger.info(
+                    "manager.cross_camera_created_runtime",
+                    pairs=len(pairs),
+                )
+                return True
+            return False
+        except Exception:
+            logger.warning(
+                "manager.cross_camera_pairs_push_failed", exc_info=True,
+            )
+            return False
+
     def update_classifier_vocabulary(self, vocabulary: list[str]) -> int:
         """Hot-swap the classifier vocabulary on every live pipeline.
 

@@ -89,6 +89,16 @@ export interface CrossCameraConfigPayload {
 export const getCrossCameraConfig = () =>
   api.get<ApiResponse<CrossCameraConfigPayload>>('/config/cross-camera').then(unwrap)
 
+export interface CrossCameraUpdatePayload {
+  overlap_pairs?: CrossCameraOverlapPair[]
+  corroboration_threshold?: number
+  max_age_seconds?: number
+  uncorroborated_severity_downgrade?: number
+}
+
+export const updateCrossCameraConfig = (payload: CrossCameraUpdatePayload) =>
+  api.put('/config/cross-camera/pairs', payload).then(u)
+
 export interface SegmenterParamsUpdate {
   max_points?: number
   min_anomaly_score?: number
