@@ -139,6 +139,9 @@ class Database:
             ("alerts", "segmentation_count", "INTEGER"),
             ("alerts", "segmentation_total_area_px", "INTEGER"),
             ("alerts", "segmentation_objects", "TEXT"),
+            ("alerts", "category", "VARCHAR(30)"),
+            ("alerts", "severity_adjusted_by_classifier", "BOOLEAN"),
+            ("alerts", "trajectory_points", "TEXT"),
             # Inference record enrichment (deployment stage + zone)
             ("inference_records", "deployment_stage", "VARCHAR(20)"),
             ("inference_records", "zone_id", "VARCHAR(50) DEFAULT 'default' NOT NULL"),
@@ -207,6 +210,9 @@ class Database:
         segmentation_count: int | None = None,
         segmentation_total_area_px: int | None = None,
         segmentation_objects: list[dict] | None = None,
+        category: str | None = None,
+        severity_adjusted_by_classifier: bool | None = None,
+        trajectory_points: str | None = None,
         _max_retries: int = 3,
     ) -> AlertRecord:
         """Save an alert to the database with retry on transient failures.
@@ -261,6 +267,9 @@ class Database:
                         segmentation_count=segmentation_count,
                         segmentation_total_area_px=segmentation_total_area_px,
                         segmentation_objects=seg_objects_json,
+                        category=category,
+                        severity_adjusted_by_classifier=severity_adjusted_by_classifier,
+                        trajectory_points=trajectory_points,
                     )
                     session.add(record)
                     session.commit()

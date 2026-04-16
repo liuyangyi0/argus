@@ -11,6 +11,7 @@ import ModuleTogglePanel from '../components/system/ModuleTogglePanel.vue'
 import ClassifierPanel from '../components/system/ClassifierPanel.vue'
 import SegmenterPanel from '../components/system/SegmenterPanel.vue'
 import CrossCameraPanel from '../components/system/CrossCameraPanel.vue'
+import ImagingPanel from '../components/system/ImagingPanel.vue'
 
 const activeTab = ref('overview')
 
@@ -56,6 +57,11 @@ function onTabChange(key: string | number) {
       <!-- SAM2 Segmenter -->
       <Tabs.TabPane key="segmenter" tab="分割器">
         <SegmenterPanel v-if="activeTab === 'segmenter'" />
+      </Tabs.TabPane>
+
+      <!-- Multi-modal Imaging -->
+      <Tabs.TabPane key="imaging" tab="多模态成像">
+        <ImagingPanel v-if="activeTab === 'imaging'" />
       </Tabs.TabPane>
 
       <!-- Cross-Camera Correlation -->
