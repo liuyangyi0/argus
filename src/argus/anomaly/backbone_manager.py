@@ -60,12 +60,16 @@ class BackboneManager:
                 version=backbone_version,
             )
 
+            device = "cuda" if torch.cuda.is_available() else "cpu"
             if backbone_path.suffix in (".bin", ".pt", ".pth"):
-                backbone = torch.load(backbone_path, map_location="cpu", weights_only=False)
+                backbone = torch.load(backbone_path, map_location=device, weights_only=False)
             else:
+                # torch.hub.load always loads to CPU; move after
                 backbone = torch.hub.load(
                     "facebookresearch/dinov2", backbone_version.split("-")[0],
                 )
+                backbone = backbone.to(device)
+            backbone.eval()
 
             with self._lock:
                 self._backbone = backbone
@@ -73,7 +77,7 @@ class BackboneManager:
                 self._backbone_path = backbone_path
                 self._loaded = True
 
-            logger.info("backbone_manager.loaded", version=backbone_version)
+            logger.info("backbone_manager.loaded", version=backbone_version, device=device)
             return True
 
         except Exception as e:
@@ -164,6 +168,9 @@ class HeadDetector:
             head_weights = torch.load(
                 self._head_path, map_location="cpu", weights_only=False,
             )
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if hasattr(head_weights, "to") and hasattr(head_weights, "eval"):
+                head_weights = head_weights.to(device).eval()
 
             with self._lock:
                 self._head = head_weights
@@ -173,6 +180,7 @@ class HeadDetector:
                 "head_detector.loaded",
                 camera_id=self._camera_id,
                 path=str(self._head_path),
+                device=device,
             )
             return True
 

@@ -65,9 +65,17 @@ class OpenVocabClassifier:
             from ultralytics import YOLOWorld
 
             self._model = YOLOWorld(self._model_name)
+            device = "cpu"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self._model.to("cuda:0")
+                    device = "cuda:0"
+            except ImportError:
+                pass
             self._model.set_classes(self._vocabulary)
             self._loaded = True
-            logger.info("classifier.loaded", model=self._model_name, vocab_size=len(self._vocabulary))
+            logger.info("classifier.loaded", model=self._model_name, vocab_size=len(self._vocabulary), device=device)
         except ImportError:
             logger.warning("classifier.yoloworld_not_available", msg="ultralytics YOLOWorld not found")
         except Exception as e:

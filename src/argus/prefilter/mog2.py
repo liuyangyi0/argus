@@ -51,38 +51,69 @@ class MOG2PreFilter:
         self.denoise = denoise
         self.enable_stabilization = enable_stabilization
 
-        self._subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=history,
-            varThreshold=var_threshold,
-            detectShadows=detect_shadows,
-        )
+        # Use CUDA MOG2 when available (requires OpenCV compiled with CUDA)
+        self._use_cuda_mog2 = False
+        try:
+            if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                self._subtractor = cv2.cuda.createBackgroundSubtractorMOG2(
+                    history=history,
+                    varThreshold=var_threshold,
+                    detectShadows=detect_shadows,
+                )
+                self._use_cuda_mog2 = True
+                logger.info("mog2.cuda_enabled")
+        except Exception:
+            pass
+
+        if not self._use_cuda_mog2:
+            self._subtractor = cv2.createBackgroundSubtractorMOG2(
+                history=history,
+                varThreshold=var_threshold,
+                detectShadows=detect_shadows,
+            )
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+        # Reusable GpuMat to avoid per-frame allocation overhead
+        self._gpu_frame: object | None = None
+        if self._use_cuda_mog2:
+            self._gpu_frame = cv2.cuda_GpuMat()
 
         # Phase correlation stabilization state
         self._prev_gray: np.ndarray | None = None
-        # Hanning window is pre-computed once and reused for phaseCorrelate
         self._hanning: np.ndarray | None = None
+
+    # Target width for the downscaled phase-correlation input.
+    # FFT cost is O(N·log N); shrinking from 1280x720 to 320x180 is ~16x
+    # faster (~2ms vs 32ms) while retaining sub-pixel vibration detection.
+    _ALIGN_WIDTH = 320
 
     def _align_frame(self, frame: np.ndarray) -> np.ndarray:
         """Compensate camera micro-vibration using phase correlation.
 
         Computes sub-pixel translation between consecutive frames in the
-        frequency domain (FFT). Only compensates small shifts (<5px) that
-        indicate vibration, not genuine scene motion.
+        frequency domain (FFT).  The correlation is performed on a
+        downscaled copy to keep latency under 3ms even at high resolution;
+        the resulting shift is scaled back to original coordinates.
 
-        Args:
-            frame: BGR image from camera.
-
-        Returns:
-            Stabilized frame (or original if stabilization is skipped).
+        Only compensates small shifts (<5px) that indicate vibration,
+        not genuine scene motion.
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = np.float64(gray)
+        h, w = frame.shape[:2]
 
-        # Lazy-init Hanning window (must match frame dimensions)
+        # Resize BEFORE cvtColor — processes 16x fewer pixels for gray conversion
+        if w > self._ALIGN_WIDTH:
+            scale = self._ALIGN_WIDTH / w
+            small_h = int(h * scale)
+            small = cv2.resize(frame, (self._ALIGN_WIDTH, small_h),
+                               interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        else:
+            scale = 1.0
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
         if self._hanning is None or self._hanning.shape != gray.shape:
             self._hanning = cv2.createHanningWindow(
-                (gray.shape[1], gray.shape[0]), cv2.CV_64F,
+                (gray.shape[1], gray.shape[0]), cv2.CV_32F,
             )
 
         if self._prev_gray is None:
@@ -95,18 +126,18 @@ class MOG2PreFilter:
 
         self._prev_gray = gray
 
-        # MED-02: Validate phase correlation result (can return NaN/Inf on edge cases)
         if not (np.isfinite(dx) and np.isfinite(dy)):
-            # Reset _prev_gray so the next frame re-initializes cleanly
-            # instead of using stale reference that produced invalid correlation
             self._prev_gray = None
             return frame
 
-        # Only compensate small vibration; large shifts are real motion
+        # Scale shift back to original resolution
+        dx /= scale
+        dy /= scale
+
         if abs(dx) < 5.0 and abs(dy) < 5.0 and (abs(dx) > 0.3 or abs(dy) > 0.3):
             M = np.float64([[1, 0, -dx], [0, 1, -dy]])
             frame = cv2.warpAffine(
-                frame, M, (frame.shape[1], frame.shape[0]),
+                frame, M, (w, h),
                 borderMode=cv2.BORDER_REPLICATE,
             )
             logger.debug(
@@ -139,7 +170,12 @@ class MOG2PreFilter:
             frame = cv2.medianBlur(frame, 3)
 
         lr = learning_rate_override if learning_rate_override is not None else self.learning_rate
-        fg_mask = self._subtractor.apply(frame, learningRate=lr)
+        if self._use_cuda_mog2:
+            self._gpu_frame.upload(frame)
+            gpu_fg = self._subtractor.apply(self._gpu_frame, learningRate=lr)
+            fg_mask = gpu_fg.download()
+        else:
+            fg_mask = self._subtractor.apply(frame, learningRate=lr)
 
         # Shadow pixels are marked as 127 by MOG2; treat only 255 as foreground
         binary_mask = (fg_mask == 255).astype(np.uint8) * 255
@@ -192,8 +228,14 @@ class MOG2PreFilter:
 
     def reset(self) -> None:
         """Reset the background model (e.g., after baseline update)."""
-        self._subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=self._subtractor.getHistory(),
-            varThreshold=self._subtractor.getVarThreshold(),
-            detectShadows=self._subtractor.getDetectShadows(),
-        )
+        h = self._subtractor.getHistory()
+        vt = self._subtractor.getVarThreshold()
+        ds = self._subtractor.getDetectShadows()
+        if self._use_cuda_mog2:
+            self._subtractor = cv2.cuda.createBackgroundSubtractorMOG2(
+                history=h, varThreshold=vt, detectShadows=ds,
+            )
+        else:
+            self._subtractor = cv2.createBackgroundSubtractorMOG2(
+                history=h, varThreshold=vt, detectShadows=ds,
+            )

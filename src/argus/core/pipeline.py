@@ -42,7 +42,7 @@ def _get_default_inference_executor() -> ThreadPoolExecutor:
         with _DEFAULT_EXECUTOR_LOCK:
             if _DEFAULT_INFERENCE_EXECUTOR is None:
                 _DEFAULT_INFERENCE_EXECUTOR = ThreadPoolExecutor(
-                    max_workers=2, thread_name_prefix="inference"
+                    max_workers=3, thread_name_prefix="inference"
                 )
     return _DEFAULT_INFERENCE_EXECUTOR
 
@@ -352,14 +352,27 @@ class DetectionPipeline:
         self._prev_brightness: float | None = None
         self._brightness_jump_threshold = ll_cfg.brightness_jump_threshold
 
-        # CLAHE preprocessing for low-light enhancement (<1ms/frame)
+        # CLAHE preprocessing for low-light enhancement
+        # Use CUDA CLAHE when available (13ms CPU → <1ms GPU)
         self._clahe_enabled = ll_cfg.clahe_enabled and ll_cfg.enabled
-        self._clahe: cv2.CLAHE | None = None
+        self._clahe: object | None = None
+        self._clahe_use_cuda = False
         if self._clahe_enabled:
-            self._clahe = cv2.createCLAHE(
-                clipLimit=ll_cfg.clahe_clip_limit,
-                tileGridSize=(ll_cfg.clahe_grid_size, ll_cfg.clahe_grid_size),
-            )
+            try:
+                if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                    self._clahe = cv2.cuda.createCLAHE(
+                        clipLimit=ll_cfg.clahe_clip_limit,
+                        tileGridSize=(ll_cfg.clahe_grid_size, ll_cfg.clahe_grid_size),
+                    )
+                    self._clahe_use_cuda = True
+                    self._clahe_gpu_mat = cv2.cuda_GpuMat()
+            except Exception:
+                pass
+            if self._clahe is None:
+                self._clahe = cv2.createCLAHE(
+                    clipLimit=ll_cfg.clahe_clip_limit,
+                    tileGridSize=(ll_cfg.clahe_grid_size, ll_cfg.clahe_grid_size),
+                )
 
         # Anti-absorption: anomaly region lock with time-based clearing (HIGH-03)
         self._locked = False
@@ -817,6 +830,13 @@ class DetectionPipeline:
         if not self._camera.connect():
             return False
 
+        # For network streams (RTSP/GigE), start a dedicated capture thread
+        # to drain the TCP buffer continuously.  read_latest() then always
+        # returns the most recent frame, preventing slow-motion playback.
+        # File and USB sources don't need this (no network buffer to drain).
+        if self._camera.protocol in ("rtsp", "gige"):
+            self._camera.start_capture_thread()
+
         self._anomaly_detector.load()
 
         # Calibrate raw scores if PostProcessor MinMax is broken
@@ -984,7 +1004,12 @@ class DetectionPipeline:
             # CLAHE low-light enhancement: equalize frame before detection stages
             if is_low_light and self._clahe is not None:
                 lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-                lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
+                if self._clahe_use_cuda:
+                    self._clahe_gpu_mat.upload(lab[:, :, 0])
+                    gpu_result = self._clahe.apply(self._clahe_gpu_mat)
+                    lab[:, :, 0] = gpu_result.download()
+                else:
+                    lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
                 frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         diag.low_light = is_low_light
 
@@ -1126,9 +1151,35 @@ class DetectionPipeline:
                 self._update_lock_state_time(time.monotonic())
                 return None
         else:
-            # Sequential: YOLO first (need masked_frame for person blurring), then anomaly
-            detection_result = self._object_detector.detect(frame)
-            t2_yolo_done = time.monotonic()
+            # Parallel: run YOLO and anomaly concurrently on the original
+            # frame.  If YOLO detects persons AND anomaly fires, re-run
+            # anomaly on the masked frame (rare case, preserves correctness).
+            yolo_future = self._inference_executor.submit(
+                self._object_detector.detect, frame,
+            )
+            anomaly_future = self._inference_executor.submit(
+                self._predict_anomaly, frame,
+            )
+            try:
+                detection_result = yolo_future.result(timeout=30.0)
+                t2_yolo_done = time.monotonic()
+                anomaly_result = anomaly_future.result(timeout=30.0)
+                t3_anomaly_done = time.monotonic()
+            except TimeoutError:
+                self.stats.frames_timeout += 1
+                self._consecutive_timeouts += 1
+                logger.error(
+                    "pipeline.inference_timeout",
+                    camera_id=self.camera_config.camera_id,
+                    consecutive=self._consecutive_timeouts,
+                    msg="Inference future timed out after 30s — skipping frame",
+                )
+                yolo_future.cancel()
+                anomaly_future.cancel()
+                self._update_lock_state_time(time.monotonic())
+                return None
+
+            self._consecutive_timeouts = 0
 
             if not detection_result.filter_available and not self._person_filter_warned:
                 self._person_filter_warned = True
@@ -1138,12 +1189,16 @@ class DetectionPipeline:
                     msg="YOLO person filter unavailable — frames will not be filtered for humans",
                 )
 
-            # When persons found but skip disabled: use masked_frame with persons blurred
-            analysis_frame = (
-                detection_result.masked_frame if detection_result.masked_frame is not None else frame
-            )
-            anomaly_result = self._predict_anomaly(analysis_frame)
-            t3_anomaly_done = time.monotonic()
+            # Re-run anomaly with person-masked frame only when both
+            # persons and anomaly are detected (rare — avoids double cost
+            # in the common case).
+            if (
+                detection_result.has_persons
+                and detection_result.masked_frame is not None
+                and anomaly_result.is_anomalous
+            ):
+                anomaly_result = self._predict_anomaly(detection_result.masked_frame)
+                t3_anomaly_done = time.monotonic()
 
         diag.stages.append(StageResult(
             stage_name="yolo",
@@ -1153,7 +1208,8 @@ class DetectionPipeline:
                 "object_count": len(detection_result.objects),
                 "classes": [o.class_name for o in detection_result.non_person_objects],
                 "track_ids": [o.track_id for o in detection_result.objects if o.track_id is not None],
-                "parallel": skip_on_person,
+                "parallel": True,
+                "mode": "skip_on_person" if skip_on_person else "rerun_masked",
             },
         ))
 
@@ -1751,20 +1807,31 @@ class DetectionPipeline:
                 for o in detection_result.objects
             ]
 
-            frame_snap = FrameSnapshot(
-                timestamp=time.time(),
-                frame_jpeg=compress_frame(
-                    frame, quality=self._ring_buffer_jpeg_quality
-                ),
-                anomaly_score=anomaly_result.anomaly_score,
-                simplex_score=getattr(simplex_result, "max_score", None) if simplex_detected else None,
-                cusum_evidence=rb_cusum,
-                yolo_persons=rb_persons,
-                frame_number=frame_data.frame_number,
-                heatmap_raw=rb_heatmap_raw,
-                yolo_boxes=rb_all_boxes,
-            )
-            self._alert_ring_buffer.append(frame_snap)
+            snap_ts = time.time()
+            snap_score = anomaly_result.anomaly_score
+            snap_simplex = getattr(simplex_result, "max_score", None) if simplex_detected else None
+            snap_frame_num = frame_data.frame_number
+            quality = self._ring_buffer_jpeg_quality
+            rb = self._alert_ring_buffer
+
+            def _encode_and_append() -> None:
+                snap = FrameSnapshot(
+                    timestamp=snap_ts,
+                    frame_jpeg=compress_frame(frame, quality=quality),
+                    anomaly_score=snap_score,
+                    simplex_score=snap_simplex,
+                    cusum_evidence=rb_cusum,
+                    yolo_persons=rb_persons,
+                    frame_number=snap_frame_num,
+                    heatmap_raw=rb_heatmap_raw,
+                    yolo_boxes=rb_all_boxes,
+                )
+                rb.append(snap)
+
+            if alert is not None:
+                _encode_and_append()
+            else:
+                self._inference_executor.submit(_encode_and_append)
         except Exception:
             logger.debug(
                 "pipeline.ring_buffer_append_failed",
@@ -1876,8 +1943,13 @@ class DetectionPipeline:
                 )
 
     def run_once(self) -> Alert | None:
-        """Read one frame from the camera and process it."""
-        frame_data = self._camera.read()
+        """Read one frame from the camera and process it.
+
+        Uses ``read_latest()`` when a capture thread is running to always
+        process the most recent frame (avoids slow-motion from buffer
+        accumulation).
+        """
+        frame_data = self._camera.read_latest()
         if frame_data is None:
             if not self._camera.state.connected:
                 self._camera.request_reconnect()
