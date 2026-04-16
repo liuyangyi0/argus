@@ -977,5 +977,28 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
         return api_validation_error(f"Unknown field: {field} in {section}")
 
     setattr(section_obj, field, req.value)
-    logger.info("config.module_toggled", key=req.key, value=req.value)
-    return api_success({"key": req.key, "value": req.value})
+
+    # Keys that only affect NEW pipelines — running ones need restart.
+    _restart_required_keys = {
+        "classifier.enabled",
+        "segmenter.enabled",
+        "cross_camera.enabled",
+        "physics.speed_enabled",
+        "physics.trajectory_enabled",
+        "physics.localization_enabled",
+        "imaging.enabled",
+        "low_light.enabled",
+    }
+    restart_required = req.key in _restart_required_keys
+
+    logger.info(
+        "config.module_toggled",
+        key=req.key,
+        value=req.value,
+        restart_required=restart_required,
+    )
+    return api_success({
+        "key": req.key,
+        "value": req.value,
+        "restart_required": restart_required,
+    })
