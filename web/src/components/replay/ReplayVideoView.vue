@@ -55,7 +55,10 @@ function onTimeUpdate() {
     Math.floor(ctrl.videoEl.value.currentTime * ctrl.fps.value),
     (ctrl.metadata.value?.frame_count || 1) - 1,
   )
-  if (idx !== ctrl.currentIndex.value) ctrl.currentIndex.value = idx
+  if (idx !== ctrl.currentIndex.value) {
+    ctrl.currentIndex.value = idx
+    ctrl.heatmapIndex.value = idx
+  }
 }
 
 function onVideoPlay() {
@@ -115,9 +118,12 @@ function onVideoError() {
 
     <img
       v-if="ctrl.showHeatmap.value && ctrl.hasHeatmaps.value"
+      v-show="ctrl.heatmapOk.value"
       :src="ctrl.heatmapUrl.value"
       class="replay-heatmap"
       :style="heatmapRect"
+      @load="ctrl.heatmapOk.value = true"
+      @error="ctrl.heatmapOk.value = false"
     />
     
     <!-- YOLO 检测框 (Canvas 60FPS) -->
