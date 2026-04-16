@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { Card, Statistic, Row, Col, Select, Spin, Typography, Empty } from 'ant-design-vue'
+import { Card, Statistic, Row, Col, Select, Spin, Typography, Empty, Button, Radio, message } from 'ant-design-vue'
+import { DownloadOutlined } from '@ant-design/icons-vue'
 import VChart from 'vue-echarts'
-import { getReportStats, getDailyTrend, getSeverityDist, getCameraDist, getFPTrend } from '../api/reports'
+import { getReportStats, getDailyTrend, getSeverityDist, getCameraDist, getFPTrend, downloadComplianceReport } from '../api/reports'
 import { SEVERITY_COLORS } from '../utils/colors'
 
 const loading = ref(true)
@@ -12,6 +13,11 @@ const trendData = ref<any>(null)
 const severityData = ref<any>(null)
 const cameraData = ref<any>(null)
 const fpData = ref<any>(null)
+
+// Compliance report controls
+const complianceDays = ref(30)
+const complianceFormat = ref<'csv' | 'pdf'>('csv')
+const complianceLoading = ref(false)
 
 async function fetchAll() {
   loading.value = true
@@ -30,6 +36,18 @@ async function fetchAll() {
     fpData.value = fp
   } catch { /* interceptor handles */ }
   finally { loading.value = false }
+}
+
+async function handleDownloadCompliance() {
+  complianceLoading.value = true
+  try {
+    await downloadComplianceReport(complianceDays.value, complianceFormat.value)
+    message.success('报告下载已开始')
+  } catch (e: any) {
+    message.error(e.message || '生成合规报告失败')
+  } finally {
+    complianceLoading.value = false
+  }
 }
 
 function handleDaysChange() { fetchAll() }
@@ -119,6 +137,28 @@ const fpOption = computed(() => {
         <Select.Option :value="90">最近 90 天</Select.Option>
       </Select>
     </div>
+
+    <!-- Compliance report download -->
+    <Card size="small" style="margin-bottom: 24px;">
+      <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+        <Typography.Text strong style="color: var(--ink); white-space: nowrap;">生成合规报告</Typography.Text>
+        <Select v-model:value="complianceDays" style="width: 120px" size="small">
+          <Select.Option :value="7">最近 7 天</Select.Option>
+          <Select.Option :value="14">最近 14 天</Select.Option>
+          <Select.Option :value="30">最近 30 天</Select.Option>
+          <Select.Option :value="60">最近 60 天</Select.Option>
+          <Select.Option :value="90">最近 90 天</Select.Option>
+        </Select>
+        <Radio.Group v-model:value="complianceFormat" size="small">
+          <Radio.Button value="csv">CSV</Radio.Button>
+          <Radio.Button value="pdf">PDF</Radio.Button>
+        </Radio.Group>
+        <Button type="primary" size="small" :loading="complianceLoading" @click="handleDownloadCompliance">
+          <template #icon><DownloadOutlined /></template>
+          下载报告
+        </Button>
+      </div>
+    </Card>
 
     <Spin :spinning="loading">
       <!-- Summary stats -->

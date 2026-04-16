@@ -55,6 +55,12 @@ const router = createRouter({
           component: () => import('../views/System.vue'),
           meta: { title: '系统' },
         },
+        {
+          path: 'replay/:alertId',
+          name: 'replay',
+          component: () => import('../views/ReplayView.vue'),
+          meta: { title: '录像回放' },
+        },
       ]
     }
   ],

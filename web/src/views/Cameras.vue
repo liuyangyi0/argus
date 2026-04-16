@@ -29,9 +29,9 @@ watch(() => addForm.value.protocol, async (proto) => {
     usbLoading.value = true
     try {
       const res = await getUsbDevices()
-      usbDevices.value = res
-      if (res.length > 0) {
-        addForm.value.source = String(res[0].index)
+      usbDevices.value = res.devices ?? res
+      if (usbDevices.value.length > 0) {
+        addForm.value.source = String(usbDevices.value[0].index)
       }
     } catch { usbDevices.value = [] }
     finally { usbLoading.value = false }

@@ -242,10 +242,26 @@ class ConnectionManager:
         return len(self._connections)
 
 
-def verify_ws_token(token: str, auth_config: AuthConfig) -> bool:
+def verify_ws_token(token: str, auth_config: AuthConfig, session_secret: str = "") -> bool:
     """Verify a WebSocket authentication token.
 
-    Delegates to the shared verify_token() in auth module.
+    Tries API token first, then session cookie token.
     """
-    from argus.dashboard.auth import verify_token
-    return verify_token(token, auth_config)
+    from argus.dashboard.auth import verify_session_token, verify_token
+
+    # Auth disabled → always allow
+    if not auth_config.enabled:
+        return True
+
+    # Try API token (X-API-Token style)
+    if verify_token(token, auth_config):
+        return True
+
+    # Try session cookie token (browser users)
+    if session_secret and token:
+        max_age = auth_config.session_timeout_minutes * 60
+        user_info = verify_session_token(token, session_secret, max_age)
+        if user_info is not None:
+            return True
+
+    return False

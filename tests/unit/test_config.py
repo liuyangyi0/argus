@@ -59,10 +59,10 @@ class TestConfigSchema:
         with pytest.raises(ValidationError):
             CameraConfig(camera_id="c1", name="t", source="x", fps_target=0)
 
-    def test_min_consecutive_frames_zero_rejected(self):
-        """min_consecutive_frames of 0 must be rejected."""
+    def test_evidence_threshold_too_low_rejected(self):
+        """evidence_threshold below minimum must be rejected."""
         with pytest.raises(ValidationError):
-            TemporalConfirmation(min_consecutive_frames=0)
+            TemporalConfirmation(evidence_threshold=0.1)
 
     def test_valid_bounds_accepted(self):
         """Valid parameter values within bounds should be accepted."""

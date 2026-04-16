@@ -22,7 +22,7 @@ def make_config(**overrides) -> AlertConfig:
     defaults = {
         "severity_thresholds": SeverityThresholds(info=0.5, low=0.7, medium=0.85, high=0.95),
         "temporal": TemporalConfirmation(
-            min_consecutive_frames=1,
+
             max_gap_seconds=10.0,
             min_spatial_overlap=0.0,
             evidence_lambda=0.80,
