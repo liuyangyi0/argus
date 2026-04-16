@@ -77,6 +77,56 @@ def _is_safe_path(file_path: str, alerts_dir: Path) -> bool:
         return False
 
 
+@router.get("/{alert_id}/detail")
+async def alert_detail(request: Request, alert_id: str):
+    """Get single alert detail as JSON."""
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    alert = db.get_alert(alert_id)
+    if not alert:
+        return api_not_found("告警不存在")
+
+    recording_store: AlertRecordingStore | None = getattr(
+        request.app.state, "recording_store", None,
+    )
+    has_recording = False
+    if recording_store:
+        has_recording = recording_store.has_recording(alert_id)
+    rec_status = "complete" if has_recording else None
+
+    data = {
+        "alert_id": alert.alert_id,
+        "timestamp": alert.timestamp.strftime(_TIMESTAMP_FMT) if alert.timestamp else None,
+        "camera_id": alert.camera_id,
+        "zone_id": getattr(alert, "zone_id", ""),
+        "severity": alert.severity,
+        "anomaly_score": alert.anomaly_score,
+        "acknowledged": alert.acknowledged,
+        "false_positive": alert.false_positive,
+        "has_recording": has_recording,
+        "recording_status": rec_status,
+        "workflow_status": getattr(alert, "workflow_status", "new"),
+        "notes": getattr(alert, "notes", ""),
+        "classification_label": getattr(alert, "classification_label", None),
+        "classification_confidence": getattr(alert, "classification_confidence", None),
+        "corroborated": getattr(alert, "corroborated", None),
+        "correlation_partner": getattr(alert, "correlation_partner", None),
+        "segmentation_count": getattr(alert, "segmentation_count", None),
+        "segmentation_total_area_px": getattr(alert, "segmentation_total_area_px", None),
+        "event_group_id": getattr(alert, "event_group_id", None),
+        "event_group_count": getattr(alert, "event_group_count", None),
+        "snapshot_path": getattr(alert, "snapshot_path", None),
+        "heatmap_path": getattr(alert, "heatmap_path", None),
+        "speed_ms": getattr(alert, "speed_ms", None),
+        "assigned_to": getattr(alert, "assigned_to", None),
+        "resolved_at": getattr(alert, "resolved_at", None),
+    }
+
+    return api_success(data)
+
+
 # ── Image serving (must be before /{alert_id} catch-all) ──
 
 @router.get("/{alert_id}/image/{image_type}")
@@ -700,7 +750,7 @@ async def save_annotations(request: Request, alert_id: str):
     annotations = body.get("annotations", [])
 
     # Store annotations as JSON in alert metadata directory
-    alerts_dir = Path(request.app.state.config.get("alerts_dir", "data/alerts"))
+    alerts_dir = Path(getattr(request.app.state, "alerts_dir", "data/alerts"))
     anno_path = alerts_dir / alert_id / "annotations.json"
     anno_path.parent.mkdir(parents=True, exist_ok=True)
 

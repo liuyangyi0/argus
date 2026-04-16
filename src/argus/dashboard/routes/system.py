@@ -117,6 +117,26 @@ async def camera_health(request: Request):
     return api_success({"cameras": result})
 
 
+@router.get("/ensemble")
+async def ensemble_status(request: Request):
+    """Per-camera ensemble detector status."""
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    if not camera_manager:
+        return api_success({"cameras": []})
+
+    def _extract_ensemble(detector):
+        if not hasattr(detector, "get_status"):
+            return None
+        return detector.get_status()
+
+    result = _collect_from_pipelines(
+        camera_manager, "_ensemble_detector", _extract_ensemble,
+        lambda: {"model_count": 0, "loaded": False, "method": "none",
+                 "model_paths": []},
+    )
+    return api_success({"cameras": result})
+
+
 @router.get("/metrics")
 def prometheus_metrics():
     """Prometheus-compatible metrics endpoint for scraping."""

@@ -67,7 +67,7 @@ async def get_active_tracks(request: Request, camera_id: str) -> JSONResponse:
     if pipeline is None:
         return api_success({"camera_id": camera_id, "tracks": []})
 
-    tracker = getattr(pipeline, "_temporal_tracker", None)
+    tracker = getattr(pipeline, "_physics_tracker", None)
     if tracker is None:
         return api_success({"camera_id": camera_id, "tracks": []})
 

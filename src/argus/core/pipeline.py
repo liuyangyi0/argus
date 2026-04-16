@@ -72,7 +72,9 @@ from argus.core.inference_record import (
     InferenceRecord,
     PrefilterDecision,
 )
-from argus.core.model_discovery import find_runtime_model, find_runtime_model_in_dir
+from argus.contracts.validation import validate_anomaly_result
+from argus.core.frame_quality import FrameQualityAssessor, QualityScore
+from argus.core.model_discovery import find_all_models, find_runtime_model, find_runtime_model_in_dir
 from argus.capture.camera import CameraCapture, FrameData
 from argus.config.schema import AlertConfig, CameraConfig, ClassifierConfig, SegmenterConfig, ZonePriority
 from argus.core.zone_mask import ZoneMaskEngine
@@ -296,6 +298,13 @@ class DetectionPipeline:
         else:
             self._anomaly_detector = base_detector
 
+        # Stage 3b: Ensemble detector — multi-model fusion for reduced false positives
+        self._ensemble_detector: object | None = None
+        if camera_config.anomaly.ensemble.enabled:
+            self._ensemble_detector = self._try_create_ensemble(
+                camera_config, model_path,
+            )
+
         # Simplex safety channel (A3): dual-channel architecture
         if camera_config.simplex.enabled:
             from argus.prefilter.simple_detector import SimplexDetector
@@ -455,6 +464,7 @@ class DetectionPipeline:
                 self._classifier_min_score = classifier_config.min_anomaly_score_to_classify
                 self._classifier_high_risk = set(classifier_config.high_risk_labels)
                 self._classifier_low_risk = set(classifier_config.low_risk_labels)
+                self._classifier_suppress = set(getattr(classifier_config, "suppress_labels", []))
                 logger.info(
                     "pipeline.classifier_configured",
                     camera_id=camera_config.camera_id,
@@ -542,6 +552,9 @@ class DetectionPipeline:
                     camera_id=camera_config.camera_id,
                     error=str(e),
                 )
+
+        # Frame quality assessment: reduce false positives from degraded input
+        self._frame_quality_assessor = FrameQualityAssessor()
 
         # Cached postprocessor for physics enrichment (avoid per-frame allocation)
         from argus.core.anomaly_postprocess import AnomalyMapProcessor
@@ -658,6 +671,147 @@ class DetectionPipeline:
                 return versions[-1]
         return None
 
+    def _try_create_ensemble(
+        self,
+        camera_config: CameraConfig,
+        primary_model_path: Path | None,
+    ) -> object | None:
+        """Create a DetectorEnsemble if enough models are available.
+
+        Discovers all model files for this camera, builds EnsembleConfig from
+        the Pydantic config, and loads the ensemble. Falls back to None (single
+        detector) if fewer than 2 models exist or loading fails.
+
+        Safety gate: only models at the "production" stage in the model registry
+        are eligible for the ensemble. If the registry is unavailable (no DB),
+        falls back to filesystem discovery with a warning.
+        """
+        try:
+            from argus.anomaly.ensemble import DetectorEnsemble, EnsembleConfig
+
+            camera_id = camera_config.camera_id
+            all_models = find_all_models(camera_id)
+
+            # Safety gate: filter discovered models to only production-stage models.
+            # This prevents candidate/shadow/canary models from bypassing the
+            # four-stage release pipeline and entering the production ensemble.
+            if self._database is not None:
+                try:
+                    from argus.storage.model_registry import ModelRegistry
+                    registry = ModelRegistry(session_factory=self._database.get_session)
+                    production_records = registry.get_by_stage(camera_id, "production")
+                    production_paths = {
+                        Path(r.model_path).resolve()
+                        for r in production_records
+                        if r.model_path
+                    }
+                    filtered_models = [m for m in all_models if m.resolve() in production_paths]
+                    logger.info(
+                        "pipeline.ensemble_registry_filter",
+                        camera_id=camera_id,
+                        discovered=len(all_models),
+                        production_approved=len(filtered_models),
+                    )
+                    all_models = filtered_models
+                except Exception:
+                    logger.warning(
+                        "pipeline.ensemble_registry_filter_failed",
+                        camera_id=camera_id,
+                        exc_info=True,
+                    )
+                    # Fall through with unfiltered all_models (logged above)
+            else:
+                logger.warning(
+                    "pipeline.ensemble_no_registry",
+                    camera_id=camera_id,
+                    reason="database unavailable; ensemble will include all discovered models "
+                           "regardless of release stage — do not use in production",
+                )
+
+            # Include the primary model path if not already in the list
+            if primary_model_path is not None:
+                resolved_primary = primary_model_path.resolve()
+                if resolved_primary not in {m for m in all_models}:
+                    all_models.insert(0, resolved_primary)
+
+            if len(all_models) < 2:
+                logger.info(
+                    "pipeline.ensemble_skipped",
+                    camera_id=camera_id,
+                    model_count=len(all_models),
+                    reason="fewer than 2 models available",
+                )
+                return None
+
+            ens_cfg = camera_config.anomaly.ensemble
+            ensemble_config = EnsembleConfig(
+                model_paths=[str(p) for p in all_models],
+                method=ens_cfg.method,
+                weights=ens_cfg.weights,
+                image_size=camera_config.anomaly.image_size,
+                threshold=camera_config.anomaly.threshold,
+                bayesian_prior=ens_cfg.bayesian_prior,
+                dynamic_fpr_weighting=ens_cfg.dynamic_fpr_weighting,
+            )
+
+            ensemble = DetectorEnsemble(ensemble_config)
+            if not ensemble.load():
+                logger.warning(
+                    "pipeline.ensemble_load_failed",
+                    camera_id=camera_id,
+                )
+                return None
+
+            if ensemble.model_count < 2:
+                logger.info(
+                    "pipeline.ensemble_skipped",
+                    camera_id=camera_id,
+                    loaded=ensemble.model_count,
+                    reason="fewer than 2 models loaded successfully",
+                )
+                return None
+
+            logger.info(
+                "pipeline.ensemble_active",
+                camera_id=camera_id,
+                model_count=ensemble.model_count,
+                method=ens_cfg.method,
+            )
+            return ensemble
+
+        except Exception:
+            logger.exception(
+                "pipeline.ensemble_creation_failed",
+                camera_id=camera_config.camera_id,
+            )
+            return None
+
+    def _predict_anomaly(self, frame: np.ndarray) -> AnomalyResult:
+        """Run anomaly detection, using ensemble if active, else single detector.
+
+        When the ensemble is active, converts EnsembleResult back to AnomalyResult
+        for downstream compatibility. Falls back to single detector on any error.
+        """
+        if self._ensemble_detector is not None:
+            try:
+                from argus.anomaly.ensemble import DetectorEnsemble
+
+                ensemble: DetectorEnsemble = self._ensemble_detector  # type: ignore[assignment]
+                ensemble_result = ensemble.predict(frame)
+                return AnomalyResult(
+                    anomaly_score=ensemble_result.anomaly_score,
+                    anomaly_map=ensemble_result.anomaly_map,
+                    is_anomalous=ensemble_result.is_anomalous,
+                    threshold=ensemble_result.threshold,
+                )
+            except Exception:
+                logger.warning(
+                    "pipeline.ensemble_predict_fallback",
+                    camera_id=self.camera_config.camera_id,
+                    msg="Ensemble predict failed — falling back to single detector",
+                )
+        return self._anomaly_detector.predict(frame)
+
     def initialize(self) -> bool:
         """Initialize all pipeline components. Returns True on success."""
         if not self._camera.connect():
@@ -684,10 +838,16 @@ class DetectionPipeline:
             duration_seconds=round(duration, 1),
         )
 
+        ensemble_active = self._ensemble_detector is not None
         logger.info(
             "pipeline.initialized",
             camera_id=self.camera_config.camera_id,
             anomaly_model_loaded=self._anomaly_detector.is_loaded,
+            ensemble_active=ensemble_active,
+            ensemble_models=(
+                self._ensemble_detector.model_count
+                if ensemble_active else 0
+            ),
             zones=len(self.camera_config.zones),
             heartbeat_interval=self._heartbeat_seconds,
         )
@@ -879,6 +1039,19 @@ class DetectionPipeline:
             if is_heartbeat:
                 self.stats.frames_heartbeat += 1
 
+        # Frame quality assessment: pre-compute confidence multiplier
+        # to reduce false positives from blurry, dark, or noisy frames.
+        try:
+            quality_score = self._frame_quality_assessor.assess(frame)
+            quality_multiplier = self._frame_quality_assessor.confidence_multiplier(quality_score)
+        except Exception:
+            logger.debug(
+                "pipeline.frame_quality_failed",
+                camera_id=frame_data.camera_id,
+                exc_info=True,
+            )
+            quality_multiplier = 1.0
+
         # Stage 2+3: YOLO person filter + Anomaly detection
         # When skip_frame_on_person=True (nuclear plant default), run both in
         # parallel via ThreadPoolExecutor to overlap YOLO 15-30ms with Anomalib.
@@ -896,7 +1069,7 @@ class DetectionPipeline:
                 self._object_detector.detect, frame,
             )
             anomaly_future: Future = self._inference_executor.submit(
-                self._anomaly_detector.predict, frame,
+                self._predict_anomaly, frame,
             )
             try:
                 detection_result: ObjectDetectionResult = yolo_future.result(timeout=30.0)
@@ -969,7 +1142,7 @@ class DetectionPipeline:
             analysis_frame = (
                 detection_result.masked_frame if detection_result.masked_frame is not None else frame
             )
-            anomaly_result = self._anomaly_detector.predict(analysis_frame)
+            anomaly_result = self._predict_anomaly(analysis_frame)
             t3_anomaly_done = time.monotonic()
 
         diag.stages.append(StageResult(
@@ -992,6 +1165,36 @@ class DetectionPipeline:
         ))
         diag.anomaly_score = anomaly_result.anomaly_score
         diag.is_anomalous = anomaly_result.is_anomalous
+
+        # Apply frame quality confidence multiplier to anomaly score.
+        # Poor quality frames (blur, low exposure) get a reduced score
+        # to cut false positives from degraded input.
+        if quality_multiplier < 1.0:
+            adjusted_score = anomaly_result.anomaly_score * quality_multiplier
+            anomaly_result = AnomalyResult(
+                anomaly_score=adjusted_score,
+                anomaly_map=anomaly_result.anomaly_map,
+                is_anomalous=adjusted_score >= anomaly_result.threshold,
+                threshold=anomaly_result.threshold,
+                detection_failed=anomaly_result.detection_failed,
+                raw_score=anomaly_result.raw_score,
+            )
+            diag.anomaly_score = adjusted_score
+            diag.is_anomalous = anomaly_result.is_anomalous
+            logger.debug(
+                "pipeline.quality_adjusted",
+                camera_id=frame_data.camera_id,
+                multiplier=round(quality_multiplier, 3),
+                original=round(anomaly_result.anomaly_score / quality_multiplier, 4)
+                if quality_multiplier > 0 else 0,
+                adjusted=round(adjusted_score, 4),
+            )
+
+        # Data contract validation at detector→grader boundary (advisory only)
+        try:
+            validate_anomaly_result(anomaly_result)
+        except Exception:
+            logger.debug("pipeline.contract_validation_failed", exc_info=True)
 
         # Feed anomaly score to drift detector
         if self._drift_detector is not None:
@@ -1184,6 +1387,17 @@ class DetectionPipeline:
                     error=str(e),
                     error_type=type(e).__name__,
                 )
+
+        # Suppress alert if classifier label matches suppress_labels
+        if classification_result is not None:
+            label, _conf = classification_result
+            if hasattr(self, "_classifier_suppress") and label in self._classifier_suppress:
+                logger.info(
+                    "pipeline.classifier_label_suppressed",
+                    camera_id=frame_data.camera_id,
+                    label=label,
+                )
+                return None
 
         # Multi-zone alert grading with semantic context
         alert = self._evaluate_zones(

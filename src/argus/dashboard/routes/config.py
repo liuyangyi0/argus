@@ -10,7 +10,6 @@ from pathlib import Path
 
 import structlog
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from argus.core.model_discovery import resolve_runtime_model_path
@@ -69,8 +68,6 @@ async def update_detection_params(request: Request):
 
     # Update temporal
     temp = config.alerts.temporal
-    if form.get("temp_frames"):
-        temp.min_consecutive_frames = int(form["temp_frames"])
     if form.get("temp_gap"):
         temp.max_gap_seconds = float(form["temp_gap"])
     if form.get("temp_overlap"):
@@ -302,10 +299,7 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
             target_id=camera_id,
             ip_address=client_ip,
         )
-    return HTMLResponse(
-        '<span style="color:#4caf50;">锁定已解除</span>',
-        headers=htmx_toast_headers("异常锁定已解除"),
-    )
+    return api_success({"camera_id": camera_id, "lock_cleared": True})
 
 
 @router.post("/camera/{camera_id}/restart")

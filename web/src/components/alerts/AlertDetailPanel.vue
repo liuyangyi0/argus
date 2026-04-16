@@ -10,7 +10,9 @@ import {
   StopOutlined,
   ExportOutlined,
   DeleteOutlined,
+  PlayCircleOutlined,
 } from '@ant-design/icons-vue'
+import { useRouter } from 'vue-router'
 import { useAlertStore } from '../../stores/useAlertStore'
 import { scoreColor } from '../../utils/colors'
 import ReplayPlayer from '../ReplayPlayer.vue'
@@ -23,6 +25,7 @@ const emit = defineEmits<{
   (e: 'close'): void
 }>()
 
+const router = useRouter()
 const store = useAlertStore()
 const { selectedAlert } = storeToRefs(store)
 
@@ -130,6 +133,17 @@ function handleDelete() {
         >
           {{ workflowLabel[selectedAlert.workflow_status] || '待处理' }}
         </Tag>
+        <Tooltip v-if="selectedAlert.has_recording" title="在独立页面查看录像回放">
+          <Button
+            size="small"
+            type="text"
+            style="color: var(--argus-text-muted)"
+            @click="router.push(`/replay/${selectedAlert.alert_id}`)"
+          >
+            <template #icon><PlayCircleOutlined /></template>
+            查看录像
+          </Button>
+        </Tooltip>
         <Tooltip title="导出证据包">
           <Button size="small" type="text" style="color: var(--argus-text-muted)">
             <template #icon><ExportOutlined /></template>
