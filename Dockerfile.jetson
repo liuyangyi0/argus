@@ -1,0 +1,174 @@
+# Argus - Jetson Orin NX Deployment Image
+# Based on NVIDIA L4T with CUDA support
+# Builds Python 3.11 + PyTorch from source for CUDA 11.4
+
+FROM nvcr.io/nvidia/l4t-base:r35.2.1 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build tools and dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    wget \
+    pkg-config \
+    zlib1g-dev \
+    libffi-dev \
+    libssl-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    liblzma-dev \
+    libncurses5-dev \
+    libgdbm-dev \
+    libnss3-dev \
+    libopenblas-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxrender1 \
+    libxext6 \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libv4l-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build Python 3.11 from source
+RUN wget -q https://www.python.org/ftp/python/3.11.9/Python-3.11.9.tgz \
+    && tar xzf Python-3.11.9.tgz \
+    && cd Python-3.11.9 \
+    && ./configure --enable-optimizations --with-lto --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install \
+    && cd / && rm -rf Python-3.11.9*
+
+RUN python3.11 --version && pip3.11 install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install CUDA toolkit for PyTorch compilation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cuda-cudart-dev-11-4 \
+    cuda-nvcc-11-4 \
+    cuda-nvrtc-dev-11-4 \
+    cuda-libraries-dev-11-4 \
+    libcudnn8 \
+    libcudnn8-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/usr/local/cuda-11.4/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda-11.4/lib64:/usr/lib/aarch64-linux-gnu/tegra:${LD_LIBRARY_PATH}"
+ENV CUDA_HOME="/usr/local/cuda-11.4"
+
+# Build PyTorch from source
+RUN pip3.11 install --no-cache-dir numpy pyyaml typing_extensions
+
+RUN git clone --recursive --depth 1 --branch v2.1.0 https://github.com/pytorch/pytorch /opt/pytorch
+
+WORKDIR /opt/pytorch
+
+ENV MAX_JOBS=2
+ENV TORCH_CUDA_ARCH_LIST="8.7"
+ENV USE_NCCL=0
+ENV USE_DISTRIBUTED=0
+ENV USE_FLASH_ATTENTION=0
+ENV USE_MKLDNN=0
+ENV BUILD_TEST=0
+ENV PYTORCH_BUILD_VERSION=2.1.0
+ENV PYTORCH_BUILD_NUMBER=1
+
+RUN pip3.11 install -r requirements.txt \
+    && python3.11 setup.py bdist_wheel \
+    && pip3.11 install dist/torch-*.whl
+
+# Build torchvision
+RUN git clone --depth 1 --branch v0.16.0 https://github.com/pytorch/vision /opt/vision \
+    && cd /opt/vision \
+    && python3.11 setup.py bdist_wheel \
+    && pip3.11 install dist/torchvision-*.whl
+
+# Save wheels for extraction
+RUN mkdir -p /wheels \
+    && cp /opt/pytorch/dist/torch-*.whl /wheels/ \
+    && cp /opt/vision/dist/torchvision-*.whl /wheels/
+
+# ========== Runtime stage ==========
+FROM nvcr.io/nvidia/l4t-base:r35.2.1 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime deps (no Python 3.11 from PPA - copy from builder)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenblas0 \
+    libjpeg8 \
+    libpng16-16 \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxrender1 \
+    libxext6 \
+    libavcodec58 \
+    libavformat58 \
+    libswscale5 \
+    libv4l-0 \
+    v4l-utils \
+    wget \
+    libcudnn8 \
+    libffi7 \
+    libssl1.1 \
+    libbz2-1.0 \
+    libreadline8 \
+    libsqlite3-0 \
+    liblzma5 \
+    libncurses5 \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Python 3.11 from builder
+COPY --from=builder /usr/local/bin/python3.11 /usr/local/bin/python3.11
+COPY --from=builder /usr/local/bin/pip3.11 /usr/local/bin/pip3.11
+COPY --from=builder /usr/local/lib/python3.11/ /usr/local/lib/python3.11/
+COPY --from=builder /usr/local/include/python3.11/ /usr/local/include/python3.11/
+RUN ln -sf /usr/local/bin/python3.11 /usr/local/bin/python3 \
+    && ldconfig
+
+ENV PATH="/usr/local/cuda/bin:/usr/local/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/tegra:${LD_LIBRARY_PATH}"
+
+# Install PyTorch wheels from builder
+COPY --from=builder /wheels/ /tmp/wheels/
+RUN pip3.11 install --no-cache-dir /tmp/wheels/*.whl && rm -rf /tmp/wheels
+
+# Install Node.js 18 for frontend build
+RUN wget -qO /tmp/node18.tar.xz https://nodejs.org/dist/v18.20.4/node-v18.20.4-linux-arm64.tar.xz \
+    && tar -xJf /tmp/node18.tar.xz -C /usr/local --strip-components=1 \
+    && rm /tmp/node18.tar.xz
+
+WORKDIR /app
+
+# Copy project and install dependencies
+COPY pyproject.toml .
+COPY src/ src/
+RUN pip3.11 install --no-cache-dir -e "."
+
+# Build frontend
+COPY web/ web/
+RUN cd web && npm install && npm run build
+
+# Download go2rtc for aarch64
+RUN wget -qO /usr/local/bin/go2rtc \
+    https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_arm64 \
+    && chmod +x /usr/local/bin/go2rtc
+
+# Copy configs and data dirs
+COPY configs/ configs/
+COPY yolo11n.pt .
+RUN mkdir -p data/baselines data/models data/exports data/db data/alerts data/logs data/recordings data/backbones data/foe_objects data/model_packages data/inference_records data/validation
+
+EXPOSE 8080 1984 8554
+
+ENTRYPOINT ["python3.11", "-m", "argus"]
+CMD ["--config", "configs/default.yaml"]
