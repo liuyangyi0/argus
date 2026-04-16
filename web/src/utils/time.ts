@@ -30,6 +30,31 @@ export function formatRelativeTime(
 }
 
 /**
+ * Format a timestamp as absolute local time: "HH:mm:ss MM-DD".
+ *
+ * @param ts  ISO string, epoch-seconds number, or undefined
+ */
+export function formatTimestamp(ts: string | number | undefined): string {
+  if (!ts) return '--'
+  const date = typeof ts === 'string' ? new Date(ts) : new Date(ts * 1000)
+  const HH = String(date.getHours()).padStart(2, '0')
+  const mm = String(date.getMinutes()).padStart(2, '0')
+  const ss = String(date.getSeconds()).padStart(2, '0')
+  const MM = String(date.getMonth() + 1).padStart(2, '0')
+  const DD = String(date.getDate()).padStart(2, '0')
+  return `${HH}:${mm}:${ss} ${MM}-${DD}`
+}
+
+/**
+ * Format a seconds count as "mm:ss" for video playback display.
+ */
+export function formatPlaybackTime(seconds: number): string {
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
+
+/**
  * Format an epoch-seconds start time as a duration string (e.g. "3分钟前开始").
  */
 export function formatDuration(startedAt: number): string {
