@@ -5,6 +5,9 @@ import { getUsers as apiGetUsers, createUser as apiCreateUser, deleteUser as api
 
 const users = ref<any[]>([])
 const usersLoading = ref(false)
+const createLoading = ref(false)
+const deleteLoading = ref(false)
+const toggleLoading = ref(false)
 const newUser = ref({ username: '', password: '', role: 'operator', display_name: '' })
 
 async function loadUsers() {
@@ -20,6 +23,7 @@ async function loadUsers() {
 }
 
 async function createUser() {
+  createLoading.value = true
   try {
     await apiCreateUser({
       username: newUser.value.username,
@@ -32,26 +36,34 @@ async function createUser() {
     loadUsers()
   } catch (e: any) {
     message.error(e.response?.data?.error || '创建失败')
+  } finally {
+    createLoading.value = false
   }
 }
 
 async function deleteUser(username: string) {
+  deleteLoading.value = true
   try {
     await apiDeleteUser(username)
     message.success('已删除')
     loadUsers()
   } catch (e: any) {
     message.error('删除失败')
+  } finally {
+    deleteLoading.value = false
   }
 }
 
 async function handleToggleActive(username: string) {
+  toggleLoading.value = true
   try {
     await toggleUserActive(username)
     message.success('状态已更新')
     loadUsers()
   } catch (e: any) {
     message.error('切换状态失败')
+  } finally {
+    toggleLoading.value = false
   }
 }
 
@@ -94,7 +106,7 @@ const roleColors: Record<string, string> = { admin: 'red', engineer: 'purple', o
           <Input v-model:value="newUser.display_name" placeholder="显示名（可选）" />
         </Form.Item>
         <Form.Item>
-          <Button type="primary" html-type="submit">添加</Button>
+          <Button type="primary" html-type="submit" :loading="createLoading">添加</Button>
         </Form.Item>
       </Form>
     </Card>
@@ -125,7 +137,7 @@ const roleColors: Record<string, string> = { admin: 'red', engineer: 'purple', o
           </template>
           <template v-if="column.key === 'action'">
             <Popconfirm title="确定删除此用户？" @confirm="deleteUser(record.username)">
-              <Button size="small" danger>删除</Button>
+              <Button size="small" danger :loading="deleteLoading">删除</Button>
             </Popconfirm>
           </template>
         </template>

@@ -22,7 +22,7 @@ import numpy as np
 import structlog
 
 from argus.alerts.grader import Alert
-from argus.config.schema import AlertConfig
+from argus.config.schema import AlertConfig, AudioAlertConfig
 from argus.core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from argus.storage.database import Database
 
@@ -47,11 +47,13 @@ class AlertDispatcher:
         database: Database,
         alerts_dir: str | Path = "data/alerts",
         on_alert: Callable[[str, dict], None] | None = None,
+        audio_config: AudioAlertConfig | None = None,
     ):
         self._config = config
         self._db = database
         self._alerts_dir = Path(alerts_dir)
         self._on_alert_ws = on_alert
+        self._audio_config = audio_config or AudioAlertConfig()
         self._alerts_dir.mkdir(parents=True, exist_ok=True)
         self._http_client = None
         self._shutdown = threading.Event()
@@ -102,6 +104,12 @@ class AlertDispatcher:
             "zone_id": alert.zone_id,
             "severity": alert.severity.value,
             "anomaly_score": round(alert.anomaly_score, 4),
+            "frame_number": alert.frame_number,
+            "detection_type": alert.detection_type,
+            "detected_objects": alert.detected_objects,
+            "corroborated": alert.corroborated,
+            "handling_policy": alert.handling_policy,
+            "event_group_count": alert.event_group_count,
         }
         if snapshot_path is not None:
             payload["snapshot_path"] = snapshot_path
@@ -109,6 +117,41 @@ class AlertDispatcher:
             payload["heatmap_path"] = heatmap_path
         if evidence_unavailable:
             payload["evidence_unavailable"] = True
+        # Optional fields — only include when set to keep payload lean
+        if alert.correlation_partner is not None:
+            payload["correlation_partner"] = alert.correlation_partner
+        if alert.model_version_id is not None:
+            payload["model_version_id"] = alert.model_version_id
+        if alert.classification_label is not None:
+            payload["classification_label"] = alert.classification_label
+        if alert.classification_confidence is not None:
+            payload["classification_confidence"] = round(alert.classification_confidence, 4)
+        if alert.severity_adjusted_by_classifier:
+            payload["severity_adjusted_by_classifier"] = True
+        if alert.segmentation_count > 0:
+            payload["segmentation_count"] = alert.segmentation_count
+            payload["segmentation_total_area_px"] = alert.segmentation_total_area_px
+            payload["segmentation_objects"] = alert.segmentation_objects
+        if alert.event_group_id is not None:
+            payload["event_group_id"] = alert.event_group_id
+        if alert.speed_ms is not None:
+            payload["speed_ms"] = alert.speed_ms
+        if alert.speed_px_per_sec is not None:
+            payload["speed_px_per_sec"] = alert.speed_px_per_sec
+        if alert.trajectory_model is not None:
+            payload["trajectory_model"] = alert.trajectory_model
+        if alert.origin_x_mm is not None:
+            payload["origin_x_mm"] = alert.origin_x_mm
+        if alert.origin_y_mm is not None:
+            payload["origin_y_mm"] = alert.origin_y_mm
+        if alert.origin_z_mm is not None:
+            payload["origin_z_mm"] = alert.origin_z_mm
+        if alert.landing_x_mm is not None:
+            payload["landing_x_mm"] = alert.landing_x_mm
+        if alert.landing_y_mm is not None:
+            payload["landing_y_mm"] = alert.landing_y_mm
+        if alert.landing_z_mm is not None:
+            payload["landing_z_mm"] = alert.landing_z_mm
         return payload
 
     def dispatch(self, alert: Alert) -> None:
@@ -184,12 +227,18 @@ class AlertDispatcher:
         # Channel 4: Audio alarm via WebSocket
         if self._on_alert_ws:
             try:
-                self._on_alert_ws("audio_alert", {
+                audio_msg = {
                     "type": "audio_alert",
                     "severity": ws_payload["severity"],
                     "alert_id": ws_payload["alert_id"],
                     "camera_id": ws_payload["camera_id"],
-                })
+                }
+                # Look up per-severity audio settings
+                sev_audio = getattr(self._audio_config, alert.severity.value, None)
+                if sev_audio is not None:
+                    audio_msg["sound"] = sev_audio.sound
+                    audio_msg["voice_template"] = sev_audio.voice_template
+                self._on_alert_ws("audio_alert", audio_msg)
             except Exception as e:
                 logger.warning("dispatch.audio_alert_failed", alert_id=alert.alert_id, error=str(e))
 

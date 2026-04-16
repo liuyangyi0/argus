@@ -80,11 +80,16 @@ async function loadConfig() {
 async function toggleModule(mod: ModuleToggle) {
   loading.value = true
   try {
-    await axios.post('/api/config/modules', {
+    const res = await axios.post('/api/config/modules', {
       key: mod.key,
       value: mod.enabled,
     })
-    message.success(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}`)
+    const restart = res.data?.data?.restart_required
+    if (restart) {
+      message.warning(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}（已运行的摄像头管线需要重启才会生效）`)
+    } else {
+      message.success(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}`)
+    }
   } catch {
     mod.enabled = !mod.enabled
     message.error(`${mod.label} 切换失败`)
