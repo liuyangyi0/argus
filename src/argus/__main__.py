@@ -135,7 +135,7 @@ def _log_gpu_environment() -> None:
             logger.info(
                 "env.cuda_available",
                 device=torch.cuda.get_device_name(0),
-                memory_mb=dev.total_mem // (1024 * 1024),
+                memory_mb=getattr(dev, 'total_memory', getattr(dev, 'total_mem', 0)) // (1024 * 1024),
                 cuda_version=torch.version.cuda,
                 torch_version=torch.__version__,
             )

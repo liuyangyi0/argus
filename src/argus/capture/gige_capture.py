@@ -24,7 +24,12 @@ import cv2
 import numpy as np
 import structlog
 
+from typing import TYPE_CHECKING
+
 from argus.capture.camera import CameraState, FrameData
+
+if TYPE_CHECKING:
+    from argus.capture.frame_buffer import LatestFrameBuffer
 
 logger = structlog.get_logger()
 
@@ -157,6 +162,12 @@ class GigECapture:
         # Non-blocking reconnection state
         self._reconnecting = False
         self._reconnect_lock = threading.Lock()
+
+        # Async capture thread buffer (initialised by start_capture_thread)
+        self._frame_buffer: LatestFrameBuffer | None = None
+
+        # Protocol identifier for pipeline dispatch
+        self.protocol: str = "gige"
 
     @property
     def state(self) -> CameraState:
@@ -465,6 +476,85 @@ class GigECapture:
 
     # ------------------------------------------------------------------
     # Cleanup
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Async capture thread (same interface as CameraCapture)
+    # ------------------------------------------------------------------
+
+    def start_capture_thread(self) -> None:
+        """Start a dedicated capture thread for latest-frame buffering."""
+        from argus.capture.frame_buffer import LatestFrameBuffer
+
+        if self._frame_buffer is not None:
+            return
+        self._frame_buffer = LatestFrameBuffer()
+        t = threading.Thread(
+            target=self._capture_loop,
+            name=f"capture-{self.camera_id}",
+            daemon=True,
+        )
+        t.start()
+        logger.info("gige.capture_thread_started", camera_id=self.camera_id)
+
+    def _capture_loop(self) -> None:
+        """Background loop: read frames and store the latest one."""
+        while not self._stop_event.is_set():
+            frame_data = self.read()
+            if frame_data is not None:
+                self._frame_buffer.put(frame_data)
+            else:
+                self._stop_event.wait(0.01)
+
+    def read_latest(self) -> FrameData | None:
+        """Return the most recently captured frame.
+
+        Falls back to ``read()`` if no capture thread is running.
+        """
+        if self._frame_buffer is None:
+            return self.read()
+        return self._frame_buffer.get(timeout=5.0)
+
+    def request_reconnect(self) -> None:
+        """Request a non-blocking reconnection attempt."""
+        with self._reconnect_lock:
+            if self._reconnecting:
+                return
+            self._reconnecting = True
+
+        thread = threading.Thread(
+            target=self._reconnect_background,
+            name=f"reconnect-{self.camera_id}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _reconnect_background(self) -> None:
+        """Background reconnection with exponential backoff."""
+        try:
+            self.release()
+            delay = self.reconnect_delay
+            attempt = 0
+            while not self._stop_event.is_set():
+                if self.max_reconnect_attempts >= 0 and attempt >= self.max_reconnect_attempts:
+                    logger.error("gige.reconnect_exhausted", camera_id=self.camera_id, attempts=attempt)
+                    break
+                attempt += 1
+                self._state.reconnect_count += 1
+                logger.info("gige.reconnecting", camera_id=self.camera_id, attempt=attempt, delay=delay)
+                self._stop_event.wait(delay)
+                if self._stop_event.is_set():
+                    break
+                if self.connect():
+                    logger.info("gige.reconnected", camera_id=self.camera_id, attempts=attempt)
+                    break
+                delay = min(delay * 2, 60.0)
+        finally:
+            with self._reconnect_lock:
+                self._reconnecting = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
     # ------------------------------------------------------------------
 
     def release(self) -> None:
