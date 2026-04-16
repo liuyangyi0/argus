@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
 import { Card, Slider, Select, Statistic, Row, Col, Space, Typography, Spin } from 'ant-design-vue'
+import { use } from 'echarts/core'
+import { BarChart } from 'echarts/charts'
+import { CanvasRenderer } from 'echarts/renderers'
+import { GridComponent, TooltipComponent, MarkLineComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
+
+use([CanvasRenderer, BarChart, GridComponent, TooltipComponent, MarkLineComponent])
 import { getThresholdPreview } from '../../api/models'
 
 const props = defineProps<{ cameras: Array<{ camera_id: string; name?: string }> }>()

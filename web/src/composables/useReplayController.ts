@@ -4,7 +4,6 @@ import {
   getReplayMetadata,
   getReplaySignals,
   getReplayVideoUrl,
-  getReplayHeatmapUrl,
   getReplayReference,
   pinReplayFrame,
 } from '../api'
@@ -26,7 +25,9 @@ export function useReplayController(alertId: string) {
   // overlays
   const showHeatmap = ref(true)
   const showBoxes = ref(false)
-  const heatmapIndex = ref(0) // frozen during play
+  const showTrajectory = ref(false)
+  const showHud = ref(true)
+  const heatmapOpacity = ref(0.4)
 
   // reference frames
   const referenceFrame = ref<string | null>(null)
@@ -41,7 +42,6 @@ export function useReplayController(alertId: string) {
   // computed properties
   const fps = computed(() => metadata.value?.fps || 15)
   const videoUrl = computed(() => getReplayVideoUrl(alertId))
-  const heatmapUrl = computed(() => getReplayHeatmapUrl(alertId, heatmapIndex.value))
   const hasHeatmaps = computed(() => signals.value?.has_heatmaps || false)
 
   const currentTimestamp = computed(() => {
@@ -64,7 +64,6 @@ export function useReplayController(alertId: string) {
       if (metadata.value?.trigger_frame_index !== undefined) {
         pendingSeekIndex.value = metadata.value.trigger_frame_index
         currentIndex.value = metadata.value.trigger_frame_index
-        heatmapIndex.value = metadata.value.trigger_frame_index
       }
       loadReference()
     } catch (e) {
@@ -213,10 +212,10 @@ export function useReplayController(alertId: string) {
   return {
     metadata, signals, currentIndex, playing, speed, loading,
     videoEl, videoError, pendingSeekIndex,
-    showHeatmap, showBoxes, heatmapIndex,
+    showHeatmap, showBoxes, showTrajectory, showHud, heatmapOpacity,
     referenceFrame, referenceDate, loadingRef, selectedRefOption,
     clipStart, clipEnd,
-    fps, videoUrl, heatmapUrl, hasHeatmaps, currentTimestamp,
+    fps, videoUrl, hasHeatmaps, currentTimestamp,
     loadData, togglePlay, stepFrame, seekTo, goToStart, goToEnd,
     handlePinFrame, handleKeydown, onRefOptionChange
   }
