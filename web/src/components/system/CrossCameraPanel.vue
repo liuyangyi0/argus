@@ -15,7 +15,6 @@ import {
   updateCrossCameraConfig,
   toggleModule,
   type CrossCameraConfigPayload,
-  type CrossCameraOverlapPair,
 } from '../../api'
 
 defineOptions({ name: 'CrossCameraPanel' })

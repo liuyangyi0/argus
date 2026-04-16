@@ -383,7 +383,6 @@ class DetectionPipeline:
                     )
                     self._clahe_use_cuda = True
                     self._clahe_gpu_mat = cv2.cuda_GpuMat()
-                    self._clahe_gpu_dst = cv2.cuda_GpuMat()
                     self._clahe_cuda_stream = cv2.cuda.Stream()
             except Exception:
                 pass
@@ -1025,11 +1024,9 @@ class DetectionPipeline:
                 lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
                 if self._clahe_use_cuda:
                     self._clahe_gpu_mat.upload(lab[:, :, 0])
-                    self._clahe.apply(
-                        self._clahe_gpu_mat, self._clahe_gpu_dst,
-                        self._clahe_cuda_stream,
-                    )
-                    lab[:, :, 0] = self._clahe_gpu_dst.download()
+                    gpu_result = self._clahe.apply(self._clahe_gpu_mat, self._clahe_cuda_stream)
+                    self._clahe_cuda_stream.waitForCompletion()
+                    lab[:, :, 0] = gpu_result.download()
                 else:
                     lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
                 frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
