@@ -529,6 +529,38 @@ class ModelTrainer:
             except Exception as e:
                 logger.error("training.model_registry_failed", error=str(e))
 
+        # Conformal calibration (A2-3): run on val set scores if detector available.
+        # Must run before TrainingResult construction so the final status is captured
+        # in the result dataclass instead of a local variable that gets discarded.
+        calibration_status: str | None = "skipped"
+        if detector is not None and val_stats.get("scores"):
+            try:
+                from argus.alerts.calibration import ConformalCalibrator
+
+                cal_scores = np.array(val_stats["scores"])
+                if len(cal_scores) >= 50:
+                    calibrator = ConformalCalibrator()
+                    cal_result = calibrator.calibrate(cal_scores)
+                    cal_path = output_dir / "calibration.json"
+                    calibrator.save(
+                        cal_result, cal_path, sorted_scores=np.sort(cal_scores)
+                    )
+                    logger.info("trainer.calibration_saved", path=str(cal_path))
+                    calibration_status = "ok"
+                else:
+                    logger.warning(
+                        "trainer.calibration_skipped",
+                        reason=f"Not enough scores for calibration ({len(cal_scores)} < 50)",
+                    )
+            except Exception as e:
+                calibration_status = "failed"
+                logger.warning("trainer.calibration_failed", error=str(e))
+
+        # Strip raw scores from val_stats to avoid bloating DB/JSON storage.
+        # Percentile statistics are already computed and sufficient for reporting.
+        if val_stats.get("scores"):
+            del val_stats["scores"]
+
         duration = time.monotonic() - start
         result = TrainingResult(
             status=TrainingStatus.COMPLETE,
@@ -558,36 +590,6 @@ class ModelTrainer:
             quality_grade=quality_report.grade,
             threshold=round(threshold_recommended, 3),
         )
-
-        # Conformal calibration (A2-3): run on val set scores if detector available
-        calibration_status = "skipped"
-        if detector is not None and val_stats.get("scores"):
-            try:
-                from argus.alerts.calibration import ConformalCalibrator
-
-                cal_scores = np.array(val_stats["scores"])
-                if len(cal_scores) >= 50:
-                    calibrator = ConformalCalibrator()
-                    cal_result = calibrator.calibrate(cal_scores)
-                    cal_path = output_dir / "calibration.json"
-                    calibrator.save(
-                        cal_result, cal_path, sorted_scores=np.sort(cal_scores)
-                    )
-                    logger.info("trainer.calibration_saved", path=str(cal_path))
-                    calibration_status = "ok"
-                else:
-                    logger.warning(
-                        "trainer.calibration_skipped",
-                        reason=f"Not enough scores for calibration ({len(cal_scores)} < 50)",
-                    )
-            except Exception as e:
-                calibration_status = "failed"
-                logger.warning("trainer.calibration_failed", error=str(e))
-
-        # Strip raw scores from val_stats to avoid bloating DB/JSON storage.
-        # Percentile statistics are already computed and sufficient for reporting.
-        if val_stats.get("scores"):
-            del val_stats["scores"]
 
         # Cleanup split directory
         split_dir = output_dir / "_split"
