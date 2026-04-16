@@ -81,6 +81,12 @@ const remainingRecordingSeconds = computed(() => {
           @click="ctrl.showBoxes.value = !ctrl.showBoxes.value"
           title="YOLO 检测框"
         >框选</button>
+        <button
+          :class="['toggle-btn', { on: ctrl.showTrajectory.value }]"
+          :disabled="!hasYoloData"
+          @click="ctrl.showTrajectory.value = !ctrl.showTrajectory.value"
+          title="轨迹叠加"
+        >轨迹</button>
       </div>
 
       <span class="ctrl-frame-info">

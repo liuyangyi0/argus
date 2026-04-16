@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { provide, onMounted, onUnmounted } from 'vue'
 import { useReplayController } from '../composables/useReplayController'
-import ReplayVideoView from './replay/ReplayVideoView.vue'
+import ReplayCanvas from './replay/ReplayCanvas.vue'
 import ReplayControls from './replay/ReplayControls.vue'
 import ReplayReference from './replay/ReplayReference.vue'
 import ReplaySignalTracks from './replay/ReplaySignalTracks.vue'
@@ -28,7 +28,7 @@ onUnmounted(() => {
     <!-- Viewport area -->
     <div class="replay-viewport-row">
       <div class="replay-main">
-        <ReplayVideoView />
+        <ReplayCanvas />
       </div>
       <ReplayReference />
     </div>
