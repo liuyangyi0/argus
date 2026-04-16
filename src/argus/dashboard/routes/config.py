@@ -1003,12 +1003,24 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
         }
         restart_required = req.key in _restart_required_keys
 
+    # Auto-persist to YAML so toggle survives restart
+    persisted = False
+    config_path = getattr(request.app.state, "config_path", None)
+    if config_path:
+        try:
+            from argus.config.loader import save_config as _save
+            _save(config, config_path)
+            persisted = True
+        except Exception as e:
+            logger.warning("config.auto_persist_failed", error=str(e))
+
     logger.info(
         "config.module_toggled",
         key=req.key,
         value=req.value,
         restart_required=restart_required,
         hot_reloaded=hot_reloaded,
+        persisted=persisted,
     )
     return api_success({
         "key": req.key,

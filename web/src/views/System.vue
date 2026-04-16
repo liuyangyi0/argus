@@ -20,7 +20,7 @@ function onTabChange(key: string | number) {
 </script>
 
 <template>
-  <main class="glass" style="margin: 12px; padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
+  <main class="glass" style="margin: 12px; padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1; overflow-y: auto;">
     <Typography.Title :level="3" style="margin-bottom: 24px; color: var(--ink)">系统管理</Typography.Title>
     <Tabs :activeKey="activeTab" @change="onTabChange">
       <!-- Overview -->
