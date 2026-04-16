@@ -237,12 +237,12 @@ class ModelTrainer:
 
     @staticmethod
     def _free_gpu_for_training() -> None:
-        """Move inference models off GPU to free VRAM for training.
+        """Aggressively free all GPU memory before training.
 
-        On a 12GB GPU (e.g. RTX 3060), YOLO + anomaly inference can
-        consume 10GB+, leaving no room for training.  Moving them to
-        CPU temporarily frees the VRAM.  Models are reloaded on demand
-        the next time inference runs after training completes.
+        On a 12GB GPU (e.g. RTX 3060), inference models + CUDA OpenCV
+        can consume 10GB+.  This method:
+        1. Moves YOLO models to CPU
+        2. Clears all PyTorch CUDA caches and tensors
         """
         import gc
         import torch
@@ -260,9 +260,19 @@ class ModelTrainer:
         except Exception:
             pass
 
+        # Force release ALL CUDA tensors and cached allocations
         gc.collect()
         torch.cuda.empty_cache()
-        logger.info("trainer.gpu_memory_freed", models_moved=freed)
+        torch.cuda.reset_peak_memory_stats()
+
+        free_mb = torch.cuda.mem_get_info()[0] // (1024 * 1024)
+        total_mb = torch.cuda.mem_get_info()[1] // (1024 * 1024)
+        logger.info(
+            "trainer.gpu_memory_freed",
+            models_moved=freed,
+            free_mb=free_mb,
+            total_mb=total_mb,
+        )
 
     @staticmethod
     def _restore_gpu_after_training() -> None:
@@ -1212,12 +1222,26 @@ class ModelTrainer:
             ToDtype(torch.float32, scale=True),
         ])
 
+        # Auto-scale batch size based on available GPU memory.
+        # DINOv2-based models (Dinomaly) need ~4GB base + ~200MB/sample.
+        # PatchCore needs ~2GB base + ~100MB/sample.
+        batch_size = 32
+        if torch.cuda.is_available():
+            free_mb = torch.cuda.mem_get_info()[0] // (1024 * 1024)
+            if free_mb < 4096:
+                batch_size = 4
+            elif free_mb < 8192:
+                batch_size = 8
+            elif free_mb < 12288:
+                batch_size = 16
+            logger.info("trainer.batch_size_auto", batch_size=batch_size, free_mb=free_mb)
+
         datamodule = Folder(
             name="baseline",
             root=str(data_dir),
             normal_dir="normal",
-            train_batch_size=32,
-            eval_batch_size=32,
+            train_batch_size=batch_size,
+            eval_batch_size=batch_size,
             num_workers=0,
             augmentations=resize_transform,
         )
@@ -1276,16 +1300,9 @@ class ModelTrainer:
                             error=str(e),
                         )
             except ImportError:
-                # Fallback: if Dinomaly not in current anomalib version, use PatchCore
-                logger.warning(
-                    "trainer.dinomaly_not_available",
-                    msg="Dinomaly not found in anomalib, falling back to PatchCore",
-                )
-                from anomalib.models import Patchcore
-                model = Patchcore(
-                    backbone="wide_resnet50_2",
-                    layers=["layer2", "layer3"],
-                    coreset_sampling_ratio=0.1,
+                raise ImportError(
+                    "Dinomaly 模型在当前 anomalib 版本中不可用。"
+                    "请升级 anomalib (pip install anomalib>=1.2) 或选择其他模型类型 (patchcore/efficient_ad)。"
                 )
         else:  # patchcore (default)
             from anomalib.models import Patchcore

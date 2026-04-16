@@ -15,7 +15,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import structlog
 
@@ -95,6 +95,7 @@ class TrainingJobExecutor:
         model_registry: ModelRegistry | None = None,
         baselines_dir: Path = Path("data/baselines"),
         model_packages_dir: Path = Path("data/model_packages"),
+        on_model_trained: Callable[[str, Path], None] | None = None,
     ):
         self._db = database
         self._trainer = trainer
@@ -105,6 +106,14 @@ class TrainingJobExecutor:
         self._baselines_dir = baselines_dir
         self._model_packages_dir = model_packages_dir
         self._model_packages_dir.mkdir(parents=True, exist_ok=True)
+        self._on_model_trained = on_model_trained
+
+    def _safe_hot_reload(self, camera_id: str, model_path: Path) -> None:
+        """Reload model into pipeline in a background thread."""
+        try:
+            self._on_model_trained(camera_id, model_path)
+        except Exception as e:
+            logger.warning("job_executor.hot_reload_failed", camera_id=camera_id, error=str(e))
 
     def recover_stale_jobs(self, max_running_hours: float = 6.0) -> int:
         """Recover jobs stuck in RUNNING state (e.g. after process crash).
@@ -374,3 +383,15 @@ class TrainingJobExecutor:
             grade=result.quality_report.grade if result.quality_report else "?",
             version=model_version_id,
         )
+
+        # Hot-reload the new model into the running pipeline.
+        # Run in a daemon thread to avoid blocking the scheduler.
+        if self._on_model_trained and result.model_path:
+            import threading
+            model_path = Path(result.model_path)
+            threading.Thread(
+                target=self._safe_hot_reload,
+                args=(camera_id, model_path),
+                daemon=True,
+                name=f"hot-reload-{camera_id}",
+            ).start()
