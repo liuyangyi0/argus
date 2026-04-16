@@ -73,10 +73,14 @@ class MOG2PreFilter:
             )
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-        # Reusable GpuMat to avoid per-frame allocation overhead
+        # Reusable GpuMat + stream to avoid per-frame allocation overhead
         self._gpu_frame: object | None = None
+        self._gpu_fg: object | None = None
+        self._cuda_stream: object | None = None
         if self._use_cuda_mog2:
             self._gpu_frame = cv2.cuda_GpuMat()
+            self._gpu_fg = cv2.cuda_GpuMat()
+            self._cuda_stream = cv2.cuda.Stream()
 
         # Phase correlation stabilization state
         self._prev_gray: np.ndarray | None = None
@@ -172,8 +176,10 @@ class MOG2PreFilter:
         lr = learning_rate_override if learning_rate_override is not None else self.learning_rate
         if self._use_cuda_mog2:
             self._gpu_frame.upload(frame)
-            gpu_fg = self._subtractor.apply(self._gpu_frame, learningRate=lr)
-            fg_mask = gpu_fg.download()
+            self._subtractor.apply(
+                self._gpu_frame, lr, self._gpu_fg, self._cuda_stream,
+            )
+            fg_mask = self._gpu_fg.download()
         else:
             fg_mask = self._subtractor.apply(frame, learningRate=lr)
 
