@@ -2,7 +2,13 @@
 import { ref, computed, onMounted } from 'vue'
 import { Card, Statistic, Row, Col, Select, Spin, Typography, Empty, Button, Radio, message } from 'ant-design-vue'
 import { DownloadOutlined } from '@ant-design/icons-vue'
+import { use } from 'echarts/core'
+import { BarChart, LineChart, PieChart } from 'echarts/charts'
+import { CanvasRenderer } from 'echarts/renderers'
+import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
+
+use([CanvasRenderer, BarChart, LineChart, PieChart, GridComponent, TooltipComponent, LegendComponent])
 import { getReportStats, getDailyTrend, getSeverityDist, getCameraDist, getFPTrend, downloadComplianceReport } from '../api/reports'
 import { SEVERITY_COLORS } from '../utils/colors'
 
