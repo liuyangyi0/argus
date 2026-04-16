@@ -45,6 +45,7 @@ def _register_training_job_processing(
     *,
     config,
     database: Database,
+    camera_manager: CameraManager | None = None,
 ) -> None:
     """Attach queued training job execution to the scheduler."""
     from argus.anomaly.baseline import BaselineManager
@@ -52,6 +53,16 @@ def _register_training_job_processing(
     from argus.anomaly.job_executor import TrainingJobExecutor
     from argus.anomaly.trainer import ModelTrainer
     from argus.storage.model_registry import ModelRegistry
+
+    # Hot-reload callback: when training completes, load the new model
+    # into the running detection pipeline for the trained camera.
+    def _on_model_trained(camera_id: str, model_path: Path) -> None:
+        if camera_manager is None:
+            return
+        pipeline = camera_manager.get_pipeline(camera_id)
+        if pipeline is not None:
+            pipeline.reload_anomaly_model(model_path)
+            logger.info("training.model_hot_reloaded", camera_id=camera_id, model_path=str(model_path))
 
     baseline_manager = BaselineManager(baselines_dir=config.storage.baselines_dir)
     trainer = ModelTrainer(
@@ -67,6 +78,7 @@ def _register_training_job_processing(
         backbone_trainer=backbone_trainer,
         model_registry=model_registry,
         baselines_dir=config.storage.baselines_dir,
+        on_model_trained=_on_model_trained,
     )
     create_job_processing_task(scheduler, job_executor)
 
@@ -442,7 +454,7 @@ def main():
         health_monitor=health,
         alerts_dir=config.storage.alerts_dir,
     )
-    _register_training_job_processing(scheduler, config=config, database=db)
+    _register_training_job_processing(scheduler, config=config, database=db, camera_manager=manager)
 
     # Scheduled retraining (C4 + A4: active learning loop)
     if config.retraining.enabled:
