@@ -603,26 +603,8 @@ async def wall_status(request: Request):
     def _build_wall_data():
         from datetime import datetime, timezone
 
-        statuses = list(camera_manager.get_status())
-        camera_ids = [s.camera_id for s in statuses]
-
-        # Aggregate lookups — fetched once, reused per tile. These used to run
-        # inside the loop which produced O(N²) calls for backpressure stats
-        # and 2*N per-camera SQL queries for alert counts / latest alerts.
-        bp_stats = camera_manager.get_backpressure_stats()
-
-        today_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        wall_alerts: dict[str, dict] = {}
-        if db is not None and camera_ids:
-            try:
-                wall_alerts = db.get_wall_status_batch(camera_ids, since=today_start)
-            except Exception:
-                logger.debug("cameras.wall_alerts_batch_failed", exc_info=True)
-
         cameras = []
-        for cam_status in statuses:
+        for cam_status in camera_manager.get_status():
             cam_id = cam_status.camera_id
             # Determine connection status: a camera is "online" if its
             # pipeline is running, even if not yet fully connected (USB
@@ -652,15 +634,37 @@ async def wall_status(request: Request):
             if stats is not None and getattr(stats, "current_fps", 0) > 0:
                 tile["fps"] = stats.current_fps
 
-            # Backpressure visibility (P0-2) — reuse the snapshot taken above.
+            # Backpressure visibility (P0-2)
+            bp_stats = camera_manager.get_backpressure_stats()
             bp = bp_stats.get(cam_id, {})
             tile["frames_dropped"] = bp.get("dropped", 0)
             tile["backpressured"] = bp.get("backpressured", False)
 
-            alert_info = wall_alerts.get(cam_id)
-            if alert_info is not None:
-                tile["alert_count_today"] = alert_info.get("count", 0)
-                tile["active_alert"] = alert_info.get("active")
+            if db is not None:
+                try:
+                    today_count = db.get_alert_count(
+                        camera_id=cam_id,
+                        since=datetime.now(timezone.utc).replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    )
+                    tile["alert_count_today"] = today_count
+                except Exception:
+                    # WARNING not DEBUG: a silent failure here means the video
+                    # wall shows "0 alerts today" forever, which operators will
+                    # misread as a healthy system.
+                    logger.warning("cameras.alert_count_today_failed", camera_id=cam_id, exc_info=True)
+
+            if db is not None:
+                try:
+                    recent = db.get_alerts(camera_id=cam_id, limit=1)
+                    if recent and recent[0].workflow_status in ("new", "acknowledged", "investigating"):
+                        tile["active_alert"] = {
+                            "alert_id": recent[0].alert_id,
+                            "severity": recent[0].severity,
+                        }
+                except Exception:
+                    logger.debug("cameras.recent_alert_query_failed", camera_id=cam_id, exc_info=True)
 
             if health_monitor is not None:
                 health = health_monitor.get_camera_health(cam_id)
