@@ -30,7 +30,16 @@ from argus.storage.models import (
 
 logger = structlog.get_logger()
 
-_USER_UPDATABLE_FIELDS = {"display_name", "role", "password_hash", "is_active"}
+# Fields on User that update_user() is allowed to set. Must match the actual
+# attribute names on the User model (see storage/models.py:User) — mismatches
+# here silently drop the kwarg because of the `hasattr(user, key)` guard below.
+_USER_UPDATABLE_FIELDS = {
+    "display_name",
+    "role",
+    "password_hash",
+    "active",
+    "last_login",
+}
 
 
 class Database:
@@ -371,8 +380,14 @@ class Database:
         camera_id: str | None = None,
         severity: str | None = None,
         since: datetime | None = None,
+        until: datetime | None = None,
     ) -> int:
-        """Get total alert count with optional filters."""
+        """Get total alert count with optional filters.
+
+        ``since``/``until`` are compared against ``AlertRecord.timestamp`` and
+        are half-open: the range is ``[since, until)``. Either side may be
+        ``None`` for an unbounded window on that end.
+        """
         with self.get_session() as session:
             stmt = select(sa_func.count()).select_from(AlertRecord)
             if camera_id:
@@ -381,6 +396,8 @@ class Database:
                 stmt = stmt.where(AlertRecord.severity == severity)
             if since is not None:
                 stmt = stmt.where(AlertRecord.timestamp >= since)
+            if until is not None:
+                stmt = stmt.where(AlertRecord.timestamp < until)
             return session.scalar(stmt) or 0
 
     def get_wall_status_batch(

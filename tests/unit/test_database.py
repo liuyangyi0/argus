@@ -103,15 +103,39 @@ class TestDatabase:
         assert db.get_alert_count(camera_id="cam_01") == 2
         assert db.get_alert_count(severity="high") == 1
 
-    def test_get_alert_count_since_filter(self, db):
-        """``since`` should only count alerts at or after the given timestamp."""
-        now = datetime.now(tz=timezone.utc)
-        db.save_alert("ALT-OLD", now - timedelta(days=2), "cam_01", "z1", "low", 0.70)
-        db.save_alert("ALT-NEW", now, "cam_01", "z1", "high", 0.95)
+    def test_get_alert_count_time_window(self, db):
+        """Should filter by the ``since``/``until`` time window.
 
-        cutoff = now - timedelta(hours=1)
-        assert db.get_alert_count(since=cutoff) == 1
-        assert db.get_alert_count(camera_id="cam_01", since=cutoff) == 1
+        Regression for the video-wall silent-failure bug where
+        cameras.wall_status() passed ``since=`` but the method did not
+        accept it, making alert_count_today always 0.
+        """
+        now = datetime.now(tz=timezone.utc)
+        yesterday = now - timedelta(days=1)
+        two_days_ago = now - timedelta(days=2)
+
+        db.save_alert("ALT-NOW", now, "cam_01", "z1", "low", 0.75)
+        db.save_alert("ALT-YDAY", yesterday, "cam_01", "z1", "low", 0.75)
+        db.save_alert("ALT-OLD", two_days_ago, "cam_01", "z1", "low", 0.75)
+
+        # since only (half-open lower bound)
+        assert db.get_alert_count(since=now - timedelta(hours=1)) == 1
+        assert db.get_alert_count(since=yesterday - timedelta(hours=1)) == 2
+
+        # until only (strict upper bound)
+        assert db.get_alert_count(until=now) == 2
+
+        # both
+        assert db.get_alert_count(
+            since=yesterday - timedelta(hours=1),
+            until=now,
+        ) == 1
+
+        # combined with camera filter
+        assert db.get_alert_count(
+            camera_id="cam_01",
+            since=now - timedelta(hours=1),
+        ) == 1
 
     def test_get_wall_status_batch(self, db):
         """Batch query should return today's count + latest-if-active per camera in a single pass.
