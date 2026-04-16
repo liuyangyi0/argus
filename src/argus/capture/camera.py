@@ -7,6 +7,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from threading import Event
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from argus.capture.frame_buffer import LatestFrameBuffer
 
 import cv2
 import numpy as np
@@ -78,6 +82,9 @@ class CameraCapture:
         self._reconnecting = False
         self._reconnect_lock = threading.Lock()
 
+        # Async capture thread buffer (initialised by start_capture_thread)
+        self._frame_buffer: LatestFrameBuffer | None = None
+
     @property
     def state(self) -> CameraState:
         return self._state
@@ -140,6 +147,9 @@ class CameraCapture:
             # Set timeouts to prevent frozen streams from blocking threads
             self._cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
             self._cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+
+            # Minimise internal OpenCV buffer to reduce stale-frame accumulation
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             # Set resolution for live sources
             if self.protocol != "file":
@@ -218,6 +228,51 @@ class CameraCapture:
             frame_number=self._state.total_frames,
             resolution=(w, h),
         )
+
+    # ------------------------------------------------------------------
+    # Async capture thread (Frigate-inspired latest-frame pattern)
+    # ------------------------------------------------------------------
+
+    def start_capture_thread(self) -> None:
+        """Start a dedicated capture thread that keeps the latest frame ready.
+
+        The capture thread continuously reads from the video source and
+        overwrites a :class:`LatestFrameBuffer`.  The detection pipeline
+        calls :meth:`read_latest` to get the most recent frame without
+        blocking on the network or accumulating stale frames.
+        """
+        from argus.capture.frame_buffer import LatestFrameBuffer
+
+        if self._frame_buffer is not None:
+            return  # already started
+        self._frame_buffer = LatestFrameBuffer()
+        t = threading.Thread(
+            target=self._capture_loop,
+            name=f"capture-{self.camera_id}",
+            daemon=True,
+        )
+        t.start()
+        logger.info("camera.capture_thread_started", camera_id=self.camera_id)
+
+    def _capture_loop(self) -> None:
+        """Background loop: read frames and store the latest one."""
+        while not self._stop_event.is_set():
+            frame_data = self.read()
+            if frame_data is not None:
+                self._frame_buffer.put(frame_data)
+            else:
+                # Camera disconnected or FPS throttle — brief yield
+                self._stop_event.wait(0.01)
+
+    def read_latest(self) -> FrameData | None:
+        """Return the most recently captured frame.
+
+        Requires :meth:`start_capture_thread` to have been called.
+        Falls back to :meth:`read` if no capture thread is running.
+        """
+        if self._frame_buffer is None:
+            return self.read()
+        return self._frame_buffer.get(timeout=5.0)
 
     def request_reconnect(self) -> None:
         """Request a non-blocking reconnection attempt.

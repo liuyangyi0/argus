@@ -219,11 +219,15 @@ class BackboneTrainer:
                 duration_seconds=time.monotonic() - start,
             )
 
+        # Move to GPU when available — training on CPU is 10-50x slower
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        backbone = backbone.to(device)
         backbone.train()
+        logger.info("backbone_trainer.device", device=str(device))
 
         # Determine feature dimension from backbone
         embed_dim = backbone.embed_dim  # 384 for vits14, 768 for vitb14, 1024 for vitl14
-        ssl_head = _SSLHead(in_dim=embed_dim, out_dim=256)
+        ssl_head = _SSLHead(in_dim=embed_dim, out_dim=256).to(device)
 
         # Create dataset and dataloader
         dataset = _BaselineImageDataset(image_paths, image_size=image_size)
@@ -299,6 +303,7 @@ class BackboneTrainer:
             for batch in dataloader:
                 if batch is None:
                     continue  # entire batch was corrupt — skip
+                batch = batch.to(device)
                 # Create two augmented views (simple: horizontal flip)
                 view1 = batch
                 view2 = torch.flip(batch, dims=[3])  # Horizontal flip
