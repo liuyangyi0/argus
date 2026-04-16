@@ -323,16 +323,33 @@ class DetectionPipeline:
         # Alert grading
         self._alert_grader = AlertGrader(config=alert_config)
 
-        # Camera
-        self._camera = CameraCapture(
-            camera_id=camera_config.camera_id,
-            source=camera_config.source,
-            protocol=camera_config.protocol,
-            fps_target=camera_config.fps_target,
-            resolution=camera_config.resolution,
-            reconnect_delay=camera_config.reconnect_delay,
-            max_reconnect_attempts=camera_config.max_reconnect_attempts,
-        )
+        # Camera — use GigECapture for GigE Vision cameras, CameraCapture
+        # for everything else (RTSP, USB, file).
+        if camera_config.protocol == "gige":
+            from argus.capture.gige_capture import GigECapture
+
+            gige_cfg = camera_config.gige
+            self._camera: CameraCapture | GigECapture = GigECapture(
+                camera_id=camera_config.camera_id,
+                source=camera_config.source,
+                fps_target=camera_config.fps_target,
+                resolution=camera_config.resolution,
+                exposure=gige_cfg.exposure,
+                gain=gige_cfg.gain,
+                pixel_format=gige_cfg.pixel_format,
+                reconnect_delay=camera_config.reconnect_delay,
+                max_reconnect_attempts=camera_config.max_reconnect_attempts,
+            )
+        else:
+            self._camera = CameraCapture(
+                camera_id=camera_config.camera_id,
+                source=camera_config.source,
+                protocol=camera_config.protocol,
+                fps_target=camera_config.fps_target,
+                resolution=camera_config.resolution,
+                reconnect_delay=camera_config.reconnect_delay,
+                max_reconnect_attempts=camera_config.max_reconnect_attempts,
+            )
 
         # Anti-absorption: time-based heartbeat (MED-05)
         # P2 fix: cap heartbeat to max_gap * 0.8 so CUSUM evidence can accumulate
