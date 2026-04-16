@@ -62,20 +62,22 @@ async function load() {
   }
 }
 
+function resetDraftFromCfg(c: CrossCameraConfigPayload) {
+  draftScalars.value = {
+    corroboration_threshold: c.corroboration_threshold,
+    max_age_seconds: c.max_age_seconds,
+    uncorroborated_severity_downgrade: c.uncorroborated_severity_downgrade,
+  }
+  draftPairs.value = c.overlap_pairs.map(p => ({
+    camera_a: p.camera_a,
+    camera_b: p.camera_b,
+    homography: p.homography.map(row => [...row]),
+  }))
+}
+
 // Keep drafts in sync when cfg reloads and we're NOT editing.
 watch(cfg, (next) => {
-  if (next && !editing.value) {
-    draftScalars.value = {
-      corroboration_threshold: next.corroboration_threshold,
-      max_age_seconds: next.max_age_seconds,
-      uncorroborated_severity_downgrade: next.uncorroborated_severity_downgrade,
-    }
-    draftPairs.value = next.overlap_pairs.map(p => ({
-      camera_a: p.camera_a,
-      camera_b: p.camera_b,
-      homography: p.homography.map(row => [...row]),
-    }))
-  }
+  if (next && !editing.value) resetDraftFromCfg(next)
 })
 
 /* ── Toggle ── */
@@ -100,33 +102,13 @@ async function handleToggle(checked: string | number | boolean) {
 /* ── Edit mode ── */
 function enterEdit() {
   if (!cfg.value) return
-  draftScalars.value = {
-    corroboration_threshold: cfg.value.corroboration_threshold,
-    max_age_seconds: cfg.value.max_age_seconds,
-    uncorroborated_severity_downgrade: cfg.value.uncorroborated_severity_downgrade,
-  }
-  draftPairs.value = cfg.value.overlap_pairs.map(p => ({
-    camera_a: p.camera_a,
-    camera_b: p.camera_b,
-    homography: p.homography.map(row => [...row]),
-  }))
+  resetDraftFromCfg(cfg.value)
   editing.value = true
 }
 
 function cancelEdit() {
   editing.value = false
-  if (cfg.value) {
-    draftScalars.value = {
-      corroboration_threshold: cfg.value.corroboration_threshold,
-      max_age_seconds: cfg.value.max_age_seconds,
-      uncorroborated_severity_downgrade: cfg.value.uncorroborated_severity_downgrade,
-    }
-    draftPairs.value = cfg.value.overlap_pairs.map(p => ({
-      camera_a: p.camera_a,
-      camera_b: p.camera_b,
-      homography: p.homography.map(row => [...row]),
-    }))
-  }
+  if (cfg.value) resetDraftFromCfg(cfg.value)
 }
 
 function addPair() {

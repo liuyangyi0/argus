@@ -6,8 +6,7 @@ import { getUsers as apiGetUsers, createUser as apiCreateUser, deleteUser as api
 const users = ref<any[]>([])
 const usersLoading = ref(false)
 const createLoading = ref(false)
-const deleteLoading = ref(false)
-const toggleLoading = ref(false)
+const busyRow = ref<string | null>(null)
 const newUser = ref({ username: '', password: '', role: 'operator', display_name: '' })
 
 async function loadUsers() {
@@ -42,7 +41,7 @@ async function createUser() {
 }
 
 async function deleteUser(username: string) {
-  deleteLoading.value = true
+  busyRow.value = username
   try {
     await apiDeleteUser(username)
     message.success('已删除')
@@ -50,12 +49,12 @@ async function deleteUser(username: string) {
   } catch (e: any) {
     message.error('删除失败')
   } finally {
-    deleteLoading.value = false
+    busyRow.value = null
   }
 }
 
 async function handleToggleActive(username: string) {
-  toggleLoading.value = true
+  busyRow.value = username
   try {
     await toggleUserActive(username)
     message.success('状态已更新')
@@ -63,7 +62,7 @@ async function handleToggleActive(username: string) {
   } catch (e: any) {
     message.error('切换状态失败')
   } finally {
-    toggleLoading.value = false
+    busyRow.value = null
   }
 }
 
@@ -137,7 +136,7 @@ const roleColors: Record<string, string> = { admin: 'red', engineer: 'purple', o
           </template>
           <template v-if="column.key === 'action'">
             <Popconfirm title="确定删除此用户？" @confirm="deleteUser(record.username)">
-              <Button size="small" danger :loading="deleteLoading">删除</Button>
+              <Button size="small" danger :loading="busyRow === record.username">删除</Button>
             </Popconfirm>
           </template>
         </template>
