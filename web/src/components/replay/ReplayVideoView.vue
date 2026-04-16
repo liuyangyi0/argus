@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { inject } from 'vue'
+import { inject, ref, computed } from 'vue'
 import type { useReplayController } from '../../composables/useReplayController'
 
 const ctrl = inject<ReturnType<typeof useReplayController>>('replayCtrl')!
@@ -7,6 +7,16 @@ const ctrl = inject<ReturnType<typeof useReplayController>>('replayCtrl')!
 const videoRef = ctrl.videoEl
 
 import VideoOverlayCanvas from './VideoOverlayCanvas.vue'
+
+// Track actual video native dimensions for heatmap alignment
+const nativeWidth = ref(0)
+const nativeHeight = ref(0)
+const heatmapAspect = computed(() => {
+  if (nativeWidth.value && nativeHeight.value) {
+    return `${nativeWidth.value} / ${nativeHeight.value}`
+  }
+  return '16 / 9'
+})
 
 function onTimeUpdate() {
   if (!ctrl.videoEl.value) return
@@ -41,6 +51,13 @@ function onVideoCanPlay() {
   }
 }
 
+function onLoadedMetadata() {
+  const el = ctrl.videoEl.value
+  if (!el) return
+  nativeWidth.value = el.videoWidth
+  nativeHeight.value = el.videoHeight
+}
+
 function onVideoError() {
   const el = ctrl.videoEl.value
   if (!el?.error) return
@@ -54,20 +71,22 @@ function onVideoError() {
       ref="videoRef"
       :src="ctrl.videoUrl.value"
       preload="auto"
+      playsinline
       class="replay-video"
       @timeupdate="onTimeUpdate"
       @play="onVideoPlay"
       @pause="onVideoPause"
       @ended="onVideoEnded"
       @canplay="onVideoCanPlay"
+      @loadedmetadata="onLoadedMetadata"
       @error="onVideoError"
     />
-    
-    <!-- 热力图 -->
+
     <img
       v-if="ctrl.showHeatmap.value && ctrl.hasHeatmaps.value"
       :src="ctrl.heatmapUrl.value"
       class="replay-heatmap"
+      :style="{ aspectRatio: heatmapAspect }"
     />
     
     <!-- YOLO 检测框 (Canvas 60FPS) -->
@@ -116,7 +135,8 @@ function onVideoError() {
 }
 .replay-heatmap {
   position: absolute;
-  top: 0; left: 0; width: 100%; height: 100%;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
   object-fit: contain;
   opacity: 0.4;
   pointer-events: none;

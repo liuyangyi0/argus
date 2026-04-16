@@ -158,8 +158,19 @@ export function useReplayController(alertId: string) {
 
   async function handlePinFrame() {
     const label = prompt('帧标签:')
-    if (label) {
+    if (!label) return
+    try {
       await pinReplayFrame(alertId, { index: currentIndex.value, label })
+      if (signals.value) {
+        if (!signals.value.key_frames) signals.value.key_frames = []
+        const idx = currentIndex.value
+        if (!signals.value.key_frames.some((kf: any) => kf.index === idx)) {
+          signals.value.key_frames.push({ index: idx, label, type: 'user' })
+        }
+      }
+      message.success('已标记帧')
+    } catch {
+      message.error('标记失败')
     }
   }
 
