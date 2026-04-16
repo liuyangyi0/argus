@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import {
-  Card, Button, Form, Select, Input, Modal, Space,
+  Card, Button, Form, Select, Input, Modal, Space, Checkbox,
   message, Badge,
 } from 'ant-design-vue'
 import { PlusOutlined } from '@ant-design/icons-vue'
@@ -24,6 +24,7 @@ const createForm = ref({
   camera_id: undefined as string | undefined,
   model_type: 'patchcore',
   zone_id: 'default',
+  skip_validation: false,
 })
 const createLoading = ref(false)
 
@@ -34,10 +35,15 @@ async function handleCreate() {
   }
   createLoading.value = true
   try {
-    await createTrainingJob(createForm.value)
+    const { skip_validation, ...rest } = createForm.value
+    const payload = {
+      ...rest,
+      ...(skip_validation ? { hyperparameters: { skip_baseline_validation: true } } : {}),
+    }
+    await createTrainingJob(payload)
     message.success('训练任务已创建，等待确认')
     createModalVisible.value = false
-    createForm.value = { job_type: 'anomaly_head', camera_id: undefined, model_type: 'patchcore', zone_id: 'default' }
+    createForm.value = { job_type: 'anomaly_head', camera_id: undefined, model_type: 'patchcore', zone_id: 'default', skip_validation: false }
     emit('refresh')
   } catch (e: any) {
     message.error(extractErrorMessage(e, '创建失败'))
@@ -99,6 +105,14 @@ async function handleCreate() {
           <Input v-model:value="createForm.zone_id" placeholder="default" :disabled="createLoading" />
           <div style="color: #8890a0; font-size: 12px; margin-top: 4px">
             区域ID对应配置中定义的检测区域，默认为 "default"（全画面）
+          </div>
+        </Form.Item>
+        <Form.Item>
+          <Checkbox v-model:checked="createForm.skip_validation" :disabled="createLoading">
+            跳过基线质量验证
+          </Checkbox>
+          <div style="color: #d97706; font-size: 12px; margin-top: 4px">
+            仅用于测试环境。跳过近似重复率等基线质量检查，允许在单一场景下训练模型。
           </div>
         </Form.Item>
       </Form>
