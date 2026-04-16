@@ -178,13 +178,21 @@ class InstanceSegmenter:
             }
             model_id = size_map.get(self._model_size, size_map["small"])
 
-            self._predictor = SAM2ImagePredictor.from_pretrained(model_id)
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+            self._predictor = SAM2ImagePredictor.from_pretrained(
+                model_id, device=device,
+            )
             self._sam2_available = True
             self._loaded = True
             logger.info(
                 "segmenter.sam2_loaded",
                 model_size=self._model_size,
                 model_id=model_id,
+                device=device,
             )
         except ImportError:
             self._sam2_available = False

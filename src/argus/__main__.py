@@ -123,6 +123,35 @@ _SEVERITY_COLORS = {
 _RESET = "\033[0m"
 
 
+def _log_gpu_environment() -> None:
+    """Log GPU/CUDA availability at startup for operator visibility."""
+    import cv2
+
+    # PyTorch / CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            dev = torch.cuda.get_device_properties(0)
+            logger.info(
+                "env.cuda_available",
+                device=torch.cuda.get_device_name(0),
+                memory_mb=dev.total_mem // (1024 * 1024),
+                cuda_version=torch.version.cuda,
+                torch_version=torch.__version__,
+            )
+        else:
+            logger.warning("env.cuda_unavailable", msg="CUDA not available — inference will run on CPU (slow)")
+    except ImportError:
+        logger.warning("env.torch_missing", msg="PyTorch not installed — GPU acceleration disabled")
+
+    # OpenCV CUDA
+    cuda_count = cv2.cuda.getCudaEnabledDeviceCount() if hasattr(cv2, "cuda") else 0
+    if cuda_count > 0:
+        logger.info("env.opencv_cuda", devices=cuda_count)
+    else:
+        logger.info("env.opencv_cuda_unavailable", msg="OpenCV CUDA not available — cv2 ops will use CPU")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -182,6 +211,9 @@ def main():
     if not cameras:
         print("Error: No cameras configured", file=sys.stderr)
         sys.exit(1)
+
+    # ── GPU / CUDA environment check ──────────────────────────────────
+    _log_gpu_environment()
 
     METRICS.ensure_initialized()
     METRICS.app_info.info({"version": "0.2.0", "node_id": config.node_id})
