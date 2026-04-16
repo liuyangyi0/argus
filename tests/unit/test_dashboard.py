@@ -1626,3 +1626,134 @@ class TestCameraManagerClassifierBroadcast:
         updated = manager.update_classifier_vocabulary(["x"])
         assert updated == 1  # only the healthy one counted
         ok.update_vocabulary.assert_called_once_with(["x"])
+
+
+class TestCrossCameraConfigPut:
+    """PUT /api/config/cross-camera/pairs (stage 2.9)."""
+
+    @pytest.fixture
+    def cc_client(self, db, health, alerts_dir):
+        from argus.config.schema import CrossCameraConfig, CameraOverlapConfig
+        config = ArgusConfig()
+        config.cross_camera = CrossCameraConfig(
+            enabled=True,
+            corroboration_threshold=0.3,
+            max_age_seconds=5.0,
+            uncorroborated_severity_downgrade=1,
+            overlap_pairs=[
+                CameraOverlapConfig(
+                    camera_a="cam_01",
+                    camera_b="cam_02",
+                    homography=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                ),
+            ],
+        )
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = []
+        camera_manager._correlator = MagicMock()
+        camera_manager.update_cross_camera_pairs.return_value = True
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        from argus.dashboard import auth as dashboard_auth
+        _orig_require_role = dashboard_auth.require_role
+        dashboard_auth.require_role = lambda request, *roles: True
+        try:
+            yield TestClient(app), config, camera_manager
+        finally:
+            dashboard_auth.require_role = _orig_require_role
+
+    def test_put_updates_scalar_params(self, cc_client):
+        client, cfg, _cm = cc_client
+        res = client.put(
+            "/api/config/cross-camera/pairs",
+            json={"corroboration_threshold": 0.5, "max_age_seconds": 10.0},
+        )
+        assert res.status_code == 200
+        data = res.json()["data"]
+        assert data["corroboration_threshold"] == 0.5
+        assert data["max_age_seconds"] == 10.0
+        assert cfg.cross_camera.corroboration_threshold == 0.5
+        assert cfg.cross_camera.max_age_seconds == 10.0
+
+    def test_put_replaces_overlap_pairs(self, cc_client):
+        client, cfg, _cm = cc_client
+        new_pairs = [
+            {
+                "camera_a": "cam_03",
+                "camera_b": "cam_04",
+                "homography": [[2, 0, 0], [0, 2, 0], [0, 0, 1]],
+            },
+        ]
+        res = client.put(
+            "/api/config/cross-camera/pairs",
+            json={"overlap_pairs": new_pairs},
+        )
+        assert res.status_code == 200
+        data = res.json()["data"]
+        assert len(data["overlap_pairs"]) == 1
+        assert data["overlap_pairs"][0]["camera_a"] == "cam_03"
+        assert len(cfg.cross_camera.overlap_pairs) == 1
+
+    def test_put_pushes_to_camera_manager(self, cc_client):
+        client, _cfg, cm = cc_client
+        client.put(
+            "/api/config/cross-camera/pairs",
+            json={"overlap_pairs": [
+                {"camera_a": "a", "camera_b": "b",
+                 "homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]},
+            ]},
+        )
+        cm.update_cross_camera_pairs.assert_called_once()
+
+    def test_put_rejects_non_3x3_matrix(self, cc_client):
+        client, _cfg, _cm = cc_client
+        res = client.put(
+            "/api/config/cross-camera/pairs",
+            json={"overlap_pairs": [
+                {"camera_a": "a", "camera_b": "b",
+                 "homography": [[1, 0], [0, 1]]},
+            ]},
+        )
+        assert res.status_code == 400
+        assert "3" in res.json()["msg"]
+
+    def test_put_rejects_same_camera(self, cc_client):
+        client, _cfg, _cm = cc_client
+        res = client.put(
+            "/api/config/cross-camera/pairs",
+            json={"overlap_pairs": [
+                {"camera_a": "cam_01", "camera_b": "cam_01",
+                 "homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]},
+            ]},
+        )
+        assert res.status_code == 400
+        assert "相同" in res.json()["msg"]
+
+    def test_put_rejects_duplicate_pair(self, cc_client):
+        client, _cfg, _cm = cc_client
+        res = client.put(
+            "/api/config/cross-camera/pairs",
+            json={"overlap_pairs": [
+                {"camera_a": "a", "camera_b": "b",
+                 "homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]},
+                {"camera_a": "b", "camera_b": "a",
+                 "homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]},
+            ]},
+        )
+        assert res.status_code == 400
+        assert "重复" in res.json()["msg"]
+
+    def test_put_empty_body_is_noop(self, cc_client):
+        client, cfg, cm = cc_client
+        before_threshold = cfg.cross_camera.corroboration_threshold
+        before_pairs = len(cfg.cross_camera.overlap_pairs)
+        res = client.put("/api/config/cross-camera/pairs", json={})
+        assert res.status_code == 200
+        assert cfg.cross_camera.corroboration_threshold == before_threshold
+        assert len(cfg.cross_camera.overlap_pairs) == before_pairs
+        cm.update_cross_camera_pairs.assert_not_called()

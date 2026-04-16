@@ -114,6 +114,34 @@ class CrossCameraCorrelator:
             partner_score_at_location=0.0,
         )
 
+    def update_pairs(
+        self,
+        pairs: list[CameraOverlapPair],
+        corroboration_threshold: float | None = None,
+    ) -> None:
+        """Replace the camera-pair mapping at runtime.
+
+        Builds the new bidirectional lookup in a local variable, then
+        swaps it in with a single reference assignment (atomic in CPython).
+        """
+        new_pairs: dict[str, list[tuple[str, np.ndarray]]] = {}
+        for pair in pairs:
+            H = np.array(pair.homography, dtype=np.float64)
+            new_pairs.setdefault(pair.camera_a, []).append((pair.camera_b, H))
+            H_inv = np.linalg.inv(H)
+            new_pairs.setdefault(pair.camera_b, []).append((pair.camera_a, H_inv))
+
+        self._pairs = new_pairs
+
+        if corroboration_threshold is not None:
+            self._corroboration_threshold = corroboration_threshold
+
+        logger.info(
+            "correlator.pairs_updated",
+            pairs=len(pairs),
+            threshold=self._corroboration_threshold,
+        )
+
     def prune_stale(self, max_age: float = 30.0) -> None:
         """Remove stale anomaly maps."""
         now = time.time()

@@ -337,7 +337,7 @@ export interface BatchInferenceResponse {
   results: Array<{
     path: string
     score: number
-    is_anomaly: boolean
+    is_anomalous: boolean
     error?: string
   }>
   scored: number
