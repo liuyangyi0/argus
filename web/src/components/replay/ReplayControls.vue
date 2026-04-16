@@ -1,11 +1,28 @@
 <script setup lang="ts">
 import { inject, computed } from 'vue'
 import { CaretRightOutlined, PauseOutlined } from '@ant-design/icons-vue'
+import { formatPlaybackTime } from '../../utils/time'
 import type { useReplayController } from '../../composables/useReplayController'
 
 const ctrl = inject<ReturnType<typeof useReplayController>>('replayCtrl')!
 
 const speeds = [0.25, 0.5, 1, 2, 4]
+
+const hasYoloData = computed(() => {
+  const boxes = ctrl.signals.value?.yolo_boxes
+  return Array.isArray(boxes) && boxes.length > 0
+})
+
+const currentTime = computed(() => {
+  const fps = ctrl.fps.value || 15
+  return formatPlaybackTime(ctrl.currentIndex.value / fps)
+})
+
+const totalDuration = computed(() => {
+  const fps = ctrl.fps.value || 15
+  const frames = ctrl.metadata.value?.frame_count || 0
+  return formatPlaybackTime(frames / fps)
+})
 
 const progressPct = computed(() => {
   const total = Math.max((ctrl.metadata.value?.frame_count || 1) - 1, 1)
@@ -60,13 +77,14 @@ const remainingRecordingSeconds = computed(() => {
         >热力</button>
         <button
           :class="['toggle-btn', { on: ctrl.showBoxes.value }]"
+          :disabled="!hasYoloData"
           @click="ctrl.showBoxes.value = !ctrl.showBoxes.value"
           title="YOLO 检测框"
         >框选</button>
       </div>
 
       <span class="ctrl-frame-info">
-        FRAME <b>{{ ctrl.currentIndex.value + 1 }}</b> / {{ ctrl.metadata.value.frame_count }} · {{ ctrl.currentTimestamp.value }}
+        <b>{{ currentTime }}</b> / {{ totalDuration }} · FRAME {{ ctrl.currentIndex.value + 1 }} / {{ ctrl.metadata.value.frame_count }}
       </span>
     </div>
 

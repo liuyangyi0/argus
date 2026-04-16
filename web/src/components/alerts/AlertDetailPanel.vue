@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import {
-  Tag, Button, Typography, Tooltip, Segmented, Steps, message, Modal,
+  Tag, Button, Typography, Tooltip, Segmented, message, Modal,
 } from 'ant-design-vue'
 import {
   CloseOutlined,
@@ -15,6 +15,7 @@ import {
 import { useRouter } from 'vue-router'
 import { useAlertStore } from '../../stores/useAlertStore'
 import { scoreColor } from '../../utils/colors'
+import { formatTimestamp } from '../../utils/time'
 import ReplayPlayer from '../ReplayPlayer.vue'
 import AnnotationOverlay from '../AnnotationOverlay.vue'
 import ImageCompareSlider from '../ImageCompareSlider.vue'
@@ -45,20 +46,6 @@ const workflowLabel: Record<string, string> = {
 const workflowColor: Record<string, string> = {
   new: 'default', acknowledged: 'green', investigating: 'blue',
   resolved: 'cyan', closed: 'default', false_positive: 'orange', uncertain: 'gold',
-}
-
-const workflowSteps = ['new', 'acknowledged', 'investigating', 'resolved', 'closed']
-const workflowStepIndex = computed(() => {
-  if (!selectedAlert.value) return 0
-  const status = selectedAlert.value.workflow_status
-  if (status === 'false_positive') return -1
-  return workflowSteps.indexOf(status)
-})
-
-function formatTimestamp(ts: string | number | undefined): string {
-  if (!ts) return '--'
-  const date = typeof ts === 'string' ? new Date(ts) : new Date(ts * 1000)
-  return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 // Pixels are hard to eyeball — kilo-pixels give a more scannable magnitude
@@ -158,6 +145,7 @@ function handleDelete() {
     <div class="detail-content">
       <ReplayPlayer
         v-if="selectedAlert.has_recording"
+        :key="selectedAlert.alert_id"
         :alert-id="selectedAlert.alert_id"
         class="detail-section-spacing"
       />
@@ -360,24 +348,6 @@ function handleDelete() {
               删除告警
             </Button>
 
-            <div class="workflow-timeline">
-              <div class="workflow-label">工作流进度</div>
-              <Steps
-                v-if="selectedAlert.workflow_status !== 'false_positive'"
-                :current="workflowStepIndex"
-                size="small"
-                style="font-size: 11px"
-              >
-                <Steps.Step title="待处理" />
-                <Steps.Step title="已确认" />
-                <Steps.Step title="调查中" />
-                <Steps.Step title="已解决" />
-                <Steps.Step title="已关闭" />
-              </Steps>
-              <div v-else class="false-positive-display">
-                <Tag color="orange" style="font-size: 12px; padding: 2px 12px">已标记为误报</Tag>
-              </div>
-            </div>
           </div>
         </div>
       </div>
@@ -571,19 +541,4 @@ function handleDelete() {
   padding: 12px 0;
 }
 
-.workflow-timeline {
-  border-top: 1px solid var(--argus-border);
-  margin-top: 4px;
-  padding-top: 10px;
-}
-.workflow-label {
-  font-size: 13px;
-  color: var(--argus-text-muted);
-  font-weight: 500;
-  margin-bottom: 8px;
-}
-.false-positive-display {
-  text-align: center;
-  padding: 8px 0;
-}
 </style>
