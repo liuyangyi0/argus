@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from pydantic import BaseModel
 
-from argus.dashboard.api_response import api_success
+from argus.dashboard.api_response import api_success, api_not_found, api_unavailable
+from argus.dashboard.forms import htmx_toast_headers
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -55,11 +56,11 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
 
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "摄像头管理器不可用"}, status_code=503)
+        return api_unavailable("摄像头管理器不可用")
 
-    pipeline = camera_manager._pipelines.get(zone_req.camera_id)
+    pipeline = camera_manager.get_pipeline(zone_req.camera_id)
     if not pipeline:
-        return JSONResponse({"error": f"摄像头 {zone_req.camera_id} 不存在"}, status_code=404)
+        return api_not_found(f"摄像头 {zone_req.camera_id} 不存在")
 
     priority_map = {
         "critical": ZonePriority.CRITICAL,
@@ -93,7 +94,10 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
             ip_address=client_ip,
         )
 
-    return api_success({"zone_id": zone_req.zone_id})
+    return api_success(
+        {"zone_id": zone_req.zone_id},
+        headers=htmx_toast_headers("区域已添加"),
+    )
 
 
 class ZoneBulkItem(BaseModel):
@@ -111,11 +115,11 @@ async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkI
 
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "摄像头管理器不可用"}, status_code=503)
+        return api_unavailable("摄像头管理器不可用")
 
-    pipeline = camera_manager._pipelines.get(camera_id)
+    pipeline = camera_manager.get_pipeline(camera_id)
     if not pipeline:
-        return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
+        return api_not_found(f"摄像头 {camera_id} 不存在")
 
     priority_map = {
         "critical": ZonePriority.CRITICAL,
@@ -150,7 +154,10 @@ async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkI
             ip_address=client_ip,
         )
 
-    return api_success({"count": len(new_zones)})
+    return api_success(
+        {"count": len(new_zones)},
+        headers=htmx_toast_headers("区域配置已保存"),
+    )
 
 
 @router.delete("/{camera_id}/{zone_id}")
@@ -158,11 +165,11 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
     """Remove a zone from a camera's pipeline."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "摄像头管理器不可用"}, status_code=503)
+        return api_unavailable("摄像头管理器不可用")
 
-    pipeline = camera_manager._pipelines.get(camera_id)
+    pipeline = camera_manager.get_pipeline(camera_id)
     if not pipeline:
-        return JSONResponse({"error": f"摄像头 {camera_id} 不存在"}, status_code=404)
+        return api_not_found(f"摄像头 {camera_id} 不存在")
 
     new_zones = [z for z in pipeline.camera_config.zones if z.zone_id != zone_id]
     pipeline.update_zones(new_zones)
@@ -180,7 +187,10 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
             ip_address=client_ip,
         )
 
-    return api_success({"deleted": True})
+    return api_success(
+        {"deleted": True},
+        headers=htmx_toast_headers("区域已删除"),
+    )
 
 
 @router.get("/snapshot/{camera_id}")
@@ -190,15 +200,15 @@ def camera_snapshot(request: Request, camera_id: str):
 
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return JSONResponse({"error": "摄像头管理器不可用"}, status_code=503)
+        return api_unavailable("摄像头管理器不可用")
 
-    pipeline = camera_manager._pipelines.get(camera_id)
+    pipeline = camera_manager.get_pipeline(camera_id)
     if not pipeline or not pipeline._camera.state.connected:
-        return JSONResponse({"error": "摄像头未连接"}, status_code=503)
+        return api_unavailable("摄像头未连接")
 
     frame_data = pipeline._camera.read()
     if frame_data is None:
-        return JSONResponse({"error": "无法获取画面"}, status_code=503)
+        return api_unavailable("无法获取画面")
 
     _, jpeg = cv2.imencode(".jpg", frame_data.frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
     return Response(content=jpeg.tobytes(), media_type="image/jpeg")
