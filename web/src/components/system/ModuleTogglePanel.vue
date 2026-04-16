@@ -26,7 +26,7 @@ const modules = ref<ModuleToggle[]>([
   {
     key: 'segmenter.enabled',
     label: 'SAM2 实例分割',
-    description: '精确分割异常区域边界（切换后需要重启已运行的摄像头）',
+    description: '精确分割异常区域边界（支持热重载）',
     enabled: false,
   },
   {
@@ -84,9 +84,13 @@ async function toggleModule(mod: ModuleToggle) {
       key: mod.key,
       value: mod.enabled,
     })
-    const restart = res.data?.data?.restart_required
+    const data = res.data?.data
+    const restart = data?.restart_required
+    const reloaded = data?.hot_reloaded ?? 0
     if (restart) {
       message.warning(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}（已运行的摄像头管线需要重启才会生效）`)
+    } else if (reloaded > 0) {
+      message.success(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}（${reloaded} 个管线已热加载）`)
     } else {
       message.success(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}`)
     }

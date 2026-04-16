@@ -972,27 +972,47 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
 
     setattr(section_obj, field, req.value)
 
-    # Keys that only affect NEW pipelines — running ones need restart.
-    _restart_required_keys = {
+    # Try hot-reload into running pipelines
+    _hot_reloadable_keys = {
         "classifier.enabled",
         "segmenter.enabled",
-        "cross_camera.enabled",
         "physics.speed_enabled",
-        "physics.trajectory_enabled",
-        "physics.localization_enabled",
-        "imaging.enabled",
-        "low_light.enabled",
     }
-    restart_required = req.key in _restart_required_keys
+    restart_required = False
+    hot_reloaded = 0
+
+    if req.key in _hot_reloadable_keys:
+        camera_manager = getattr(request.app.state, "camera_manager", None)
+        if camera_manager:
+            for cam_config in getattr(config, "cameras", []):
+                pipeline = camera_manager.get_pipeline(cam_config.camera_id)
+                if pipeline is not None:
+                    try:
+                        pipeline.reload_module(req.key, req.value)
+                        hot_reloaded += 1
+                    except Exception as e:
+                        logger.warning("config.hot_reload_failed", camera_id=cam_config.camera_id, error=str(e))
+    else:
+        # These still need restart (no hot-reload path yet)
+        _restart_required_keys = {
+            "cross_camera.enabled",
+            "imaging.enabled",
+            "low_light.enabled",
+            "physics.trajectory_enabled",
+            "physics.localization_enabled",
+        }
+        restart_required = req.key in _restart_required_keys
 
     logger.info(
         "config.module_toggled",
         key=req.key,
         value=req.value,
         restart_required=restart_required,
+        hot_reloaded=hot_reloaded,
     )
     return api_success({
         "key": req.key,
         "value": req.value,
         "restart_required": restart_required,
+        "hot_reloaded": hot_reloaded,
     })
