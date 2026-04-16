@@ -306,6 +306,10 @@ class AlertDispatcher:
 
         Polls the queue, retries each payload up to max_retries with
         exponential backoff, and logs dropped payloads at ERROR level.
+
+        On shutdown, performs a best-effort drain of any remaining queued
+        payloads (single attempt each, no backoff) so the process can exit
+        without dropping items that were already queued before shutdown.
         """
         while not self._shutdown.is_set():
             try:
@@ -342,8 +346,40 @@ class AlertDispatcher:
                         self._shutdown.wait(timeout=min(backoff, 30.0))
                         backoff = min(backoff * 2, 30.0)
 
+        # Drain phase: single attempt per item, no retry/backoff. The DB
+        # already has the alert (dispatch_database ran before queueing), so
+        # losing a webhook here is a delivery failure — not an audit loss.
+        drained = 0
+        failed = 0
+        while True:
+            try:
+                data = queue.get_nowait()
+            except Empty:
+                break
+            try:
+                send_fn(data)
+                drained += 1
+            except Exception as e:
+                failed += 1
+                logger.error(
+                    f"dispatch.{channel}_dropped_on_shutdown",
+                    alert_id=data.get("alert_id"),
+                    error=str(e),
+                )
+        if drained or failed:
+            logger.info(
+                f"{channel}_worker.drain_complete",
+                drained=drained,
+                failed=failed,
+            )
+
     def _db_worker(self) -> None:
-        """Background thread that persists alerts to the database."""
+        """Background thread that persists alerts to the database.
+
+        After shutdown is signalled, drains any remaining items in the
+        queue before exiting so buffered alerts are written to the DB
+        rather than silently dropped.
+        """
         logger.info("db_worker.started")
         while not self._shutdown.is_set():
             try:
@@ -353,6 +389,21 @@ class AlertDispatcher:
             self._dispatch_database(
                 data["alert"], data["snapshot_path"], data["heatmap_path"],
             )
+
+        # Drain remaining items. _dispatch_database swallows its own exceptions
+        # (see its try/except), so failures here are logged, not raised.
+        drained = 0
+        while True:
+            try:
+                data = self._db_queue.get_nowait()
+            except Empty:
+                break
+            self._dispatch_database(
+                data["alert"], data["snapshot_path"], data["heatmap_path"],
+            )
+            drained += 1
+        if drained:
+            logger.info("db_worker.drain_complete", drained=drained)
 
     def _webhook_worker(self) -> None:
         """Background thread that sends webhook HTTP POST requests."""
