@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from argus.core.alert_ring_buffer import SolidifiedRecording
 
 from argus.config.schema import AlertConfig, AlertSeverity, SeverityThresholds, ZonePriority
+from argus.contracts.validation import validate_alert
 
 logger = structlog.get_logger()
 
@@ -347,6 +348,13 @@ class AlertGrader:
 
             # Reset tracker after emitting alert
             self._trackers[zone_key] = _AnomalyTracker()
+
+        # Data contract validation at grader→dispatcher boundary (advisory only)
+        if alert is not None:
+            try:
+                validate_alert(alert)
+            except Exception:
+                logger.debug("grader.contract_validation_failed", exc_info=True)
 
         return alert
 

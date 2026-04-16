@@ -35,7 +35,7 @@ def _make_fast_config(**overrides) -> AlertConfig:
             info=0.3, low=0.5, medium=0.7, high=0.9,
         ),
         temporal=TemporalConfirmation(
-            min_consecutive_frames=2,
+
             max_gap_seconds=10.0,
             evidence_lambda=0.8,
             evidence_threshold=1.0,

@@ -239,7 +239,8 @@ def create_app(
     async def websocket_endpoint(websocket: WebSocket):
         token = websocket.query_params.get("token", "")
         auth_cfg = getattr(config, "auth", None) or AuthConfig()
-        if not verify_ws_token(token, auth_cfg):
+        secret = getattr(app.state, "session_secret", "")
+        if not verify_ws_token(token, auth_cfg, session_secret=secret):
             await websocket.close(code=4401, reason="Authentication required")
             return
 

@@ -22,7 +22,7 @@ def make_config(**overrides) -> AlertConfig:
     defaults = {
         "severity_thresholds": SeverityThresholds(info=0.5, low=0.7, medium=0.85, high=0.95),
         "temporal": TemporalConfirmation(
-            min_consecutive_frames=3,
+
             max_gap_seconds=10.0,
             evidence_lambda=0.95,
             evidence_threshold=3.0,
@@ -51,7 +51,7 @@ class TestAlertGrader:
         """Alert should only fire after evidence accumulates past threshold."""
         grader = AlertGrader(make_config(
             temporal=TemporalConfirmation(
-                min_consecutive_frames=3,
+
                 max_gap_seconds=10.0,
                 evidence_lambda=0.95,
                 evidence_threshold=3.0,
@@ -84,7 +84,7 @@ class TestAlertGrader:
         """Scores should map to the correct severity levels."""
         config = make_config(
             temporal=TemporalConfirmation(
-                min_consecutive_frames=1, max_gap_seconds=10.0,
+                max_gap_seconds=10.0,
                 evidence_lambda=0.80, evidence_threshold=0.5,
             ),
             suppression=SuppressionConfig(same_zone_window_seconds=10, same_camera_window_seconds=5),
@@ -115,7 +115,7 @@ class TestAlertGrader:
         """Critical zones should amplify the score."""
         config = make_config(
             temporal=TemporalConfirmation(
-                min_consecutive_frames=1, max_gap_seconds=10.0,
+                max_gap_seconds=10.0,
                 evidence_lambda=0.80, evidence_threshold=0.5,
             ),
             suppression=SuppressionConfig(same_zone_window_seconds=10, same_camera_window_seconds=5),
@@ -137,7 +137,7 @@ class TestAlertGrader:
         """Duplicate alerts within the suppression window should be suppressed."""
         config = make_config(
             temporal=TemporalConfirmation(
-                min_consecutive_frames=1, max_gap_seconds=10.0,
+                max_gap_seconds=10.0,
                 evidence_lambda=0.80, evidence_threshold=0.5,
             ),
             suppression=SuppressionConfig(same_zone_window_seconds=300, same_camera_window_seconds=60),
@@ -168,7 +168,7 @@ class TestAlertGrader:
         """Reset should allow new alerts from the same zone."""
         config = make_config(
             temporal=TemporalConfirmation(
-                min_consecutive_frames=1, max_gap_seconds=10.0,
+                max_gap_seconds=10.0,
                 evidence_lambda=0.80, evidence_threshold=0.5,
             ),
             suppression=SuppressionConfig(same_zone_window_seconds=300, same_camera_window_seconds=60),
@@ -199,7 +199,7 @@ class TestAlertGrader:
         """Alert should contain all expected fields."""
         config = make_config(
             temporal=TemporalConfirmation(
-                min_consecutive_frames=1, max_gap_seconds=10.0,
+                max_gap_seconds=10.0,
                 evidence_lambda=0.80, evidence_threshold=0.5,
             ),
         )
@@ -228,7 +228,7 @@ class TestCUSUMEvidence:
     def _make_cusum_config(self, lam=0.95, threshold=3.0):
         return make_config(
             temporal=TemporalConfirmation(
-                min_consecutive_frames=1,
+
                 max_gap_seconds=10.0,
                 evidence_lambda=lam,
                 evidence_threshold=threshold,
@@ -288,7 +288,7 @@ class TestCUSUMEvidence:
         """IoU < min_spatial_overlap → evidence 归零。"""
         config = make_config(
             temporal=TemporalConfirmation(
-                min_consecutive_frames=1,
+
                 max_gap_seconds=10.0,
                 min_spatial_overlap=0.3,
                 evidence_lambda=0.95,

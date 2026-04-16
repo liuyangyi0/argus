@@ -52,8 +52,8 @@ const zoneEditorData = ref<any[]>(camera.value?.zones || [])
 
 async function saveZones() {
   try {
-    const { api } = await import('../api/client')
-    await api.put(`/zones/${cameraId}`, zoneEditorData.value)
+    const { updateZones } = await import('../api/zones')
+    await updateZones(cameraId, zoneEditorData.value)
   } catch { /* handled by global interceptor */ }
 }
 

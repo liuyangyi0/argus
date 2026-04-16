@@ -34,6 +34,7 @@ from argus.storage.audit import AuditLogger
 from argus.storage.backup import BackupManager
 from argus.storage.alert_recording import AlertRecordingStore
 from argus.storage.database import Database
+from argus.storage.inference_buffer import InferenceBuffer
 from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
@@ -197,12 +198,17 @@ def main():
         db.create_user("admin", hash_password("admin"), "admin", "管理员")
         logger.info("auth.default_user_created", username="admin", msg="Default admin user created (password: admin)")
 
+    # Write-behind buffer for batched inference record DB persistence
+    inference_buffer = InferenceBuffer(database=db, flush_seconds=60, max_size=1000)
+    inference_buffer.start()
+
     health = HealthMonitor()
 
     dispatcher = AlertDispatcher(
         config=config.alerts,
         database=db,
         alerts_dir=config.storage.alerts_dir,
+        audio_config=getattr(config.dashboard, "audio_alerts", None),
     )
 
     def on_alert(alert: Alert):
@@ -331,6 +337,7 @@ def main():
         app.state.audit_logger = audit_logger
         app.state.recording_store = alert_recording_store  # FR-033: shared with pipelines
         app.state.active_learning_sampler = active_learning_sampler
+        app.state.inference_buffer = inference_buffer
 
         # Wire camera status changes → WebSocket broadcast so dashboard
         # updates immediately when cameras start/stop (not just on poll).
@@ -510,6 +517,7 @@ def main():
         if retention_manager is not None:
             retention_manager.stop()
         record_store.stop()
+        inference_buffer.stop()  # flush remaining records before DB close
         dispatcher.close()
         db.close()
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
 
 from argus.dashboard.api_response import api_success, api_unavailable, api_validation_error
 
@@ -41,5 +40,5 @@ async def dismiss_task(request: Request, task_id: str):
         return api_unavailable("不可用")
 
     if task_manager.dismiss(task_id):
-        return HTMLResponse("")
+        return api_success({"dismissed": True})
     return api_validation_error("无法清除运行中的任务")

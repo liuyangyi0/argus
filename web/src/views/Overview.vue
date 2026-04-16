@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useWallStore } from '../stores/useWallStore'
+import { getDailyTrend } from '../api/reports'
 
 defineOptions({ name: 'OverviewPage' })
 
@@ -82,6 +83,95 @@ onMounted(() => {
     isFullscreen.value = !!document.fullscreenElement
   })
 })
+
+// ── Trend chart ──
+// The time-range buttons represent how many of the returned daily data points
+// to display (the API returns up to 30 daily labels; we show the tail).
+const trendRange = ref<'5m' | '2m' | '30s'>('2m')
+const trendRangeCount: Record<string, number> = { '5m': 30, '2m': 14, '30s': 7 }
+
+const trendData = ref<{ labels: string[]; high: number[]; medium: number[]; low: number[]; info: number[] } | null>(null)
+const trendError = ref(false)
+const trendLoading = ref(false)
+
+async function fetchTrend() {
+  trendLoading.value = true
+  trendError.value = false
+  try {
+    const res = await getDailyTrend(30)
+    trendData.value = res
+  } catch {
+    trendError.value = true
+    trendData.value = null
+  } finally {
+    trendLoading.value = false
+  }
+}
+
+// Slice to the last N data points for the selected range
+const trendSliced = computed(() => {
+  if (!trendData.value) return null
+  const n = trendRangeCount[trendRange.value]
+  const slice = <T>(arr: T[]): T[] => arr.slice(-n)
+  return {
+    labels: slice(trendData.value.labels),
+    high: slice(trendData.value.high),
+    medium: slice(trendData.value.medium),
+    low: slice(trendData.value.low),
+    info: slice(trendData.value.info),
+  }
+})
+
+// Build SVG polyline points for a series mapped into a 1000×160 viewBox
+function trendPoints(series: number[], allSeries: number[][]): string {
+  const allVals = allSeries.flat()
+  const maxVal = Math.max(...allVals, 1)
+  const n = series.length
+  if (n < 2) return ''
+  const stepX = 1000 / (n - 1)
+  return series
+    .map((v, i) => {
+      const x = i * stepX
+      const y = 160 - (v / maxVal) * 148 + 4
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+    .join(' ')
+}
+
+// Y coordinate of the last point in the high series (for live dot placement)
+const trendHighEndY = computed(() => {
+  if (!trendSliced.value || trendSliced.value.high.length < 2) return 80
+  const series = trendSliced.value.high
+  const allVals = [...series, ...trendSliced.value.medium]
+  const maxVal = Math.max(...allVals, 1)
+  const last = series[series.length - 1]
+  return 160 - (last / maxVal) * 148 + 4
+})
+
+// Fetch on mount and whenever tab is switched to trend
+onMounted(fetchTrend)
+watch(rightTab, (tab) => { if (tab === 'trend' && !trendData.value && !trendLoading.value) fetchTrend() })
+
+// ── Camera sparkline ──
+// Normalize score_sparkline to SVG polyline points in a 100×40 viewBox
+function sparklinePoints(values: number[]): string {
+  if (!values || values.length < 2) return ''
+  const max = Math.max(...values, 0.01)
+  const n = values.length
+  const stepX = 100 / (n - 1)
+  return values
+    .map((v, i) => {
+      const x = i * stepX
+      const y = 40 - (v / max) * 36 + 2
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+    .join(' ')
+}
+function sparklineFill(values: number[]): string {
+  if (!values || values.length < 2) return ''
+  const pts = sparklinePoints(values)
+  return `${pts} 100,40 0,40`
+}
 </script>
 
 <template>
@@ -154,10 +244,10 @@ onMounted(() => {
                 loading="lazy"
                 @error="($event.target as HTMLImageElement).style.display = 'none'"
               />
-              <div v-if="cam.current_score && cam.current_score > 0.6" style="position: absolute; bottom: 0; left: 0; right: 0; height: 35%; z-index: 1; pointer-events: none; mix-blend-mode: multiply;">
+              <div v-if="cam.current_score && cam.current_score > 0.6 && cam.score_sparkline?.length >= 2" style="position: absolute; bottom: 0; left: 0; right: 0; height: 35%; z-index: 1; pointer-events: none; mix-blend-mode: multiply;">
                 <svg width="100%" height="100%" viewBox="0 0 100 40" preserveAspectRatio="none">
-                  <path d="M0 30 Q 15 15, 30 25 T 60 20 T 100 25 L 100 50 L 0 50 Z" fill="rgba(229,72,77,.18)"/>
-                  <path d="M0 30 Q 15 15, 30 25 T 60 20 T 100 25" fill="none" stroke="#e5484d" stroke-width="1.8" vector-effect="non-scaling-stroke"/>
+                  <polygon :points="sparklineFill(cam.score_sparkline)" fill="rgba(229,72,77,.18)"/>
+                  <polyline :points="sparklinePoints(cam.score_sparkline)" fill="none" stroke="#e5484d" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
               </div>
 
@@ -231,19 +321,95 @@ onMounted(() => {
         <div class="trend" style="padding: 8px 6px; flex: 1; display: flex; flex-direction: column;">
           <div class="trend-head" style="margin-bottom: 24px; flex-direction: column; align-items: flex-start; gap: 12px;">
             <div class="left">
-              <h3 style="font-size: 13.5px"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>异常分数全局趋势</h3>
-              <span class="meta" style="font-size: 11px; margin-top:4px; display:block">实时更新 · 最近 2 分钟</span>
+              <h3 style="font-size: 13.5px"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>异常告警趋势</h3>
+              <span class="meta" style="font-size: 11px; margin-top:4px; display:block">
+                {{ trendLoading ? '加载中…' : trendError ? '数据加载失败' : trendData ? '按日统计' : '' }}
+              </span>
             </div>
-            <div class="seg" style="align-self:stretch; background:rgba(10,10,15,.04); padding:3px; gap:2px"><button style="flex:1">5m</button><button class="on" style="flex:1">2m</button><button style="flex:1">30s</button></div>
+            <div class="seg" style="align-self:stretch; background:rgba(10,10,15,.04); padding:3px; gap:2px">
+              <button style="flex:1" :class="{ on: trendRange === '5m' }" @click="trendRange = '5m'">30天</button>
+              <button style="flex:1" :class="{ on: trendRange === '2m' }" @click="trendRange = '2m'">14天</button>
+              <button style="flex:1" :class="{ on: trendRange === '30s' }" @click="trendRange = '30s'">7天</button>
+            </div>
           </div>
-          <div class="chart" style="flex:1; min-height: 180px; margin-top: auto">
+
+          <!-- Error state -->
+          <div v-if="trendError" style="text-align:center;color:var(--ink-5);font-size:12px;padding:40px 0">
+            数据加载失败，请稍后重试
+          </div>
+
+          <!-- Loading state -->
+          <div v-else-if="trendLoading" style="text-align:center;color:var(--ink-5);font-size:12px;padding:40px 0">
+            加载中…
+          </div>
+
+          <!-- Chart -->
+          <div v-else-if="trendSliced" class="chart" style="flex:1; min-height: 180px; margin-top: auto">
             <div class="grid-h"><div></div><div></div><div></div><div></div><div></div></div>
             <svg width="100%" height="100%" viewBox="0 0 1000 160" preserveAspectRatio="none">
-              <defs><linearGradient id="tg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0a0a0c" stop-opacity=".16"/><stop offset="100%" stop-color="#0a0a0c" stop-opacity="0"/></linearGradient></defs>
-              <path d="M0 160 L0 110 C 40 110, 60 70, 100 70 C 140 70, 160 95, 200 95 C 240 95, 260 50, 300 50 C 340 50, 360 120, 400 120 C 440 120, 460 30, 500 30 C 540 30, 560 80, 600 80 C 640 80, 660 20, 700 20 C 740 20, 760 60, 800 60 C 840 60, 860 130, 900 130 C 940 130, 960 70, 1000 70 L 1000 180 L 0 180 Z" fill="url(#tg)"/>
-              <path d="M0 110 C 40 110, 60 70, 100 70 C 140 70, 160 95, 200 95 C 240 95, 260 50, 300 50 C 340 50, 360 120, 400 120 C 440 120, 460 30, 500 30 C 540 30, 560 80, 600 80 C 640 80, 660 20, 700 20 C 740 20, 760 60, 800 60 C 840 60, 860 130, 900 130 C 940 130, 960 70, 1000 70" fill="none" stroke="#0a0a0c" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>
-              <circle cx="1000" cy="70" r="4.5" fill="#fff" stroke="#0a0a0c" stroke-width="2"><animate attributeName="r" values="4;7;4" dur="2s" repeatCount="indefinite"/></circle>
+              <defs>
+                <linearGradient id="tg-high" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#e5484d" stop-opacity=".22"/>
+                  <stop offset="100%" stop-color="#e5484d" stop-opacity="0"/>
+                </linearGradient>
+                <linearGradient id="tg-medium" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#f59e0b" stop-opacity=".16"/>
+                  <stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/>
+                </linearGradient>
+              </defs>
+
+              <!-- high series fill -->
+              <polygon
+                v-if="trendSliced.high.length >= 2"
+                :points="trendPoints(trendSliced.high, [trendSliced.high, trendSliced.medium]) + ` 1000,160 0,160`"
+                fill="url(#tg-high)"
+              />
+              <!-- medium series fill -->
+              <polygon
+                v-if="trendSliced.medium.length >= 2"
+                :points="trendPoints(trendSliced.medium, [trendSliced.high, trendSliced.medium]) + ` 1000,160 0,160`"
+                fill="url(#tg-medium)"
+              />
+              <!-- medium line -->
+              <polyline
+                v-if="trendSliced.medium.length >= 2"
+                :points="trendPoints(trendSliced.medium, [trendSliced.high, trendSliced.medium])"
+                fill="none" stroke="#f59e0b" stroke-width="1.8"
+                vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"
+                stroke-dasharray="6,3"
+              />
+              <!-- high line -->
+              <polyline
+                v-if="trendSliced.high.length >= 2"
+                :points="trendPoints(trendSliced.high, [trendSliced.high, trendSliced.medium])"
+                fill="none" stroke="#e5484d" stroke-width="2.5"
+                vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"
+              />
+              <!-- live dot at end of high series -->
+              <circle
+                v-if="trendSliced.high.length >= 2"
+                cx="1000"
+                :cy="trendHighEndY"
+                r="4.5" fill="#fff" stroke="#e5484d" stroke-width="2"
+              >
+                <animate attributeName="r" values="4;7;4" dur="2s" repeatCount="indefinite"/>
+              </circle>
             </svg>
+
+            <!-- Legend -->
+            <div style="display:flex;gap:14px;justify-content:flex-end;margin-top:8px">
+              <span style="display:flex;align-items:center;gap:4px;font-size:10.5px;color:var(--ink-4)">
+                <span style="width:12px;height:2px;background:#e5484d;border-radius:1px;display:inline-block"></span>高
+              </span>
+              <span style="display:flex;align-items:center;gap:4px;font-size:10.5px;color:var(--ink-4)">
+                <span style="width:12px;height:2px;background:#f59e0b;border-radius:1px;display:inline-block;opacity:.7"></span>中
+              </span>
+            </div>
+          </div>
+
+          <!-- No data fallback -->
+          <div v-else style="text-align:center;color:var(--ink-5);font-size:12px;padding:40px 0">
+            暂无趋势数据
           </div>
         </div>
       </div>
