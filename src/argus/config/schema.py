@@ -158,6 +158,25 @@ class CaptureQualityConfig(BaseModel):
     )
 
 
+class EnsembleDetectionConfig(BaseModel):
+    """Multi-model ensemble for reduced false positives."""
+
+    enabled: bool = Field(default=False, description="Enable multi-model ensemble detection")
+    method: Literal["mean", "max", "weighted", "vote", "bayesian"] = Field(
+        default="mean", description="Score fusion method",
+    )
+    weights: list[float] | None = Field(
+        default=None, description="Model weights for 'weighted' method",
+    )
+    bayesian_prior: float = Field(
+        default=0.01, ge=0.001, le=0.5,
+        description="Prior probability of anomaly for Bayesian fusion",
+    )
+    dynamic_fpr_weighting: bool = Field(
+        default=False, description="Dynamically adjust weights based on per-model FPR",
+    )
+
+
 class AnomalyConfig(BaseModel):
     """Anomalib anomaly detection parameters."""
 
@@ -253,7 +272,7 @@ class AnomalyConfig(BaseModel):
         description="Maximum average inference latency (ms) allowed during warmup",
     )
     verify_model_signature: bool = Field(
-        default=False,
+        default=True,
         description="Require cryptographic signature verification on model files",
     )
     min_shadow_days: int = Field(
@@ -272,6 +291,11 @@ class AnomalyConfig(BaseModel):
     backbone_max_total_images: int = Field(
         default=50000, ge=1000, le=200000,
         description="Maximum total images across all cameras for backbone training",
+    )
+    # Multi-model ensemble
+    ensemble: EnsembleDetectionConfig = Field(
+        default_factory=EnsembleDetectionConfig,
+        description="Multi-model ensemble detection for reduced false positives",
     )
 
 
@@ -576,11 +600,6 @@ class SeverityThresholds(BaseModel):
 class TemporalConfirmation(BaseModel):
     """Require anomaly persistence before alerting."""
 
-    min_consecutive_frames: int = Field(
-        default=3, ge=1, le=30,
-        description="DEPRECATED: Not enforced by AlertGrader. "
-        "Use evidence_threshold to control alert sensitivity instead.",
-    )
     max_gap_seconds: float = Field(default=10.0, ge=1.0, le=120.0)
     min_spatial_overlap: float = Field(
         default=0.3, ge=0.0, le=1.0,
@@ -954,10 +973,10 @@ class ImagingConfig(BaseModel):
         default=3, ge=1, le=5,
         description="Number of fused input channels: 1=gray, 3=RGB, 4=RGB+DoLP, 5=RGB+DoLP+NIR",
     )
-    deglare_method: Literal["stokes", "min_intensity", "polafree"] = Field(
+    deglare_method: Literal["stokes", "min_intensity"] = Field(
         default="stokes",
         description="Reflection removal method: stokes (classical Stokes-based), "
-        "min_intensity (fast I_min approximation), polafree (deep learning)",
+        "min_intensity (fast I_min approximation)",
     )
     dolp_threshold: float = Field(
         default=0.3, ge=0.0, le=1.0,

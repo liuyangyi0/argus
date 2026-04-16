@@ -88,6 +88,22 @@ export interface AlertSummary {
   segmentation_count?: number | null
   segmentation_total_area_px?: number | null
   segmentation_objects?: SegmentationObject[] | null
+  // Event grouping
+  event_group_id?: string | null
+  event_group_count?: number | null
+  // Image paths
+  snapshot_path?: string | null
+  heatmap_path?: string | null
+  // Physics enrichment
+  speed_ms?: number | null
+  speed_px_per_sec?: number | null
+  trajectory_model?: string | null
+  origin_x_mm?: number | null
+  origin_y_mm?: number | null
+  origin_z_mm?: number | null
+  // Workflow
+  assigned_to?: string | null
+  resolved_at?: string | null
 }
 
 export interface SegmentationObject {
@@ -296,8 +312,7 @@ export interface AuditPayload { entries: AuditEntry[] }
 
 export interface ModelRegistryResponse {
   models: ModelInfo[]
-  active_model?: ModelInfo
-  total?: number
+  total: number
 }
 
 export interface TrainingJobsResponse {
@@ -316,21 +331,28 @@ export interface ShadowReportResponse {
 }
 
 export interface ABScoresResponse {
-  scores: Array<{ t: string; prod: number; shadow: number }>
+  scores: Array<{ t: string; production: number | null; shadow: number; shadow_alert?: boolean; prod_alert?: boolean }>
+  total: number
+  shadow_version_id: string
 }
 
 export interface ABDistributionResponse {
-  bins: number[]
-  prod: number[]
-  shadow: number[]
+  bin_edges: number[]
+  production_counts: number[]
+  shadow_counts: number[]
+  total_samples: number
 }
 
 export interface ABLiveCompareResponse {
-  camera_id: string
-  shadow_version_id: string
-  production: { score: number; heatmap_b64?: string }
-  shadow: { score: number; heatmap_b64?: string }
-  original_b64?: string
+  production_score?: number
+  production_heatmap?: string | null
+  production_latency_ms?: number
+  production_error?: string
+  shadow_score?: number
+  shadow_heatmap?: string | null
+  shadow_latency_ms?: number
+  shadow_error?: string
+  original_frame?: string
 }
 
 export interface BatchInferenceResponse {

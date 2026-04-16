@@ -2,13 +2,40 @@
 
 from __future__ import annotations
 
+import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from argus.dashboard.forms import htmx_toast_headers
+from argus.dashboard.api_response import api_success
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _persist_zones(request: Request, camera_id: str, zones: list) -> None:
+    """Persist zone changes for *camera_id* back to the YAML config file.
+
+    Updates both the in-memory ``app.state.config`` and the file on disk.
+    Silently skips when ``config_path`` is unavailable (e.g. tests).
+    """
+    config = getattr(request.app.state, "config", None)
+    config_path = getattr(request.app.state, "config_path", None)
+    if config is None or config_path is None:
+        return
+
+    # Update the matching camera in the in-memory config
+    for cam in getattr(config, "cameras", []):
+        if cam.camera_id == camera_id:
+            cam.zones = list(zones)
+            break
+
+    # Write back to disk
+    try:
+        from argus.config.loader import save_config
+        save_config(config, config_path)
+    except Exception:
+        logger.exception("zone_persist.failed camera_id=%s", camera_id)
 
 
 class ZoneCreateRequest(BaseModel):
@@ -52,6 +79,7 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
     current_zones = list(pipeline.camera_config.zones)
     current_zones.append(new_zone)
     pipeline.update_zones(current_zones)
+    _persist_zones(request, zone_req.camera_id, current_zones)
 
     audit = getattr(request.app.state, "audit_logger", None)
     client_ip = request.client.host if request.client else ""
@@ -65,10 +93,7 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
             ip_address=client_ip,
         )
 
-    return JSONResponse(
-        {"status": "ok", "zone_id": zone_req.zone_id},
-        headers=htmx_toast_headers("区域已添加"),
-    )
+    return api_success({"zone_id": zone_req.zone_id})
 
 
 class ZoneBulkItem(BaseModel):
@@ -111,6 +136,7 @@ async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkI
         ))
 
     pipeline.update_zones(new_zones)
+    _persist_zones(request, camera_id, new_zones)
 
     audit = getattr(request.app.state, "audit_logger", None)
     client_ip = request.client.host if request.client else ""
@@ -124,10 +150,7 @@ async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkI
             ip_address=client_ip,
         )
 
-    return JSONResponse(
-        {"status": "ok", "count": len(new_zones)},
-        headers=htmx_toast_headers("区域配置已保存"),
-    )
+    return api_success({"count": len(new_zones)})
 
 
 @router.delete("/{camera_id}/{zone_id}")
@@ -143,6 +166,7 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
 
     new_zones = [z for z in pipeline.camera_config.zones if z.zone_id != zone_id]
     pipeline.update_zones(new_zones)
+    _persist_zones(request, camera_id, new_zones)
 
     audit = getattr(request.app.state, "audit_logger", None)
     client_ip = request.client.host if request.client else ""
@@ -156,10 +180,7 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
             ip_address=client_ip,
         )
 
-    return JSONResponse(
-        {"status": "ok"},
-        headers=htmx_toast_headers("区域已删除"),
-    )
+    return api_success({"deleted": True})
 
 
 @router.get("/snapshot/{camera_id}")

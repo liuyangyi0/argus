@@ -13,6 +13,9 @@ export interface ZoneCreateRequest {
 export const createZone = (data: ZoneCreateRequest) =>
   api.post('/zones', data).then(u)
 
+export const updateZones = (cameraId: string, zones: any[]) =>
+  api.put(`/zones/${cameraId}`, zones).then(u)
+
 export const deleteZone = (cameraId: string, zoneId: string) =>
   api.delete(`/zones/${cameraId}/${zoneId}`).then(u)
 

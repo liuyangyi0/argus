@@ -81,3 +81,28 @@ def resolve_runtime_model_path(model_path: str | Path, camera_id: str) -> Path |
             return match
 
     return find_runtime_model(camera_id)
+
+
+def find_all_models(camera_id: str) -> list[Path]:
+    """Discover all inference-ready model files for a camera.
+
+    Searches data/exports/{camera_id} and data/models/{camera_id} for
+    .pt and .xml files. Returns deduplicated list sorted by mtime (newest first).
+    Used by DetectorEnsemble to find multiple models for multi-model fusion.
+    """
+    seen: set[Path] = set()
+    results: list[tuple[float, Path]] = []
+
+    for search_dir in (Path("data/exports") / camera_id, Path("data/models") / camera_id):
+        if not search_dir.exists():
+            continue
+        for suffix in (".xml", ".pt"):
+            for match in search_dir.rglob(f"*{suffix}"):
+                resolved = match.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    results.append((match.stat().st_mtime, resolved))
+
+    # Sort newest first
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [path for _, path in results]
