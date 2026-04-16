@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { inject, ref, computed } from 'vue'
+import { inject, ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import type { useReplayController } from '../../composables/useReplayController'
 
 const ctrl = inject<ReturnType<typeof useReplayController>>('replayCtrl')!
@@ -8,15 +8,46 @@ const videoRef = ctrl.videoEl
 
 import VideoOverlayCanvas from './VideoOverlayCanvas.vue'
 
-// Track actual video native dimensions for heatmap alignment
+// Compute the actual rect where object-fit:contain renders the video,
+// so the heatmap overlay can be positioned exactly on top.
+const containerRef = ref<HTMLDivElement | null>(null)
 const nativeWidth = ref(0)
 const nativeHeight = ref(0)
-const heatmapAspect = computed(() => {
-  if (nativeWidth.value && nativeHeight.value) {
-    return `${nativeWidth.value} / ${nativeHeight.value}`
+const containerWidth = ref(0)
+const containerHeight = ref(0)
+
+const heatmapRect = computed<Record<string, string>>(() => {
+  const vw = nativeWidth.value
+  const vh = nativeHeight.value
+  const cw = containerWidth.value
+  const ch = containerHeight.value
+  if (!vw || !vh || !cw || !ch) {
+    return { top: '0', left: '0', width: '100%', height: '100%' }
   }
-  return '16 / 9'
+  const scale = Math.min(cw / vw, ch / vh)
+  const rw = vw * scale
+  const rh = vh * scale
+  return {
+    left: `${(cw - rw) / 2}px`,
+    top: `${(ch - rh) / 2}px`,
+    width: `${rw}px`,
+    height: `${rh}px`,
+  }
 })
+
+let resizeObs: ResizeObserver | null = null
+onMounted(() => {
+  if (containerRef.value) {
+    const update = () => {
+      containerWidth.value = containerRef.value!.clientWidth
+      containerHeight.value = containerRef.value!.clientHeight
+    }
+    resizeObs = new ResizeObserver(update)
+    resizeObs.observe(containerRef.value)
+    update()
+  }
+})
+onBeforeUnmount(() => { resizeObs?.disconnect() })
 
 function onTimeUpdate() {
   if (!ctrl.videoEl.value) return
@@ -66,7 +97,7 @@ function onVideoError() {
 </script>
 
 <template>
-  <div class="replay-player">
+  <div ref="containerRef" class="replay-player">
     <video
       ref="videoRef"
       :src="ctrl.videoUrl.value"
@@ -86,7 +117,7 @@ function onVideoError() {
       v-if="ctrl.showHeatmap.value && ctrl.hasHeatmaps.value"
       :src="ctrl.heatmapUrl.value"
       class="replay-heatmap"
-      :style="{ aspectRatio: heatmapAspect }"
+      :style="heatmapRect"
     />
     
     <!-- YOLO 检测框 (Canvas 60FPS) -->
@@ -135,9 +166,7 @@ function onVideoError() {
 }
 .replay-heatmap {
   position: absolute;
-  top: 0; left: 0;
-  width: 100%; height: 100%;
-  object-fit: contain;
+  object-fit: fill;
   opacity: 0.4;
   pointer-events: none;
   mix-blend-mode: screen;
