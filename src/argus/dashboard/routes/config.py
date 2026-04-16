@@ -614,6 +614,140 @@ async def get_cross_camera_config(request: Request):
     })
 
 
+class CrossCameraPairEntry(BaseModel):
+    camera_a: str
+    camera_b: str
+    homography: list[list[float]]
+
+
+class CrossCameraUpdateRequest(BaseModel):
+    overlap_pairs: list[CrossCameraPairEntry] | None = None
+    corroboration_threshold: float | None = None
+    max_age_seconds: float | None = None
+    uncorroborated_severity_downgrade: int | None = None
+
+
+@router.put("/cross-camera/pairs")
+async def update_cross_camera_config(
+    request: Request, req: CrossCameraUpdateRequest,
+):
+    """Patch cross-camera correlation config at runtime.
+
+    ``overlap_pairs`` replaces the full list when provided.  Scalar params
+    (``corroboration_threshold``, ``max_age_seconds``,
+    ``uncorroborated_severity_downgrade``) are individually optional.
+    Pushes pair/threshold changes to the live correlator via
+    ``camera_manager.update_cross_camera_pairs()``.
+    """
+    from argus.config.schema import CameraOverlapConfig
+    from argus.core.correlation import CameraOverlapPair
+    from argus.dashboard.auth import require_role
+
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("需要管理员或工程师权限")
+
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    cfg = getattr(config, "cross_camera", None)
+    if cfg is None:
+        return api_unavailable("跨相机配置不可用")
+
+    # ── Validate overlap_pairs ──
+    if req.overlap_pairs is not None:
+        seen: set[frozenset[str]] = set()
+        for p in req.overlap_pairs:
+            if p.camera_a == p.camera_b:
+                return api_validation_error(
+                    f"camera_a 和 camera_b 不能相同 ('{p.camera_a}')"
+                )
+            if len(p.homography) != 3 or any(
+                len(row) != 3 for row in p.homography
+            ):
+                return api_validation_error(
+                    f"homography 必须是 3×3 矩阵 ('{p.camera_a}' → '{p.camera_b}')"
+                )
+            key = frozenset({p.camera_a, p.camera_b})
+            if key in seen:
+                return api_validation_error(
+                    f"重复的相机对 ('{p.camera_a}' ↔ '{p.camera_b}')"
+                )
+            seen.add(key)
+
+    # ── Validate scalar params ──
+    if req.corroboration_threshold is not None and not (
+        0.1 <= req.corroboration_threshold <= 0.9
+    ):
+        return api_validation_error("corroboration_threshold 必须在 [0.1, 0.9] 范围内")
+    if req.max_age_seconds is not None and not (
+        1.0 <= req.max_age_seconds <= 30.0
+    ):
+        return api_validation_error("max_age_seconds 必须在 [1.0, 30.0] 范围内")
+    if req.uncorroborated_severity_downgrade is not None and not (
+        0 <= req.uncorroborated_severity_downgrade <= 2
+    ):
+        return api_validation_error("uncorroborated_severity_downgrade 必须在 [0, 2] 范围内")
+
+    # ── Apply to in-memory config ──
+    if req.overlap_pairs is not None:
+        cfg.overlap_pairs = [
+            CameraOverlapConfig(
+                camera_a=p.camera_a,
+                camera_b=p.camera_b,
+                homography=p.homography,
+            )
+            for p in req.overlap_pairs
+        ]
+    if req.corroboration_threshold is not None:
+        cfg.corroboration_threshold = req.corroboration_threshold
+    if req.max_age_seconds is not None:
+        cfg.max_age_seconds = req.max_age_seconds
+    if req.uncorroborated_severity_downgrade is not None:
+        cfg.uncorroborated_severity_downgrade = req.uncorroborated_severity_downgrade
+
+    # ── Hot-push to correlator ──
+    correlator_updated = False
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    if camera_manager is not None and (
+        req.overlap_pairs is not None or req.corroboration_threshold is not None
+    ):
+        try:
+            pairs = [
+                CameraOverlapPair(
+                    camera_a=p.camera_a,
+                    camera_b=p.camera_b,
+                    homography=p.homography,
+                )
+                for p in cfg.overlap_pairs
+            ]
+            correlator_updated = camera_manager.update_cross_camera_pairs(
+                pairs=pairs,
+                corroboration_threshold=req.corroboration_threshold,
+            )
+        except Exception:
+            logger.warning("config.cross_camera_pairs_push_failed", exc_info=True)
+
+    logger.info(
+        "config.cross_camera_updated",
+        pairs=len(cfg.overlap_pairs),
+        corroboration_threshold=cfg.corroboration_threshold,
+        max_age_seconds=cfg.max_age_seconds,
+        correlator_updated=correlator_updated,
+    )
+
+    return api_success({
+        "overlap_pairs": [
+            {"camera_a": p.camera_a, "camera_b": p.camera_b, "homography": p.homography}
+            for p in cfg.overlap_pairs
+        ],
+        "corroboration_threshold": cfg.corroboration_threshold,
+        "max_age_seconds": cfg.max_age_seconds,
+        "uncorroborated_severity_downgrade": cfg.uncorroborated_severity_downgrade,
+        "correlator_updated": correlator_updated,
+    })
+
+
 class SegmenterParamsRequest(BaseModel):
     max_points: int | None = None
     min_anomaly_score: float | None = None
@@ -843,5 +977,28 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
         return api_validation_error(f"Unknown field: {field} in {section}")
 
     setattr(section_obj, field, req.value)
-    logger.info("config.module_toggled", key=req.key, value=req.value)
-    return api_success({"key": req.key, "value": req.value})
+
+    # Keys that only affect NEW pipelines — running ones need restart.
+    _restart_required_keys = {
+        "classifier.enabled",
+        "segmenter.enabled",
+        "cross_camera.enabled",
+        "physics.speed_enabled",
+        "physics.trajectory_enabled",
+        "physics.localization_enabled",
+        "imaging.enabled",
+        "low_light.enabled",
+    }
+    restart_required = req.key in _restart_required_keys
+
+    logger.info(
+        "config.module_toggled",
+        key=req.key,
+        value=req.value,
+        restart_required=restart_required,
+    )
+    return api_success({
+        "key": req.key,
+        "value": req.value,
+        "restart_required": restart_required,
+    })
