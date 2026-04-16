@@ -2122,6 +2122,66 @@ class DetectionPipeline:
         """Hot-reload the anomaly detection model without stopping the pipeline."""
         return self._anomaly_detector.hot_reload(Path(model_path))
 
+    def reload_module(self, key: str, enabled: bool) -> bool:
+        """Hot-reload an optional module without restarting the pipeline.
+
+        Returns True if the module state changed.
+        """
+        if key == "classifier.enabled":
+            if enabled and self._classifier is None:
+                try:
+                    from argus.anomaly.classifier import OpenVocabClassifier
+                    cfg = self._classifier_config
+                    if cfg is None:
+                        return False
+                    self._classifier = OpenVocabClassifier(
+                        model_name=cfg.model_name,
+                        vocabulary=cfg.vocabulary,
+                    )
+                    self._classifier.load()
+                    self._classifier_min_score = cfg.min_anomaly_score_to_classify
+                    self._classifier_high_risk = set(cfg.high_risk_labels)
+                    self._classifier_low_risk = set(cfg.low_risk_labels)
+                    self._classifier_suppress = set(getattr(cfg, "suppress_labels", []))
+                    logger.info("pipeline.classifier_hot_loaded", camera_id=self.camera_config.camera_id)
+                except Exception as e:
+                    logger.warning("pipeline.classifier_hot_load_failed", error=str(e))
+                    return False
+            elif not enabled and self._classifier is not None:
+                self._classifier = None
+                logger.info("pipeline.classifier_unloaded", camera_id=self.camera_config.camera_id)
+            return True
+
+        if key == "segmenter.enabled":
+            if enabled and self._segmenter is None:
+                try:
+                    from argus.anomaly.segmenter import InstanceSegmenter
+                    cfg = self._segmenter_config
+                    if cfg is None:
+                        return False
+                    self._segmenter = InstanceSegmenter(
+                        model_size=cfg.model_size,
+                        min_mask_area_px=cfg.min_mask_area_px,
+                        timeout_seconds=cfg.timeout_seconds,
+                    )
+                    self._segmenter.load()
+                    self._segmenter_max_points = cfg.max_points
+                    self._segmenter_min_score = cfg.min_anomaly_score
+                    logger.info("pipeline.segmenter_hot_loaded", camera_id=self.camera_config.camera_id)
+                except Exception as e:
+                    logger.warning("pipeline.segmenter_hot_load_failed", error=str(e))
+                    return False
+            elif not enabled and self._segmenter is not None:
+                self._segmenter = None
+                logger.info("pipeline.segmenter_unloaded", camera_id=self.camera_config.camera_id)
+            return True
+
+        if key == "physics.speed_enabled":
+            self.camera_config.physics = self.camera_config.physics  # config already updated
+            return True
+
+        return False
+
     def set_model_version_id(self, model_version_id: str | None) -> None:
         """Update the model version tag used in alerts and inference records."""
         self._model_version_id = model_version_id
