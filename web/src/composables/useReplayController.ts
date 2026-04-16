@@ -26,7 +26,8 @@ export function useReplayController(alertId: string) {
   // overlays
   const showHeatmap = ref(true)
   const showBoxes = ref(false)
-  const heatmapIndex = ref(0) // frozen during play
+  const heatmapIndex = ref(0)
+  const heatmapOk = ref(true) // false when current frame has no heatmap (404)
 
   // reference frames
   const referenceFrame = ref<string | null>(null)
@@ -43,6 +44,21 @@ export function useReplayController(alertId: string) {
   const videoUrl = computed(() => getReplayVideoUrl(alertId))
   const heatmapUrl = computed(() => getReplayHeatmapUrl(alertId, heatmapIndex.value))
   const hasHeatmaps = computed(() => signals.value?.has_heatmaps || false)
+
+  // Preload all heatmap images into browser cache for instant switching during playback
+  function preloadHeatmaps() {
+    if (!metadata.value?.frame_count || !hasHeatmaps.value) return
+    const total = metadata.value.frame_count
+    let i = 0
+    function batch() {
+      for (let n = 0; n < 8 && i < total; n++, i++) {
+        const img = new Image()
+        img.src = getReplayHeatmapUrl(alertId, i)
+      }
+      if (i < total) setTimeout(batch, 50)
+    }
+    batch()
+  }
 
   const currentTimestamp = computed(() => {
     const ts = signals.value?.timestamps?.[currentIndex.value]
@@ -66,6 +82,7 @@ export function useReplayController(alertId: string) {
         currentIndex.value = metadata.value.trigger_frame_index
         heatmapIndex.value = metadata.value.trigger_frame_index
       }
+      preloadHeatmaps()
       loadReference()
     } catch (e) {
       message.error('回放数据加载失败')
@@ -213,7 +230,7 @@ export function useReplayController(alertId: string) {
   return {
     metadata, signals, currentIndex, playing, speed, loading,
     videoEl, videoError, pendingSeekIndex,
-    showHeatmap, showBoxes, heatmapIndex,
+    showHeatmap, showBoxes, heatmapIndex, heatmapOk,
     referenceFrame, referenceDate, loadingRef, selectedRefOption,
     clipStart, clipEnd,
     fps, videoUrl, heatmapUrl, hasHeatmaps, currentTimestamp,
