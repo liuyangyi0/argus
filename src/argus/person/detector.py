@@ -51,14 +51,26 @@ _registry_lock = threading.Lock()
 
 
 def get_shared_yolo(model_name: str) -> Any:
-    """Get or create a shared YOLO model instance. Thread-safe."""
+    """Get or create a shared YOLO model instance. Thread-safe.
+
+    Automatically places the model on CUDA when available to avoid
+    the 5-10x inference slowdown of CPU execution.
+    """
     with _registry_lock:
         if model_name not in _shared_yolo_registry:
             from ultralytics import YOLO
 
             model = YOLO(model_name)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    model.to("cuda:0")
+                    logger.info("yolo.shared_loaded", model=model_name, device="cuda:0")
+                else:
+                    logger.info("yolo.shared_loaded", model=model_name, device="cpu")
+            except ImportError:
+                logger.info("yolo.shared_loaded", model=model_name, device="cpu")
             _shared_yolo_registry[model_name] = model
-            logger.info("yolo.shared_loaded", model=model_name)
         return _shared_yolo_registry[model_name]
 
 

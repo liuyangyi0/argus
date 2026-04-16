@@ -99,7 +99,6 @@ class AnomalibDetector:
             )
             return False
 
-        # Try OpenVINO first (faster inference), then fall back to Torch
         suffix = self._model_path.suffix.lower()
         if suffix == ".ckpt":
             logger.error(
@@ -108,6 +107,24 @@ class AnomalibDetector:
                 msg="Lightning checkpoint is not deployable; use model.pt or model.xml",
             )
             return False
+
+        # Detect CUDA availability once
+        _cuda_available = False
+        try:
+            import torch
+            _cuda_available = torch.cuda.is_available()
+        except ImportError:
+            pass
+
+        # When CUDA is available, prefer Torch+CUDA over OpenVINO (which
+        # defaults to CPU).  This avoids the 10-40x slowdown observed when
+        # anomaly inference runs on CPU instead of GPU.
+        if _cuda_available:
+            if self._try_load_torch(device="cuda"):
+                return True
+            # CUDA Torch failed — fall through to OpenVINO / CPU Torch
+
+        # OpenVINO path (CPU) — used when CUDA is unavailable or Torch failed
         if suffix in (".xml", ".onnx", ".bin"):
             try:
                 from anomalib.deploy import OpenVINOInferencer
@@ -120,22 +137,35 @@ class AnomalibDetector:
             except Exception as e:
                 logger.warning("anomaly.openvino_failed", error=str(e))
 
-        # Torch inferencer for .ckpt / .pt files (or OpenVINO fallback)
+        # Final fallback: Torch on CPU
+        if not _cuda_available:
+            if self._try_load_torch(device="cpu"):
+                return True
+
+        logger.error("anomaly.load_failed", path=str(self._model_path))
+        return False
+
+    def _try_load_torch(self, device: str = "cpu") -> bool:
+        """Attempt to load the model via TorchInferencer on the given device."""
         try:
             import os
-            # Required for Anomalib Torch model loading (TorchInferencer).
-            # Only affects the Torch fallback path when OpenVINO is unavailable.
-            # Security: enables arbitrary code execution from model files — only load trusted models.
             os.environ.setdefault("TRUST_REMOTE_CODE", "1")
             from anomalib.deploy import TorchInferencer
-            self._engine = TorchInferencer(path=self._model_path)
+            self._engine = TorchInferencer(
+                path=self._model_path,
+                device=device,
+            )
             self._loaded = True
             self._check_minmax_normalization()
-            logger.info("anomaly.model_loaded_torch", path=str(self._model_path))
+            logger.info(
+                "anomaly.model_loaded_torch",
+                path=str(self._model_path),
+                device=device,
+            )
             self._load_calibration()
             return True
         except Exception as e:
-            logger.error("anomaly.load_failed", error=str(e))
+            logger.warning("anomaly.torch_load_failed", device=device, error=str(e))
             return False
 
     def _check_minmax_normalization(self) -> None:
