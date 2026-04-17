@@ -11,6 +11,7 @@ import {
 import { pauseCaptureJob, resumeCaptureJob, abortCaptureJob } from '../../api'
 import { JOB_STATUS_MAP } from '../../composables/useModelState'
 import { useBaselineStore } from '../../stores/useBaselineStore'
+import { extractErrorMessage } from '../../utils/error'
 import type { CameraSummary, TaskInfo } from '../../types/api'
 
 import BaselineTable from './BaselineTable.vue'
@@ -42,8 +43,8 @@ async function handlePauseJob(taskId: string) {
     await pauseCaptureJob(taskId)
     message.success('任务已暂停')
     props.loadTasks()
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '暂停失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '暂停失败'))
   }
 }
 
@@ -52,8 +53,8 @@ async function handleResumeJob(taskId: string) {
     await resumeCaptureJob(taskId)
     message.success('任务已恢复')
     props.loadTasks()
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '恢复失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '恢复失败'))
   }
 }
 
@@ -69,8 +70,8 @@ function handleAbortJob(taskId: string) {
         await abortCaptureJob(taskId)
         message.success('任务已中止')
         props.loadTasks()
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '中止失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '中止失败'))
       }
     },
   })

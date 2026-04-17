@@ -16,10 +16,12 @@ from argus.alerts.grader import Alert
 from argus.core.degradation import DegradationState, DegradationStateMachine, LockState
 from argus.core.inference_record import FinalDecision, InferenceRecord
 from argus.core.pipeline import DetectionPipeline, PipelineStats
+from argus.storage.models import InferenceRecord as DBInferenceRecord
 
 if TYPE_CHECKING:
     from argus.core.health import HealthMonitor
     from argus.storage.audit import AuditLogger
+    from argus.storage.inference_buffer import InferenceBuffer
     from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
@@ -59,6 +61,7 @@ class CameraInferenceRunner:
         audit_logger: AuditLogger | None = None,
         max_consecutive_failures: int = 5,
         refuse_start_on_backbone_failure: bool = False,
+        inference_buffer: InferenceBuffer | None = None,
     ):
         self._pipeline = pipeline
         self._health_monitor = health_monitor
@@ -71,6 +74,7 @@ class CameraInferenceRunner:
         self._degradation = DegradationStateMachine(camera_id, audit_logger)
         self._consecutive_failures = 0
         self._record_store: InferenceRecordStore | None = None
+        self._inference_buffer: InferenceBuffer | None = inference_buffer
 
     @property
     def pipeline(self) -> DetectionPipeline:
@@ -157,7 +161,75 @@ class CameraInferenceRunner:
                 raw_frame = self._pipeline.get_raw_frame()
                 self._record_store.submit(last_record, raw_frame)
 
+        # DB write-behind buffer: persist non-NORMAL frames to the
+        # inference_records table for batched queries / evaluation.
+        #
+        # NORMAL frames are intentionally skipped to mirror the disk
+        # InferenceRecordStore behaviour and avoid ~1200-row/min inserts
+        # on quiet cameras.  If downstream evaluation later needs NORMAL
+        # samples as negatives, drop the final_decision filter below and
+        # size InferenceBuffer.max_size accordingly.
+        if last_record is not None and self._inference_buffer is not None:
+            if last_record.final_decision in (FinalDecision.INFO, FinalDecision.ALERT):
+                db_record = self._build_db_record(last_record, alert)
+                if db_record is not None:
+                    self._inference_buffer.append(db_record)
+
         return alert
+
+    def _build_db_record(
+        self,
+        record: InferenceRecord,
+        alert: Alert | None,
+    ) -> DBInferenceRecord | None:
+        """Convert the pipeline's audit dataclass to the ORM row for DB persistence.
+
+        ``InferenceRecord`` in ``argus.core.inference_record`` is the
+        audit dataclass built by the pipeline; ``InferenceRecord`` in
+        ``argus.storage.models`` is the ORM row expected by
+        ``InferenceBuffer``.  They share many fields but not all — this
+        helper does the mapping and tolerates missing bits.
+        """
+        try:
+            # Zone: pipeline may encode it in cusum_evidence keys as
+            # "camera_id:zone_id"; fall back to "default".
+            zone_id = "default"
+            if record.cusum_evidence:
+                first_key = next(iter(record.cusum_evidence), "")
+                if ":" in first_key:
+                    zone_id = first_key.split(":", 1)[1] or "default"
+
+            # Frame number: the dataclass doesn't carry it directly, so
+            # use the pipeline's running counter (captured just before
+            # the record was built).
+            frame_number = int(self._pipeline.stats.frames_captured)
+
+            # Inference latency: sum the per-stage durations when available.
+            latency_ms = None
+            if record.stage_durations_ms:
+                try:
+                    latency_ms = float(sum(record.stage_durations_ms.values()))
+                except (TypeError, ValueError):
+                    latency_ms = None
+
+            return DBInferenceRecord(
+                camera_id=record.camera_id,
+                zone_id=zone_id,
+                frame_number=frame_number,
+                timestamp=record.timestamp_ns / 1e9,
+                model_version_id=record.model_version or None,
+                anomaly_score=float(record.anomaly_score),
+                inference_latency_ms=latency_ms,
+                was_alert=alert is not None,
+                alert_id=alert.alert_id if alert is not None else None,
+            )
+        except Exception:
+            logger.debug(
+                "runner.db_record_build_failed",
+                camera_id=self._camera_id,
+                exc_info=True,
+            )
+            return None
 
     def _handle_failure_threshold(self) -> None:
         """Handle N consecutive detection failures by attempting model reload."""

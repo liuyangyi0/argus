@@ -15,6 +15,7 @@ import {
   updateSegmenterParams,
   type SegmenterConfigPayload,
 } from '../../api'
+import { extractErrorMessage } from '../../utils/error'
 
 defineOptions({ name: 'SegmenterPanel' })
 
@@ -45,8 +46,8 @@ async function load() {
   error.value = null
   try {
     cfg.value = await getSegmenterConfig()
-  } catch (e: any) {
-    error.value = e?.response?.data?.msg || e?.message || '加载分割器配置失败'
+  } catch (e) {
+    error.value = extractErrorMessage(e, '加载分割器配置失败')
     cfg.value = null
   } finally {
     loading.value = false
@@ -105,8 +106,8 @@ async function saveDraft() {
       : '参数已保存（当前无运行中管线）')
     editing.value = false
     await load()
-  } catch (e: any) {
-    message.error(e?.response?.data?.msg || e?.message || '保存失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '保存失败'))
   } finally {
     saving.value = false
   }
@@ -123,8 +124,8 @@ async function handleToggle(checked: string | number | boolean) {
       ? '分割器已启用（已运行的摄像头需要重启才会生效）'
       : '分割器已关闭')
     await load()
-  } catch (e: any) {
-    message.error(e?.response?.data?.msg || '切换失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '切换失败'))
   } finally {
     toggling.value = false
   }

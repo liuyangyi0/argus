@@ -17,6 +17,7 @@ import {
   reexportModel, recalibrateModel,
 } from '../../api'
 import { STAGE_MAP, VALID_TRANSITIONS, STAGE_LABELS } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 import type { ModelInfo, ModelVersionEvent, CameraSummary } from '../../types/api'
 
 const props = defineProps<{
@@ -76,8 +77,8 @@ function handleActivate(record: any) {
         await activateModel(record.model_version_id)
         message.success(`模型 ${record.model_version_id} 已激活`)
         emit('changed')
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '激活失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '激活失败'))
       } finally {
         activatingModel.value = null
       }
@@ -97,8 +98,8 @@ function handleRollback(record: any) {
         const res = await rollbackModel(record.model_version_id)
         message.success(`已回滚到 ${res.activated}`)
         emit('changed')
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '回滚失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '回滚失败'))
       }
     },
   })
@@ -116,8 +117,8 @@ function handleDeleteModel(record: any) {
         await deleteModel(record.model_version_id)
         message.success('模型已删除')
         emit('changed')
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '删除失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '删除失败'))
       }
     },
   })
@@ -161,8 +162,8 @@ async function submitPromote() {
     message.success(`模型已推进到 ${STAGE_MAP[promoteForm.value.target_stage]?.text || promoteForm.value.target_stage}`)
     promoteModalVisible.value = false
     emit('changed')
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '推进失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '推进失败'))
   } finally {
     promotingModel.value = null
   }
@@ -180,8 +181,8 @@ function handleRetire(record: any) {
         await retireModel(record.model_version_id, { triggered_by: 'operator' })
         message.success('模型已退役')
         emit('changed')
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '退役失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '退役失败'))
       }
     },
   })
@@ -196,8 +197,8 @@ async function handleViewShadowReport(record: any) {
   try {
     const res = await getShadowReport(record.model_version_id, { days: 7 })
     shadowReport.value = res
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '获取影子报告失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '获取影子报告失败'))
   } finally {
     shadowReportLoading.value = false
   }
@@ -210,8 +211,8 @@ async function handleViewStageHistory(record: any) {
   try {
     const res = await getStageHistory(record.model_version_id)
     stageHistory.value = res.events || []
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '获取历史失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '获取历史失败'))
   } finally {
     stageHistoryLoading.value = false
   }
@@ -238,8 +239,8 @@ async function submitReexport() {
     message.success('重新导出成功')
     reexportModalVisible.value = false
     emit('changed')
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '重新导出失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '重新导出失败'))
   } finally {
     reexportLoading.value = false
   }
@@ -258,8 +259,8 @@ function handleRecalibrate(record: any) {
         const n = res.n_samples
         message.success(`重新校准成功 (${n} 个样本)`)
         emit('changed')
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '重新校准失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '重新校准失败'))
       } finally {
         recalibrateLoading.value = null
       }

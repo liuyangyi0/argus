@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, onDeactivated, onActivated, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useWallStore } from '../stores/useWallStore'
 import { getDailyTrend } from '../api/reports'
@@ -47,12 +47,37 @@ const avgLatency = computed(() => {
 })
 
 const clock = ref('--:--:--')
+let clockTimer: ReturnType<typeof setInterval> | null = null
+
+function updateClock() {
+  // Skip while tab is hidden — saves work and prevents jumpy updates on resume.
+  if (document.hidden) return
+  clock.value = new Date().toTimeString().slice(0, 8)
+}
+
+function startClock() {
+  if (clockTimer !== null) return
+  updateClock()
+  clockTimer = setInterval(updateClock, 1000)
+}
+
+function stopClock() {
+  if (clockTimer !== null) {
+    clearInterval(clockTimer)
+    clockTimer = null
+  }
+}
+
 onMounted(() => {
   wallStore.fetchInitialStatus()
-  setInterval(() => {
-    clock.value = new Date().toTimeString().slice(0, 8)
-  }, 1000)
+  startClock()
 })
+
+// keep-alive path: view is deactivated (cached) → stop; reactivated → restart.
+onDeactivated(stopClock)
+onActivated(startClock)
+// Safety net for full teardown / HMR.
+onBeforeUnmount(stopClock)
 
 const rightTab = ref<'alerts' | 'trend'>('alerts')
 
@@ -78,10 +103,14 @@ const toggleFullscreen = () => {
     document.exitFullscreen().catch(() => {})
   }
 }
+function onFullscreenChange() {
+  isFullscreen.value = !!document.fullscreenElement
+}
 onMounted(() => {
-  document.addEventListener('fullscreenchange', () => {
-    isFullscreen.value = !!document.fullscreenElement
-  })
+  document.addEventListener('fullscreenchange', onFullscreenChange)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
 })
 
 // ── Trend chart ──

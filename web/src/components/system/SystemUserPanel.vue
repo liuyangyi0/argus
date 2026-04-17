@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue'
 import { Card, Table, Button, Form, Input, Select, message, Popconfirm, Tag, Switch } from 'ant-design-vue'
 import { getUsers as apiGetUsers, createUser as apiCreateUser, deleteUser as apiDeleteUser, toggleUserActive } from '../../api'
+import { extractErrorMessage } from '../../utils/error'
 
 const users = ref<any[]>([])
 const usersLoading = ref(false)
@@ -33,8 +34,8 @@ async function createUser() {
     message.success('用户已创建')
     newUser.value = { username: '', password: '', role: 'operator', display_name: '' }
     loadUsers()
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '创建失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '创建失败'))
   } finally {
     createLoading.value = false
   }

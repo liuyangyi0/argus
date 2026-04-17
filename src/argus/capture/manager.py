@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from argus.core.health import HealthMonitor
     from argus.storage.audit import AuditLogger
     from argus.storage.database import Database
+    from argus.storage.inference_buffer import InferenceBuffer
     from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
@@ -76,6 +77,7 @@ class CameraManager:
         alert_recording_store: object | None = None,
         event_bus: object | None = None,
         sensor_fusion: object | None = None,
+        inference_buffer: InferenceBuffer | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
@@ -92,6 +94,7 @@ class CameraManager:
         self._alert_recording_store = alert_recording_store
         self._event_bus = event_bus
         self._sensor_fusion = sensor_fusion
+        self._inference_buffer = inference_buffer
         self._runners: dict[str, CameraInferenceRunner] = {}
         self._pipelines: dict[str, DetectionPipeline] = {}  # backward compat
         self._threads: dict[str, threading.Thread] = {}
@@ -140,6 +143,11 @@ class CameraManager:
         n_workers = min(max(len(cameras), 2) * 2, os.cpu_count() or 4)
         self._inference_executor = ThreadPoolExecutor(
             max_workers=n_workers, thread_name_prefix="inference"
+        )
+        # Separate pool for ring-buffer JPEG encoding so cv2.imencode (5-15ms)
+        # never competes with YOLO/Anomaly futures for inference worker slots.
+        self._encode_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="rb-encode"
         )
 
         # 5.3: Process-level watchdog
@@ -299,6 +307,7 @@ class CameraManager:
         self._runners.clear()
         self._threads.clear()
         self._inference_executor.shutdown(wait=False, cancel_futures=True)
+        self._encode_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("manager.stopped")
 
     def add_camera_config(self, cam_config: CameraConfig) -> None:
@@ -800,6 +809,7 @@ class CameraManager:
             database=self._db,
             event_bus=self._event_bus,
             inference_executor=self._inference_executor,
+            encode_executor=self._encode_executor,
             sensor_fusion=self._sensor_fusion,
         )
 
@@ -812,6 +822,7 @@ class CameraManager:
             audit_logger=self._audit_logger,
             max_consecutive_failures=deg_config.max_consecutive_failures,
             refuse_start_on_backbone_failure=deg_config.refuse_start_on_backbone_failure,
+            inference_buffer=self._inference_buffer,
         )
         if self._record_store is not None:
             runner.set_record_store(self._record_store)
