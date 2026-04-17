@@ -39,6 +39,7 @@ class FrameDiagnostics:
     pipeline_mode: str = "active"
     low_light: bool = False
     frame_id: str = ""  # uuid hex, populated by pipeline for audit linkage
+    alignment_shift_px: tuple[float, float] = (0.0, 0.0)
 
 
 @dataclass
