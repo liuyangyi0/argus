@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { storeToRefs } from 'pinia'
 import {
   Tag, Button, Typography, Tooltip, Segmented, message, Modal,
@@ -11,6 +11,7 @@ import {
   ExportOutlined,
   DeleteOutlined,
   PlayCircleOutlined,
+  AppstoreOutlined,
 } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import { useAlertStore } from '../../stores/useAlertStore'
@@ -65,6 +66,18 @@ function formatArea(px: number): string {
   if (px < 1_000_000) return `${(px / 1000).toFixed(1)} K px`
   return `${(px / 1_000_000).toFixed(2)} M px`
 }
+
+// A "多机位回放" storyboard is only meaningful when there's another camera
+// we can pair the alert with — either through the cross-camera correlation
+// pipeline (correlation_partner) or because the event grouping has picked
+// up related alerts from multiple cameras (event_group_count > 1).
+const hasMultiCam = computed(() => {
+  const a = selectedAlert.value
+  if (!a) return false
+  if (a.correlation_partner) return true
+  if ((a.event_group_count ?? 0) > 1) return true
+  return false
+})
 
 async function handleAcknowledge() {
   if (!selectedAlert.value) return
@@ -138,6 +151,17 @@ function handleDelete() {
           >
             <template #icon><PlayCircleOutlined /></template>
             查看录像
+          </Button>
+        </Tooltip>
+        <Tooltip v-if="hasMultiCam" title="在共享时间线上同步播放所有关联摄像头">
+          <Button
+            size="small"
+            type="text"
+            style="color: var(--argus-text-muted)"
+            @click="router.push(`/replay/${selectedAlert.alert_id}/storyboard`)"
+          >
+            <template #icon><AppstoreOutlined /></template>
+            多机位回放
           </Button>
         </Tooltip>
         <Tooltip title="导出证据包">
