@@ -34,6 +34,7 @@ class FrameData:
     timestamp: float  # monotonic time
     frame_number: int
     resolution: tuple[int, int]  # (width, height)
+    is_nir: bool = False  # True when frame was captured under NIR strobe
 
 
 @dataclass

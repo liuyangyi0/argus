@@ -49,6 +49,25 @@ export interface ClassifierConfigPayload {
 export const getClassifierConfig = () =>
   api.get<ApiResponse<ClassifierConfigPayload>>('/config/classifier').then(unwrap)
 
+// ── Imaging (multi-modal: polarization + NIR) ──
+export interface ImagingConfigPayload {
+  enabled: boolean
+  mode: 'visible_only' | 'polarization' | 'polarization_nir'
+  camera_sdk: 'opencv' | 'arena' | 'spinnaker'
+  nir_strobe_enabled: boolean
+  polarization_processing: boolean
+  fusion_channels: number
+  deglare_method: 'stokes' | 'min_intensity'
+  dolp_threshold: number
+  runtime: {
+    total_pipelines: number
+    pipelines_with_imaging: number
+  }
+}
+
+export const getImagingConfig = () =>
+  api.get<ApiResponse<ImagingConfigPayload>>('/config/imaging').then(unwrap)
+
 // ── Segmenter (SAM2 instance segmentation) ──
 export interface SegmenterConfigPayload {
   enabled: boolean

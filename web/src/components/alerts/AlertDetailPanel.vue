@@ -39,6 +39,15 @@ const severityColor: Record<string, string> = {
 const severityLabel: Record<string, string> = {
   high: '高', medium: '中', low: '低', info: '提示',
 }
+const categoryMeta: Record<string, { label: string; color: string }> = {
+  projectile: { label: '抛射物', color: 'red' },
+  static_foreign: { label: '静态异物', color: 'orange' },
+  scene_change: { label: '场景变化', color: 'blue' },
+  environmental: { label: '环境干扰', color: 'default' },
+  person_intrusion: { label: '人员入侵', color: 'purple' },
+  equipment_displacement: { label: '设备位移', color: 'gold' },
+  unknown: { label: '未分类', color: 'default' },
+}
 const workflowLabel: Record<string, string> = {
   new: '待处理', acknowledged: '已确认', investigating: '调查中',
   resolved: '已解决', closed: '已关闭', false_positive: '误报', uncertain: '待定',
@@ -247,6 +256,14 @@ function handleDelete() {
                 </Tooltip>
               </span>
             </div>
+            <div v-if="selectedAlert.category" class="meta-row">
+              <span class="meta-k">分类</span>
+              <span class="meta-v">
+                <Tag :color="categoryMeta[selectedAlert.category]?.color || 'default'" style="margin: 0">
+                  {{ categoryMeta[selectedAlert.category]?.label || selectedAlert.category }}
+                </Tag>
+              </span>
+            </div>
             <div class="meta-row">
               <span class="meta-k">置信度</span>
               <span class="meta-v" :style="{ color: scoreColor(selectedAlert.anomaly_score), fontWeight: 600 }">{{ selectedAlert.anomaly_score?.toFixed(4) }}</span>
@@ -294,6 +311,14 @@ function handleDelete() {
                 >
                   总面积 {{ formatArea(selectedAlert.segmentation_total_area_px) }}
                 </span>
+              </span>
+            </div>
+            <div v-if="selectedAlert.speed_ms || selectedAlert.speed_px_per_sec || selectedAlert.trajectory_model" class="meta-row">
+              <span class="meta-k">物理数据</span>
+              <span class="meta-v">
+                <Tag v-if="selectedAlert.speed_ms" color="cyan" style="margin: 0">{{ selectedAlert.speed_ms.toFixed(2) }} m/s</Tag>
+                <Tag v-else-if="selectedAlert.speed_px_per_sec" color="cyan" style="margin: 0">{{ selectedAlert.speed_px_per_sec.toFixed(0) }} px/s</Tag>
+                <Tag v-if="selectedAlert.trajectory_model" color="green" style="margin: 0; margin-left: 4px">{{ selectedAlert.trajectory_model }}</Tag>
               </span>
             </div>
             <div class="meta-row">

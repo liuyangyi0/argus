@@ -101,6 +101,10 @@ export interface AlertSummary {
   origin_x_mm?: number | null
   origin_y_mm?: number | null
   origin_z_mm?: number | null
+  // Alert category classification
+  category?: string | null
+  // Trajectory centroid history for visualization
+  trajectory_points?: Array<{t: number, x: number, y: number}> | null
   // Workflow
   assigned_to?: string | null
   resolved_at?: string | null

@@ -684,6 +684,14 @@ class AlertConfig(BaseModel):
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     circuit_breaker_threshold: int = Field(default=5, ge=1, le=50)
     circuit_breaker_timeout: float = Field(default=60.0, ge=10.0, le=600.0)
+    category_enabled: bool = Field(default=True, description="启用告警自动分类")
+    enabled_categories: list[str] = Field(
+        default=[
+            "projectile", "static_foreign", "scene_change",
+            "environmental", "person_intrusion", "equipment_displacement",
+        ],
+        description="启用的告警分类列表",
+    )
 
 
 class AuthConfig(BaseModel):

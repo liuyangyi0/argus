@@ -124,6 +124,15 @@ const severityColor: Record<string, string> = {
 const severityLabel: Record<string, string> = {
   high: '高', medium: '中', low: '低', info: '提示',
 }
+const categoryMeta: Record<string, { label: string; color: string }> = {
+  projectile: { label: '抛射物', color: 'red' },
+  static_foreign: { label: '静态异物', color: 'orange' },
+  scene_change: { label: '场景变化', color: 'blue' },
+  environmental: { label: '环境干扰', color: 'default' },
+  person_intrusion: { label: '人员入侵', color: 'purple' },
+  equipment_displacement: { label: '设备位移', color: 'gold' },
+  unknown: { label: '未分类', color: 'default' },
+}
 const workflowLabel: Record<string, string> = {
   new: '待处理', acknowledged: '已确认', investigating: '调查中',
   resolved: '已解决', closed: '已关闭', false_positive: '误报', uncertain: '待定',
@@ -155,6 +164,7 @@ const columns = computed(() => {
         { text: '提示', value: 'info' },
       ],
     },
+    { title: '分类', key: 'category', width: isCompact ? 64 : 76 },
     { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: isCompact ? 80 : 100, ellipsis: true },
     { title: '分数', key: 'score', width: 64 },
     { title: '时间', key: 'time', width: 80 },
@@ -271,6 +281,12 @@ const columns = computed(() => {
               </Tag>
             </Popover>
           </Space>
+        </template>
+
+        <template v-if="column.key === 'category'">
+          <Tag :color="categoryMeta[record.category]?.color || 'default'" style="margin: 0; font-size: 11px">
+            {{ categoryMeta[record.category]?.label || record.category || '未分类' }}
+          </Tag>
         </template>
 
         <template v-if="column.key === 'score'">
