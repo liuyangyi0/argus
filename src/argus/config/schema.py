@@ -1176,6 +1176,27 @@ class ContinuousRecordingConfig(BaseModel):
         return self
 
 
+class SensorFusionConfig(BaseModel):
+    """External sensor fusion hook — generic multi-modal signal input.
+
+    Third-party sensors (temperature, vibration, radiation, lidar, etc.)
+    can push short-lived multipliers keyed on ``(camera_id, zone_id)`` that
+    bias the alert grader's severity calculation. The config here only
+    governs activation and default TTL — the transport is HTTP
+    ``/api/sensors/signal``.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Consult external sensor fusion multipliers during grading",
+    )
+    default_valid_for_s: float = Field(
+        default=60.0, ge=0.0, le=3600.0,
+        description="Default time-to-live (seconds) for a pushed signal when "
+        "the client does not specify one",
+    )
+
+
 class ArgusConfig(BaseModel):
     """Top-level configuration for the Argus system."""
 
@@ -1198,6 +1219,10 @@ class ArgusConfig(BaseModel):
     physics: PhysicsConfig = Field(default_factory=PhysicsConfig)
     continuous_recording: ContinuousRecordingConfig = Field(
         default_factory=ContinuousRecordingConfig,
+    )
+    sensor_fusion: SensorFusionConfig = Field(
+        default_factory=SensorFusionConfig,
+        description="External sensor fusion hook (generic multi-modal signal input)",
     )
     camera_groups: list[CameraGroupConfig] = Field(
         default_factory=list,

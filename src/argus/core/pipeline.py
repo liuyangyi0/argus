@@ -198,6 +198,7 @@ class DetectionPipeline:
         database: object | None = None,
         event_bus: EventBus | None = None,
         inference_executor: ThreadPoolExecutor | None = None,
+        sensor_fusion: object | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
@@ -339,7 +340,7 @@ class DetectionPipeline:
         self._simplex_reference_set = False
 
         # Alert grading
-        self._alert_grader = AlertGrader(config=alert_config)
+        self._alert_grader = AlertGrader(config=alert_config, sensor_fusion=sensor_fusion)
 
         # Camera — use GigECapture for GigE Vision cameras, CameraCapture
         # for everything else (RTSP, USB, file).

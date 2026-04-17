@@ -75,6 +75,7 @@ class CameraManager:
         database: Database | None = None,
         alert_recording_store: object | None = None,
         event_bus: object | None = None,
+        sensor_fusion: object | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
@@ -90,6 +91,7 @@ class CameraManager:
         self._db = database
         self._alert_recording_store = alert_recording_store
         self._event_bus = event_bus
+        self._sensor_fusion = sensor_fusion
         self._runners: dict[str, CameraInferenceRunner] = {}
         self._pipelines: dict[str, DetectionPipeline] = {}  # backward compat
         self._threads: dict[str, threading.Thread] = {}
@@ -786,6 +788,7 @@ class CameraManager:
             database=self._db,
             event_bus=self._event_bus,
             inference_executor=self._inference_executor,
+            sensor_fusion=self._sensor_fusion,
         )
 
         # 5.1: Wrap pipeline in CameraInferenceRunner
