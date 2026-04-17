@@ -114,6 +114,11 @@ alerts:
   suppression:
     same_zone_window_seconds: 300.0
     same_camera_window_seconds: 60.0
+  early_warning:
+    enabled: true
+    score_threshold: 0.95
+    require_detection_or_classifier: true
+    classifier_min_confidence: 0.9
   calibration:
     enabled: false
     target_fpr_info: 0.1
