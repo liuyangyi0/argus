@@ -8,6 +8,7 @@ import {
 import { useBaselineStore } from '../../stores/useBaselineStore'
 import { BASELINE_STATE_MAP } from '../../composables/useModelState'
 import { extractErrorMessage } from '../../utils/error'
+import BaselineImagesPanel from './BaselineImagesPanel.vue'
 
 defineOptions({ name: 'BaselineVersionDrawer' })
 
@@ -28,8 +29,31 @@ const versionColumns = [
   { title: '图片', dataIndex: 'image_count', key: 'image_count', width: 70 },
   { title: '审核人', dataIndex: 'verified_by', key: 'verified_by', width: 100 },
   { title: '审核时间', dataIndex: 'verified_at', key: 'verified_at', width: 140 },
-  { title: '操作', key: 'action', width: 180 },
+  { title: '操作', key: 'action', width: 220 },
 ]
+
+// Track which row has its image-manager expanded. Only one at a time keeps
+// the drawer compact.
+const expandedVersions = ref<string[]>([])
+
+function toggleImages(version: string) {
+  if (expandedVersions.value.includes(version)) {
+    expandedVersions.value = expandedVersions.value.filter((v) => v !== version)
+  } else {
+    expandedVersions.value = [version]
+  }
+}
+
+async function onImagesChanged() {
+  // Refresh the version list so image_count stays accurate after upload/delete.
+  if (versionDrawerCamera.value) {
+    try {
+      await store.loadBaselineVersions(versionDrawerCamera.value)
+    } catch (e) {
+      // Swallow — the images panel already surfaced the upstream error.
+    }
+  }
+}
 
 function handleVerify(record: any) {
   const verifiedByRef = ref('')
@@ -136,8 +160,10 @@ function handleDelete(record: any) {
       :data-source="baselineVersions"
       :loading="versionsLoading"
       :pagination="false"
+      :expanded-row-keys="expandedVersions"
       row-key="version"
       size="small"
+      @update:expanded-row-keys="(keys) => { expandedVersions = keys as string[] }"
     >
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'state'">
@@ -150,6 +176,13 @@ function handleDelete(record: any) {
           <span v-else style="color: #999">-</span>
         </template>
         <template v-if="column.key === 'action'">
+          <Button
+            size="small"
+            style="margin-right: 4px"
+            @click="toggleImages(record.version)"
+          >
+            {{ expandedVersions.includes(record.version) ? '收起图片' : '管理图片' }}
+          </Button>
           <Button
             v-if="record.state === 'draft'"
             size="small"
@@ -182,6 +215,15 @@ function handleDelete(record: any) {
           </Button>
           <span v-if="record.state === 'retired'" style="color: #999">已退役</span>
         </template>
+      </template>
+      <template #expandedRowRender="{ record }">
+        <BaselineImagesPanel
+          :camera-id="record.camera_id"
+          :version="record.version"
+          :state="record.state"
+          :zone-id="record.zone_id || 'default'"
+          @changed="onImagesChanged"
+        />
       </template>
     </Table>
     <Divider />
