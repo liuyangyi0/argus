@@ -401,3 +401,26 @@ export interface BatchInferenceResponse {
   scored: number
   total: number
 }
+
+// ── Multi-camera Storyboard (synchronous replay across correlated cameras) ──
+
+/** One camera entry in a storyboard — the frontend needs `trigger_offset_s`
+ *  to align each camera's local time against the shared master clock. */
+export interface StoryboardCamera {
+  alert_id: string
+  camera_id: string
+  /** Epoch seconds — only kept for UI debug/labelling, not used for sync. */
+  trigger_timestamp: number
+  /** Seconds relative to the primary alert's trigger_timestamp.
+   *  Primary camera is 0; other cameras are positive/negative deltas. */
+  trigger_offset_s: number
+  metadata_url: string
+  video_url: string
+  signals_url: string
+}
+
+export interface StoryboardResponse {
+  primary_alert_id: string
+  cameras: StoryboardCamera[]
+  count: number
+}
