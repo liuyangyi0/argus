@@ -456,6 +456,7 @@ class ModelTrainer:
                         model=model,
                         export_format=export_format,
                         export_path=export_path_str,
+                        image_size=image_size,
                         quantization=quantization,
                         val_dir=val_dir,
                         calibration_images=calibration_images,
@@ -1390,6 +1391,7 @@ class ModelTrainer:
         model,
         export_format: str,
         export_path: str,
+        image_size: int,
         quantization: str = "fp16",
         val_dir: Path | None = None,
         calibration_images: int = 100,
@@ -1412,6 +1414,13 @@ class ModelTrainer:
             # PyTorch 2.11 + anomalib currently trips over dynamic_axes when
             # torch.onnx.export uses the dynamo exporter. Force the stable path.
             export_kwargs["onnx_kwargs"] = {"dynamo": False}
+            # Lock the exported graph to a static [1,3,H,W] input shape. Without
+            # this, anomalib emits a dynamic-axes ONNX/OpenVINO IR whose internal
+            # Broadcast ops resolve at inference time — Dinomaly2 fails with
+            # "Broadcast Check failed Value -1 not in range". The detector
+            # already resizes every frame to image_size before inference, so
+            # static export matches actual usage and costs nothing.
+            export_kwargs["input_size"] = (image_size, image_size)
         try:
             engine.export(
                 model=model,
@@ -1656,6 +1665,9 @@ class ModelTrainer:
             export_kwargs = {}
             if export_format in {"openvino", "onnx"}:
                 export_kwargs["onnx_kwargs"] = {"dynamo": False}
+                # Lock static [1,3,H,W] input shape so Broadcast ops don't
+                # fail at inference time (see _export_model for context).
+                export_kwargs["input_size"] = (image_size, image_size)
 
             engine = Engine(default_root_dir=str(model_dir), max_epochs=1)
             engine.export(

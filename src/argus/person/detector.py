@@ -129,7 +129,9 @@ class YOLOObjectDetector:
         sahi_enabled: bool = False,
         sahi_slice_size: int = 640,
         sahi_overlap_ratio: float = 0.25,
+        camera_id: str = "unknown",
     ):
+        from argus.core.model_status import ModelStatus
         self.confidence = confidence
         self.skip_frame_on_person = skip_frame_on_person
         self.mask_padding = mask_padding
@@ -143,6 +145,14 @@ class YOLOObjectDetector:
         self._sahi_slice_size = sahi_slice_size
         self._sahi_overlap_ratio = sahi_overlap_ratio
         self._sahi_model = None  # lazy-loaded AutoDetectionModel
+        self.status = ModelStatus(
+            name="yolo",
+            camera_id=camera_id,
+            model_path=model_name,
+        )
+        self.status.set_extra(classes=list(self.classes_to_detect),
+                              tracking=enable_tracking,
+                              sahi=sahi_enabled)
 
     def _ensure_model(self):
         """Lazy-load the YOLO model on first use. Degrades gracefully on failure."""
@@ -160,6 +170,19 @@ class YOLOObjectDetector:
                 classes=self.classes_to_detect,
                 tracking=self.enable_tracking,
             )
+            # Detect actual backend — ultralytics YOLO exposes .device
+            device = "unknown"
+            try:
+                dev = getattr(self._model, "device", None)
+                if dev is not None:
+                    device = str(dev).replace(":", "-")  # cuda:0 -> cuda-0
+                    if "cuda" in device:
+                        device = "cuda"
+                    elif "cpu" in device:
+                        device = "cpu"
+            except Exception:
+                pass
+            self.status.mark_loaded(backend=device, model_path=self._model_name)
         except Exception as e:
             self._available = False
             logger.error(
@@ -167,6 +190,7 @@ class YOLOObjectDetector:
                 error=str(e),
                 msg="Person filtering OFFLINE — all frames will be analyzed unfiltered",
             )
+            self.status.mark_load_failed(str(e))
 
     def _detect_sahi(self, frame: np.ndarray) -> list[ObjectDetection]:
         """Run SAHI sliced inference for small/distant object detection."""
@@ -222,47 +246,53 @@ class YOLOObjectDetector:
         if not self._available:
             return PersonFilterResult(persons=[], has_persons=False, filter_available=False)
 
-        # SAHI sliced inference for small/distant objects
-        if self._sahi_enabled:
-            objects = self._detect_sahi(frame)
-        else:
-            # YOLO-002: Use tracking if enabled, otherwise standard predict
-            if self.enable_tracking:
-                results = self._model.track(
-                    frame,
-                    classes=self.classes_to_detect,
-                    conf=self.confidence,
-                    persist=True,
-                    verbose=False,
-                )
+        try:
+            # SAHI sliced inference for small/distant objects
+            if self._sahi_enabled:
+                objects = self._detect_sahi(frame)
             else:
-                results = self._model.predict(
-                    frame,
-                    classes=self.classes_to_detect,
-                    conf=self.confidence,
-                    verbose=False,
-                )
+                # YOLO-002: Use tracking if enabled, otherwise standard predict
+                if self.enable_tracking:
+                    results = self._model.track(
+                        frame,
+                        classes=self.classes_to_detect,
+                        conf=self.confidence,
+                        persist=True,
+                        verbose=False,
+                    )
+                else:
+                    results = self._model.predict(
+                        frame,
+                        classes=self.classes_to_detect,
+                        conf=self.confidence,
+                        verbose=False,
+                    )
 
-            objects = []
-            if results and results[0].boxes is not None:
-                for box in results[0].boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                    conf = float(box.conf[0])
-                    class_id = int(box.cls[0])
-                    class_name = COCO_CLASS_NAMES.get(class_id, f"class_{class_id}")
+                objects = []
+                if results and results[0].boxes is not None:
+                    for box in results[0].boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        conf = float(box.conf[0])
+                        class_id = int(box.cls[0])
+                        class_name = COCO_CLASS_NAMES.get(class_id, f"class_{class_id}")
 
-                    # YOLO-002: Extract track ID if available
-                    track_id = None
-                    if self.enable_tracking and box.id is not None:
-                        track_id = int(box.id[0])
+                        # YOLO-002: Extract track ID if available
+                        track_id = None
+                        if self.enable_tracking and box.id is not None:
+                            track_id = int(box.id[0])
 
-                    objects.append(ObjectDetection(
-                        x1=x1, y1=y1, x2=x2, y2=y2,
-                        confidence=conf,
-                        class_id=class_id,
-                        class_name=class_name,
-                        track_id=track_id,
-                    ))
+                        objects.append(ObjectDetection(
+                            x1=x1, y1=y1, x2=x2, y2=y2,
+                            confidence=conf,
+                            class_id=class_id,
+                            class_name=class_name,
+                            track_id=track_id,
+                        ))
+            self.status.mark_inference_success()
+        except Exception as e:
+            logger.warning("yolo.predict_failed", error=str(e), error_type=type(e).__name__)
+            self.status.mark_inference_failure(f"{type(e).__name__}: {e}")
+            return PersonFilterResult(persons=[], has_persons=False, filter_available=False)
 
         # Split into persons vs non-person objects
         persons = [o for o in objects if o.class_id == 0]

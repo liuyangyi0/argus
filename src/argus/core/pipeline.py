@@ -281,6 +281,7 @@ class DetectionPipeline:
             sahi_enabled=camera_config.person_filter.sahi_enabled,
             sahi_slice_size=camera_config.person_filter.sahi_slice_size,
             sahi_overlap_ratio=camera_config.person_filter.sahi_overlap_ratio,
+            camera_id=camera_config.camera_id,
         )
 
         # Stage 3: Anomaly detector — auto-discover trained model
@@ -301,6 +302,7 @@ class DetectionPipeline:
                 ssim_sensitivity=camera_config.anomaly.ssim_sensitivity,
                 ssim_midpoint=camera_config.anomaly.ssim_midpoint,
                 enable_calibration=camera_config.anomaly.enable_calibration,
+                camera_id=camera_config.camera_id,
             )
         if camera_config.anomaly.enable_multiscale:
             from argus.anomaly.detector import MultiScaleDetector

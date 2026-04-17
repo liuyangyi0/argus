@@ -84,6 +84,34 @@ def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
     return pipeline
 
 
+@router.get("/status")
+def models_status(request: Request) -> JSONResponse:
+    """Aggregate health status of every detector across all cameras.
+
+    Returns a flat list of :class:`~argus.core.model_status.ModelStatus`
+    records (anomaly + YOLO per camera). The frontend polls this every few
+    seconds so operators can see "cam1 anomaly is failing" without having
+    to grep server logs.
+    """
+    manager = getattr(request.app.state, "camera_manager", None)
+    if manager is None:
+        return api_success({"models": []})
+
+    out: list[dict] = []
+    runners = getattr(manager, "_runners", None) or {}
+    for _cid, runner in runners.items():
+        pipeline = getattr(runner, "_pipeline", None)
+        if pipeline is None:
+            continue
+        anomaly = getattr(pipeline, "_anomaly_detector", None)
+        if anomaly is not None and hasattr(anomaly, "status"):
+            out.append(anomaly.status.to_dict())
+        yolo = getattr(pipeline, "_object_detector", None)
+        if yolo is not None and hasattr(yolo, "status"):
+            out.append(yolo.status.to_dict())
+    return api_success({"models": out})
+
+
 @router.get("/json")
 async def list_models(request: Request, camera_id: str | None = None):
     """List all registered models, optionally filtered by camera_id."""

@@ -20,12 +20,33 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from argus.config.schema import ArgusConfig
 
 _ENV_PREFIX = "ARGUS__"
+
+
+def _normalize_path_separators(data: Any) -> Any:
+    """Replace backslashes with forward slashes in every string leaf.
+
+    Defends against Windows-authored YAML that embeds ``data\\models`` as a
+    literal backslash: Linux treats ``\\`` as a single opaque filename
+    character, so the app creates a directory *named* ``data\\models`` and
+    then can't find it when later code joins paths with ``/``. Running the
+    raw config dict through this walker before pydantic validation makes
+    every downstream consumer see POSIX-shaped paths regardless of where
+    the YAML was written.
+    """
+    if isinstance(data, str):
+        return data.replace("\\", "/") if "\\" in data else data
+    if isinstance(data, dict):
+        return {k: _normalize_path_separators(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_normalize_path_separators(v) for v in data]
+    return data
 
 
 def _apply_env_overrides(raw: dict) -> dict:
@@ -72,6 +93,7 @@ def load_config(config_path: str | Path) -> ArgusConfig:
         raw = {}
 
     raw = _apply_env_overrides(raw)
+    raw = _normalize_path_separators(raw)
 
     return ArgusConfig.model_validate(raw)
 
@@ -105,6 +127,7 @@ def load_config_layered(
 
     if apply_env:
         merged = _apply_env_overrides(merged)
+    merged = _normalize_path_separators(merged)
 
     return ArgusConfig.model_validate(merged)
 
@@ -124,7 +147,7 @@ def save_config(config: ArgusConfig, config_path: str | Path) -> None:
     import time
 
     path = Path(config_path)
-    data = config.model_dump(mode="json")
+    data = _normalize_path_separators(config.model_dump(mode="json"))
     tmp = path.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)

@@ -12,6 +12,7 @@ import ClassifierPanel from '../components/system/ClassifierPanel.vue'
 import SegmenterPanel from '../components/system/SegmenterPanel.vue'
 import CrossCameraPanel from '../components/system/CrossCameraPanel.vue'
 import ImagingPanel from '../components/system/ImagingPanel.vue'
+import ModelStatusPanel from '../components/system/ModelStatusPanel.vue'
 
 const activeTab = ref('overview')
 
@@ -27,6 +28,14 @@ function onTabChange(key: string | number) {
       <!-- Overview -->
       <Tabs.TabPane key="overview" tab="系统概览">
         <SystemOverviewPanel />
+        <div style="margin-top: 16px">
+          <ModelStatusPanel />
+        </div>
+      </Tabs.TabPane>
+
+      <!-- Model Runtime Status -->
+      <Tabs.TabPane key="model-status" tab="模型状态">
+        <ModelStatusPanel v-if="activeTab === 'model-status'" />
       </Tabs.TabPane>
 
       <!-- Config & Backup target merged into SystemConfigPanel for brevity but we use tabs for old links -->
