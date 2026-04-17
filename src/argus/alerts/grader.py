@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 from argus.config.schema import AlertConfig, AlertSeverity, SeverityThresholds, ZonePriority
 from argus.contracts.validation import validate_alert
+from argus.core.metrics import METRICS
 
 logger = structlog.get_logger()
 
@@ -274,9 +275,31 @@ class AlertGrader:
             tracker.last_seen = now
 
             # Step 3b: Spatial continuity check — anomaly region must overlap with
-            # the previous frame's anomaly region to filter transient noise
-            min_overlap = self._config.temporal.min_spatial_overlap
-            if min_overlap > 0 and anomaly_map is not None:
+            # the previous frame's anomaly region to filter transient noise.
+            #
+            # F3: `spatial_continuity_enabled` + `spatial_continuity_iou_threshold`
+            # give operators explicit control over the IoU gate (default 0.7, was
+            # effectively 0.3 via min_spatial_overlap). `spatial_continuity_mode`
+            # chooses between fully resetting evidence on mismatch ("reset", new
+            # stricter default) and the legacy 50% decay ("decay"). We fall back
+            # on the legacy `min_spatial_overlap` when the new-style gate is
+            # explicitly disabled, so existing configs keep behaving the same.
+            temporal_cfg = self._config.temporal
+            legacy_overlap = temporal_cfg.min_spatial_overlap
+            if getattr(temporal_cfg, "spatial_continuity_enabled", True):
+                sc_threshold = float(
+                    getattr(
+                        temporal_cfg,
+                        "spatial_continuity_iou_threshold",
+                        legacy_overlap,
+                    )
+                )
+                sc_mode = getattr(temporal_cfg, "spatial_continuity_mode", "reset")
+            else:
+                sc_threshold = legacy_overlap
+                sc_mode = "decay"  # preserve historical 50% decay when new gate is off
+
+            if sc_threshold > 0 and anomaly_map is not None:
                 curr_mask = (anomaly_map > 0.5).astype(np.uint8)
                 if tracker.prev_anomaly_mask is not None:
                     prev_mask = tracker.prev_anomaly_mask
@@ -298,16 +321,36 @@ class AlertGrader:
                     intersection = np.count_nonzero(curr_mask & prev_mask)
                     union = np.count_nonzero(curr_mask | prev_mask)
                     iou = intersection / union if union > 0 else 0.0
-                    if iou < min_overlap:
+                    if iou < sc_threshold:
                         logger.debug(
                             "grader.spatial_mismatch",
                             zone=zone_key,
                             iou=round(iou, 3),
-                            threshold=min_overlap,
+                            threshold=sc_threshold,
+                            mode=sc_mode,
                         )
-                        # Decay instead of reset to tolerate camera vibration
-                        tracker.evidence *= 0.5
-                        tracker.max_score = adjusted_score
+                        if sc_mode == "reset":
+                            # F3: hard reset — local-motion false positives that
+                            # keep scoring high but on shifting pixels no longer
+                            # accumulate evidence.
+                            tracker.evidence = 0.0
+                            tracker.first_seen = now
+                            tracker.max_score = adjusted_score
+                            try:
+                                METRICS.spatial_continuity_resets.labels(
+                                    camera_id=camera_id,
+                                ).inc()
+                            except Exception:
+                                # Metrics must never break the grader.
+                                logger.debug(
+                                    "grader.spatial_reset_metric_failed",
+                                    exc_info=True,
+                                )
+                        else:
+                            # Legacy 50% decay to tolerate camera vibration.
+                            tracker.evidence *= 0.5
+                            tracker.max_score = adjusted_score
+                # Keep only the most recent mask — bounded memory per tracker.
                 tracker.prev_anomaly_mask = curr_mask
 
             # Exponential evidence accumulation
