@@ -23,7 +23,7 @@ cameras:
     lock_score_threshold: 0.85
     lock_clear_frames: 10
   alignment:
-    enabled: false
+    enabled: true
     max_shift_px: 5.0
     downsample: 4
     ref_update_interval_s: 60.0
@@ -40,7 +40,7 @@ cameras:
     image_size:
     - 256
     - 256
-    enable_multiscale: false
+    enable_multiscale: true
     tile_size: 512
     tile_overlap: 0.25
     dinomaly_backbone: dinov2_vitb14
@@ -120,7 +120,7 @@ alerts:
     require_detection_or_classifier: true
     classifier_min_confidence: 0.9
   calibration:
-    enabled: false
+    enabled: true
     target_fpr_info: 0.1
     target_fpr_low: 0.01
     target_fpr_medium: 0.001
@@ -205,7 +205,7 @@ capture_quality:
   person_confidence: 0.3
   entropy_min: 3.0
 classifier:
-  enabled: false
+  enabled: true
   model_name: yolov8s-worldv2.pt
   vocabulary:
   - wrench
