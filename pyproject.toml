@@ -41,6 +41,11 @@ dev = [
 ]
 quantize = ["nncf>=2.7.0"]
 segment = ["sam2>=1.0"]
+polarization = ["polanalyser>=1.0"]
+lucid = ["arena-api>=2.0"]
+# FLIR Spinnaker: PySpin is distributed via FLIR's SDK installer, not PyPI.
+# Install manually from https://www.flir.com/products/spinnaker-sdk/
+# flir = ["PySpin"]
 
 [project.scripts]
 argus = "argus.__main__:main"

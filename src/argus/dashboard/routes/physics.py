@@ -29,11 +29,21 @@ async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
         if alert is None:
             return api_not_found(f"Alert {alert_id} not found")
 
+        import json as _json
+
+        points = None
+        if alert.trajectory_points:
+            try:
+                points = _json.loads(alert.trajectory_points)
+            except Exception:
+                points = None
+
         return api_success({
             "alert_id": alert_id,
             "speed_ms": alert.speed_ms,
             "speed_px_per_sec": alert.speed_px_per_sec,
             "trajectory_model": alert.trajectory_model,
+            "points": points,
             "origin": {
                 "x_mm": alert.origin_x_mm,
                 "y_mm": alert.origin_y_mm,
