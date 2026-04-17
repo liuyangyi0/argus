@@ -328,6 +328,16 @@ def main():
     # Attach sampler to event_bus so pipeline can buffer frames for saving
     event_bus._active_sampler = active_learning_sampler  # type: ignore[attr-defined]
 
+    # External sensor fusion — shared between CameraManager (for grader)
+    # and create_app (for HTTP API). Build it here so both sides point at
+    # the same in-memory store.
+    from argus.sensors.fusion import SensorFusion
+    fusion_cfg = getattr(config, "sensor_fusion", None)
+    sensor_fusion = SensorFusion(
+        enabled=bool(getattr(fusion_cfg, "enabled", False)),
+        default_valid_for_s=float(getattr(fusion_cfg, "default_valid_for_s", 60.0)),
+    )
+
     # Start camera manager with all cameras
     manager = CameraManager(
         cameras=cameras,
@@ -344,6 +354,7 @@ def main():
         database=db,
         alert_recording_store=alert_recording_store,
         event_bus=event_bus,
+        sensor_fusion=sensor_fusion,
     )
 
     # Graceful shutdown
@@ -377,6 +388,7 @@ def main():
             config_path=args.config,
             task_manager=task_mgr,
             go2rtc_instance=_go2rtc,
+            sensor_fusion=sensor_fusion,
         )
         app.state.audit_logger = audit_logger
         app.state.recording_store = alert_recording_store  # FR-033: shared with pipelines

@@ -25,6 +25,7 @@ from pathlib import Path
 
 if TYPE_CHECKING:
     from argus.core.alert_ring_buffer import SolidifiedRecording
+    from argus.sensors.fusion import SensorFusion
 
 from argus.config.schema import AlertConfig, AlertSeverity, SeverityThresholds, ZonePriority
 from argus.contracts.validation import validate_alert
@@ -155,9 +156,11 @@ class AlertGrader:
         config: AlertConfig,
         node_id: str = "edge",
         calibration_path: Path | None = None,
+        sensor_fusion: SensorFusion | None = None,
     ):
         self._config = config
         self._node_id = node_id
+        self._sensor_fusion = sensor_fusion
         self._trackers: dict[str, _AnomalyTracker] = defaultdict(_AnomalyTracker)
         self._last_alerts: dict[str, float] = {}  # zone_key -> last alert timestamp
         self._last_camera_alerts: dict[str, float] = {}  # camera_id -> last alert timestamp
@@ -223,7 +226,21 @@ class AlertGrader:
 
         # Step 1: Apply zone priority multiplier
         multiplier = self._config.zone_multipliers.get(zone_priority.value, 1.0)
-        adjusted_score = max(0.0, min(anomaly_score * multiplier, 1.0))
+        adjusted_score = anomaly_score * multiplier
+
+        # Step 1b: External sensor fusion — bias severity via (camera, zone) signal
+        if self._sensor_fusion is not None:
+            fusion_multiplier = self._sensor_fusion.get_multiplier(camera_id, zone_id)
+            if fusion_multiplier != 1.0:
+                adjusted_score *= fusion_multiplier
+                logger.debug(
+                    "grader.fusion_applied",
+                    zone=zone_key,
+                    fusion_multiplier=round(fusion_multiplier, 3),
+                    adjusted_score=round(adjusted_score, 3),
+                )
+
+        adjusted_score = max(0.0, min(adjusted_score, 1.0))
 
         # Step 2: Determine severity (None if below info threshold)
         severity = self._score_to_severity(adjusted_score)

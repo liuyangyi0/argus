@@ -1,5 +1,14 @@
 """Shared test fixtures."""
 
+import sys
+from pathlib import Path
+
+# Ensure the worktree's src/ is first on sys.path so an editable install
+# from another worktree doesn't shadow the code under test.
+_SRC = str(Path(__file__).resolve().parent.parent / "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
 import numpy as np
 import pytest
 
