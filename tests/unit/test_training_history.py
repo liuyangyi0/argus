@@ -155,6 +155,75 @@ class TestTrainingRecord:
         assert record.quality_grade is None
 
 
+class TestPhase1PhaseTwoFields:
+    """Phase 1 + 2: real-labeled P/R/F1 + raw scores/labels persistence."""
+
+    def test_phase1_metrics_roundtrip(self, db):
+        """val_precision/recall/f1/auroc/pr_auc/confusion_matrix survive DB round-trip."""
+        import json
+        cm = {"tp": 45, "fp": 5, "fn": 3, "tn": 47}
+        saved = db.save_training_record(_make_training_record(
+            val_precision=0.9,
+            val_recall=0.9375,
+            val_f1=0.9677,
+            val_auroc=0.97,
+            val_pr_auc=0.95,
+            val_confusion_matrix=json.dumps(cm),
+            val_real_sample_count=100,
+        ))
+        r = db.get_training_record(saved.id)
+        assert r.val_precision == pytest.approx(0.9)
+        assert r.val_recall == pytest.approx(0.9375)
+        assert r.val_f1 == pytest.approx(0.9677)
+        assert r.val_auroc == pytest.approx(0.97)
+        assert r.val_pr_auc == pytest.approx(0.95)
+        assert json.loads(r.val_confusion_matrix) == cm
+        assert r.val_real_sample_count == 100
+
+    def test_phase2_scores_labels_roundtrip(self, db):
+        """Raw val_scores_json / val_labels_json survive DB round-trip."""
+        import json
+        scores = [0.1, 0.3, 0.7, 0.9]
+        labels = [0, 0, 1, 1]
+        saved = db.save_training_record(_make_training_record(
+            val_scores_json=json.dumps(scores),
+            val_labels_json=json.dumps(labels),
+        ))
+        r = db.get_training_record(saved.id)
+        assert json.loads(r.val_scores_json) == scores
+        assert json.loads(r.val_labels_json) == labels
+
+    def test_to_dict_includes_phase1_fields_but_not_raw_arrays(self, db):
+        """to_dict exposes Phase 1 metrics; scores/labels arrays intentionally excluded."""
+        import json
+        saved = db.save_training_record(_make_training_record(
+            val_f1=0.88,
+            val_auroc=0.94,
+            val_scores_json=json.dumps([0.1, 0.9]),
+            val_labels_json=json.dumps([0, 1]),
+        ))
+        d = db.get_training_record(saved.id).to_dict()
+        assert d["val_f1"] == pytest.approx(0.88)
+        assert d["val_auroc"] == pytest.approx(0.94)
+        # Raw arrays should NOT leak via to_dict (they're fetched via the metrics endpoint)
+        assert "val_scores_json" not in d
+        assert "val_labels_json" not in d
+
+    def test_nullable_fields_default_to_none(self, db):
+        """Phase 1/2 fields default to None when not provided."""
+        saved = db.save_training_record(_make_training_record())  # no new fields set
+        r = db.get_training_record(saved.id)
+        assert r.val_precision is None
+        assert r.val_recall is None
+        assert r.val_f1 is None
+        assert r.val_auroc is None
+        assert r.val_pr_auc is None
+        assert r.val_confusion_matrix is None
+        assert r.val_real_sample_count is None
+        assert r.val_scores_json is None
+        assert r.val_labels_json is None
+
+
 class TestCaptureStats:
     def test_accepted_and_rejected_counts(self):
         """CaptureStats tracks accepted and rejected frame counts."""

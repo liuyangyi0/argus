@@ -68,6 +68,10 @@ class ValidationReport:
     real_pr_auc: float | None = None
     real_confusion_matrix: dict | None = None
     real_sample_count: int | None = None
+    # Phase 2: raw per-sample scores/labels — enables frontend threshold slider
+    # without re-running the model. None when real-labeled eval was skipped.
+    real_scores: list[float] | None = None
+    real_labels: list[int] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -234,6 +238,8 @@ class TrainingValidator:
             real_pr_auc=real.get("pr_auc"),
             real_confusion_matrix=real.get("confusion_matrix"),
             real_sample_count=real.get("sample_count"),
+            real_scores=real.get("scores"),
+            real_labels=real.get("labels"),
         )
 
         logger.info(
@@ -612,6 +618,8 @@ class TrainingValidator:
             "n_positive": metrics["n_positive"],
             "n_negative": metrics["n_negative"],
             "threshold": metrics["threshold"],
+            "scores": metrics["scores"],
+            "labels": metrics["labels"],
         }
 
         passed = metrics["f1"] >= min_f1
