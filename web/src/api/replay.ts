@@ -11,7 +11,16 @@ export const getReplayFrameUrl = (alertId: string, index: number) =>
   `/api/replay/${alertId}/frame/${index}`
 export const getReplayHeatmapUrl = (alertId: string, index: number) =>
   `/api/replay/${alertId}/heatmap/${index}`
-export const getReplayReference = (alertId: string, params?: { date?: string; time?: string }) =>
+export const getReplayReference = (
+  alertId: string,
+  params?: { date?: string; time?: string; frame_offset_seconds?: number },
+) =>
   api.get(`/replay/${alertId}/reference`, { params }).then(u)
 export const pinReplayFrame = (alertId: string, data: { index: number; label: string }) =>
   api.post(`/replay/${alertId}/pin-frame`, data).then(u)
+export const addReplayClip = (
+  alertId: string,
+  data: { start_index: number; end_index: number; label?: string },
+) => api.post(`/replay/${alertId}/clips`, data).then(u)
+export const deleteReplayClip = (alertId: string, index: number) =>
+  api.delete(`/replay/${alertId}/clips/${index}`).then(u)

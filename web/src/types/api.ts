@@ -141,6 +141,14 @@ export interface TrajectoryFit {
   landing: TrajectoryFitPoint
 }
 
+// Persisted operator-marked clip range on the replay timeline (FR-033).
+export interface ReplayClip {
+  start_index: number
+  end_index: number
+  label: string
+  created_at: string
+}
+
 export interface TaskInfo {
   task_id: string
   task_type: string

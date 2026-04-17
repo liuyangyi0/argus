@@ -414,6 +414,75 @@ class AlertRecordingStore:
         meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
         return True
 
+    def list_clips(self, alert_id: str) -> list[dict] | None:
+        """Return the persisted operator clip ranges for a recording.
+
+        Returns ``None`` when the recording does not exist, ``[]`` when it
+        exists but has no clips yet. Each clip is ``{start_index, end_index,
+        label, created_at}``.
+        """
+        rec_dir = self._find_recording_dir(alert_id)
+        if rec_dir is None:
+            return None
+        sig_path = rec_dir / "signals.json"
+        if not sig_path.exists():
+            return []
+        signals = json.loads(sig_path.read_text(encoding="utf-8"))
+        clips = signals.get("clips")
+        if not isinstance(clips, list):
+            return []
+        return clips
+
+    def add_clip(
+        self,
+        alert_id: str,
+        start_index: int,
+        end_index: int,
+        label: str = "",
+    ) -> dict | None:
+        """Append an operator-marked clip range to ``signals.json``.
+
+        Returns the created clip dict on success, ``None`` if the recording
+        does not exist.
+        """
+        rec_dir = self._find_recording_dir(alert_id)
+        if rec_dir is None:
+            return None
+        sig_path = rec_dir / "signals.json"
+        if not sig_path.exists():
+            return None
+        signals = json.loads(sig_path.read_text(encoding="utf-8"))
+        clips = signals.get("clips")
+        if not isinstance(clips, list):
+            clips = []
+        clip = {
+            "start_index": int(start_index),
+            "end_index": int(end_index),
+            "label": str(label or ""),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        clips.append(clip)
+        signals["clips"] = clips
+        sig_path.write_text(json.dumps(signals, ensure_ascii=False), encoding="utf-8")
+        return clip
+
+    def delete_clip(self, alert_id: str, index: int) -> bool:
+        """Remove a clip by its array index. Returns ``True`` on success."""
+        rec_dir = self._find_recording_dir(alert_id)
+        if rec_dir is None:
+            return False
+        sig_path = rec_dir / "signals.json"
+        if not sig_path.exists():
+            return False
+        signals = json.loads(sig_path.read_text(encoding="utf-8"))
+        clips = signals.get("clips")
+        if not isinstance(clips, list) or index < 0 or index >= len(clips):
+            return False
+        clips.pop(index)
+        signals["clips"] = clips
+        sig_path.write_text(json.dumps(signals, ensure_ascii=False), encoding="utf-8")
+        return True
+
     def has_recording(self, alert_id: str) -> bool:
         """Check if a recording exists for the given alert."""
         return self._find_recording_dir(alert_id) is not None
