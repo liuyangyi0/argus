@@ -141,6 +141,26 @@ export interface TrajectoryFit {
   landing: TrajectoryFitPoint
 }
 
+// Live health record for one detector on one camera
+// (aggregated at /api/models/status). backend values depend on the detector:
+//   anomaly: "torch-cuda" | "torch-cpu" | "openvino" | "ssim-fallback" | "disabled" | "none"
+//   yolo:    "cuda" | "cpu" | "disabled" | "none"
+export interface ModelHealthStatus {
+  name: string
+  camera_id: string
+  loaded: boolean
+  backend: string
+  model_path: string | null
+  image_size: [number, number] | null
+  last_error: string | null
+  last_error_ts: number | null
+  consecutive_failures: number
+  total_inferences: number
+  total_failures: number
+  last_success_ts: number | null
+  extra: Record<string, unknown>
+}
+
 // Persisted operator-marked clip range on the replay timeline (FR-033).
 export interface ReplayClip {
   start_index: number
