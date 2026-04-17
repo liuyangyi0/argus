@@ -245,6 +245,24 @@ class DetectionPipeline:
             enable_stabilization=camera_config.mog2.enable_stabilization,
         )
 
+        # Stage 0.75: Phase-correlation alignment (cancels camera micro-vibration
+        # before MOG2/anomaly detection; the #1 false-positive source for
+        # fixed cameras near pumps, fans, and turbines).
+        if camera_config.alignment.enabled:
+            from argus.preprocessing.alignment import create_from_config
+
+            self._aligner = create_from_config(camera_config.alignment)
+            self._m_alignment_shift_dx = METRICS.alignment_shift_px.labels(
+                camera_id=_cid, axis="dx",
+            )
+            self._m_alignment_shift_dy = METRICS.alignment_shift_px.labels(
+                camera_id=_cid, axis="dy",
+            )
+        else:
+            self._aligner = None
+            self._m_alignment_shift_dx = None
+            self._m_alignment_shift_dy = None
+
         # Stage 2: Object detection (YOLO-003: multi-class + tracking + SAHI)
         self._object_detector = YOLOObjectDetector(
             model_name=camera_config.person_filter.model_name,
@@ -1054,6 +1072,30 @@ class DetectionPipeline:
                 ))
             except Exception as e:
                 logger.debug("pipeline.imaging_preprocessing_error", error=str(e))
+
+        # Stage 0.75: Phase-correlation alignment
+        if self._aligner is not None:
+            t_align = time.monotonic()
+            try:
+                frame, (align_dx, align_dy) = self._aligner.align(frame)
+                diag.alignment_shift_px = (align_dx, align_dy)
+                if self._m_alignment_shift_dx is not None:
+                    self._m_alignment_shift_dx.observe(abs(align_dx))
+                    self._m_alignment_shift_dy.observe(abs(align_dy))
+                diag.stages.append(StageResult(
+                    stage_name="alignment",
+                    duration_ms=(time.monotonic() - t_align) * 1000,
+                    metadata={
+                        "dx": round(align_dx, 3),
+                        "dy": round(align_dy, 3),
+                    },
+                ))
+            except Exception as e:
+                logger.debug(
+                    "pipeline.alignment_error",
+                    camera_id=frame_data.camera_id,
+                    error=str(e),
+                )
 
         # Save latest frame reference — get_latest_frame() copies on read
         with self._latest_frame_lock:

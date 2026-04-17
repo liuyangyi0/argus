@@ -524,6 +524,32 @@ class GigEConfig(BaseModel):
     )
 
 
+class AlignmentConfig(BaseModel):
+    """Sub-pixel phase-correlation alignment for camera micro-vibration.
+
+    Runs before anomaly detection to cancel 1-2px frame-to-frame shifts
+    caused by pumps, fans, and turbines — the #1 source of false positives
+    in fixed-camera nuclear plant deployments.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable phase-correlation alignment preprocessing stage",
+    )
+    max_shift_px: float = Field(
+        default=5.0, ge=0.5, le=50.0,
+        description="Shifts above this (on either axis) are treated as real motion and skipped",
+    )
+    downsample: int = Field(
+        default=4, ge=1, le=16,
+        description="Run phase correlation at 1/N resolution to keep latency low",
+    )
+    ref_update_interval_s: float = Field(
+        default=60.0, ge=1.0, le=3600.0,
+        description="Seconds between reference frame refreshes to track slow scene drift",
+    )
+
+
 class CameraConfig(BaseModel):
     """Configuration for a single camera."""
 
@@ -550,6 +576,10 @@ class CameraConfig(BaseModel):
         description="Seconds without frames before forced reconnect (5-300)",
     )
     mog2: MOG2Config = Field(default_factory=MOG2Config)
+    alignment: AlignmentConfig = Field(
+        default_factory=AlignmentConfig,
+        description="Phase-correlation alignment for camera micro-vibration",
+    )
     person_filter: PersonFilterConfig = Field(default_factory=PersonFilterConfig)
     anomaly: AnomalyConfig = Field(default_factory=AnomalyConfig)
     simplex: SimplexConfig = Field(default_factory=SimplexConfig)
