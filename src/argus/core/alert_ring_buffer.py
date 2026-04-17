@@ -42,6 +42,10 @@ class FrameSnapshot:
     # Raw uint8 anomaly map (not JPEG-encoded) — encoding deferred to solidify time
     heatmap_raw: np.ndarray | None = None
     yolo_boxes: list[dict] | None = None  # all YOLO detections [{bbox, class, confidence}]
+    # Active temporal tracks at this frame — serialized for trajectory replay.
+    # Each dict: {"track_id": int, "centroid_x": float, "centroid_y": float,
+    #             "max_score": float, "area_px": int}
+    active_tracks: list[dict] = field(default_factory=list)
 
 
 class RecordingStatus(str, Enum):

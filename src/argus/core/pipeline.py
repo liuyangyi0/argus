@@ -1593,6 +1593,7 @@ class DetectionPipeline:
                 )
 
         # P1-P3: Physics enrichment (speed, trajectory, localization)
+        active_tracks_payload: list[dict] = []
         if alert is not None and anomaly_result.is_anomalous:
             try:
                 regions = self._physics_postproc.extract_regions(
@@ -1601,35 +1602,113 @@ class DetectionPipeline:
                 ) if anomaly_result.anomaly_map is not None else []
                 temporal = self._physics_tracker.update(regions, self._frame_counter)
 
-                # P1: Speed estimation
-                if self._speed_estimator and temporal.active_tracks:
-                    best_track = max(temporal.active_tracks, key=lambda t: t.max_score)
-                    speed_est = self._speed_estimator.estimate(best_track)
-                    alert.speed_px_per_sec = speed_est.speed_px_per_sec
-                    alert.speed_ms = speed_est.speed_ms
+                # Serialize active tracks for the ring buffer (drives replay trajectory)
+                active_tracks_payload = [
+                    {
+                        "track_id": t.track_id,
+                        "centroid_x": float(t.centroid_x),
+                        "centroid_y": float(t.centroid_y),
+                        "max_score": float(t.max_score),
+                        "area_px": int(t.area_px),
+                    }
+                    for t in temporal.active_tracks
+                ]
 
-                # P2: Trajectory fitting (phase 2)
+                # Per-track trajectory fits (used for persistence + API)
+                trajectories_payload: list[dict] = []
                 if (
                     self._trajectory_analyzer
                     and self._camera_calibration
                     and temporal.active_tracks
                 ):
-                    best_track = max(temporal.active_tracks, key=lambda t: t.max_score)
-                    if len(best_track.trajectory_history) >= 5:
-                        from argus.physics.trajectory import trajectory_points_from_pixel_history
+                    from argus.physics.trajectory import (
+                        trajectory_points_from_pixel_history,
+                    )
+                    for track in temporal.active_tracks:
+                        if len(track.trajectory_history) < 5:
+                            continue
                         world_pts = trajectory_points_from_pixel_history(
-                            best_track.trajectory_history,
+                            track.trajectory_history,
                             self._camera_calibration,
                         )
                         fit = self._trajectory_analyzer.fit_trajectory(world_pts)
-                        if fit is not None:
-                            alert.trajectory_model = fit.model_type
-                            alert.origin_x_mm = fit.origin.x_mm
-                            alert.origin_y_mm = fit.origin.y_mm
-                            alert.origin_z_mm = fit.origin.z_mm
-                            alert.landing_x_mm = fit.landing.x_mm
-                            alert.landing_y_mm = fit.landing.y_mm
-                            alert.landing_z_mm = fit.landing.z_mm
+                        if fit is None:
+                            continue
+                        try:
+                            ox, oy = self._camera_calibration.world_to_pixel(
+                                fit.origin.x_mm, fit.origin.y_mm, fit.origin.z_mm,
+                            )
+                            lx, ly = self._camera_calibration.world_to_pixel(
+                                fit.landing.x_mm, fit.landing.y_mm, fit.landing.z_mm,
+                            )
+                        except Exception:
+                            ox = oy = lx = ly = None
+                        per_track_speed = None
+                        if self._speed_estimator:
+                            try:
+                                per_track_speed = self._speed_estimator.estimate(track)
+                            except Exception:
+                                per_track_speed = None
+                        trajectories_payload.append({
+                            "track_id": int(track.track_id),
+                            "is_primary": False,
+                            "model_type": fit.model_type,
+                            "r_squared": float(fit.r_squared),
+                            "speed_ms": (
+                                float(per_track_speed.speed_ms)
+                                if per_track_speed and per_track_speed.speed_ms is not None
+                                else None
+                            ),
+                            "speed_px_per_sec": (
+                                float(per_track_speed.speed_px_per_sec)
+                                if per_track_speed else None
+                            ),
+                            "origin": {
+                                "x_mm": float(fit.origin.x_mm),
+                                "y_mm": float(fit.origin.y_mm),
+                                "z_mm": float(fit.origin.z_mm),
+                                "x_px": float(ox) if ox is not None else None,
+                                "y_px": float(oy) if oy is not None else None,
+                            },
+                            "landing": {
+                                "x_mm": float(fit.landing.x_mm),
+                                "y_mm": float(fit.landing.y_mm),
+                                "z_mm": float(fit.landing.z_mm),
+                                "x_px": float(lx) if lx is not None else None,
+                                "y_px": float(ly) if ly is not None else None,
+                            },
+                        })
+
+                # Mark primary = track with highest max_score; mirror its scalars onto alert
+                if trajectories_payload:
+                    score_by_id = {
+                        int(t.track_id): float(t.max_score)
+                        for t in temporal.active_tracks
+                    }
+                    primary = max(
+                        trajectories_payload,
+                        key=lambda tr: score_by_id.get(tr["track_id"], 0.0),
+                    )
+                    primary["is_primary"] = True
+                    alert.trajectory_model = primary["model_type"]
+                    alert.origin_x_mm = primary["origin"]["x_mm"]
+                    alert.origin_y_mm = primary["origin"]["y_mm"]
+                    alert.origin_z_mm = primary["origin"]["z_mm"]
+                    alert.landing_x_mm = primary["landing"]["x_mm"]
+                    alert.landing_y_mm = primary["landing"]["y_mm"]
+                    alert.landing_z_mm = primary["landing"]["z_mm"]
+                    if primary["speed_ms"] is not None:
+                        alert.speed_ms = primary["speed_ms"]
+                    if primary["speed_px_per_sec"] is not None:
+                        alert.speed_px_per_sec = primary["speed_px_per_sec"]
+                    import json as _json
+                    alert.trajectories_json = _json.dumps(trajectories_payload)
+                elif self._speed_estimator and temporal.active_tracks:
+                    # No fit available — still surface best-track speed
+                    best_track = max(temporal.active_tracks, key=lambda t: t.max_score)
+                    speed_est = self._speed_estimator.estimate(best_track)
+                    alert.speed_px_per_sec = speed_est.speed_px_per_sec
+                    alert.speed_ms = speed_est.speed_ms
             except Exception as e:
                 logger.debug(
                     "pipeline.physics_enrichment_error",
@@ -1764,6 +1843,7 @@ class DetectionPipeline:
         self._handle_ring_buffer(
             frame_data, frame, anomaly_result, detection_result,
             simplex_result, simplex_detected, alert,
+            active_tracks_payload,
         )
 
         return alert
@@ -1777,6 +1857,7 @@ class DetectionPipeline:
         simplex_result: object | None,
         simplex_detected: bool,
         alert: Alert | None,
+        active_tracks: list[dict] | None = None,
     ) -> None:
         """Ring buffer frame append, post-capture flush, and alert solidify."""
         if self._alert_ring_buffer is None:
@@ -1833,6 +1914,8 @@ class DetectionPipeline:
             quality = self._ring_buffer_jpeg_quality
             rb = self._alert_ring_buffer
 
+            rb_active_tracks = list(active_tracks) if active_tracks else []
+
             def _encode_and_append() -> None:
                 snap = FrameSnapshot(
                     timestamp=snap_ts,
@@ -1844,6 +1927,7 @@ class DetectionPipeline:
                     frame_number=snap_frame_num,
                     heatmap_raw=rb_heatmap_raw,
                     yolo_boxes=rb_all_boxes,
+                    active_tracks=rb_active_tracks,
                 )
                 rb.append(snap)
 

@@ -101,6 +101,10 @@ export interface AlertSummary {
   origin_x_mm?: number | null
   origin_y_mm?: number | null
   origin_z_mm?: number | null
+  landing_x_mm?: number | null
+  landing_y_mm?: number | null
+  landing_z_mm?: number | null
+  trajectories?: TrajectoryFit[] | null
   // Workflow
   assigned_to?: string | null
   resolved_at?: string | null
@@ -111,6 +115,25 @@ export interface SegmentationObject {
   area_px: number
   centroid: [number, number]
   confidence: number
+}
+
+export interface TrajectoryFitPoint {
+  x_mm: number
+  y_mm: number
+  z_mm: number
+  x_px: number | null
+  y_px: number | null
+}
+
+export interface TrajectoryFit {
+  track_id: number
+  is_primary: boolean
+  model_type: string
+  r_squared: number
+  speed_ms: number | null
+  speed_px_per_sec: number | null
+  origin: TrajectoryFitPoint
+  landing: TrajectoryFitPoint
 }
 
 export interface TaskInfo {

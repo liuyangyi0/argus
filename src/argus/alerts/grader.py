@@ -85,6 +85,8 @@ class Alert:
     landing_x_mm: float | None = None
     landing_y_mm: float | None = None
     landing_z_mm: float | None = None
+    # Per-track trajectory fits (primary + others) serialised as JSON for persistence
+    trajectories_json: str | None = None
     # Set by pipeline after alert recording is solidified to disk
     _solidified_recording: SolidifiedRecording | None = None
 

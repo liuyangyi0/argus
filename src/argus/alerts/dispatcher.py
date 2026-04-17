@@ -152,6 +152,13 @@ class AlertDispatcher:
             payload["landing_y_mm"] = alert.landing_y_mm
         if alert.landing_z_mm is not None:
             payload["landing_z_mm"] = alert.landing_z_mm
+        trajectories_json = getattr(alert, "trajectories_json", None)
+        if trajectories_json:
+            import json as _json
+            try:
+                payload["trajectories"] = _json.loads(trajectories_json)
+            except Exception:
+                pass
         return payload
 
     def dispatch(self, alert: Alert) -> None:
@@ -284,6 +291,7 @@ class AlertDispatcher:
                 landing_x_mm=alert.landing_x_mm,
                 landing_y_mm=alert.landing_y_mm,
                 landing_z_mm=alert.landing_z_mm,
+                trajectories_json=getattr(alert, "trajectories_json", None),
                 classification_label=alert.classification_label,
                 classification_confidence=alert.classification_confidence,
                 corroborated=getattr(alert, "corroborated", None),

@@ -6,12 +6,15 @@ import {
   getReplayVideoUrl,
   getReplayReference,
   pinReplayFrame,
+  getAlertTrajectory,
 } from '../api'
+import type { TrajectoryFit } from '../types/api'
 
 export function useReplayController(alertId: string) {
   // core state
   const metadata = ref<any>(null)
   const signals = ref<any>(null)
+  const trajectoryFits = ref<TrajectoryFit[]>([])
   const currentIndex = ref(0)
   const playing = ref(false)
   const speed = ref(1)
@@ -54,12 +57,39 @@ export function useReplayController(alertId: string) {
   async function loadData() {
     loading.value = true
     try {
-      const [metaRes, sigRes] = await Promise.all([
+      const [metaRes, sigRes, trajRes] = await Promise.all([
         getReplayMetadata(alertId),
         getReplaySignals(alertId),
+        // Older alerts have no trajectory record — swallow 404 but log real errors
+        getAlertTrajectory(alertId).catch((err) => {
+          if (!/404|not found/i.test(String(err?.message ?? err))) {
+            console.warn('[replay] trajectory fetch failed:', err)
+          }
+          return null
+        }),
       ])
       metadata.value = metaRes
       signals.value = sigRes
+      trajectoryFits.value = trajRes?.trajectories ?? []
+
+      // Transform backend's {track_id: [{frame_index, x, y, t}]} into a
+      // frame-indexed array per track for the canvas compositor.
+      const tracksMap = (sigRes as any)?.trajectory_points ?? {}
+      const frameCount = Array.isArray(sigRes?.timestamps) ? sigRes.timestamps.length : 0
+      if (frameCount > 0 && tracksMap && typeof tracksMap === 'object') {
+        const byTrack: Record<string, Array<{ x: number; y: number } | null>> = {}
+        for (const [tid, pts] of Object.entries<any>(tracksMap)) {
+          const arr: Array<{ x: number; y: number } | null> = new Array(frameCount).fill(null)
+          for (const p of (pts as any[])) {
+            const idx = p?.frame_index
+            if (Number.isInteger(idx) && idx >= 0 && idx < frameCount) {
+              arr[idx] = { x: p.x, y: p.y }
+            }
+          }
+          byTrack[tid] = arr
+        }
+        ;(signals.value as any).trajectory_points_by_track = byTrack
+      }
 
       if (metadata.value?.trigger_frame_index !== undefined) {
         pendingSeekIndex.value = metadata.value.trigger_frame_index
@@ -210,7 +240,7 @@ export function useReplayController(alertId: string) {
   }
 
   return {
-    metadata, signals, currentIndex, playing, speed, loading,
+    metadata, signals, trajectoryFits, currentIndex, playing, speed, loading,
     videoEl, videoError, pendingSeekIndex,
     showHeatmap, showBoxes, showTrajectory, showHud, heatmapOpacity,
     referenceFrame, referenceDate, loadingRef, selectedRefOption,

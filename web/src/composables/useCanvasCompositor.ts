@@ -1,5 +1,6 @@
 import { ref, type Ref, watch, onBeforeUnmount } from 'vue'
 import type { useHeatmapCache } from './useHeatmapCache'
+import type { TrajectoryFit } from '../types/api'
 
 /* ── Types ── */
 
@@ -9,9 +10,12 @@ interface YoloBox {
   confidence?: number
 }
 
+type TrackPoints = ({ x: number; y: number } | null)[]
+
 interface SignalsData {
   yolo_boxes?: YoloBox[][]
-  trajectory_points?: ({ x: number; y: number } | null)[]
+  trajectory_points?: TrackPoints
+  trajectory_points_by_track?: Record<string, TrackPoints>
   speed_px_per_sec?: (number | null)[]
   origin?: { x: number; y: number }
   landing?: { x: number; y: number }
@@ -42,6 +46,50 @@ interface CompositorOptions {
   showHud: Ref<boolean>
   heatmapOpacity: Ref<number>
   metadata: Ref<ReplayMeta | null>
+  // Optional: per-track origin/landing + speed fits fetched from
+  // /physics/{alert_id}/trajectory. When absent the compositor still works
+  // using only the per-frame trajectory_points_by_track signal.
+  trajectoryFits?: Ref<TrajectoryFit[]>
+}
+
+/* ── Multi-track colour helpers ── */
+
+// Deterministic HSL hue per track_id using the golden ratio for even spread.
+function trackHue(trackId: number | string): number {
+  const n = typeof trackId === 'number' ? trackId : parseInt(String(trackId), 10) || 0
+  // 137.508° is the golden angle — successive tracks land far apart on the wheel.
+  return (n * 137.508) % 360
+}
+
+function trackColor(trackId: number | string, alpha = 1, isPrimary = false): string {
+  const h = trackHue(trackId)
+  const s = isPrimary ? 90 : 70
+  const l = isPrimary ? 55 : 60
+  return `hsla(${h.toFixed(1)}, ${s}%, ${l}%, ${alpha})`
+}
+
+/* Clamp (px,py) to the visible canvas rect; returns the clamped coordinate
+ * plus whether the original point was outside the rect and its direction. */
+function clampToEdge(
+  px: number,
+  py: number,
+  w: number,
+  h: number,
+  pad = 8,
+): { x: number; y: number; outside: boolean; angle: number } {
+  const outside = px < pad || px > w - pad || py < pad || py > h - pad
+  if (!outside) {
+    return { x: px, y: py, outside: false, angle: 0 }
+  }
+  const cx = w / 2
+  const cy = h / 2
+  const dx = px - cx
+  const dy = py - cy
+  const angle = Math.atan2(dy, dx)
+  // Clamp to the padded rect
+  const x = Math.max(pad, Math.min(w - pad, px))
+  const y = Math.max(pad, Math.min(h - pad, py))
+  return { x, y, outside: true, angle }
 }
 
 /* ── Compositor ── */
@@ -147,21 +195,24 @@ export function useCanvasCompositor(options: CompositorOptions) {
     }
   }
 
-  function drawTrajectory(
+  function drawTrackPolyline(
     ctx: CanvasRenderingContext2D,
-    points: ({ x: number; y: number } | null)[],
+    trackId: number | string,
+    points: TrackPoints,
     frameIndex: number,
     videoWidth: number,
     videoHeight: number,
+    isPrimary: boolean,
   ): void {
     const scaleX = displayWidth / videoWidth
     const scaleY = displayHeight / videoHeight
+    const lineColor = trackColor(trackId, isPrimary ? 0.9 : 0.55, isPrimary)
 
-    // Draw polyline up to current frame
     ctx.beginPath()
-    ctx.strokeStyle = 'rgba(59, 130, 246, 0.7)' // blue-500
-    ctx.lineWidth = 2
+    ctx.strokeStyle = lineColor
+    ctx.lineWidth = isPrimary ? 3 : 2
     let started = false
+    let lastPt: { x: number; y: number } | null = null
     for (let i = 0; i <= frameIndex && i < points.length; i++) {
       const pt = points[i]
       if (!pt) continue
@@ -173,77 +224,138 @@ export function useCanvasCompositor(options: CompositorOptions) {
       } else {
         ctx.lineTo(px, py)
       }
+      lastPt = { x: px, y: py }
     }
     ctx.stroke()
 
-    // Draw centroid markers
+    // Centroid dots — smaller for secondary tracks
+    const dotRadius = isPrimary ? 3 : 2
     for (let i = 0; i <= frameIndex && i < points.length; i++) {
       const pt = points[i]
       if (!pt) continue
       const px = pt.x * scaleX
       const py = pt.y * scaleY
       ctx.beginPath()
-      ctx.arc(px, py, 3, 0, Math.PI * 2)
-      ctx.fillStyle =
-        i === frameIndex ? '#f59e0b' : 'rgba(59, 130, 246, 0.5)'
+      ctx.arc(px, py, dotRadius, 0, Math.PI * 2)
+      ctx.fillStyle = i === frameIndex
+        ? '#f59e0b'
+        : trackColor(trackId, isPrimary ? 0.6 : 0.35, isPrimary)
       ctx.fill()
+    }
+
+    // Track id label on the most recent point
+    if (lastPt && isPrimary) {
+      ctx.save()
+      ctx.font = '600 10px monospace'
+      ctx.fillStyle = lineColor
+      ctx.shadowColor = 'rgba(0, 0, 0, 0.8)'
+      ctx.shadowBlur = 3
+      ctx.fillText(`#${trackId}`, lastPt.x + 6, lastPt.y - 6)
+      ctx.restore()
     }
   }
 
-  function drawOriginLanding(
+  function drawOffscreenMarker(
     ctx: CanvasRenderingContext2D,
-    sig: SignalsData,
+    clamped: { x: number; y: number; angle: number },
+    label: string,
+    color: string,
+    originalPx: number,
+    originalPy: number,
+  ): void {
+    // Draw a triangular arrow pointing toward the offscreen point
+    const { x, y, angle } = clamped
+    ctx.save()
+    ctx.translate(x, y)
+    ctx.rotate(angle)
+    ctx.beginPath()
+    ctx.moveTo(10, 0)
+    ctx.lineTo(-6, 6)
+    ctx.lineTo(-6, -6)
+    ctx.closePath()
+    ctx.fillStyle = color
+    ctx.fill()
+    ctx.restore()
+
+    // Distance label next to the arrow
+    const dist = Math.round(Math.hypot(originalPx - x, originalPy - y))
+    ctx.save()
+    ctx.font = '600 10px monospace'
+    ctx.fillStyle = '#fff'
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.85)'
+    ctx.shadowBlur = 3
+    // Place text just inside the canvas, on the opposite side of the arrow
+    const tx = x - Math.cos(angle) * 16
+    const ty = y - Math.sin(angle) * 16
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillText(`${label} ${dist}px`, tx, ty)
+    ctx.restore()
+  }
+
+  function drawFitEndpoints(
+    ctx: CanvasRenderingContext2D,
+    fit: TrajectoryFit,
     videoWidth: number,
     videoHeight: number,
   ): void {
     const scaleX = displayWidth / videoWidth
     const scaleY = displayHeight / videoHeight
+    const color = trackColor(fit.track_id, fit.is_primary ? 0.95 : 0.6, fit.is_primary)
 
-    // Origin: diamond shape
-    if (sig.origin) {
-      const ox = sig.origin.x * scaleX
-      const oy = sig.origin.y * scaleY
-      ctx.save()
-      ctx.translate(ox, oy)
-      ctx.rotate(Math.PI / 4)
-      ctx.fillStyle = 'rgba(34, 197, 94, 0.7)' // green-500
-      ctx.fillRect(-6, -6, 12, 12)
-      ctx.restore()
+    // Origin (release point) — diamond when on-screen, arrow when off
+    if (fit.origin.x_px != null && fit.origin.y_px != null) {
+      const ox = fit.origin.x_px * scaleX
+      const oy = fit.origin.y_px * scaleY
+      const c = clampToEdge(ox, oy, displayWidth, displayHeight)
+      if (c.outside) {
+        drawOffscreenMarker(ctx, c, `↑#${fit.track_id}`, color, ox, oy)
+      } else {
+        ctx.save()
+        ctx.translate(ox, oy)
+        ctx.rotate(Math.PI / 4)
+        ctx.fillStyle = color
+        ctx.strokeStyle = 'rgba(0,0,0,0.6)'
+        ctx.lineWidth = 1
+        const s = fit.is_primary ? 7 : 5
+        ctx.fillRect(-s, -s, s * 2, s * 2)
+        ctx.strokeRect(-s, -s, s * 2, s * 2)
+        ctx.restore()
+      }
     }
 
-    // Landing: circle
-    if (sig.landing) {
-      const lx = sig.landing.x * scaleX
-      const ly = sig.landing.y * scaleY
-      ctx.beginPath()
-      ctx.arc(lx, ly, 8, 0, Math.PI * 2)
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.7)' // red-500
-      ctx.fill()
+    // Landing (impact point) — circle when on-screen, arrow when off
+    if (fit.landing.x_px != null && fit.landing.y_px != null) {
+      const lx = fit.landing.x_px * scaleX
+      const ly = fit.landing.y_px * scaleY
+      const c = clampToEdge(lx, ly, displayWidth, displayHeight)
+      if (c.outside) {
+        drawOffscreenMarker(ctx, c, `↓#${fit.track_id}`, color, lx, ly)
+      } else {
+        ctx.beginPath()
+        ctx.arc(lx, ly, fit.is_primary ? 9 : 6, 0, Math.PI * 2)
+        ctx.fillStyle = color
+        ctx.fill()
+        ctx.strokeStyle = 'rgba(0,0,0,0.6)'
+        ctx.lineWidth = 1
+        ctx.stroke()
+      }
     }
   }
 
-  function drawSpeedLabel(
+  function drawSpeedLabelAt(
     ctx: CanvasRenderingContext2D,
-    sig: SignalsData,
-    frameIndex: number,
+    pt: { x: number; y: number },
+    speedPxPerSec: number,
     videoWidth: number,
     videoHeight: number,
   ): void {
-    const speeds = sig.speed_px_per_sec
-    if (!speeds || speeds[frameIndex] == null) return
-    const points = sig.trajectory_points
-    if (!points) return
-
-    const pt = points[frameIndex]
-    if (!pt) return
-
     const scaleX = displayWidth / videoWidth
     const scaleY = displayHeight / videoHeight
     const px = pt.x * scaleX
     const py = pt.y * scaleY
-    const speed = speeds[frameIndex]!
 
-    const text = `${speed.toFixed(1)} px/s`
+    const text = `${speedPxPerSec.toFixed(1)} px/s`
     ctx.font = '600 11px monospace'
     const metrics = ctx.measureText(text)
     const pad = 4
@@ -341,22 +453,48 @@ export function useCanvasCompositor(options: CompositorOptions) {
       drawYoloBoxes(ctx, boxes, vw, vh)
     }
 
-    // Layer 4: Trajectory
+    // Layer 4: Trajectory (multi-track)
     if (showTrajectory.value && sig) {
-      // Derive trajectory from YOLO boxes if no explicit trajectory data
-      let points = sig.trajectory_points
-      if (!points && sig.yolo_boxes) {
-        points = sig.yolo_boxes.map((frameBoxes: YoloBox[]) => {
+      const fits = options.trajectoryFits?.value ?? []
+      const primaryId = fits.find((f) => f.is_primary)?.track_id
+      const byTrack = sig.trajectory_points_by_track
+
+      if (byTrack && Object.keys(byTrack).length > 0) {
+        // Draw each track's polyline. Primary last so it sits on top.
+        const entries = Object.entries(byTrack)
+        const ordered = entries.sort(([a], [b]) => {
+          if (primaryId != null && Number(a) === primaryId) return 1
+          if (primaryId != null && Number(b) === primaryId) return -1
+          return 0
+        })
+        for (const [tid, points] of ordered) {
+          const isPrimary = primaryId != null && Number(tid) === primaryId
+          drawTrackPolyline(ctx, tid, points, frameIndex, vw, vh, isPrimary)
+
+          // Per-track speed label at the current point
+          const fit = fits.find((f) => String(f.track_id) === tid)
+          const spd = fit?.speed_px_per_sec
+          const currentPt = points[frameIndex]
+          if (isPrimary && currentPt && spd != null) {
+            drawSpeedLabelAt(ctx, currentPt, spd, vw, vh)
+          }
+        }
+      } else if (sig.trajectory_points) {
+        // Legacy single-track path kept for backward compatibility
+        drawTrackPolyline(ctx, 'legacy', sig.trajectory_points, frameIndex, vw, vh, true)
+      } else if (sig.yolo_boxes) {
+        // Fallback: derive a synthetic trajectory from YOLO first box per frame
+        const derived: TrackPoints = sig.yolo_boxes.map((frameBoxes: YoloBox[]) => {
           if (!frameBoxes || frameBoxes.length === 0) return null
-          const box = frameBoxes[0]
-          const [x1, y1, x2, y2] = box.bbox
+          const [x1, y1, x2, y2] = frameBoxes[0].bbox
           return { x: (x1 + x2) / 2, y: (y1 + y2) / 2 }
         })
+        drawTrackPolyline(ctx, 'yolo', derived, frameIndex, vw, vh, true)
       }
-      if (points) {
-        drawTrajectory(ctx, points, frameIndex, vw, vh)
-        drawOriginLanding(ctx, sig, vw, vh)
-        drawSpeedLabel(ctx, sig, frameIndex, vw, vh)
+
+      // Origin / landing endpoints per track (with offscreen arrow fallback)
+      for (const fit of fits) {
+        drawFitEndpoints(ctx, fit, vw, vh)
       }
     }
 
@@ -467,6 +605,16 @@ export function useCanvasCompositor(options: CompositorOptions) {
       }
     },
   )
+
+  // Re-render when trajectory fits arrive asynchronously (API returns after signals)
+  if (options.trajectoryFits) {
+    watch(options.trajectoryFits, () => {
+      if (!playing.value) {
+        lastRenderedIndex = -1
+        renderOnce()
+      }
+    })
+  }
 
   /* ── Re-start RVFC loop when play resumes ── */
 

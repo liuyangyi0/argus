@@ -14,7 +14,13 @@ router = APIRouter()
 
 @router.get("/{alert_id}/trajectory")
 async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
-    """Get trajectory data for a specific alert."""
+    """Get trajectory data for a specific alert.
+
+    Returns both the primary-track scalars (mm-space, matches ORM fields) and
+    the full list of per-track fits (with pixel-space origin/landing so the
+    frontend can overlay them on video). ``trajectories`` is always a list and
+    is empty when no fit was persisted.
+    """
     db = getattr(request.app.state, "database", None)
     if db is None:
         return api_not_found("Database not available")
@@ -22,6 +28,7 @@ async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
     with db.get_session() as session:
         from argus.storage.models import AlertRecord
         from sqlalchemy import select
+        import json as _json
 
         alert = session.scalar(
             select(AlertRecord).where(AlertRecord.alert_id == alert_id)
@@ -29,21 +36,37 @@ async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
         if alert is None:
             return api_not_found(f"Alert {alert_id} not found")
 
+        trajectories: list = []
+        if alert.trajectories_json:
+            try:
+                parsed = _json.loads(alert.trajectories_json)
+                if isinstance(parsed, list):
+                    trajectories = parsed
+            except Exception:
+                trajectories = []
+
+        primary = None
+        if alert.trajectory_model is not None:
+            primary = {
+                "speed_ms": alert.speed_ms,
+                "speed_px_per_sec": alert.speed_px_per_sec,
+                "trajectory_model": alert.trajectory_model,
+                "origin": {
+                    "x_mm": alert.origin_x_mm,
+                    "y_mm": alert.origin_y_mm,
+                    "z_mm": alert.origin_z_mm,
+                } if alert.origin_x_mm is not None else None,
+                "landing": {
+                    "x_mm": alert.landing_x_mm,
+                    "y_mm": alert.landing_y_mm,
+                    "z_mm": alert.landing_z_mm,
+                } if alert.landing_x_mm is not None else None,
+            }
+
         return api_success({
             "alert_id": alert_id,
-            "speed_ms": alert.speed_ms,
-            "speed_px_per_sec": alert.speed_px_per_sec,
-            "trajectory_model": alert.trajectory_model,
-            "origin": {
-                "x_mm": alert.origin_x_mm,
-                "y_mm": alert.origin_y_mm,
-                "z_mm": alert.origin_z_mm,
-            } if alert.origin_x_mm is not None else None,
-            "landing": {
-                "x_mm": alert.landing_x_mm,
-                "y_mm": alert.landing_y_mm,
-                "z_mm": alert.landing_z_mm,
-            } if alert.landing_x_mm is not None else None,
+            "primary": primary,
+            "trajectories": trajectories,
             "classification": {
                 "label": alert.classification_label,
                 "confidence": alert.classification_confidence,
