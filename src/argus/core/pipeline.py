@@ -1657,11 +1657,17 @@ class DetectionPipeline:
                 ))
                 return None
 
-        # Multi-zone alert grading with semantic context
+        # Multi-zone alert grading with semantic context.
+        # Classification info is forwarded so the grader can use it as
+        # corroboration for the F1 single-frame early-warning fast path.
+        cls_label = classification_result[0] if classification_result else None
+        cls_conf = classification_result[1] if classification_result else None
         alert = self._evaluate_zones(
             frame_data, anomaly_result, frame,
             detection_type=detection_type,
             detected_objects=detected_objects,
+            classification_label=cls_label,
+            classification_confidence=cls_conf,
         )
 
         # D1: Attach classification to alert and adjust severity
@@ -2499,6 +2505,8 @@ class DetectionPipeline:
     def _evaluate_zones(
         self, frame_data: FrameData, anomaly_result: AnomalyResult, frame: np.ndarray,
         detection_type: str = "anomaly", detected_objects: list[dict] | None = None,
+        classification_label: str | None = None,
+        classification_confidence: float | None = None,
     ) -> Alert | None:
         """Evaluate anomaly against all configured include zones.
 
@@ -2521,6 +2529,8 @@ class DetectionPipeline:
                 anomaly_map=anomaly_result.anomaly_map,
                 detection_type=detection_type,
                 detected_objects=detected_objects,
+                classification_label=classification_label,
+                classification_confidence=classification_confidence,
             )
 
         # Evaluate all zones and return highest-severity alert; break ties by score (HIGH-06)
@@ -2543,6 +2553,8 @@ class DetectionPipeline:
                 anomaly_map=anomaly_result.anomaly_map,
                 detection_type=detection_type,
                 detected_objects=detected_objects,
+                classification_label=classification_label,
+                classification_confidence=classification_confidence,
             )
             if alert is not None:
                 rank = _severity_rank(alert.severity)
