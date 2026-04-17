@@ -223,6 +223,85 @@ async def training_history_json(request: Request):
     return api_success({"records": [r.to_dict() for r in records]})
 
 
+@router.get("/training-history/{record_id}/metrics")
+async def training_history_metrics(request: Request, record_id: int):
+    """Phase 2: per-record P/R curve + raw scores/labels for threshold slider.
+
+    Returns scores/labels as two aligned arrays (length ≤ a few hundred typically),
+    plus a pre-computed PR curve. The frontend can recompute P/R/F1 at any
+    threshold locally by thresholding the scores — no model re-run needed.
+    """
+    database = getattr(request.app.state, "database", None)
+    if not database:
+        return api_unavailable("数据库不可用")
+
+    record = database.get_training_record(record_id)
+    if record is None:
+        return api_not_found(f"训练记录不存在: {record_id}")
+
+    if not record.val_scores_json or not record.val_labels_json:
+        return api_success({
+            "record_id": record_id,
+            "has_labeled_eval": False,
+            "message": "本次训练没有真实标注评估数据",
+        })
+
+    import json as _json
+    try:
+        scores = _json.loads(record.val_scores_json)
+        labels = _json.loads(record.val_labels_json)
+    except Exception:
+        logger.warning("baseline.metrics_json_parse_failed", record_id=record_id, exc_info=True)
+        return api_internal_error("评估数据解析失败")
+
+    if len(scores) != len(labels):
+        return api_internal_error(
+            f"评估数据长度不一致: scores={len(scores)} vs labels={len(labels)}",
+        )
+
+    from argus.anomaly.metrics import (
+        compute_pr_curve,
+        evaluate_at_threshold,
+        find_optimal_threshold,
+    )
+
+    import numpy as np
+    y_scores = np.asarray(scores, dtype=np.float64)
+    y_true = np.asarray(labels, dtype=np.int64)
+
+    threshold_used = record.threshold_recommended if record.threshold_recommended else 0.7
+    metrics_at_threshold = evaluate_at_threshold(y_true, y_scores, threshold_used)
+    pr_curve = compute_pr_curve(y_true, y_scores)
+    optimal_threshold = find_optimal_threshold(y_true, y_scores, target="f1")
+
+    cm_stored = None
+    if record.val_confusion_matrix:
+        try:
+            cm_stored = _json.loads(record.val_confusion_matrix)
+        except Exception:
+            cm_stored = None
+
+    return api_success({
+        "record_id": record_id,
+        "has_labeled_eval": True,
+        "scores": scores,
+        "labels": labels,
+        "threshold_used": threshold_used,
+        "metrics_at_threshold": metrics_at_threshold,
+        "pr_curve": pr_curve,
+        "optimal_f1_threshold": optimal_threshold,
+        "stored_confusion_matrix": cm_stored,
+        "stored_metrics": {
+            "precision": record.val_precision,
+            "recall": record.val_recall,
+            "f1": record.val_f1,
+            "auroc": record.val_auroc,
+            "pr_auc": record.val_pr_auc,
+        },
+        "sample_count": len(scores),
+    })
+
+
 @router.delete("/version")
 async def delete_baseline_version(request: Request):
     """Delete an entire baseline version directory and its lifecycle record."""
@@ -616,9 +695,17 @@ def _train_model_task(
             # Phase 1: extract real-labeled metrics from ValidationReport when present
             vr = result.validation_report
             val_cm_json = None
-            if vr is not None and getattr(vr, "real_confusion_matrix", None):
+            val_scores_json_str = None
+            val_labels_json_str = None
+            if vr is not None:
                 import json as _json
-                val_cm_json = _json.dumps(vr.real_confusion_matrix)
+                if getattr(vr, "real_confusion_matrix", None):
+                    val_cm_json = _json.dumps(vr.real_confusion_matrix)
+                # Phase 2: persist raw scores/labels for frontend threshold slider
+                if getattr(vr, "real_scores", None) is not None:
+                    val_scores_json_str = _json.dumps([round(float(s), 6) for s in vr.real_scores])
+                if getattr(vr, "real_labels", None) is not None:
+                    val_labels_json_str = _json.dumps([int(l) for l in vr.real_labels])
 
             record = TrainingRecord(
                 camera_id=camera_id,
@@ -646,6 +733,8 @@ def _train_model_task(
                 val_pr_auc=getattr(vr, "real_pr_auc", None) if vr else None,
                 val_confusion_matrix=val_cm_json,
                 val_real_sample_count=getattr(vr, "real_sample_count", None) if vr else None,
+                val_scores_json=val_scores_json_str,
+                val_labels_json=val_labels_json_str,
                 model_path=result.model_path,
                 export_path=str(Path(models_dir).parent / "exports" / camera_id / "default") if fmt else None,
                 checkpoint_valid=output_val.get("checkpoint_valid"),
