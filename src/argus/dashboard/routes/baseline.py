@@ -613,6 +613,13 @@ def _train_model_task(
             val_stats = result.val_stats or {}
             quality = result.quality_report
 
+            # Phase 1: extract real-labeled metrics from ValidationReport when present
+            vr = result.validation_report
+            val_cm_json = None
+            if vr is not None and getattr(vr, "real_confusion_matrix", None):
+                import json as _json
+                val_cm_json = _json.dumps(vr.real_confusion_matrix)
+
             record = TrainingRecord(
                 camera_id=camera_id,
                 zone_id="default",
@@ -632,6 +639,13 @@ def _train_model_task(
                 val_score_p95=val_stats.get("p95"),
                 quality_grade=quality.grade if quality else None,
                 threshold_recommended=result.threshold_recommended,
+                val_precision=getattr(vr, "real_precision", None) if vr else None,
+                val_recall=getattr(vr, "real_recall", None) if vr else None,
+                val_f1=getattr(vr, "real_f1", None) if vr else None,
+                val_auroc=getattr(vr, "real_auroc", None) if vr else None,
+                val_pr_auc=getattr(vr, "real_pr_auc", None) if vr else None,
+                val_confusion_matrix=val_cm_json,
+                val_real_sample_count=getattr(vr, "real_sample_count", None) if vr else None,
                 model_path=result.model_path,
                 export_path=str(Path(models_dir).parent / "exports" / camera_id / "default") if fmt else None,
                 checkpoint_valid=output_val.get("checkpoint_valid"),

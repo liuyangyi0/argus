@@ -290,6 +290,19 @@ class TrainingRecord(Base):
     quality_grade: Mapped[str | None] = mapped_column(String(1), nullable=True)
     threshold_recommended: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Real-labeled P/R/F1/AUROC/PR-AUC (Phase 1)
+    # Populated when data/validation/{camera_id}/confirmed (positives) and
+    # data/baselines/{camera_id}/false_positives (negatives) have ≥10 samples each.
+    # All NULL when real labels are unavailable; do not conflate with val_score_*
+    # which are computed on the training-time normal holdout only.
+    val_precision: Mapped[float | None] = mapped_column(Float, nullable=True)
+    val_recall: Mapped[float | None] = mapped_column(Float, nullable=True)
+    val_f1: Mapped[float | None] = mapped_column(Float, nullable=True)
+    val_auroc: Mapped[float | None] = mapped_column(Float, nullable=True)
+    val_pr_auc: Mapped[float | None] = mapped_column(Float, nullable=True)
+    val_confusion_matrix: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON {tp,fp,fn,tn}
+    val_real_sample_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Output validation (TRN-006)
     model_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     export_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -327,6 +340,13 @@ class TrainingRecord(Base):
             "val_score_p95": self.val_score_p95,
             "quality_grade": self.quality_grade,
             "threshold_recommended": self.threshold_recommended,
+            "val_precision": self.val_precision,
+            "val_recall": self.val_recall,
+            "val_f1": self.val_f1,
+            "val_auroc": self.val_auroc,
+            "val_pr_auc": self.val_pr_auc,
+            "val_confusion_matrix": self.val_confusion_matrix,
+            "val_real_sample_count": self.val_real_sample_count,
             "model_path": self.model_path,
             "export_path": self.export_path,
             "checkpoint_valid": self.checkpoint_valid,
