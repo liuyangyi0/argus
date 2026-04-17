@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 import structlog
 
+from argus.core.model_status import ModelStatus
+
 logger = structlog.get_logger()
 
 
@@ -64,12 +66,19 @@ class AnomalibDetector:
         ssim_sensitivity: float = 50.0,
         ssim_midpoint: float = 0.015,
         enable_calibration: bool = True,
+        camera_id: str = "unknown",
     ):
         self.threshold = threshold
         self.image_size = image_size
         self._model_path = Path(model_path) if model_path else None
         self._engine = None
         self._loaded = False
+        self.status = ModelStatus(
+            name="anomaly",
+            camera_id=camera_id,
+            image_size=image_size,
+            model_path=str(self._model_path) if self._model_path else None,
+        )
         self._enable_calibration = enable_calibration
         self._calibration_scores: np.ndarray | None = None  # sorted scores for p-value
         self._calibration_n: int = 0
@@ -99,6 +108,8 @@ class AnomalibDetector:
                 msg="No trained model found, using SSIM fallback",
                 ssim_threshold=self._ssim_threshold,
             )
+            self.status.mark_loaded(backend="ssim-fallback", image_size=self.image_size)
+            self.status.set_extra(reason="no_model_found")
             return False
 
         suffix = self._model_path.suffix.lower()
@@ -108,6 +119,7 @@ class AnomalibDetector:
                 path=str(self._model_path),
                 msg="Lightning checkpoint is not deployable; use model.pt or model.xml",
             )
+            self.status.mark_load_failed("unsupported_checkpoint")
             return False
 
         # Detect CUDA availability once
@@ -135,9 +147,15 @@ class AnomalibDetector:
                 self._check_minmax_normalization()
                 logger.info("anomaly.model_loaded_openvino", path=str(self._model_path))
                 self._load_calibration()
+                self.status.mark_loaded(
+                    backend="openvino",
+                    model_path=str(self._model_path),
+                    image_size=self.image_size,
+                )
                 return True
             except Exception as e:
                 logger.warning("anomaly.openvino_failed", error=str(e))
+                self.status.mark_load_failed(f"openvino: {e}")
 
         # Final fallback: Torch on CPU
         if not _cuda_available:
@@ -145,6 +163,7 @@ class AnomalibDetector:
                 return True
 
         logger.error("anomaly.load_failed", path=str(self._model_path))
+        self.status.mark_load_failed("all backends failed")
         return False
 
     def _try_load_torch(self, device: str = "cpu") -> bool:
@@ -165,6 +184,11 @@ class AnomalibDetector:
                 device=device,
             )
             self._load_calibration()
+            self.status.mark_loaded(
+                backend=f"torch-{device}",
+                model_path=str(self._model_path),
+                image_size=self.image_size,
+            )
             return True
         except Exception as e:
             logger.warning("anomaly.torch_load_failed", device=device, error=str(e))
@@ -443,6 +467,7 @@ class AnomalibDetector:
                 else:
                     anomaly_map = np.zeros_like(anomaly_map, dtype=np.float32)
 
+            self.status.mark_inference_success()
             return AnomalyResult(
                 anomaly_score=anomaly_score,
                 anomaly_map=anomaly_map,
@@ -452,6 +477,7 @@ class AnomalibDetector:
             )
         except Exception as e:
             logger.error("anomaly.predict_failed", error=str(e), error_type=type(e).__name__)
+            self.status.mark_inference_failure(f"{type(e).__name__}: {e}")
             return self._safe_result()
 
     def _safe_result(self) -> AnomalyResult:

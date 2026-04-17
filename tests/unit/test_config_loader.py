@@ -10,8 +10,10 @@ import yaml
 from argus.config.loader import (
     _apply_env_overrides,
     _deep_merge,
+    _normalize_path_separators,
     load_config,
     load_config_layered,
+    save_config,
 )
 
 
@@ -157,3 +159,72 @@ class TestLoadConfig:
             assert config.dashboard.port == 9999
         finally:
             del os.environ["ARGUS__DASHBOARD__PORT"]
+
+
+class TestPathSeparatorNormalization:
+    """Windows→Linux safety: `data\\models` in YAML must become `data/models`."""
+
+    def test_walker_replaces_backslashes_in_str(self):
+        assert _normalize_path_separators("data\\models") == "data/models"
+
+    def test_walker_ignores_strings_without_backslashes(self):
+        # identity — no copy churn for the common path
+        s = "data/models"
+        assert _normalize_path_separators(s) is s
+
+    def test_walker_recurses_into_nested_dicts(self):
+        data = {
+            "storage": {
+                "models_dir": "data\\models",
+                "baselines_dir": "data\\baselines",
+            },
+            "log_level": "INFO",  # non-path strings untouched
+        }
+        out = _normalize_path_separators(data)
+        assert out["storage"]["models_dir"] == "data/models"
+        assert out["storage"]["baselines_dir"] == "data/baselines"
+        assert out["log_level"] == "INFO"
+
+    def test_walker_recurses_into_lists(self):
+        data = {"dirs": ["data\\a", "data\\b", "c/already/ok"]}
+        assert _normalize_path_separators(data)["dirs"] == [
+            "data/a", "data/b", "c/already/ok",
+        ]
+
+    def test_database_url_normalized(self):
+        data = {"storage": {"database_url": "sqlite:///data\\db\\argus.db"}}
+        assert _normalize_path_separators(data)["storage"]["database_url"] == \
+            "sqlite:///data/db/argus.db"
+
+    def test_load_config_normalizes_backslashes(self, tmp_path):
+        """Raw YAML with backslashes loads as posix-shaped paths."""
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "node_id": "test-node",
+            "cameras": [],
+            "storage": {
+                "models_dir": "data\\models",
+                "baselines_dir": "data\\baselines",
+            },
+        }))
+        config = load_config(str(cfg_file))
+        # Path.as_posix() is the stable cross-platform representation.
+        # On Windows, str(Path("data/models")) renders "data\\models" natively;
+        # as_posix() is what downstream consumers should compare against.
+        assert config.storage.models_dir.as_posix() == "data/models"
+        assert config.storage.baselines_dir.as_posix() == "data/baselines"
+
+    def test_save_config_emits_posix_separators(self, tmp_path):
+        """A Windows-authored save must not leak `\\` back into the YAML."""
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "node_id": "test-node",
+            "cameras": [],
+            "storage": {"models_dir": "data\\models"},
+        }))
+        config = load_config(str(cfg_file))
+
+        out_path = tmp_path / "out.yaml"
+        save_config(config, str(out_path))
+        dumped_text = out_path.read_text(encoding="utf-8")
+        assert "\\" not in dumped_text

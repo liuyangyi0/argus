@@ -1,9 +1,16 @@
-import type { ApiResponse, HealthPayload } from '../types/api'
+import type { ApiResponse, HealthPayload, ModelHealthStatus } from '../types/api'
 import { api, unwrap, u } from './client'
 
 // ── Health ──
 export const getHealth = () =>
   api.get<ApiResponse<HealthPayload>>('/system/health').then(unwrap)
+
+// ── Per-model live health ──
+export const getModelsStatus = () =>
+  api
+    .get<ApiResponse<{ models: ModelHealthStatus[] }>>('/models/status')
+    .then(unwrap)
+    .then((payload) => payload.models)
 
 // ── Config ──
 export const reloadConfig = () => api.post('/config/reload').then(u)
