@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { inject, computed } from 'vue'
+import { inject, computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { CaretRightOutlined, PauseOutlined } from '@ant-design/icons-vue'
 import { formatPlaybackTime } from '../../utils/time'
 import type { useReplayController } from '../../composables/useReplayController'
@@ -7,6 +7,113 @@ import type { useReplayController } from '../../composables/useReplayController'
 const ctrl = inject<ReturnType<typeof useReplayController>>('replayCtrl')!
 
 const speeds = [0.25, 0.5, 1, 2, 4]
+
+// ── Confidence sparkline under the scrubber ──
+const sparkCanvas = ref<HTMLCanvasElement | null>(null)
+const SPARK_HEIGHT = 20
+let sparkRaf = 0
+
+function drawSparkline() {
+  const canvas = sparkCanvas.value
+  if (!canvas) return
+  const scores: number[] = ctrl.signals.value?.anomaly_scores || []
+  const cssWidth = canvas.clientWidth || canvas.parentElement?.clientWidth || 0
+  if (cssWidth <= 0) return
+  const dpr = Math.max(1, window.devicePixelRatio || 1)
+  if (canvas.width !== cssWidth * dpr || canvas.height !== SPARK_HEIGHT * dpr) {
+    canvas.width = cssWidth * dpr
+    canvas.height = SPARK_HEIGHT * dpr
+  }
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, cssWidth, SPARK_HEIGHT)
+
+  if (scores.length === 0) return
+
+  const maxScore = Math.max(...scores, 0.01)
+  const n = scores.length
+  const innerH = SPARK_HEIGHT - 2
+
+  // Baseline guide
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.25)'
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  ctx.moveTo(0, SPARK_HEIGHT - 1)
+  ctx.lineTo(cssWidth, SPARK_HEIGHT - 1)
+  ctx.stroke()
+
+  // Polyline of scores, normalized to [0, maxScore]
+  ctx.strokeStyle = 'rgba(59, 130, 246, 0.4)'
+  ctx.fillStyle = 'rgba(59, 130, 246, 0.12)'
+  ctx.lineWidth = 1.25
+  ctx.beginPath()
+  for (let i = 0; i < n; i++) {
+    const x = n === 1 ? cssWidth / 2 : (i / (n - 1)) * cssWidth
+    const norm = Math.max(0, Math.min(1, scores[i] / maxScore))
+    const y = SPARK_HEIGHT - 1 - norm * innerH
+    if (i === 0) ctx.moveTo(x, y)
+    else ctx.lineTo(x, y)
+  }
+  ctx.stroke()
+  ctx.lineTo(cssWidth, SPARK_HEIGHT - 1)
+  ctx.lineTo(0, SPARK_HEIGHT - 1)
+  ctx.closePath()
+  ctx.fill()
+
+  // Current-frame marker (vertical red line)
+  const total = Math.max((ctrl.metadata.value?.frame_count || n) - 1, 1)
+  const cursorX = total > 0 ? (ctrl.currentIndex.value / total) * cssWidth : 0
+  ctx.strokeStyle = 'rgba(239, 68, 68, 0.85)'
+  ctx.lineWidth = 1.25
+  ctx.beginPath()
+  ctx.moveTo(cursorX, 0)
+  ctx.lineTo(cursorX, SPARK_HEIGHT)
+  ctx.stroke()
+}
+
+function scheduleDraw() {
+  if (sparkRaf) cancelAnimationFrame(sparkRaf)
+  sparkRaf = requestAnimationFrame(drawSparkline)
+}
+
+let resizeObserver: ResizeObserver | null = null
+
+onMounted(() => {
+  nextTick(drawSparkline)
+  if (sparkCanvas.value && typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => scheduleDraw())
+    resizeObserver.observe(sparkCanvas.value)
+  }
+})
+
+onUnmounted(() => {
+  if (sparkRaf) cancelAnimationFrame(sparkRaf)
+  if (resizeObserver) resizeObserver.disconnect()
+})
+
+watch(
+  () => [ctrl.currentIndex.value, ctrl.signals.value?.anomaly_scores?.length],
+  () => scheduleDraw(),
+)
+
+// ── Clip markers ──
+function clipLeft(idx: number) {
+  const total = Math.max((ctrl.metadata.value?.frame_count || 1) - 1, 1)
+  return (Math.max(0, Math.min(idx, total)) / total) * 100
+}
+
+function clipWidth(start: number, end: number) {
+  const total = Math.max((ctrl.metadata.value?.frame_count || 1) - 1, 1)
+  const a = Math.max(0, Math.min(start, total))
+  const b = Math.max(0, Math.min(end, total))
+  return Math.max(((b - a) / total) * 100, 0.6)
+}
+
+function clipTitle(c: { start_index: number; end_index: number; label: string }) {
+  const base = `#${c.start_index}–${c.end_index}`
+  return c.label ? `${c.label} · ${base}` : base
+}
 
 const hasYoloData = computed(() => {
   const boxes = ctrl.signals.value?.yolo_boxes
@@ -98,8 +205,44 @@ const remainingRecordingSeconds = computed(() => {
     <div class="replay-timeline">
       <div class="tl-bar">
         <div class="tl-progress" :style="{ width: progressPct + '%' }"></div>
+        <!-- Persisted clip markers (bracket spans survive reload) -->
+        <div
+          v-for="(clip, idx) in ctrl.persistedClips.value"
+          :key="`clip-${idx}-${clip.created_at}`"
+          class="tl-clip"
+          :style="{
+            left: clipLeft(clip.start_index) + '%',
+            width: clipWidth(clip.start_index, clip.end_index) + '%',
+          }"
+          :title="clipTitle(clip)"
+        >
+          <span
+            class="tl-clip-start"
+            :title="clipTitle(clip)"
+            @click.stop="ctrl.seekTo(clip.start_index)"
+          ></span>
+          <span
+            class="tl-clip-end"
+            :title="clipTitle(clip)"
+            @click.stop="ctrl.seekTo(clip.end_index)"
+          ></span>
+          <button
+            class="tl-clip-del"
+            type="button"
+            title="删除片段"
+            @click.stop="ctrl.removeClip(idx)"
+          >×</button>
+        </div>
         <div class="tl-head" :style="{ left: progressPct + '%' }"></div>
       </div>
+
+      <!-- Confidence sparkline: faint primary curve + red current-frame line -->
+      <canvas
+        ref="sparkCanvas"
+        class="tl-sparkline"
+        :style="{ height: SPARK_HEIGHT + 'px' }"
+      ></canvas>
+
       <input
         type="range"
         :min="0"
@@ -256,6 +399,76 @@ const remainingRecordingSeconds = computed(() => {
   background: #f59e0b;
   transform: translateX(-1px);
   transition: left .05s linear;
+}
+.tl-clip {
+  position: absolute;
+  top: -3px;
+  height: 9px;
+  border-top: 1px solid rgba(34, 197, 94, 0.75);
+  border-bottom: 1px solid rgba(34, 197, 94, 0.75);
+  background: rgba(34, 197, 94, 0.08);
+  pointer-events: none;
+}
+.tl-clip-start,
+.tl-clip-end {
+  position: absolute;
+  top: -1px;
+  width: 6px;
+  height: 11px;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.tl-clip-start {
+  left: -1px;
+  border-left: 2px solid rgba(34, 197, 94, 0.9);
+  border-top: 2px solid rgba(34, 197, 94, 0.9);
+  border-bottom: 2px solid rgba(34, 197, 94, 0.9);
+  border-right: none;
+  border-radius: 2px 0 0 2px;
+  background: rgba(34, 197, 94, 0.25);
+}
+.tl-clip-end {
+  right: -1px;
+  border-right: 2px solid rgba(34, 197, 94, 0.9);
+  border-top: 2px solid rgba(34, 197, 94, 0.9);
+  border-bottom: 2px solid rgba(34, 197, 94, 0.9);
+  border-left: none;
+  border-radius: 0 2px 2px 0;
+  background: rgba(34, 197, 94, 0.25);
+}
+.tl-clip-start:hover,
+.tl-clip-end:hover {
+  background: rgba(34, 197, 94, 0.55);
+}
+.tl-clip-del {
+  position: absolute;
+  top: -9px;
+  right: -6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line-2);
+  background: var(--bg);
+  color: var(--ink-4);
+  font-size: 9px;
+  line-height: 10px;
+  padding: 0;
+  cursor: pointer;
+  display: none;
+  pointer-events: auto;
+}
+.tl-clip:hover .tl-clip-del {
+  display: block;
+}
+.tl-clip-del:hover {
+  color: #ef4444;
+  border-color: #ef4444;
+}
+.tl-sparkline {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  pointer-events: none;
 }
 .tl-input {
   position: absolute;

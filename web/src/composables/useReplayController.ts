@@ -6,9 +6,11 @@ import {
   getReplayVideoUrl,
   getReplayReference,
   pinReplayFrame,
+  addReplayClip,
+  deleteReplayClip,
   getAlertTrajectory,
 } from '../api'
-import type { TrajectoryFit } from '../types/api'
+import type { ReplayClip, TrajectoryFit } from '../types/api'
 
 export function useReplayController(alertId: string) {
   // core state
@@ -37,10 +39,13 @@ export function useReplayController(alertId: string) {
   const referenceDate = ref('')
   const loadingRef = ref(false)
   const selectedRefOption = ref('yesterday')
+  const referenceOffsetSeconds = ref(0)
+  const lastRefDate = ref<string | undefined>(undefined)
 
   // clips
   const clipStart = ref<number | null>(null)
   const clipEnd = ref<number | null>(null)
+  const persistedClips = ref<ReplayClip[]>([])
 
   // computed properties
   const fps = computed(() => metadata.value?.fps || 15)
@@ -95,6 +100,11 @@ export function useReplayController(alertId: string) {
         pendingSeekIndex.value = metadata.value.trigger_frame_index
         currentIndex.value = metadata.value.trigger_frame_index
       }
+
+      // Rehydrate operator-persisted clip ranges so they survive reload.
+      const loadedClips = Array.isArray((sigRes as any)?.clips) ? (sigRes as any).clips : []
+      persistedClips.value = loadedClips as ReplayClip[]
+
       loadReference()
     } catch (e) {
       message.error('回放数据加载失败')
@@ -106,9 +116,14 @@ export function useReplayController(alertId: string) {
 
   async function loadReference(date?: string) {
     loadingRef.value = true
+    lastRefDate.value = date ?? lastRefDate.value
     try {
-      const params: any = {}
-      if (date) params.date = date
+      const params: Record<string, string | number> = {}
+      const effectiveDate = date ?? lastRefDate.value
+      if (effectiveDate) params.date = effectiveDate
+      if (referenceOffsetSeconds.value) {
+        params.frame_offset_seconds = referenceOffsetSeconds.value
+      }
       const res = await getReplayReference(alertId, params)
       if (res.available && res.frame_base64) {
         referenceFrame.value = `data:image/jpeg;base64,${res.frame_base64}`
@@ -120,6 +135,37 @@ export function useReplayController(alertId: string) {
       referenceFrame.value = null
     } finally {
       loadingRef.value = false
+    }
+  }
+
+  // Clip persistence (POST on [ + ], DELETE via marker menu)
+  async function commitClip(startIdx: number, endIdx: number, label?: string) {
+    try {
+      const res = await addReplayClip(alertId, {
+        start_index: startIdx,
+        end_index: endIdx,
+        label: label || '',
+      })
+      if (Array.isArray(res?.clips)) {
+        persistedClips.value = res.clips as ReplayClip[]
+      }
+      message.success(`片段已保存 #${startIdx}–${endIdx}`)
+    } catch {
+      message.error('片段保存失败')
+    }
+  }
+
+  async function removeClip(index: number) {
+    if (index < 0 || index >= persistedClips.value.length) return
+    try {
+      const res = await deleteReplayClip(alertId, index)
+      if (Array.isArray(res?.clips)) {
+        persistedClips.value = res.clips as ReplayClip[]
+      } else {
+        persistedClips.value = persistedClips.value.filter((_, i) => i !== index)
+      }
+    } catch {
+      message.error('删除失败')
     }
   }
 
@@ -222,6 +268,15 @@ export function useReplayController(alertId: string) {
     }
   })
 
+  // Debounce reference-frame re-fetching while the operator drags the slider.
+  let refOffsetTimer: ReturnType<typeof setTimeout> | null = null
+  watch(referenceOffsetSeconds, () => {
+    if (refOffsetTimer) clearTimeout(refOffsetTimer)
+    refOffsetTimer = setTimeout(() => {
+      loadReference()
+    }, 150)
+  })
+
   // Shortcuts logic (exposed so component can addEventListener on mount)
   function handleKeydown(e: KeyboardEvent) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
@@ -234,8 +289,21 @@ export function useReplayController(alertId: string) {
       case 'l': case 'L': speed.value = Math.min(4, speed.value * 2); if (videoEl.value?.paused) safePlay(); break
       case 'Home': goToStart(); break
       case 'End': goToEnd(); break
-      case '[': clipStart.value = currentIndex.value; break
-      case ']': clipEnd.value = currentIndex.value; break
+      case '[': {
+        clipStart.value = currentIndex.value
+        clipEnd.value = null
+        break
+      }
+      case ']': {
+        clipEnd.value = currentIndex.value
+        // If a [ has been set, auto-persist the range so it survives reload.
+        if (clipStart.value !== null && clipEnd.value !== null) {
+          const a = Math.min(clipStart.value, clipEnd.value)
+          const b = Math.max(clipStart.value, clipEnd.value)
+          commitClip(a, b)
+        }
+        break
+      }
     }
   }
 
@@ -244,9 +312,11 @@ export function useReplayController(alertId: string) {
     videoEl, videoError, pendingSeekIndex,
     showHeatmap, showBoxes, showTrajectory, showHud, heatmapOpacity,
     referenceFrame, referenceDate, loadingRef, selectedRefOption,
-    clipStart, clipEnd,
+    referenceOffsetSeconds,
+    clipStart, clipEnd, persistedClips,
     fps, videoUrl, hasHeatmaps, currentTimestamp,
-    loadData, togglePlay, stepFrame, seekTo, goToStart, goToEnd,
-    handlePinFrame, handleKeydown, onRefOptionChange
+    loadData, loadReference, togglePlay, stepFrame, seekTo, goToStart, goToEnd,
+    handlePinFrame, handleKeydown, onRefOptionChange,
+    commitClip, removeClip,
   }
 }

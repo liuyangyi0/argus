@@ -315,3 +315,50 @@ class TestAlertRecordingStore:
         assert not (old_rec_dir / "recording.mp4").exists()
         assert (old_rec_dir / "trigger_frame.jpg").exists()
         assert (old_rec_dir / "signals.json").exists()
+
+    def test_clip_add_list_delete(self, tmp_path):
+        """Operator clip ranges should round-trip through signals.json."""
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        store.save(_make_recording(frame_count=10, status=RecordingStatus.COMPLETE))
+
+        # Fresh recordings have no clips
+        assert store.list_clips("ALT-TEST-001") == []
+
+        c1 = store.add_clip("ALT-TEST-001", 1, 4, "first_half")
+        assert c1 is not None
+        assert c1["start_index"] == 1 and c1["end_index"] == 4
+        assert c1["label"] == "first_half"
+        assert c1["created_at"]
+
+        store.add_clip("ALT-TEST-001", 5, 9)
+
+        clips = store.list_clips("ALT-TEST-001")
+        assert clips is not None and len(clips) == 2
+        assert clips[0]["label"] == "first_half"
+        assert clips[1]["label"] == ""
+
+        # Delete the first clip — second should shift to index 0
+        assert store.delete_clip("ALT-TEST-001", 0) is True
+        remaining = store.list_clips("ALT-TEST-001")
+        assert remaining is not None and len(remaining) == 1
+        assert remaining[0]["start_index"] == 5
+
+        # Out-of-range index is a no-op
+        assert store.delete_clip("ALT-TEST-001", 99) is False
+        # Unknown alert is a no-op
+        assert store.add_clip("NOPE", 0, 1) is None
+        assert store.list_clips("NOPE") is None
+        assert store.delete_clip("NOPE", 0) is False
+
+    def test_clips_persist_across_reload(self, tmp_path):
+        """A fresh store instance should read the same clips from disk."""
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        store.save(_make_recording(status=RecordingStatus.COMPLETE))
+        store.add_clip("ALT-TEST-001", 2, 7, "peak")
+
+        store2 = AlertRecordingStore(archive_dir=str(tmp_path))
+        clips = store2.list_clips("ALT-TEST-001")
+        assert clips is not None and len(clips) == 1
+        assert clips[0]["label"] == "peak"
+        assert clips[0]["start_index"] == 2
+        assert clips[0]["end_index"] == 7
