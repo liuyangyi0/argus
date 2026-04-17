@@ -22,6 +22,11 @@ cameras:
     heartbeat_frames: 150
     lock_score_threshold: 0.85
     lock_clear_frames: 10
+  alignment:
+    enabled: false
+    max_shift_px: 5.0
+    downsample: 4
+    ref_update_interval_s: 60.0
   person_filter:
     confidence: 0.4
     skip_frame_on_person: false

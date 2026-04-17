@@ -77,6 +77,7 @@ class MetricsRegistry:
         self.camera_status: Gauge | _NoOpMetric = _NOOP
         self.go2rtc_streams: Gauge | _NoOpMetric = _NOOP
         self.pipeline_stage_seconds: Histogram | _NoOpMetric = _NOOP
+        self.alignment_shift_px: Histogram | _NoOpMetric = _NOOP
         self.mog2_change_ratio: Gauge | _NoOpMetric = _NOOP
         self.ws_connections: Gauge | _NoOpMetric = _NOOP
         self.db_queue_size: Gauge | _NoOpMetric = _NOOP
@@ -175,6 +176,14 @@ class MetricsRegistry:
             f"{ns}_mog2_change_ratio",
             "MOG2 background subtraction change ratio",
             ["camera_id"],
+            registry=reg,
+        )
+
+        self.alignment_shift_px = Histogram(
+            f"{ns}_alignment_shift_px",
+            "Phase-correlation alignment shift magnitude in original-resolution pixels",
+            ["camera_id", "axis"],
+            buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0),
             registry=reg,
         )
 
