@@ -99,6 +99,8 @@ class Alert:
     landing_z_mm: float | None = None
     # Trajectory centroid history for visualization (max 300 points)
     trajectory_points: list[tuple[float, float, float]] | None = None
+    # Per-track trajectory fits (primary + others) serialised as JSON for persistence
+    trajectories_json: str | None = None
     # Set by pipeline after alert recording is solidified to disk
     _solidified_recording: SolidifiedRecording | None = None
 

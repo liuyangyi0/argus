@@ -127,6 +127,8 @@ class Database:
             ("alerts", "landing_x_mm", "REAL"),
             ("alerts", "landing_y_mm", "REAL"),
             ("alerts", "landing_z_mm", "REAL"),
+            # Multi-track trajectory fits (JSON with per-track mm + px fields)
+            ("alerts", "trajectories_json", "TEXT"),
             # Classification enrichment
             ("alerts", "classification_label", "VARCHAR(100)"),
             ("alerts", "classification_confidence", "REAL"),
@@ -194,6 +196,8 @@ class Database:
         landing_x_mm: float | None = None,
         landing_y_mm: float | None = None,
         landing_z_mm: float | None = None,
+        # Multi-track trajectory fits (already JSON-encoded by caller)
+        trajectories_json: str | None = None,
         # Classification enrichment
         classification_label: str | None = None,
         classification_confidence: float | None = None,
@@ -260,6 +264,7 @@ class Database:
                         landing_x_mm=landing_x_mm,
                         landing_y_mm=landing_y_mm,
                         landing_z_mm=landing_z_mm,
+                        trajectories_json=trajectories_json,
                         classification_label=classification_label,
                         classification_confidence=classification_confidence,
                         corroborated=corroborated,

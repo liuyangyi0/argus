@@ -37,6 +37,7 @@ const compositor = useCanvasCompositor({
   showHud: ctrl.showHud,
   heatmapOpacity: ctrl.heatmapOpacity,
   metadata: ctrl.metadata,
+  trajectoryFits: ctrl.trajectoryFits,
 })
 
 // Sync compositor currentIndex back to the controller

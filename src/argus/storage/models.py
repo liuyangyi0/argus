@@ -105,6 +105,10 @@ class AlertRecord(Base):
     landing_x_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
     landing_y_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
     landing_z_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Multi-track trajectory fits (JSON list of per-track origin/landing/speed/model
+    # with pixel-space projections for video overlay). Primary track mirrors the
+    # origin_*_mm / landing_*_mm / speed_* scalar fields above.
+    trajectories_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Classification enrichment
     classification_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
     classification_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -139,6 +143,12 @@ class AlertRecord(Base):
                 segmentation_objects_parsed = _json.loads(self.segmentation_objects)
             except Exception:
                 segmentation_objects_parsed = None
+        trajectories_parsed: list | None = None
+        if self.trajectories_json:
+            try:
+                trajectories_parsed = _json.loads(self.trajectories_json)
+            except Exception:
+                trajectories_parsed = None
         return {
             "id": self.id,
             "alert_id": self.alert_id,
@@ -167,6 +177,7 @@ class AlertRecord(Base):
             "landing_x_mm": self.landing_x_mm,
             "landing_y_mm": self.landing_y_mm,
             "landing_z_mm": self.landing_z_mm,
+            "trajectories": trajectories_parsed,
             "classification_label": self.classification_label,
             "classification_confidence": self.classification_confidence,
             "corroborated": self.corroborated,
