@@ -89,6 +89,11 @@ def replay_signals(request: Request, alert_id: str):
     key_frames = _compute_key_frames(signals)
     signals["key_frames"] = key_frames
 
+    # Ensure persisted clip ranges are exposed to the frontend even for older
+    # recordings saved before the clips field was introduced.
+    clips = store.list_clips(alert_id)
+    signals["clips"] = clips if clips is not None else []
+
     return api_success(signals)
 
 
@@ -211,10 +216,17 @@ def replay_reference(
     alert_id: str,
     date: str = Query(default="", description="Reference date YYYY-MM-DD"),
     time_str: str = Query(default="", alias="time", description="Reference time HH:MM:SS"),
+    frame_offset_seconds: float = Query(
+        default=0.0,
+        description="Seconds to shift the reference frame relative to trigger time",
+    ),
 ):
     """Return a historical reference frame from the same camera at the same time of day.
 
-    If no specific date is given, defaults to yesterday.
+    If no specific date is given, defaults to yesterday. The optional
+    ``frame_offset_seconds`` shifts the target timestamp so operators can scrub
+    through the historical recording (e.g. ``+2.5`` reads the reference frame
+    2.5 seconds after trigger time).
     Returns {available: bool, frame_base64: str|null, source_date: str}.
     """
     store = _get_recording_store(request)
@@ -239,12 +251,16 @@ def replay_reference(
     else:
         ref_date = trigger_dt - timedelta(days=1)
 
-    # Build the reference timestamp (same time of day on reference date)
+    # Build the reference timestamp (same time of day on reference date),
+    # then shift by the requested offset so operators can scrub ±30s.
     ref_dt = ref_date.replace(
         hour=trigger_dt.hour,
         minute=trigger_dt.minute,
         second=trigger_dt.second,
+        microsecond=trigger_dt.microsecond,
     )
+    if frame_offset_seconds:
+        ref_dt = ref_dt + timedelta(seconds=float(frame_offset_seconds))
     ref_date_str = ref_dt.strftime("%Y-%m-%d")
 
     # Search for recordings from the same camera on the reference date
@@ -256,8 +272,11 @@ def replay_reference(
             "source_date": ref_date_str,
         })
 
-    # Find the recording closest to the reference time
-    best_frame: bytes | None = None
+    # Find the recording whose span covers (or is closest to) ref_ts, then
+    # extract the frame inside that recording aligned to ref_ts. This lets the
+    # frontend scrub the historical recording via frame_offset_seconds.
+    best_rec_dir: Path | None = None
+    best_meta: dict | None = None
     best_distance = float("inf")
     ref_ts = ref_dt.timestamp()
 
@@ -269,25 +288,53 @@ def replay_reference(
             continue
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            dist = abs(meta["trigger_timestamp"] - ref_ts)
-            if dist < best_distance:
-                trigger_idx = meta.get("trigger_frame_index", 0)
-                # Check archived trigger frame first, then extract from video
-                trigger_frame_path = rec_dir / "trigger_frame.jpg"
-                if trigger_frame_path.exists():
-                    best_frame = trigger_frame_path.read_bytes()
-                    best_distance = dist
-                else:
-                    from argus.storage.alert_recording import _find_video_file
-                    video_path = _find_video_file(rec_dir)
-                    if video_path is not None:
-                        from argus.core.video_encoder import extract_frame_jpeg
-                        frame_data = extract_frame_jpeg(video_path, trigger_idx)
-                        if frame_data:
-                            best_frame = frame_data
-                            best_distance = dist
         except (json.JSONDecodeError, KeyError):
             continue
+
+        start_ts = meta.get("start_timestamp", meta.get("trigger_timestamp", 0))
+        end_ts = meta.get("end_timestamp", meta.get("trigger_timestamp", 0))
+        if start_ts <= ref_ts <= end_ts:
+            dist = 0.0
+        else:
+            dist = min(abs(start_ts - ref_ts), abs(end_ts - ref_ts))
+        if dist < best_distance:
+            best_distance = dist
+            best_rec_dir = rec_dir
+            best_meta = meta
+
+    best_frame: bytes | None = None
+    if best_rec_dir is not None and best_meta is not None:
+        start_ts = best_meta.get(
+            "start_timestamp", best_meta.get("trigger_timestamp", 0)
+        )
+        end_ts = best_meta.get(
+            "end_timestamp", best_meta.get("trigger_timestamp", 0)
+        )
+        frame_count = int(best_meta.get("frame_count", 0) or 0)
+        fps = float(best_meta.get("fps", 15) or 15)
+        trigger_idx = int(best_meta.get("trigger_frame_index", 0) or 0)
+
+        # Pick the in-recording frame index that best aligns with ref_ts.
+        if frame_count > 0:
+            if end_ts > start_ts:
+                rel = (ref_ts - start_ts) / (end_ts - start_ts)
+                target_idx = int(round(rel * (frame_count - 1)))
+            else:
+                target_idx = int(round((ref_ts - start_ts) * fps))
+            target_idx = max(0, min(frame_count - 1, target_idx))
+        else:
+            target_idx = trigger_idx
+
+        # If the archived downsampled form is all we have, fall back to the
+        # preserved trigger frame regardless of offset.
+        trigger_frame_path = best_rec_dir / "trigger_frame.jpg"
+        from argus.storage.alert_recording import _find_video_file
+        video_path = _find_video_file(best_rec_dir)
+        if video_path is not None:
+            from argus.core.video_encoder import extract_frame_jpeg
+            best_frame = extract_frame_jpeg(video_path, target_idx)
+        if best_frame is None and trigger_frame_path.exists():
+            best_frame = trigger_frame_path.read_bytes()
 
     if best_frame is not None:
         return api_success({
@@ -321,6 +368,67 @@ async def pin_frame(request: Request, alert_id: str):
         return api_not_found("录像不存在")
 
     return api_success({"success": True})
+
+
+@router.post("/{alert_id}/clips")
+async def add_clip(request: Request, alert_id: str):
+    """Persist an operator-marked clip range for this recording.
+
+    Request body: ``{"start_index": int, "end_index": int, "label"?: str}``.
+    The clip is appended to ``signals.json`` so it survives page reload.
+    """
+    store = _get_recording_store(request)
+    if store is None:
+        return api_unavailable("录像存储未配置")
+
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return api_validation_error("请求体必须是合法 JSON")
+
+    start_index = body.get("start_index")
+    end_index = body.get("end_index")
+    label = body.get("label", "") or ""
+
+    if not isinstance(start_index, int) or not isinstance(end_index, int):
+        return api_validation_error("start_index 和 end_index 必须为整数")
+    if start_index < 0 or end_index < 0:
+        return api_validation_error("帧索引不能为负")
+    if end_index < start_index:
+        return api_validation_error("end_index 不能小于 start_index")
+
+    metadata = store.load_metadata(alert_id)
+    if metadata is None:
+        return api_not_found("录像不存在")
+    frame_count = int(metadata.get("frame_count", 0) or 0)
+    if frame_count and (start_index >= frame_count or end_index >= frame_count):
+        return api_validation_error(
+            f"帧索引越界，录像共 {frame_count} 帧"
+        )
+
+    clip = store.add_clip(alert_id, start_index, end_index, label)
+    if clip is None:
+        return api_not_found("录像不存在")
+
+    clips = store.list_clips(alert_id) or []
+    return api_success({"clip": clip, "clips": clips})
+
+
+@router.delete("/{alert_id}/clips/{index}")
+def delete_clip(request: Request, alert_id: str, index: int):
+    """Remove a persisted clip by its array index."""
+    store = _get_recording_store(request)
+    if store is None:
+        return api_unavailable("录像存储未配置")
+
+    if index < 0:
+        return api_validation_error("clip 索引不能为负")
+
+    if not store.delete_clip(alert_id, index):
+        return api_not_found("clip 不存在")
+
+    clips = store.list_clips(alert_id) or []
+    return api_success({"clips": clips})
 
 
 def _compute_key_frames(signals: dict) -> list[dict]:
