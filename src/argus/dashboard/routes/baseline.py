@@ -13,7 +13,8 @@ import cv2
 import numpy as np
 import structlog
 from fastapi import APIRouter, Request
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from starlette.datastructures import UploadFile
 
 from argus.dashboard.api_response import (
     api_conflict,
@@ -1115,3 +1116,261 @@ async def retire_baseline(request: Request):
         return api_success({"version": record.to_dict()})
     except Exception as e:
         return api_validation_error(str(e))
+
+
+# ── Per-image CRUD for baseline versions ──
+
+# Keep upload cap conservative — 10 MB covers high-res PNGs but blocks junk.
+_IMAGE_UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+_IMAGE_UPLOAD_ALLOWED_CONTENT_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",  # non-standard but seen in the wild
+    # Fallback: some browsers send application/octet-stream for drag-and-drop.
+    "application/octet-stream",
+}
+# Strict filename safety for path parameters — must match the canonical
+# pattern emitted by BaselineManager.add_image_from_bytes / save_frame, plus
+# tolerate legacy fp_* and img_* prefixes that older installs may contain.
+_IMAGE_FILENAME_PATTERN = r"^[A-Za-z0-9_\-]+\.(png|jpg|jpeg)$"
+
+
+def _validate_filename_param(filename: str) -> bool:
+    """Reject traversal / null / oversized filenames in URL path params."""
+    import re as _re
+
+    if not filename or len(filename) > 128:
+        return False
+    if "/" in filename or "\\" in filename or "\x00" in filename or ".." in filename:
+        return False
+    return bool(_re.match(_IMAGE_FILENAME_PATTERN, filename))
+
+
+@router.get("/{camera_id}/{version}/images")
+async def list_version_images(camera_id: str, version: str, request: Request):
+    """List images stored in a baseline version directory."""
+    baseline_mgr = _get_baseline_manager(request)
+    if baseline_mgr is None:
+        return api_unavailable("基线管理器不可用")
+
+    zone_id = request.query_params.get("zone_id", _DEFAULT_ZONE_ID)
+    images = baseline_mgr.list_images(camera_id, version, zone_id=zone_id)
+    total_bytes = sum(item["size_bytes"] for item in images)
+
+    # Active state info lets the frontend disable buttons without a second call.
+    lifecycle = _get_lifecycle(request)
+    is_active = False
+    version_state = None
+    if lifecycle:
+        rec = lifecycle.get_version(camera_id, zone_id, version)
+        if rec is not None:
+            version_state = rec.state
+            is_active = rec.state == "active"
+
+    return api_success({
+        "camera_id": camera_id,
+        "zone_id": zone_id,
+        "version": version,
+        "state": version_state,
+        "is_active": is_active,
+        "total": len(images),
+        "total_bytes": total_bytes,
+        "images": images,
+    })
+
+
+@router.get("/{camera_id}/{version}/images/{filename}/content")
+async def get_version_image_content(
+    camera_id: str,
+    version: str,
+    filename: str,
+    request: Request,
+):
+    """Serve a single baseline image file (for thumbnail <img> tags)."""
+    if not _validate_filename_param(filename):
+        return api_validation_error("文件名不合法")
+
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    zone_id = request.query_params.get("zone_id", _DEFAULT_ZONE_ID)
+    baselines_dir = Path(config.storage.baselines_dir)
+    version_dir = baselines_dir / camera_id / zone_id / version
+    file_path = version_dir / filename
+
+    # Containment check — defensive even though the pattern already blocks ..
+    try:
+        resolved_file = file_path.resolve()
+        resolved_version = version_dir.resolve()
+    except OSError:
+        return api_not_found("图片不存在")
+    if resolved_file.parent != resolved_version:
+        return api_validation_error("文件路径不合法")
+
+    if not resolved_file.is_file():
+        return api_not_found("图片不存在")
+
+    suffix = resolved_file.suffix.lower().lstrip(".")
+    media_type = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+    }.get(suffix, "application/octet-stream")
+    # Cache thumbnails briefly — filenames are content-addressed-ish (index + ext)
+    # so within a session they don't change; but short TTL so delete/upload show
+    # up quickly.
+    return FileResponse(
+        str(resolved_file),
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=60"},
+    )
+
+
+@router.delete("/{camera_id}/{version}/images/{filename}")
+async def delete_version_image(
+    camera_id: str,
+    version: str,
+    filename: str,
+    request: Request,
+):
+    """Delete a single baseline image. Refuses ACTIVE versions."""
+    if not _validate_filename_param(filename):
+        return api_validation_error("文件名不合法")
+
+    baseline_mgr = _get_baseline_manager(request)
+    if baseline_mgr is None:
+        return api_unavailable("基线管理器不可用")
+
+    zone_id = request.query_params.get("zone_id", _DEFAULT_ZONE_ID)
+    lifecycle = _get_lifecycle(request)
+    if lifecycle is not None:
+        rec = lifecycle.get_version(camera_id, zone_id, version)
+        if rec is not None and rec.state == "active":
+            return api_validation_error("生产中的基线图片不可删除，请先退役")
+
+    ok = baseline_mgr.delete_image(camera_id, version, filename, zone_id=zone_id)
+    if not ok:
+        return api_not_found("图片不存在或删除失败")
+
+    # Sync lifecycle image_count so the version drawer stays accurate.
+    if lifecycle is not None:
+        rec = lifecycle.get_version(camera_id, zone_id, version)
+        if rec is not None:
+            try:
+                new_count = len(baseline_mgr.list_images(camera_id, version, zone_id=zone_id))
+                lifecycle.register_version(
+                    camera_id=camera_id,
+                    zone_id=zone_id,
+                    version=version,
+                    image_count=new_count,
+                )
+            except Exception:
+                logger.debug("baseline.image_count_sync_failed", exc_info=True)
+
+    audit = getattr(request.app.state, "audit_logger", None)
+    if audit:
+        client_ip = request.client.host if request.client else ""
+        audit.log(
+            user="operator",
+            action="delete_baseline_image",
+            target_type="baseline",
+            target_id=f"{camera_id}/{zone_id}/{version}",
+            detail=filename,
+            ip_address=client_ip,
+        )
+    return api_success({"filename": filename})
+
+
+@router.post("/{camera_id}/{version}/images")
+async def upload_version_image(
+    camera_id: str,
+    version: str,
+    request: Request,
+):
+    """Upload a single image into a baseline version.
+
+    Form field name is ``file``; multipart/form-data.
+    Rejects ACTIVE versions, files >10 MB, and non-image content types.
+    """
+    # Parse the multipart body manually so we keep control over size/validation.
+    try:
+        form = await request.form()
+    except Exception:
+        return api_validation_error("请求体无法解析（需要 multipart/form-data）")
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        return api_validation_error("缺少 file 字段（multipart/form-data）")
+
+    content_type = (upload.content_type or "").lower()
+    if content_type and content_type not in _IMAGE_UPLOAD_ALLOWED_CONTENT_TYPES:
+        return api_validation_error(f"不支持的 content-type: {content_type}")
+
+    # Derive extension — prefer content-type, fall back to filename.
+    if content_type == "image/png":
+        ext = "png"
+    elif content_type in {"image/jpeg", "image/jpg"}:
+        ext = "jpg"
+    else:
+        # Fall back to the filename suffix for octet-stream uploads.
+        original_name = upload.filename or ""
+        suffix = Path(original_name).suffix.lower().lstrip(".")
+        if suffix == "jpeg":
+            suffix = "jpg"
+        if suffix not in {"png", "jpg"}:
+            return api_validation_error("只支持 png/jpg/jpeg 图片")
+        ext = suffix
+
+    data = await upload.read()
+    if len(data) > _IMAGE_UPLOAD_MAX_BYTES:
+        return api_validation_error(
+            f"图片过大（{len(data) / 1024 / 1024:.1f} MB），上限 10 MB",
+        )
+    if not data:
+        return api_validation_error("图片内容为空")
+
+    zone_id = request.query_params.get("zone_id", _DEFAULT_ZONE_ID)
+
+    baseline_mgr = _get_baseline_manager(request)
+    if baseline_mgr is None:
+        return api_unavailable("基线管理器不可用")
+
+    try:
+        new_filename = baseline_mgr.add_image_from_bytes(
+            camera_id=camera_id,
+            version=version,
+            data=data,
+            ext=ext,
+            zone_id=zone_id,
+        )
+    except ValueError as exc:
+        return api_validation_error(str(exc))
+
+    # Keep lifecycle image_count in sync so the draft/verified page is accurate.
+    lifecycle = _get_lifecycle(request)
+    if lifecycle is not None:
+        rec = lifecycle.get_version(camera_id, zone_id, version)
+        if rec is not None:
+            try:
+                new_count = len(baseline_mgr.list_images(camera_id, version, zone_id=zone_id))
+                lifecycle.register_version(
+                    camera_id=camera_id,
+                    zone_id=zone_id,
+                    version=version,
+                    image_count=new_count,
+                )
+            except Exception:
+                logger.debug("baseline.image_count_sync_failed", exc_info=True)
+
+    audit = getattr(request.app.state, "audit_logger", None)
+    if audit:
+        client_ip = request.client.host if request.client else ""
+        audit.log(
+            user="operator",
+            action="upload_baseline_image",
+            target_type="baseline",
+            target_id=f"{camera_id}/{zone_id}/{version}",
+            detail=new_filename,
+            ip_address=client_ip,
+        )
+    return api_success({"filename": new_filename, "size_bytes": len(data)})

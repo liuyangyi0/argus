@@ -207,3 +207,285 @@ class TestFalsePositiveAddsToBaseline:
         images = list(baseline_dir.glob("*.jpg")) + list(baseline_dir.glob("*.png"))
         assert len(images) >= 1
         assert any("fp_" in p.name for p in images)
+
+
+class TestImageCrud:
+    """Tests for per-image list/delete/upload on baseline versions."""
+
+    def _encode_png(self, color=(0, 0, 0), size=(32, 32)):
+        """Build a valid PNG byte stream for upload tests."""
+        import cv2
+
+        img = np.full((size[1], size[0], 3), color, dtype=np.uint8)
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        return buf.tobytes()
+
+    def _encode_jpg(self, color=(128, 128, 128), size=(32, 32)):
+        import cv2
+
+        img = np.full((size[1], size[0], 3), color, dtype=np.uint8)
+        ok, buf = cv2.imencode(".jpg", img)
+        assert ok
+        return buf.tobytes()
+
+    # ── list_images ──
+
+    def test_list_images_empty_for_missing_version(self, bm):
+        """Unknown camera/version returns empty list (not an error)."""
+        result = bm.list_images("cam_missing", "v999")
+        assert result == []
+
+    def test_list_images_returns_metadata_sorted(self, bm):
+        """Should list png + jpg files with size/created_at, sorted by filename."""
+        version_dir = bm.create_new_version("cam_01", "default")
+        frame = np.zeros((50, 50, 3), dtype=np.uint8)
+        bm.save_frame(frame, version_dir, 0)  # baseline_00000.png
+        bm.save_frame(frame, version_dir, 2)  # baseline_00002.png
+        bm.save_frame(frame, version_dir, 1)  # baseline_00001.png
+
+        # Also drop in a jpg and an ignored file
+        (version_dir / "extra.jpg").write_bytes(self._encode_jpg())
+        (version_dir / "README.txt").write_text("skip me")
+
+        result = bm.list_images("cam_01", "v001")
+        names = [item["filename"] for item in result]
+        assert names == [
+            "baseline_00000.png",
+            "baseline_00001.png",
+            "baseline_00002.png",
+            "extra.jpg",
+        ]
+        # Metadata shape
+        assert all({"filename", "size_bytes", "created_at"} <= set(r) for r in result)
+        assert all(isinstance(r["size_bytes"], int) and r["size_bytes"] > 0 for r in result)
+        # created_at parses as ISO
+        from datetime import datetime as _dt
+
+        _dt.fromisoformat(result[0]["created_at"])
+
+    # ── delete_image safety ──
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        [
+            "../etc/passwd.png",                       # traversal
+            "..\\windows\\system32\\bad.png",          # backslash traversal
+            "legit/subdir/file.png",                   # nested path
+            "legit\\subdir\\file.png",                 # windows nested
+            "has\x00null.png",                         # null byte
+            "no_ext",                                  # no extension
+            "bad.exe",                                 # wrong extension
+            "bad.gif",                                 # wrong extension
+            "",                                        # empty
+            "a" * 200 + ".png",                        # oversized
+        ],
+    )
+    def test_delete_image_rejects_unsafe_filename(self, bm, bad_name):
+        """Path traversal / null bytes / bad extensions must be rejected."""
+        version_dir = bm.create_new_version("cam_01", "default")
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        bm.save_frame(frame, version_dir, 0)
+
+        assert bm.delete_image("cam_01", "v001", bad_name) is False
+        # Existing good file must still be present
+        assert (version_dir / "baseline_00000.png").exists()
+
+    def test_delete_image_success(self, bm):
+        """Canonical filename, non-active version deletes."""
+        version_dir = bm.create_new_version("cam_01", "default")
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        bm.save_frame(frame, version_dir, 0)
+        bm.save_frame(frame, version_dir, 1)
+
+        assert bm.delete_image("cam_01", "v001", "baseline_00000.png") is True
+        assert not (version_dir / "baseline_00000.png").exists()
+        assert (version_dir / "baseline_00001.png").exists()
+
+    def test_delete_image_missing_file_returns_false(self, bm):
+        bm.create_new_version("cam_01", "default")
+        assert bm.delete_image("cam_01", "v001", "baseline_00099.png") is False
+
+    def test_delete_image_refuses_active_version(self, tmp_path):
+        """ACTIVE versions are immutable — delete must be rejected."""
+        from argus.anomaly.baseline_lifecycle import BaselineLifecycle
+        from argus.storage.audit import AuditLogger
+        from argus.storage.database import Database
+
+        database = Database(f"sqlite:///{tmp_path / 'test.db'}")
+        database.initialize()
+        lifecycle = BaselineLifecycle(database, AuditLogger(database))
+
+        bm_lc = BaselineManager(tmp_path / "baselines", lifecycle=lifecycle)
+        version_dir = bm_lc.create_new_version("cam_01", "default")
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        # save_frame refuses to write to ACTIVE, so populate first, then activate
+        bm_lc.save_frame(frame, version_dir, 0)
+
+        lifecycle.verify("cam_01", "default", "v001", verified_by="wang")
+        lifecycle.activate("cam_01", "default", "v001", user="wang")
+
+        assert bm_lc.delete_image("cam_01", "v001", "baseline_00000.png") is False
+        assert (version_dir / "baseline_00000.png").exists()
+
+    # ── add_image_from_bytes ──
+
+    def test_add_image_picks_next_index(self, bm):
+        """Next filename should be max existing index + 1 (5-digit)."""
+        version_dir = bm.create_new_version("cam_01", "default")
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        bm.save_frame(frame, version_dir, 0)
+        bm.save_frame(frame, version_dir, 5)
+
+        new_name = bm.add_image_from_bytes(
+            "cam_01", "v001", data=self._encode_png(), ext="png",
+        )
+        assert new_name == "baseline_00006.png"
+        assert (version_dir / new_name).exists()
+
+    def test_add_image_rejects_invalid_ext(self, bm):
+        bm.create_new_version("cam_01", "default")
+        with pytest.raises(ValueError, match="不支持的图片格式"):
+            bm.add_image_from_bytes("cam_01", "v001", data=b"xxx", ext="gif")
+
+    def test_add_image_rejects_corrupt_bytes(self, bm):
+        bm.create_new_version("cam_01", "default")
+        with pytest.raises(ValueError, match="图片内容损坏"):
+            bm.add_image_from_bytes(
+                "cam_01", "v001", data=b"not an image at all", ext="png",
+            )
+
+    def test_add_image_refuses_active_version(self, tmp_path):
+        from argus.anomaly.baseline_lifecycle import BaselineLifecycle
+        from argus.storage.audit import AuditLogger
+        from argus.storage.database import Database
+
+        database = Database(f"sqlite:///{tmp_path / 'test.db'}")
+        database.initialize()
+        lifecycle = BaselineLifecycle(database, AuditLogger(database))
+
+        bm_lc = BaselineManager(tmp_path / "baselines", lifecycle=lifecycle)
+        version_dir = bm_lc.create_new_version("cam_01", "default")
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        bm_lc.save_frame(frame, version_dir, 0)
+
+        lifecycle.verify("cam_01", "default", "v001", verified_by="wang")
+        lifecycle.activate("cam_01", "default", "v001", user="wang")
+
+        import cv2
+        ok, buf = cv2.imencode(".png", np.zeros((20, 20, 3), dtype=np.uint8))
+        assert ok
+        with pytest.raises(ValueError, match="生产中的基线"):
+            bm_lc.add_image_from_bytes(
+                "cam_01", "v001", data=buf.tobytes(), ext="png",
+            )
+
+
+class TestImageUploadRoute:
+    """End-to-end tests for the upload / list / delete HTTP routes."""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        """FastAPI TestClient with the baseline router mounted and a
+        BaselineManager pointing at tmp_path."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from argus.anomaly.baseline import BaselineManager
+        from argus.dashboard.routes.baseline import router as baseline_router
+
+        app = FastAPI()
+
+        class _StubStorage:
+            baselines_dir = str(tmp_path / "baselines")
+            models_dir = str(tmp_path / "models")
+
+        class _StubConfig:
+            storage = _StubStorage()
+
+        class _StubState:
+            pass
+
+        bm = BaselineManager(baselines_dir=tmp_path / "baselines")
+        app.state.config = _StubConfig()
+        app.state.baseline_manager = bm
+        app.state.baseline_lifecycle = None
+        app.state.audit_logger = None
+
+        app.include_router(baseline_router, prefix="/api/baseline", tags=["baseline"])
+
+        # Seed one version
+        bm.create_new_version("cam_01", "default")
+
+        return TestClient(app), bm
+
+    def test_list_empty(self, client):
+        tc, _bm = client
+        r = tc.get("/api/baseline/cam_01/v001/images")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["code"] == 0
+        assert body["data"]["images"] == []
+        assert body["data"]["total"] == 0
+
+    def test_upload_png_and_list(self, client):
+        import cv2
+        import numpy as np
+
+        tc, _bm = client
+        img = np.full((40, 40, 3), 10, dtype=np.uint8)
+        _ok, buf = cv2.imencode(".png", img)
+        payload = buf.tobytes()
+
+        r = tc.post(
+            "/api/baseline/cam_01/v001/images",
+            files={"file": ("fresh.png", payload, "image/png")},
+        )
+        assert r.status_code == 200
+        assert r.json()["data"]["filename"] == "baseline_00000.png"
+
+        r = tc.get("/api/baseline/cam_01/v001/images")
+        assert r.json()["data"]["total"] == 1
+
+    def test_upload_rejects_oversized(self, client):
+        tc, _bm = client
+        # 11 MB of zeros — over the 10 MB cap
+        payload = b"\x89PNG\r\n\x1a\n" + b"0" * (11 * 1024 * 1024)
+        r = tc.post(
+            "/api/baseline/cam_01/v001/images",
+            files={"file": ("big.png", payload, "image/png")},
+        )
+        assert r.status_code == 400
+        body = r.json()
+        assert "上限 10 MB" in body["msg"]
+
+    def test_upload_rejects_bad_content_type(self, client):
+        tc, _bm = client
+        r = tc.post(
+            "/api/baseline/cam_01/v001/images",
+            files={"file": ("evil.sh", b"#!/bin/sh", "application/x-shellscript")},
+        )
+        assert r.status_code == 400
+
+    def test_delete_traversal_rejected_by_route(self, client):
+        """Path parameter with `..` or `/` must not reach the handler."""
+        tc, _bm = client
+        # URL-encoded .. still gets filtered by FastAPI normalization; try dot-dot via
+        # an explicit filename with a literal `..` string
+        r = tc.delete("/api/baseline/cam_01/v001/images/..%2Fpasswd.png")
+        # Either 404 (path routing never matches) or 400 (validation rejected).
+        assert r.status_code in (400, 404, 405)
+
+    def test_content_route_serves_image(self, client):
+        import cv2
+        import numpy as np
+
+        tc, bm = client
+        img = np.full((20, 20, 3), 50, dtype=np.uint8)
+        _ok, buf = cv2.imencode(".png", img)
+        bm.add_image_from_bytes("cam_01", "v001", data=buf.tobytes(), ext="png")
+
+        r = tc.get("/api/baseline/cam_01/v001/images/baseline_00000.png/content")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("image/png")
+        assert len(r.content) > 0
