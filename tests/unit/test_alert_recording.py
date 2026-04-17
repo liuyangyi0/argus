@@ -13,7 +13,10 @@ from argus.core.alert_ring_buffer import (
     RecordingStatus,
     SolidifiedRecording,
 )
-from argus.storage.alert_recording import AlertRecordingStore
+from argus.storage.alert_recording import (
+    AlertRecordingStore,
+    _aggregate_trajectories,
+)
 
 
 def _make_jpeg(width: int = 640, height: int = 480, value: int = 128) -> bytes:
@@ -120,6 +123,114 @@ class TestAlertRecordingStore:
         arr = np.frombuffer(frame, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         assert img is not None
+
+    def test_trajectory_points_in_signals(self, tmp_path):
+        """_build_signals should emit trajectory_points keyed by track_id."""
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        ts = time.time()
+        # Frame 0: track 1 at (10,10), track 2 at (100,100)
+        # Frame 1: only track 1 at (20,10)
+        # Frame 2: track 1 gone, track 2 at (110,105)
+        frames = [
+            FrameSnapshot(
+                timestamp=ts, frame_jpeg=_make_jpeg(), anomaly_score=0.1,
+                simplex_score=None, cusum_evidence={}, yolo_persons=[],
+                frame_number=0,
+                active_tracks=[
+                    {"track_id": 1, "centroid_x": 10.0, "centroid_y": 10.0,
+                     "max_score": 0.5, "area_px": 100},
+                    {"track_id": 2, "centroid_x": 100.0, "centroid_y": 100.0,
+                     "max_score": 0.3, "area_px": 50},
+                ],
+            ),
+            FrameSnapshot(
+                timestamp=ts + 1, frame_jpeg=_make_jpeg(), anomaly_score=0.2,
+                simplex_score=None, cusum_evidence={}, yolo_persons=[],
+                frame_number=1,
+                active_tracks=[
+                    {"track_id": 1, "centroid_x": 20.0, "centroid_y": 10.0,
+                     "max_score": 0.6, "area_px": 110},
+                ],
+            ),
+            FrameSnapshot(
+                timestamp=ts + 2, frame_jpeg=_make_jpeg(), anomaly_score=0.3,
+                simplex_score=None, cusum_evidence={}, yolo_persons=[],
+                frame_number=2,
+                active_tracks=[
+                    {"track_id": 2, "centroid_x": 110.0, "centroid_y": 105.0,
+                     "max_score": 0.4, "area_px": 60},
+                ],
+            ),
+        ]
+        recording = SolidifiedRecording(
+            alert_id="ALT-TRAJ-001", camera_id="cam_01", severity="medium",
+            trigger_timestamp=ts, trigger_frame_index=2, frames=frames, fps=15,
+            status=RecordingStatus.COMPLETE,
+        )
+        store.save(recording)
+        signals = store.load_signals("ALT-TRAJ-001")
+
+        traj = signals["trajectory_points"]
+        assert set(traj.keys()) == {"1", "2"}
+        # Track 1 appears on frames 0, 1 (not 2)
+        assert [p["frame_index"] for p in traj["1"]] == [0, 1]
+        assert traj["1"][0]["x"] == 10.0 and traj["1"][0]["y"] == 10.0
+        assert traj["1"][1]["x"] == 20.0
+        # Track 2 appears on frames 0, 2 (not 1)
+        assert [p["frame_index"] for p in traj["2"]] == [0, 2]
+
+    def test_aggregate_trajectories_offset(self):
+        """_aggregate_trajectories should honour frame_index_offset."""
+        ts = time.time()
+        frames = [
+            FrameSnapshot(
+                timestamp=ts + i, frame_jpeg=b"", anomaly_score=0.1,
+                simplex_score=None, cusum_evidence={}, yolo_persons=[],
+                frame_number=i,
+                active_tracks=[{"track_id": 7, "centroid_x": float(i),
+                                "centroid_y": 0.0, "max_score": 0.5, "area_px": 1}],
+            )
+            for i in range(3)
+        ]
+        out = _aggregate_trajectories(frames, frame_index_offset=10)
+        assert [p["frame_index"] for p in out["7"]] == [10, 11, 12]
+
+    def test_append_post_frames_trajectory_continuity(self, tmp_path):
+        """trajectory_points should keep frame_index continuous across pre/post."""
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        ts = time.time()
+        pre_frames = [
+            FrameSnapshot(
+                timestamp=ts + i, frame_jpeg=_make_jpeg(), anomaly_score=0.1,
+                simplex_score=None, cusum_evidence={}, yolo_persons=[],
+                frame_number=i,
+                active_tracks=[{"track_id": 1, "centroid_x": float(i),
+                                "centroid_y": 0.0, "max_score": 0.5, "area_px": 1}],
+            )
+            for i in range(3)
+        ]
+        recording = SolidifiedRecording(
+            alert_id="ALT-APPEND-001", camera_id="cam_01", severity="medium",
+            trigger_timestamp=ts, trigger_frame_index=2, frames=pre_frames, fps=15,
+            status=RecordingStatus.RECORDING,
+        )
+        store.save(recording)
+
+        post_frames = [
+            FrameSnapshot(
+                timestamp=ts + 3 + i, frame_jpeg=_make_jpeg(), anomaly_score=0.1,
+                simplex_score=None, cusum_evidence={}, yolo_persons=[],
+                frame_number=3 + i,
+                active_tracks=[{"track_id": 1, "centroid_x": 3.0 + i,
+                                "centroid_y": 0.0, "max_score": 0.5, "area_px": 1}],
+            )
+            for i in range(2)
+        ]
+        assert store.append_post_frames("ALT-APPEND-001", post_frames)
+
+        signals = store.load_signals("ALT-APPEND-001")
+        indices = [p["frame_index"] for p in signals["trajectory_points"]["1"]]
+        assert indices == [0, 1, 2, 3, 4]
 
     def test_has_recording(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))

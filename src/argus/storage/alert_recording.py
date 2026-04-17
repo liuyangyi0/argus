@@ -39,6 +39,30 @@ def _find_video_file(rec_dir: Path) -> Path | None:
     return None
 
 
+def _aggregate_trajectories(
+    frames: list[FrameSnapshot],
+    frame_index_offset: int = 0,
+) -> dict[str, list[dict]]:
+    """Group per-frame active_tracks into {track_id: [{frame_index, t, x, y}]}.
+
+    Groups by track_id so the frontend can render one polyline per track. Each
+    point carries the absolute ``frame_index`` (offset-aware for pre/post
+    concatenation) plus the original timestamp.
+    """
+    by_track: dict[str, list[dict]] = {}
+    for local_idx, f in enumerate(frames):
+        frame_idx = frame_index_offset + local_idx
+        for tr in f.active_tracks:
+            tid = str(tr["track_id"])
+            by_track.setdefault(tid, []).append({
+                "frame_index": frame_idx,
+                "t": float(f.timestamp),
+                "x": float(tr["centroid_x"]),
+                "y": float(tr["centroid_y"]),
+            })
+    return by_track
+
+
 def _encode_heatmap_jpeg(heatmap_raw: np.ndarray, quality: int = 60) -> bytes | None:
     """Encode a raw anomaly map to a JET-colorized JPEG. Returns None on failure."""
     hmap = heatmap_raw
@@ -291,6 +315,14 @@ class AlertRecordingStore:
             existing_signals["yolo_boxes"].extend(post_signals["yolo_boxes"])
         if has_heatmaps:
             existing_signals["has_heatmaps"] = True
+
+        # Merge trajectory_points with frame_index offset to keep indices continuous
+        existing_traj = existing_signals.setdefault("trajectory_points", {})
+        post_traj = _aggregate_trajectories(
+            post_frames, frame_index_offset=existing_count,
+        )
+        for tid, pts in post_traj.items():
+            existing_traj.setdefault(tid, []).extend(pts)
         signals_path.write_text(
             json.dumps(existing_signals, ensure_ascii=False), encoding="utf-8"
         )
@@ -589,6 +621,7 @@ class AlertRecordingStore:
             ],
             "yolo_boxes": [f.yolo_boxes or [] for f in frames],
             "has_heatmaps": any(f.heatmap_raw is not None for f in frames),
+            "trajectory_points": _aggregate_trajectories(frames),
         }
         return signals
 
