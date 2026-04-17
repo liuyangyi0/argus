@@ -172,6 +172,91 @@ class TestCameraForms:
         assert data["cameras"][0]["camera_id"] == "cam_02"
         assert data["cameras"][0]["degradation"] == "rtsp_broken"
 
+    def test_wall_status_uses_batched_db_query(self, db, health, alerts_dir):
+        """wall/status must collapse to O(1) SQL queries regardless of camera count.
+
+        Regression target: the previous loop called ``get_alert_count`` and
+        ``get_alerts(limit=1)`` per camera, producing 2N+1 queries per poll.
+        With 4 cameras * 4 clients * 5 Hz this saturated SQLite and contended
+        with AlertDispatcher writes. The route now uses
+        ``get_wall_status_batch`` for a single round-trip.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from sqlalchemy import event
+
+        # Seed alerts: one today (active, high severity) + one yesterday
+        # (must NOT count toward alert_count_today, verifying the ``since``
+        # cutoff in the batch query).
+        now = datetime.now(tz=timezone.utc)
+        for i in range(5):
+            cam_id = f"cam_{i:02d}"
+            db.save_alert(f"A-{i}-1", now - timedelta(minutes=i), cam_id, "z1", "high", 0.9)
+            db.save_alert(f"A-{i}-2", now - timedelta(days=1), cam_id, "z1", "low", 0.6)
+
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = [
+            SimpleNamespace(
+                camera_id=f"cam_{i:02d}",
+                name=f"Camera {i:02d}",
+                connected=True,
+                running=True,
+                model_version_id=None,
+                stats=None,
+            )
+            for i in range(5)
+        ]
+        camera_manager.get_pipeline.return_value = None
+        camera_manager.get_backpressure_stats.return_value = {
+            f"cam_{i:02d}": {"pending": 0, "dropped": 0, "backpressured": False}
+            for i in range(5)
+        }
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        counter = {"n": 0}
+
+        def _count(conn, cursor, stmt, params, context, executemany):  # noqa: ARG001
+            counter["n"] += 1
+
+        event.listen(db._engine, "before_cursor_execute", _count)
+        try:
+            response = client.get("/api/cameras/wall/status")
+        finally:
+            event.remove(db._engine, "before_cursor_execute", _count)
+
+        assert response.status_code == 200
+        body = response.json()
+        data = body["data"]
+        assert len(data["cameras"]) == 5
+
+        # JSON shape must stay backward-compatible (frontend is untouched).
+        sample = data["cameras"][0]
+        required_keys = {
+            "camera_id", "name", "status", "model_version", "fps",
+            "current_score", "score_sparkline", "alert_count_today",
+            "active_alert", "degradation", "frames_dropped", "backpressured",
+        }
+        assert required_keys.issubset(sample.keys())
+
+        # Today's alerts get counted and the latest-if-active shows up.
+        for tile in data["cameras"]:
+            assert tile["alert_count_today"] == 1
+            assert tile["active_alert"] is not None
+            assert tile["active_alert"]["severity"] == "high"
+
+        # Core invariant: query count is bounded (not proportional to N).
+        # batch implementation issues ~2 statements (count + latest-row).
+        # Allow a small ceiling for incidental framework queries, but assert
+        # it is nowhere near 2*N+1 = 11 we had before.
+        assert counter["n"] <= 4, f"expected <=4 SQL queries, got {counter['n']}"
+
 
 class TestBaselineForms:
     def test_create_app_initializes_baseline_lifecycle(self, db, health, alerts_dir):
@@ -981,24 +1066,31 @@ class TestSchedulerWiring:
         database.get_session = MagicMock()
         config = ArgusConfig()
 
-        baseline_manager_cls = MagicMock(return_value=MagicMock())
+        baseline_manager = MagicMock()
+        model_trainer = MagicMock()
         backbone_trainer_cls = MagicMock(return_value=MagicMock())
-        trainer_cls = MagicMock(return_value=MagicMock())
         registry_cls = MagicMock(return_value=MagicMock())
         executor_cls = MagicMock(return_value=MagicMock())
         register_task = MagicMock()
 
-        monkeypatch.setattr("argus.anomaly.baseline.BaselineManager", baseline_manager_cls)
         monkeypatch.setattr("argus.anomaly.backbone_trainer.BackboneTrainer", backbone_trainer_cls)
-        monkeypatch.setattr("argus.anomaly.trainer.ModelTrainer", trainer_cls)
         monkeypatch.setattr("argus.storage.model_registry.ModelRegistry", registry_cls)
         monkeypatch.setattr("argus.anomaly.job_executor.TrainingJobExecutor", executor_cls)
         monkeypatch.setattr("argus.__main__.create_job_processing_task", register_task)
 
-        _register_training_job_processing(scheduler, config=config, database=database)
+        _register_training_job_processing(
+            scheduler,
+            config=config,
+            database=database,
+            baseline_manager=baseline_manager,
+            model_trainer=model_trainer,
+        )
 
         backbone_trainer_cls.assert_called_once()
         executor_cls.assert_called_once()
+        # Ensure the shared model_trainer instance was forwarded to the executor
+        _, kwargs = executor_cls.call_args
+        assert kwargs["trainer"] is model_trainer
         register_task.assert_called_once()
 
 

@@ -198,12 +198,19 @@ class DetectionPipeline:
         database: object | None = None,
         event_bus: EventBus | None = None,
         inference_executor: ThreadPoolExecutor | None = None,
+        encode_executor: ThreadPoolExecutor | None = None,
+        sensor_fusion: object | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
         self._on_drift = on_drift
         self._event_bus = event_bus
         self._inference_executor = inference_executor or _get_default_inference_executor()
+        # Ring-buffer JPEG encoding runs on a dedicated pool so it never
+        # starves inference futures (encode = 5-15ms each; inference = ~30ms).
+        # When no executor is injected (standalone usage), fall back to the
+        # inference pool — callers doing heavy encoding should inject one.
+        self._encode_executor = encode_executor or self._inference_executor
         self._model_version_id = model_version_id
         self._shadow_runner = shadow_runner
         self._feedback_manager = feedback_manager
@@ -244,6 +251,24 @@ class DetectionPipeline:
             denoise=camera_config.mog2.denoise,
             enable_stabilization=camera_config.mog2.enable_stabilization,
         )
+
+        # Stage 0.75: Phase-correlation alignment (cancels camera micro-vibration
+        # before MOG2/anomaly detection; the #1 false-positive source for
+        # fixed cameras near pumps, fans, and turbines).
+        if camera_config.alignment.enabled:
+            from argus.preprocessing.alignment import create_from_config
+
+            self._aligner = create_from_config(camera_config.alignment)
+            self._m_alignment_shift_dx = METRICS.alignment_shift_px.labels(
+                camera_id=_cid, axis="dx",
+            )
+            self._m_alignment_shift_dy = METRICS.alignment_shift_px.labels(
+                camera_id=_cid, axis="dy",
+            )
+        else:
+            self._aligner = None
+            self._m_alignment_shift_dx = None
+            self._m_alignment_shift_dy = None
 
         # Stage 2: Object detection (YOLO-003: multi-class + tracking + SAHI)
         self._object_detector = YOLOObjectDetector(
@@ -323,7 +348,7 @@ class DetectionPipeline:
         self._simplex_reference_set = False
 
         # Alert grading
-        self._alert_grader = AlertGrader(config=alert_config)
+        self._alert_grader = AlertGrader(config=alert_config, sensor_fusion=sensor_fusion)
 
         # Camera — use GigECapture for GigE Vision cameras, CameraCapture
         # for everything else (RTSP, USB, file).
@@ -625,6 +650,12 @@ class DetectionPipeline:
             fps=camera_config.fps_target,
             trajectory_history_length=(
                 self._physics_config.trajectory_history_length if self._physics_config else 300
+            ),
+            stationary_suppress_enabled=getattr(
+                alert_config.temporal, "stationary_suppress_enabled", True,
+            ),
+            stationary_suppress_after_s=float(
+                getattr(alert_config.temporal, "stationary_suppress_after_s", 10.0),
             ),
         )
 
@@ -1057,15 +1088,49 @@ class DetectionPipeline:
             except Exception as e:
                 logger.debug("pipeline.imaging_preprocessing_error", error=str(e))
 
+        # Stage 0.75: Phase-correlation alignment
+        if self._aligner is not None:
+            t_align = time.monotonic()
+            try:
+                frame, (align_dx, align_dy) = self._aligner.align(frame)
+                diag.alignment_shift_px = (align_dx, align_dy)
+                if self._m_alignment_shift_dx is not None:
+                    self._m_alignment_shift_dx.observe(abs(align_dx))
+                    self._m_alignment_shift_dy.observe(abs(align_dy))
+                diag.stages.append(StageResult(
+                    stage_name="alignment",
+                    duration_ms=(time.monotonic() - t_align) * 1000,
+                    metadata={
+                        "dx": round(align_dx, 3),
+                        "dy": round(align_dy, 3),
+                    },
+                ))
+            except Exception as e:
+                logger.debug(
+                    "pipeline.alignment_error",
+                    camera_id=frame_data.camera_id,
+                    error=str(e),
+                )
+
         # Save latest frame reference — get_latest_frame() copies on read
         with self._latest_frame_lock:
             self._latest_frame = frame
+
+        # Single full-resolution BGR->GRAY conversion shared by brightness
+        # detection (below) and MOG2 stabilization. Valid only for this frame.
+        frame_gray: np.ndarray | None = None
+        need_gray = self._low_light_enabled or getattr(
+            self._prefilter, "enable_stabilization", False,
+        )
+        if need_gray:
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._frame_gray = frame_gray
 
         # Low-light detection: bypass MOG2 when scene is dark
         is_low_light = False
         brightness_jump = False
         if self._low_light_enabled:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = frame_gray if frame_gray is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mean_brightness = float(gray.mean())
             is_low_light = mean_brightness < self._low_light_threshold
 
@@ -1108,6 +1173,9 @@ class DetectionPipeline:
                 else:
                     lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
                 frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                # CLAHE altered frame pixels — the cached gray no longer matches.
+                frame_gray = None
+                self._frame_gray = None
         diag.low_light = is_low_light
 
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
@@ -1136,10 +1204,10 @@ class DetectionPipeline:
         if not skip_prefilter:
             if freeze_mog2:
                 prefilter_result: PreFilterResult = self._prefilter.process(
-                    frame, learning_rate_override=0.0
+                    frame, learning_rate_override=0.0, gray_frame=frame_gray,
                 )
             else:
-                prefilter_result = self._prefilter.process(frame)
+                prefilter_result = self._prefilter.process(frame, gray_frame=frame_gray)
             if not prefilter_result.has_change:
                 self.stats.frames_skipped_no_change += 1
                 mog2_skipped = True
@@ -1155,9 +1223,9 @@ class DetectionPipeline:
                 return None
         else:
             if is_locked:
-                self._prefilter.process(frame, learning_rate_override=0.0)
+                self._prefilter.process(frame, learning_rate_override=0.0, gray_frame=frame_gray)
             else:
-                self._prefilter.process(frame)
+                self._prefilter.process(frame, gray_frame=frame_gray)
             if is_heartbeat:
                 self.stats.frames_heartbeat += 1
 
@@ -1552,11 +1620,75 @@ class DetectionPipeline:
                 )
                 return None
 
-        # Multi-zone alert grading with semantic context
+        # F5: Stationary-object suppression. Run the temporal tracker up-front
+        # (instead of only after a successful alert, as the physics enrichment
+        # path does below) so we can decide whether every active track has
+        # settled into a suppressed state. When every track in the frame is
+        # suppressed — and therefore the only reason anomaly scoring would
+        # re-fire is a long-settled object — we skip grader evaluation so the
+        # operator is not re-alerted. A brand-new track (i.e. a freshly
+        # entered object) cannot be suppressed in the same frame it is born,
+        # so this still lets fresh anomalies through. The result is cached so
+        # the physics-enrichment block does not re-run update() and create
+        # duplicate tracks.
+        pre_temporal = None
+        if (
+            anomaly_result.is_anomalous
+            and getattr(self, "_physics_tracker", None) is not None
+            and getattr(self, "_physics_postproc", None) is not None
+        ):
+            try:
+                pre_regions = (
+                    self._physics_postproc.extract_regions(
+                        anomaly_result.anomaly_map, threshold=0.3,
+                    )
+                    if anomaly_result.anomaly_map is not None
+                    else []
+                )
+                pre_temporal = self._physics_tracker.update(
+                    pre_regions, self._frame_counter,
+                )
+            except Exception as e:
+                logger.debug(
+                    "pipeline.temporal_tracker_failed",
+                    camera_id=frame_data.camera_id,
+                    error=str(e),
+                )
+                pre_temporal = None
+
+            if (
+                pre_temporal is not None
+                and pre_temporal.active_tracks
+                and all(t.suppressed for t in pre_temporal.active_tracks)
+            ):
+                logger.debug(
+                    "pipeline.alert_suppressed_stationary",
+                    camera_id=frame_data.camera_id,
+                    frame_number=frame_data.frame_number,
+                    track_ids=[t.track_id for t in pre_temporal.active_tracks],
+                )
+                self._update_latency(start)
+                diag.total_duration_ms = (time.monotonic() - start) * 1000
+                self._diagnostics.append(diag)
+                self._diagnostics.append_score(FrameScoreRecord(
+                    frame_number=frame_data.frame_number,
+                    timestamp=time.time(),
+                    anomaly_score=anomaly_result.anomaly_score,
+                    was_alert=False,
+                ))
+                return None
+
+        # Multi-zone alert grading with semantic context.
+        # Classification info is forwarded so the grader can use it as
+        # corroboration for the F1 single-frame early-warning fast path.
+        cls_label = classification_result[0] if classification_result else None
+        cls_conf = classification_result[1] if classification_result else None
         alert = self._evaluate_zones(
             frame_data, anomaly_result, frame,
             detection_type=detection_type,
             detected_objects=detected_objects,
+            classification_label=cls_label,
+            classification_confidence=cls_conf,
         )
 
         # D1: Attach classification to alert and adjust severity
@@ -1674,11 +1806,17 @@ class DetectionPipeline:
         active_tracks_payload: list[dict] = []
         if alert is not None and anomaly_result.is_anomalous:
             try:
-                regions = self._physics_postproc.extract_regions(
-                    anomaly_result.anomaly_map,
-                    threshold=0.3,
-                ) if anomaly_result.anomaly_map is not None else []
-                temporal = self._physics_tracker.update(regions, self._frame_counter)
+                # Reuse the temporal result computed up-front for F5
+                # suppression; fall back to a fresh update only if the
+                # pre-pass bailed out (e.g. exception path above).
+                if pre_temporal is not None:
+                    temporal = pre_temporal
+                else:
+                    regions = self._physics_postproc.extract_regions(
+                        anomaly_result.anomaly_map,
+                        threshold=0.3,
+                    ) if anomaly_result.anomaly_map is not None else []
+                    temporal = self._physics_tracker.update(regions, self._frame_counter)
 
                 # Serialize active tracks for the ring buffer (drives replay trajectory)
                 active_tracks_payload = [
@@ -1795,17 +1933,17 @@ class DetectionPipeline:
                 )
 
         if alert is not None:
-            # Persist trajectory centroid history for visualization
+            # Persist trajectory centroid history for visualization.
+            # Read-only access: calling update([]) here would double-advance
+            # the stationary-suppress state machine and delete stale tracks.
             try:
                 if (
                     hasattr(self, '_physics_tracker')
                     and self._physics_tracker is not None
                 ):
-                    temporal_state = self._physics_tracker.update([], self._frame_counter)
-                    for track in getattr(temporal_state, 'active_tracks', []):
-                        if getattr(track, 'trajectory_history', None):
-                            alert.trajectory_points = list(track.trajectory_history)
-                            break
+                    histories = self._physics_tracker.get_trajectory_histories()
+                    if histories:
+                        alert.trajectory_points = histories[0]
             except Exception:
                 pass
 
@@ -2031,7 +2169,7 @@ class DetectionPipeline:
             if alert is not None:
                 _encode_and_append()
             else:
-                self._inference_executor.submit(_encode_and_append)
+                self._encode_executor.submit(_encode_and_append)
         except Exception:
             logger.debug(
                 "pipeline.ring_buffer_append_failed",
@@ -2388,6 +2526,8 @@ class DetectionPipeline:
     def _evaluate_zones(
         self, frame_data: FrameData, anomaly_result: AnomalyResult, frame: np.ndarray,
         detection_type: str = "anomaly", detected_objects: list[dict] | None = None,
+        classification_label: str | None = None,
+        classification_confidence: float | None = None,
     ) -> Alert | None:
         """Evaluate anomaly against all configured include zones.
 
@@ -2410,6 +2550,8 @@ class DetectionPipeline:
                 anomaly_map=anomaly_result.anomaly_map,
                 detection_type=detection_type,
                 detected_objects=detected_objects,
+                classification_label=classification_label,
+                classification_confidence=classification_confidence,
             )
 
         # Evaluate all zones and return highest-severity alert; break ties by score (HIGH-06)
@@ -2432,6 +2574,8 @@ class DetectionPipeline:
                 anomaly_map=anomaly_result.anomaly_map,
                 detection_type=detection_type,
                 detected_objects=detected_objects,
+                classification_label=classification_label,
+                classification_confidence=classification_confidence,
             )
             if alert is not None:
                 rank = _severity_rank(alert.severity)

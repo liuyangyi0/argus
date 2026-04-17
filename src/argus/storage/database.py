@@ -104,6 +104,17 @@ class Database:
             ("alerts", "assigned_to", "VARCHAR(100)"),
             ("alerts", "resolved_at", "DATETIME"),
             ("training_records", "group_id", "VARCHAR(100)"),
+            # Phase 1: real-labeled P/R/F1/AUROC/PR-AUC metrics
+            ("training_records", "val_precision", "REAL"),
+            ("training_records", "val_recall", "REAL"),
+            ("training_records", "val_f1", "REAL"),
+            ("training_records", "val_auroc", "REAL"),
+            ("training_records", "val_pr_auc", "REAL"),
+            ("training_records", "val_confusion_matrix", "TEXT"),
+            ("training_records", "val_real_sample_count", "INTEGER"),
+            # Phase 2: raw per-sample scores/labels for threshold slider
+            ("training_records", "val_scores_json", "TEXT"),
+            ("training_records", "val_labels_json", "TEXT"),
             ("models", "backbone_version_id", "VARCHAR(128)"),
             # Model release pipeline
             ("models", "stage", "VARCHAR(20) DEFAULT 'candidate'"),

@@ -25,9 +25,11 @@ from pathlib import Path
 
 if TYPE_CHECKING:
     from argus.core.alert_ring_buffer import SolidifiedRecording
+    from argus.sensors.fusion import SensorFusion
 
 from argus.config.schema import AlertConfig, AlertSeverity, SeverityThresholds, ZonePriority
 from argus.contracts.validation import validate_alert
+from argus.core.metrics import METRICS
 
 logger = structlog.get_logger()
 
@@ -38,6 +40,11 @@ HANDLING_POLICIES: dict[AlertSeverity, str] = {
     AlertSeverity.MEDIUM: "confirm",
     AlertSeverity.HIGH: "detail_required",
 }
+
+# F1 early-warning: detection classes that do NOT on their own justify a
+# fast-path fire. "Person" intrusions still require CUSUM corroboration because
+# a transient person walk-through is expected behaviour in many zones.
+_EARLY_WARNING_IGNORED_DETECTION_CLASSES: frozenset[str] = frozenset({"person"})
 
 
 class AlertCategory(str, Enum):
@@ -77,6 +84,8 @@ class Alert:
     severity_adjusted_by_classifier: bool = False
     # Alert category classification
     category: str = "unknown"
+    # F1: Single-frame early-warning fast path (bypasses CUSUM evidence wait)
+    triggered_by_early_warning: bool = False
     # D2: Instance segmentation
     segmentation_count: int = 0
     segmentation_total_area_px: int = 0
@@ -155,9 +164,11 @@ class AlertGrader:
         config: AlertConfig,
         node_id: str = "edge",
         calibration_path: Path | None = None,
+        sensor_fusion: SensorFusion | None = None,
     ):
         self._config = config
         self._node_id = node_id
+        self._sensor_fusion = sensor_fusion
         self._trackers: dict[str, _AnomalyTracker] = defaultdict(_AnomalyTracker)
         self._last_alerts: dict[str, float] = {}  # zone_key -> last alert timestamp
         self._last_camera_alerts: dict[str, float] = {}  # camera_id -> last alert timestamp
@@ -198,6 +209,8 @@ class AlertGrader:
         anomaly_map: np.ndarray | None = None,
         detection_type: str = "anomaly",
         detected_objects: list[dict] | None = None,
+        classification_label: str | None = None,
+        classification_confidence: float | None = None,
     ) -> Alert | None:
         """Evaluate an anomaly detection and potentially produce an alert.
 
@@ -223,10 +236,56 @@ class AlertGrader:
 
         # Step 1: Apply zone priority multiplier
         multiplier = self._config.zone_multipliers.get(zone_priority.value, 1.0)
-        adjusted_score = max(0.0, min(anomaly_score * multiplier, 1.0))
+        adjusted_score = anomaly_score * multiplier
+
+        # Step 1b: External sensor fusion — bias severity via (camera, zone) signal
+        if self._sensor_fusion is not None:
+            fusion_multiplier = self._sensor_fusion.get_multiplier(camera_id, zone_id)
+            if fusion_multiplier != 1.0:
+                adjusted_score *= fusion_multiplier
+                logger.debug(
+                    "grader.fusion_applied",
+                    zone=zone_key,
+                    fusion_multiplier=round(fusion_multiplier, 3),
+                    adjusted_score=round(adjusted_score, 3),
+                )
+
+        adjusted_score = max(0.0, min(adjusted_score, 1.0))
 
         # Step 2: Determine severity (None if below info threshold)
         severity = self._score_to_severity(adjusted_score)
+
+        # F1: Single-frame early-warning fast path.  When anomaly + detection (or
+        # classifier) both fire strongly on one frame, bypass CUSUM evidence
+        # accumulation but still respect suppression windows so we don't storm.
+        ew_cfg = getattr(self._config, "early_warning", None)
+        if (
+            ew_cfg is not None
+            and ew_cfg.enabled
+            and severity is not None
+            and adjusted_score >= ew_cfg.score_threshold
+            and self._early_warning_corroborated(
+                ew_cfg, detection_type, detected_objects,
+                classification_label, classification_confidence,
+            )
+        ):
+            ew_alert = self._fire_early_warning(
+                camera_id=camera_id,
+                zone_id=zone_id,
+                zone_key=zone_key,
+                adjusted_score=adjusted_score,
+                severity=severity,
+                frame_number=frame_number,
+                frame=frame,
+                anomaly_map=anomaly_map,
+                detection_type=detection_type,
+                detected_objects=detected_objects,
+                classification_label=classification_label,
+                classification_confidence=classification_confidence,
+                now=now,
+            )
+            if ew_alert is not None:
+                return ew_alert
 
         # Step 3: CUSUM temporal evidence accumulation (thread-safe)
         with self._tracker_lock:
@@ -257,9 +316,31 @@ class AlertGrader:
             tracker.last_seen = now
 
             # Step 3b: Spatial continuity check — anomaly region must overlap with
-            # the previous frame's anomaly region to filter transient noise
-            min_overlap = self._config.temporal.min_spatial_overlap
-            if min_overlap > 0 and anomaly_map is not None:
+            # the previous frame's anomaly region to filter transient noise.
+            #
+            # F3: `spatial_continuity_enabled` + `spatial_continuity_iou_threshold`
+            # give operators explicit control over the IoU gate (default 0.7, was
+            # effectively 0.3 via min_spatial_overlap). `spatial_continuity_mode`
+            # chooses between fully resetting evidence on mismatch ("reset", new
+            # stricter default) and the legacy 50% decay ("decay"). We fall back
+            # on the legacy `min_spatial_overlap` when the new-style gate is
+            # explicitly disabled, so existing configs keep behaving the same.
+            temporal_cfg = self._config.temporal
+            legacy_overlap = temporal_cfg.min_spatial_overlap
+            if getattr(temporal_cfg, "spatial_continuity_enabled", True):
+                sc_threshold = float(
+                    getattr(
+                        temporal_cfg,
+                        "spatial_continuity_iou_threshold",
+                        legacy_overlap,
+                    )
+                )
+                sc_mode = getattr(temporal_cfg, "spatial_continuity_mode", "reset")
+            else:
+                sc_threshold = legacy_overlap
+                sc_mode = "decay"  # preserve historical 50% decay when new gate is off
+
+            if sc_threshold > 0 and anomaly_map is not None:
                 curr_mask = (anomaly_map > 0.5).astype(np.uint8)
                 if tracker.prev_anomaly_mask is not None:
                     prev_mask = tracker.prev_anomaly_mask
@@ -281,16 +362,36 @@ class AlertGrader:
                     intersection = np.count_nonzero(curr_mask & prev_mask)
                     union = np.count_nonzero(curr_mask | prev_mask)
                     iou = intersection / union if union > 0 else 0.0
-                    if iou < min_overlap:
+                    if iou < sc_threshold:
                         logger.debug(
                             "grader.spatial_mismatch",
                             zone=zone_key,
                             iou=round(iou, 3),
-                            threshold=min_overlap,
+                            threshold=sc_threshold,
+                            mode=sc_mode,
                         )
-                        # Decay instead of reset to tolerate camera vibration
-                        tracker.evidence *= 0.5
-                        tracker.max_score = adjusted_score
+                        if sc_mode == "reset":
+                            # F3: hard reset — local-motion false positives that
+                            # keep scoring high but on shifting pixels no longer
+                            # accumulate evidence.
+                            tracker.evidence = 0.0
+                            tracker.first_seen = now
+                            tracker.max_score = adjusted_score
+                            try:
+                                METRICS.spatial_continuity_resets.labels(
+                                    camera_id=camera_id,
+                                ).inc()
+                            except Exception:
+                                # Metrics must never break the grader.
+                                logger.debug(
+                                    "grader.spatial_reset_metric_failed",
+                                    exc_info=True,
+                                )
+                        else:
+                            # Legacy 50% decay to tolerate camera vibration.
+                            tracker.evidence *= 0.5
+                            tracker.max_score = adjusted_score
+                # Keep only the most recent mask — bounded memory per tracker.
                 tracker.prev_anomaly_mask = curr_mask
 
             # Exponential evidence accumulation
@@ -372,6 +473,148 @@ class AlertGrader:
             except Exception:
                 logger.debug("grader.contract_validation_failed", exc_info=True)
 
+        return alert
+
+    @staticmethod
+    def _early_warning_corroborated(
+        ew_cfg,
+        detection_type: str,
+        detected_objects: list[dict] | None,
+        classification_label: str | None,
+        classification_confidence: float | None,
+    ) -> bool:
+        """Return True if the frame carries enough corroboration to take the F1 fast path.
+
+        With ``require_detection_or_classifier=True`` (default), one of the following
+        must hold:
+          - ``detected_objects`` contains at least one non-person class
+          - ``detection_type == "hybrid"`` (YOLO and anomaly both agree)
+          - A classifier label fired with confidence ≥ ``classifier_min_confidence``
+
+        With the guard disabled, pure anomaly-only frames also qualify.
+        """
+        if not ew_cfg.require_detection_or_classifier:
+            return True
+
+        # Detection corroboration: at least one non-person detected object.
+        if detected_objects:
+            for obj in detected_objects:
+                class_name = (obj.get("class_name") or "").strip().lower()
+                if class_name and class_name not in _EARLY_WARNING_IGNORED_DETECTION_CLASSES:
+                    return True
+
+        # Hybrid mode: both YOLO and anomaly agree, so even if the class filter
+        # above excluded "person" we trust the hybrid flag itself.
+        if detection_type == "hybrid":
+            return True
+
+        # Classifier corroboration: high-confidence open-vocabulary label.
+        if (
+            classification_label is not None
+            and classification_confidence is not None
+            and classification_confidence >= ew_cfg.classifier_min_confidence
+        ):
+            return True
+
+        return False
+
+    def _fire_early_warning(
+        self,
+        *,
+        camera_id: str,
+        zone_id: str,
+        zone_key: str,
+        adjusted_score: float,
+        severity: AlertSeverity,
+        frame_number: int,
+        frame: np.ndarray | None,
+        anomaly_map: np.ndarray | None,
+        detection_type: str,
+        detected_objects: list[dict] | None,
+        classification_label: str | None,
+        classification_confidence: float | None,
+        now: float,
+    ) -> Alert | None:
+        """Build and emit an early-warning alert, honoring suppression windows.
+
+        Returns None when a suppression window rejects the fire, letting the
+        caller fall through to the standard CUSUM path (which will also no-op
+        on the same window).
+        """
+        with self._tracker_lock:
+            # Zone-level suppression
+            last_alert_time = self._last_alerts.get(zone_key, 0)
+            if now - last_alert_time < self._config.suppression.same_zone_window_seconds:
+                logger.debug(
+                    "grader.early_warning_suppressed",
+                    zone=zone_key,
+                    score=round(adjusted_score, 3),
+                )
+                return None
+
+            # Camera-level throttle
+            last_camera_alert = self._last_camera_alerts.get(camera_id, 0)
+            cam_window = self._config.suppression.same_camera_window_seconds
+            if now - last_camera_alert < cam_window:
+                logger.debug(
+                    "grader.early_warning_camera_suppressed",
+                    zone=zone_key,
+                    camera=camera_id,
+                    score=round(adjusted_score, 3),
+                )
+                return None
+
+            self._alert_counter += 1
+            seq = self._alert_counter
+            self._last_alerts[zone_key] = now
+            self._last_camera_alerts[camera_id] = now
+
+            # Reset CUSUM tracker — the early-warning fire consumes the evidence
+            # the same way a normal fire would, so we don't double-alert.
+            self._trackers[zone_key] = _AnomalyTracker()
+
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
+            rnd = random.randint(0, 0xFFFF)
+            alert_id = f"ALT-{self._node_id}-{ts}-{seq:04d}-{rnd:04x}"
+
+            event_group_id, event_group_count = self._assign_event_group(
+                zone_key, alert_id, time.time(),
+            )
+
+            alert = Alert(
+                alert_id=alert_id,
+                camera_id=camera_id,
+                zone_id=zone_id,
+                severity=severity,
+                anomaly_score=adjusted_score,
+                timestamp=time.time(),
+                frame_number=frame_number,
+                snapshot=frame,
+                heatmap=anomaly_map,
+                detection_type=detection_type,
+                detected_objects=detected_objects or [],
+                classification_label=classification_label,
+                classification_confidence=classification_confidence,
+                handling_policy=HANDLING_POLICIES.get(severity, "quick"),
+                event_group_id=event_group_id,
+                event_group_count=event_group_count,
+                triggered_by_early_warning=True,
+            )
+
+        try:
+            validate_alert(alert)
+        except Exception:
+            logger.debug("grader.contract_validation_failed", exc_info=True)
+
+        logger.info(
+            "grader.early_warning_fired",
+            zone=zone_key,
+            camera=camera_id,
+            score=round(adjusted_score, 3),
+            severity=severity.value,
+            detection_type=detection_type,
+            classification_label=classification_label,
+        )
         return alert
 
     def _assign_event_group(

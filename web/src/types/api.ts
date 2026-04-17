@@ -161,6 +161,14 @@ export interface ModelHealthStatus {
   extra: Record<string, unknown>
 }
 
+// Persisted operator-marked clip range on the replay timeline (FR-033).
+export interface ReplayClip {
+  start_index: number
+  end_index: number
+  label: string
+  created_at: string
+}
+
 export interface TaskInfo {
   task_id: string
   task_type: string
@@ -258,6 +266,14 @@ export interface TrainingRecord {
   val_score_p95: number | null
   quality_grade: string | null
   threshold_recommended: number | null
+  // Phase 1: real-labeled P/R/F1/AUROC/PR-AUC
+  val_precision: number | null
+  val_recall: number | null
+  val_f1: number | null
+  val_auroc: number | null
+  val_pr_auc: number | null
+  val_confusion_matrix: string | null  // JSON-encoded {tp,fp,fn,tn}
+  val_real_sample_count: number | null
   model_path: string | null
   export_path: string | null
   checkpoint_valid: boolean | null
@@ -269,6 +285,42 @@ export interface TrainingRecord {
   duration_seconds: number
   trained_at: string | null
   created_at: string | null
+}
+
+// Phase 2: per-record metrics payload for MetricsChart
+export interface TrainingMetricsResponse {
+  record_id: number
+  has_labeled_eval: boolean
+  message?: string
+  scores?: number[]
+  labels?: number[]
+  threshold_used?: number
+  optimal_f1_threshold?: number
+  sample_count?: number
+  metrics_at_threshold?: {
+    precision: number
+    recall: number
+    f1: number
+    auroc: number
+    pr_auc: number
+    confusion_matrix: { tp: number; fp: number; fn: number; tn: number }
+    threshold: number
+    n_positive: number
+    n_negative: number
+  }
+  pr_curve?: {
+    precisions: number[]
+    recalls: number[]
+    thresholds: number[]
+  }
+  stored_confusion_matrix?: { tp: number; fp: number; fn: number; tn: number } | null
+  stored_metrics?: {
+    precision: number | null
+    recall: number | null
+    f1: number | null
+    auroc: number | null
+    pr_auc: number | null
+  }
 }
 
 export interface TrainingJobInfo {
@@ -412,4 +464,27 @@ export interface BatchInferenceResponse {
   }>
   scored: number
   total: number
+}
+
+// ── Multi-camera Storyboard (synchronous replay across correlated cameras) ──
+
+/** One camera entry in a storyboard — the frontend needs `trigger_offset_s`
+ *  to align each camera's local time against the shared master clock. */
+export interface StoryboardCamera {
+  alert_id: string
+  camera_id: string
+  /** Epoch seconds — only kept for UI debug/labelling, not used for sync. */
+  trigger_timestamp: number
+  /** Seconds relative to the primary alert's trigger_timestamp.
+   *  Primary camera is 0; other cameras are positive/negative deltas. */
+  trigger_offset_s: number
+  metadata_url: string
+  video_url: string
+  signals_url: string
+}
+
+export interface StoryboardResponse {
+  primary_alert_id: string
+  cameras: StoryboardCamera[]
+  count: number
 }

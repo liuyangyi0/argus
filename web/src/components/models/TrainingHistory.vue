@@ -2,15 +2,17 @@
 import { ref, computed, onMounted } from 'vue'
 import {
   Card, Table, Button, Tag, Space, Modal, Form, Select,
-  Descriptions, message,
+  Descriptions, message, Typography,
 } from 'ant-design-vue'
 import {
   HistoryOutlined, SwapOutlined, ReloadOutlined,
-  CheckCircleOutlined, CloseCircleOutlined,
+  CheckCircleOutlined, CloseCircleOutlined, LineChartOutlined,
 } from '@ant-design/icons-vue'
 import { getTrainingHistory, compareModels } from '../../api'
 import { GRADE_COLORS, RECOMMENDATION_COLORS, RECOMMENDATION_TEXT } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 import type { TrainingRecord } from '../../types/api'
+import MetricsChart from './MetricsChart.vue'
 
 const trainingHistory = ref<TrainingRecord[]>([])
 const historyLoading = ref(false)
@@ -60,8 +62,8 @@ async function handleCompare() {
       new_record_id: compareForm.value.new_record_id,
     })
     compareResult.value = res
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '对比失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '对比失败'))
   } finally {
     comparing.value = false
   }
@@ -74,6 +76,8 @@ const historyColumns = [
   { title: '基线数', dataIndex: 'baseline_count', key: 'baseline_count', width: 80 },
   { title: '训练/验证', key: 'split', width: 100 },
   { title: '质量', key: 'grade', width: 70 },
+  { title: 'F1', key: 'f1', width: 80 },
+  { title: 'AUROC', key: 'auroc', width: 80 },
   { title: '推荐阈值', key: 'threshold', width: 100 },
   { title: '状态', key: 'status', width: 80 },
   { title: '耗时', key: 'duration', width: 80 },
@@ -128,6 +132,18 @@ onMounted(loadHistory)
           </Tag>
           <span v-else style="color: #666">-</span>
         </template>
+        <template v-if="column.key === 'f1'">
+          <Tag v-if="record.val_f1 != null" color="purple" style="font-weight: 600">
+            {{ record.val_f1.toFixed(3) }}
+          </Tag>
+          <span v-else style="color: #999">-</span>
+        </template>
+        <template v-if="column.key === 'auroc'">
+          <span v-if="record.val_auroc != null" :style="{ color: record.val_auroc >= 0.9 ? '#15a34a' : record.val_auroc >= 0.7 ? '#d29b1f' : '#e5484d' }">
+            {{ record.val_auroc.toFixed(3) }}
+          </span>
+          <span v-else style="color: #999">-</span>
+        </template>
         <template v-if="column.key === 'threshold'">
           {{ record.threshold_recommended != null ? record.threshold_recommended.toFixed(3) : '-' }}
         </template>
@@ -157,7 +173,7 @@ onMounted(loadHistory)
     v-model:open="historyDetailVisible"
     title="训练详情"
     :footer="null"
-    width="720px"
+    width="1000px"
   >
     <Descriptions v-if="historyDetail" bordered :column="2" size="small" style="margin-top: 16px">
       <Descriptions.Item label="摄像头">{{ historyDetail.camera_id }}</Descriptions.Item>
@@ -226,6 +242,40 @@ onMounted(loadHistory)
         <span style="color: #e5484d">{{ historyDetail.error }}</span>
       </Descriptions.Item>
     </Descriptions>
+
+    <!-- Phase 1 real-labeled P/R/F1/AUROC/PR-AUC summary row -->
+    <Descriptions
+      v-if="historyDetail && (historyDetail.val_f1 != null || historyDetail.val_auroc != null)"
+      bordered :column="4" size="small" style="margin-top: 12px"
+      title="真实标注评估"
+    >
+      <Descriptions.Item label="Precision">
+        {{ historyDetail.val_precision != null ? (historyDetail.val_precision * 100).toFixed(1) + '%' : '-' }}
+      </Descriptions.Item>
+      <Descriptions.Item label="Recall">
+        {{ historyDetail.val_recall != null ? (historyDetail.val_recall * 100).toFixed(1) + '%' : '-' }}
+      </Descriptions.Item>
+      <Descriptions.Item label="F1">
+        <Tag v-if="historyDetail.val_f1 != null" color="purple" style="font-weight: 600">
+          {{ historyDetail.val_f1.toFixed(4) }}
+        </Tag>
+      </Descriptions.Item>
+      <Descriptions.Item label="样本数">{{ historyDetail.val_real_sample_count ?? '-' }}</Descriptions.Item>
+      <Descriptions.Item label="AUROC">{{ historyDetail.val_auroc?.toFixed(4) ?? '-' }}</Descriptions.Item>
+      <Descriptions.Item label="PR-AUC">{{ historyDetail.val_pr_auc?.toFixed(4) ?? '-' }}</Descriptions.Item>
+    </Descriptions>
+
+    <!-- Phase 2: embedded MetricsChart (PR / ROC / threshold slider / CM) -->
+    <div
+      v-if="historyDetail && historyDetail.val_f1 != null"
+      style="margin-top: 16px"
+    >
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
+        <LineChartOutlined />
+        <Typography.Text strong>指标分析</Typography.Text>
+      </div>
+      <MetricsChart :record-id="historyDetail.id" />
+    </div>
   </Modal>
 
   <!-- Compare Modal -->

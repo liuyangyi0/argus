@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from argus.core.health import HealthMonitor
     from argus.storage.audit import AuditLogger
     from argus.storage.database import Database
+    from argus.storage.inference_buffer import InferenceBuffer
     from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
@@ -75,6 +76,8 @@ class CameraManager:
         database: Database | None = None,
         alert_recording_store: object | None = None,
         event_bus: object | None = None,
+        sensor_fusion: object | None = None,
+        inference_buffer: InferenceBuffer | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
@@ -90,6 +93,8 @@ class CameraManager:
         self._db = database
         self._alert_recording_store = alert_recording_store
         self._event_bus = event_bus
+        self._sensor_fusion = sensor_fusion
+        self._inference_buffer = inference_buffer
         self._runners: dict[str, CameraInferenceRunner] = {}
         self._pipelines: dict[str, DetectionPipeline] = {}  # backward compat
         self._threads: dict[str, threading.Thread] = {}
@@ -138,6 +143,11 @@ class CameraManager:
         n_workers = min(max(len(cameras), 2) * 2, os.cpu_count() or 4)
         self._inference_executor = ThreadPoolExecutor(
             max_workers=n_workers, thread_name_prefix="inference"
+        )
+        # Separate pool for ring-buffer JPEG encoding so cv2.imencode (5-15ms)
+        # never competes with YOLO/Anomaly futures for inference worker slots.
+        self._encode_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="rb-encode"
         )
 
         # 5.3: Process-level watchdog
@@ -297,6 +307,7 @@ class CameraManager:
         self._runners.clear()
         self._threads.clear()
         self._inference_executor.shutdown(wait=False, cancel_futures=True)
+        self._encode_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("manager.stopped")
 
     def add_camera_config(self, cam_config: CameraConfig) -> None:
@@ -733,6 +744,18 @@ class CameraManager:
                 alert.corroborated = result.corroborated
                 alert.correlation_partner = result.partner_camera
                 if not result.corroborated:
+                    # F4: Force-corroboration mode — drop the alert entirely
+                    # instead of downgrading, when the zone demands it.
+                    if self._zone_requires_corroboration(alert.camera_id, alert.zone_id):
+                        logger.info(
+                            "alerts.suppressed_uncorroborated",
+                            alert_id=alert.alert_id,
+                            camera_id=alert.camera_id,
+                            zone_id=alert.zone_id,
+                            partner=result.partner_camera,
+                        )
+                        return
+
                     downgrade = (
                         self._cross_camera_config.uncorroborated_severity_downgrade
                         if self._cross_camera_config
@@ -786,6 +809,8 @@ class CameraManager:
             database=self._db,
             event_bus=self._event_bus,
             inference_executor=self._inference_executor,
+            encode_executor=self._encode_executor,
+            sensor_fusion=self._sensor_fusion,
         )
 
         # 5.1: Wrap pipeline in CameraInferenceRunner
@@ -797,6 +822,7 @@ class CameraManager:
             audit_logger=self._audit_logger,
             max_consecutive_failures=deg_config.max_consecutive_failures,
             refuse_start_on_backbone_failure=deg_config.refuse_start_on_backbone_failure,
+            inference_buffer=self._inference_buffer,
         )
         if self._record_store is not None:
             runner.set_record_store(self._record_store)
@@ -957,6 +983,22 @@ class CameraManager:
             return severity
         new_idx = max(0, idx - levels)
         return cls._SEVERITY_ORDER[new_idx]
+
+    def _zone_requires_corroboration(self, camera_id: str, zone_id: str) -> bool:
+        """Return True when the zone's F4 ``require_corroboration`` flag is set.
+
+        Missing camera or zone (e.g. synthetic "default" zone_id) safely
+        returns False so we fall back to the existing downgrade behaviour.
+        """
+        cam_config = next(
+            (c for c in self._cameras if c.camera_id == camera_id), None,
+        )
+        if cam_config is None:
+            return False
+        for zone in cam_config.zones:
+            if zone.zone_id == zone_id:
+                return bool(getattr(zone, "require_corroboration", False))
+        return False
 
     # --- 5.3: Process-level watchdog ---
 

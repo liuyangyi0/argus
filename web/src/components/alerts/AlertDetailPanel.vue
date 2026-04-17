@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { storeToRefs } from 'pinia'
 import {
   Tag, Button, Typography, Tooltip, Segmented, message, Modal,
@@ -11,11 +11,13 @@ import {
   ExportOutlined,
   DeleteOutlined,
   PlayCircleOutlined,
+  AppstoreOutlined,
 } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import { useAlertStore } from '../../stores/useAlertStore'
 import { scoreColor } from '../../utils/colors'
 import { formatTimestamp } from '../../utils/time'
+import { extractErrorMessage } from '../../utils/error'
 import ReplayPlayer from '../ReplayPlayer.vue'
 import AnnotationOverlay from '../AnnotationOverlay.vue'
 import ImageCompareSlider from '../ImageCompareSlider.vue'
@@ -32,6 +34,50 @@ const { selectedAlert } = storeToRefs(store)
 
 const imageMode = ref<'composite' | 'snapshot' | 'heatmap' | 'compare'>('composite')
 const annotationMode = ref(false)
+
+// When an alert has both a recording and a snapshot, the user can toggle between
+// "录像" (video replay) and "触发帧" (annotated trigger frame). Without a recording
+// there is nothing to toggle to, so the snapshot panel is shown unconditionally.
+const viewMode = ref<'recording' | 'snapshot'>('recording')
+
+// Reset view mode to "recording" when switching between alerts, otherwise the
+// operator jumps into the snapshot tab on an alert where that isn't the default.
+watch(() => selectedAlert.value?.alert_id, () => {
+  viewMode.value = 'recording'
+  imageMode.value = 'composite'
+  annotationMode.value = false
+})
+
+// Track the compare/annotation layer's rendered size so we aren't hard-coding
+// 640×480 for frames that may actually be 1280×720 or larger.
+const compareContainerRef = ref<HTMLDivElement | null>(null)
+const compareSize = ref({ width: 640, height: 480 })
+let compareResizeObs: ResizeObserver | null = null
+
+function updateCompareSize() {
+  const el = compareContainerRef.value
+  if (!el) return
+  const w = el.clientWidth || 640
+  // 4:3 fallback when we have no natural dimensions yet — we intentionally
+  // don't read the image because it may still be loading.
+  const h = Math.round(w * 0.5625) // 16:9 by default (matches most cameras)
+  compareSize.value = { width: w, height: h }
+}
+
+onMounted(() => {
+  updateCompareSize()
+  if (typeof ResizeObserver !== 'undefined') {
+    compareResizeObs = new ResizeObserver(() => updateCompareSize())
+    // Observer is attached lazily once the element actually renders.
+    watch(compareContainerRef, (el) => {
+      if (el && compareResizeObs) compareResizeObs.observe(el)
+    }, { immediate: true })
+  }
+})
+
+onBeforeUnmount(() => {
+  compareResizeObs?.disconnect()
+})
 
 const severityColor: Record<string, string> = {
   high: 'red', medium: 'orange', low: 'gold', info: 'blue',
@@ -66,13 +112,25 @@ function formatArea(px: number): string {
   return `${(px / 1_000_000).toFixed(2)} M px`
 }
 
+// A "多机位回放" storyboard is only meaningful when there's another camera
+// we can pair the alert with — either through the cross-camera correlation
+// pipeline (correlation_partner) or because the event grouping has picked
+// up related alerts from multiple cameras (event_group_count > 1).
+const hasMultiCam = computed(() => {
+  const a = selectedAlert.value
+  if (!a) return false
+  if (a.correlation_partner) return true
+  if ((a.event_group_count ?? 0) > 1) return true
+  return false
+})
+
 async function handleAcknowledge() {
   if (!selectedAlert.value) return
   try {
     await store.ackAlert(selectedAlert.value.alert_id)
     message.success('已确认')
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '确认失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '确认失败'))
   }
 }
 
@@ -81,8 +139,8 @@ async function handleFalsePositive() {
   try {
     await store.fpAlert(selectedAlert.value.alert_id)
     message.success('已标记误报')
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '标记失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '标记失败'))
   }
 }
 
@@ -100,8 +158,8 @@ function handleDelete() {
         await store.delAlert(id)
         message.success('已删除')
         // Store clears selectedAlert on successful delete → panel collapses.
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '删除失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '删除失败'))
       }
     },
   })
@@ -140,6 +198,17 @@ function handleDelete() {
             查看录像
           </Button>
         </Tooltip>
+        <Tooltip v-if="hasMultiCam" title="在共享时间线上同步播放所有关联摄像头">
+          <Button
+            size="small"
+            type="text"
+            style="color: var(--argus-text-muted)"
+            @click="router.push(`/replay/${selectedAlert.alert_id}/storyboard`)"
+          >
+            <template #icon><AppstoreOutlined /></template>
+            多机位回放
+          </Button>
+        </Tooltip>
         <Tooltip title="导出证据包">
           <Button size="small" type="text" style="color: var(--argus-text-muted)">
             <template #icon><ExportOutlined /></template>
@@ -152,14 +221,34 @@ function handleDelete() {
     </div>
 
     <div class="detail-content">
+      <!-- View-mode switch: only shown when both a recording and a snapshot exist,
+           so the operator can flip between the video replay and the annotated
+           trigger frame (composite/heatmap/snapshot). -->
+      <div
+        v-if="selectedAlert.has_recording && selectedAlert.snapshot_path"
+        class="view-mode-bar"
+      >
+        <Segmented
+          v-model:value="viewMode"
+          :options="[
+            { label: '录像', value: 'recording' },
+            { label: '触发帧', value: 'snapshot' },
+          ]"
+          size="small"
+        />
+      </div>
+
       <ReplayPlayer
-        v-if="selectedAlert.has_recording"
+        v-if="selectedAlert.has_recording && viewMode === 'recording'"
         :key="selectedAlert.alert_id"
         :alert-id="selectedAlert.alert_id"
         class="detail-section-spacing"
       />
 
-      <div v-if="!selectedAlert.has_recording && selectedAlert.snapshot_path" class="detail-section-spacing">
+      <div
+        v-if="selectedAlert.snapshot_path && (!selectedAlert.has_recording || viewMode === 'snapshot')"
+        class="detail-section-spacing"
+      >
         <div class="image-mode-bar">
           <Segmented
             v-model:value="imageMode"
@@ -191,14 +280,16 @@ function handleDelete() {
         </div>
 
         <div v-if="imageMode === 'compare'" class="compare-section">
-          <ImageCompareSlider
-            :left-src="`/api/alerts/${selectedAlert.alert_id}/image/snapshot`"
-            :right-src="`/api/alerts/${selectedAlert.alert_id}/image/heatmap`"
-            left-label="原始帧"
-            right-label="热力图"
-            :width="640"
-            :height="480"
-          />
+          <div ref="compareContainerRef" class="compare-responsive-wrap">
+            <ImageCompareSlider
+              :left-src="`/api/alerts/${selectedAlert.alert_id}/image/snapshot`"
+              :right-src="`/api/alerts/${selectedAlert.alert_id}/image/heatmap`"
+              left-label="原始帧"
+              right-label="热力图"
+              :width="compareSize.width"
+              :height="compareSize.height"
+            />
+          </div>
           <Typography.Text type="secondary" style="font-size: 11px; margin-top: 4px; display: block">
             按住 Alt 悬停可放大区域
           </Typography.Text>
@@ -211,8 +302,8 @@ function handleDelete() {
           />
           <AnnotationOverlay
             v-if="annotationMode"
-            :width="640"
-            :height="480"
+            :width="compareSize.width"
+            :height="compareSize.height"
             :alert-id="selectedAlert.alert_id"
             :camera-id="selectedAlert.camera_id"
           />
@@ -440,11 +531,20 @@ function handleDelete() {
   margin-bottom: 20px;
 }
 
+.view-mode-bar {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+}
 .image-mode-bar {
   display: flex;
   align-items: center;
   gap: 12px;
   margin-bottom: 10px;
+}
+.compare-responsive-wrap {
+  width: 100%;
+  max-width: 100%;
 }
 .score-display-wrapper {
   margin-left: auto;

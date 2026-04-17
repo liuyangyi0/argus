@@ -99,14 +99,11 @@ class AnomalibDetector:
         Returns True if model loaded successfully, False if no model available.
         """
         if self._model_path is None or not self._model_path.exists():
-            # SSIM fallback uses frame difference — needs a much lower threshold
-            # than Anomalib models (frame diff 95th percentile is typically 0.0-0.3)
-            self._ssim_threshold = min(self.threshold, 0.15)
             logger.warning(
                 "anomaly.no_model",
                 path=str(self._model_path),
                 msg="No trained model found, using SSIM fallback",
-                ssim_threshold=self._ssim_threshold,
+                threshold=self.threshold,
             )
             self.status.mark_loaded(backend="ssim-fallback", image_size=self.image_size)
             self.status.set_extra(reason="no_model_found")

@@ -47,16 +47,31 @@ class StepResult:
 
 @dataclass
 class ValidationReport:
-    """Combined result of all three validation steps."""
+    """Combined result of all validation steps."""
 
     all_passed: bool = False
     steps: list[StepResult] = field(default_factory=list)
     duration_seconds: float = 0.0
 
-    # Convenience accessors
+    # Convenience accessors for the synthetic-data pipeline
     auroc: float | None = None
     recall: float | None = None
     replay: dict | None = None
+
+    # Phase 1: real-labeled P/R/F1/AUROC/PR-AUC. Populated only when
+    # data/validation/{camera_id}/confirmed and data/baselines/{camera_id}/
+    # false_positives each have ≥10 samples. None when skipped.
+    real_precision: float | None = None
+    real_recall: float | None = None
+    real_f1: float | None = None
+    real_auroc: float | None = None
+    real_pr_auc: float | None = None
+    real_confusion_matrix: dict | None = None
+    real_sample_count: int | None = None
+    # Phase 2: raw per-sample scores/labels — enables frontend threshold slider
+    # without re-running the model. None when real-labeled eval was skipped.
+    real_scores: list[float] | None = None
+    real_labels: list[int] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +79,13 @@ class ValidationReport:
             "auroc": self.auroc,
             "recall": self.recall,
             "replay": self.replay,
+            "real_precision": self.real_precision,
+            "real_recall": self.real_recall,
+            "real_f1": self.real_f1,
+            "real_auroc": self.real_auroc,
+            "real_pr_auc": self.real_pr_auc,
+            "real_confusion_matrix": self.real_confusion_matrix,
+            "real_sample_count": self.real_sample_count,
             "duration_seconds": round(self.duration_seconds, 1),
             "steps": [
                 {
@@ -183,6 +205,10 @@ class TrainingValidator:
         )
         steps.append(step3)
 
+        # Step 4: Phase 1 — real-labeled P/R/F1/AUROC/PR-AUC
+        step4 = self._validate_real_labeled(detector, camera_id, threshold)
+        steps.append(step4)
+
         duration = time.monotonic() - start
 
         # All must pass (skipped counts as pass), but at least one must
@@ -195,6 +221,9 @@ class TrainingValidator:
                 msg="All validation steps were skipped — marking as NOT passed",
             )
 
+        # Hoist step 4's real-labeled metrics onto the report for easy DB persistence
+        real = step4.detail if not step4.skipped else {}
+
         report = ValidationReport(
             all_passed=all_passed,
             steps=steps,
@@ -202,6 +231,15 @@ class TrainingValidator:
             auroc=step1.metric_value if not step1.skipped else None,
             recall=step2.metric_value if not step2.skipped else None,
             replay=step3.detail if not step3.skipped else None,
+            real_precision=real.get("precision"),
+            real_recall=real.get("recall"),
+            real_f1=real.get("f1"),
+            real_auroc=real.get("auroc"),
+            real_pr_auc=real.get("pr_auc"),
+            real_confusion_matrix=real.get("confusion_matrix"),
+            real_sample_count=real.get("sample_count"),
+            real_scores=real.get("scores"),
+            real_labels=real.get("labels"),
         )
 
         logger.info(
@@ -209,6 +247,8 @@ class TrainingValidator:
             all_passed=all_passed,
             auroc=step1.metric_value,
             recall=step2.metric_value,
+            real_f1=report.real_f1,
+            real_auroc=report.real_auroc,
             duration=f"{duration:.1f}s",
         )
 
@@ -526,3 +566,80 @@ class TrainingValidator:
                 skipped=True,
                 skip_reason=f"Historical replay failed: {e}",
             )
+
+    def _validate_real_labeled(
+        self,
+        detector,
+        camera_id: str,
+        threshold: float,
+        min_f1: float = 0.0,
+    ) -> StepResult:
+        """Step 4 (Phase 1): P/R/F1/AUROC/PR-AUC on real human-labeled data.
+
+        Loads positives from data/validation/{camera_id}/confirmed/ and negatives
+        from data/baselines/{camera_id}/false_positives/. Skipped when either
+        directory is missing or has fewer than 10 samples. min_f1=0.0 means this
+        step never fails training (advisory only) — tighten later once a baseline
+        F1 is established.
+        """
+        try:
+            from argus.validation.recall_test import evaluate_real_labeled
+
+            metrics = evaluate_real_labeled(
+                detector,
+                camera_id=camera_id,
+                threshold=threshold,
+            )
+        except Exception as e:
+            logger.error("validation.real_labeled_failed", error=str(e))
+            return StepResult(
+                name="real_labeled_metrics",
+                passed=True,
+                skipped=True,
+                skip_reason=f"Real-labeled evaluation failed: {e}",
+            )
+
+        if metrics is None:
+            return StepResult(
+                name="real_labeled_metrics",
+                passed=True,
+                skipped=True,
+                skip_reason="No real-labeled data (need ≥10 positives and ≥10 negatives)",
+            )
+
+        detail = {
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1"],
+            "auroc": metrics["auroc"],
+            "pr_auc": metrics["pr_auc"],
+            "confusion_matrix": metrics["confusion_matrix"],
+            "sample_count": metrics["n_positive"] + metrics["n_negative"],
+            "n_positive": metrics["n_positive"],
+            "n_negative": metrics["n_negative"],
+            "threshold": metrics["threshold"],
+            "scores": metrics["scores"],
+            "labels": metrics["labels"],
+        }
+
+        passed = metrics["f1"] >= min_f1
+        logger.info(
+            "validation.real_labeled",
+            camera_id=camera_id,
+            precision=round(metrics["precision"], 4),
+            recall=round(metrics["recall"], 4),
+            f1=round(metrics["f1"], 4),
+            auroc=round(metrics["auroc"], 4),
+            pr_auc=round(metrics["pr_auc"], 4),
+            n_pos=metrics["n_positive"],
+            n_neg=metrics["n_negative"],
+        )
+
+        return StepResult(
+            name="real_labeled_metrics",
+            passed=passed,
+            metric_name="F1",
+            metric_value=metrics["f1"],
+            threshold=min_f1,
+            detail=detail,
+        )

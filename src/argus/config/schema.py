@@ -44,6 +44,11 @@ class ZoneConfig(BaseModel):
     zone_type: Literal["include", "exclude"] = "include"
     priority: ZonePriority = ZonePriority.STANDARD
     anomaly_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    require_corroboration: bool = Field(
+        default=False,
+        description="F4: Drop uncorroborated alerts entirely for this zone instead of "
+        "severity downgrade. Strict mode for zones that must have cross-camera confirmation.",
+    )
 
 
 class MOG2Config(BaseModel):
@@ -524,6 +529,32 @@ class GigEConfig(BaseModel):
     )
 
 
+class AlignmentConfig(BaseModel):
+    """Sub-pixel phase-correlation alignment for camera micro-vibration.
+
+    Runs before anomaly detection to cancel 1-2px frame-to-frame shifts
+    caused by pumps, fans, and turbines — the #1 source of false positives
+    in fixed-camera nuclear plant deployments.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable phase-correlation alignment preprocessing stage",
+    )
+    max_shift_px: float = Field(
+        default=5.0, ge=0.5, le=50.0,
+        description="Shifts above this (on either axis) are treated as real motion and skipped",
+    )
+    downsample: int = Field(
+        default=4, ge=1, le=16,
+        description="Run phase correlation at 1/N resolution to keep latency low",
+    )
+    ref_update_interval_s: float = Field(
+        default=60.0, ge=1.0, le=3600.0,
+        description="Seconds between reference frame refreshes to track slow scene drift",
+    )
+
+
 class CameraConfig(BaseModel):
     """Configuration for a single camera."""
 
@@ -550,6 +581,10 @@ class CameraConfig(BaseModel):
         description="Seconds without frames before forced reconnect (5-300)",
     )
     mog2: MOG2Config = Field(default_factory=MOG2Config)
+    alignment: AlignmentConfig = Field(
+        default_factory=AlignmentConfig,
+        description="Phase-correlation alignment for camera micro-vibration",
+    )
     person_filter: PersonFilterConfig = Field(default_factory=PersonFilterConfig)
     anomaly: AnomalyConfig = Field(default_factory=AnomalyConfig)
     simplex: SimplexConfig = Field(default_factory=SimplexConfig)
@@ -642,6 +677,31 @@ class TemporalConfirmation(BaseModel):
         default=3.0, ge=0.5, le=20.0,
         description="Accumulated evidence threshold to trigger alert (0.5-20.0)",
     )
+    # F3: Strict spatial continuity — reject anomalies that drift across frames
+    # (e.g. peeling paint, loose insulation whose bright pixels shift each frame).
+    spatial_continuity_enabled: bool = Field(
+        default=True,
+        description="Gate CUSUM accumulation on IoU between consecutive anomaly masks",
+    )
+    spatial_continuity_iou_threshold: float = Field(
+        default=0.7, ge=0.0, le=1.0,
+        description="Minimum IoU between consecutive anomaly masks for evidence to continue",
+    )
+    spatial_continuity_mode: Literal["decay", "reset"] = Field(
+        default="reset",
+        description="Behavior on IoU below threshold: 'reset' zeroes evidence (stricter), "
+        "'decay' halves evidence (legacy behavior)",
+    )
+    # F5: Stationary-object suppression — once a track sits still long enough,
+    # stop re-triggering alerts for it every frame (e.g. settled FOE at pool bottom).
+    stationary_suppress_enabled: bool = Field(
+        default=True,
+        description="Suppress alerts for tracks that have been stationary for a long time",
+    )
+    stationary_suppress_after_s: float = Field(
+        default=10.0, ge=1.0, le=600.0,
+        description="Seconds a track must remain stationary before it is marked suppressed",
+    )
 
 
 class SuppressionConfig(BaseModel):
@@ -649,6 +709,35 @@ class SuppressionConfig(BaseModel):
 
     same_zone_window_seconds: float = Field(default=300.0, ge=10.0, le=3600.0)
     same_camera_window_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
+
+
+class EarlyWarningConfig(BaseModel):
+    """F1: Single-frame fast-path bypass of CUSUM evidence accumulation.
+
+    When a single frame has an extremely high anomaly score AND corroborating
+    evidence from YOLO detection or open-vocabulary classifier, emit the alert
+    immediately rather than waiting for CUSUM evidence to accumulate. Suppression
+    windows still apply to prevent storms.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable single-frame early-warning fast path",
+    )
+    score_threshold: float = Field(
+        default=0.95, ge=0.5, le=0.99,
+        description="Adjusted anomaly score (post zone multiplier) required to fire the fast path",
+    )
+    require_detection_or_classifier: bool = Field(
+        default=True,
+        description="Require corroborating YOLO detection or classifier label before firing. "
+        "Set False to allow pure-anomaly-only early warning (more false positives).",
+    )
+    classifier_min_confidence: float = Field(
+        default=0.9, ge=0.1, le=0.99,
+        description="If the classifier fired, its confidence must be >= this value to qualify "
+        "as early-warning corroboration.",
+    )
 
 
 class WebhookConfig(BaseModel):
@@ -677,6 +766,7 @@ class AlertConfig(BaseModel):
     severity_thresholds: SeverityThresholds = Field(default_factory=SeverityThresholds)
     temporal: TemporalConfirmation = Field(default_factory=TemporalConfirmation)
     suppression: SuppressionConfig = Field(default_factory=SuppressionConfig)
+    early_warning: EarlyWarningConfig = Field(default_factory=EarlyWarningConfig)
     calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     zone_multipliers: dict[str, float] = Field(
         default_factory=lambda: {"critical": 1.2, "standard": 1.0, "low_priority": 0.8}
@@ -1146,6 +1236,27 @@ class ContinuousRecordingConfig(BaseModel):
         return self
 
 
+class SensorFusionConfig(BaseModel):
+    """External sensor fusion hook — generic multi-modal signal input.
+
+    Third-party sensors (temperature, vibration, radiation, lidar, etc.)
+    can push short-lived multipliers keyed on ``(camera_id, zone_id)`` that
+    bias the alert grader's severity calculation. The config here only
+    governs activation and default TTL — the transport is HTTP
+    ``/api/sensors/signal``.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Consult external sensor fusion multipliers during grading",
+    )
+    default_valid_for_s: float = Field(
+        default=60.0, ge=0.0, le=3600.0,
+        description="Default time-to-live (seconds) for a pushed signal when "
+        "the client does not specify one",
+    )
+
+
 class ArgusConfig(BaseModel):
     """Top-level configuration for the Argus system."""
 
@@ -1168,6 +1279,10 @@ class ArgusConfig(BaseModel):
     physics: PhysicsConfig = Field(default_factory=PhysicsConfig)
     continuous_recording: ContinuousRecordingConfig = Field(
         default_factory=ContinuousRecordingConfig,
+    )
+    sensor_fusion: SensorFusionConfig = Field(
+        default_factory=SensorFusionConfig,
+        description="External sensor fusion hook (generic multi-modal signal input)",
     )
     camera_groups: list[CameraGroupConfig] = Field(
         default_factory=list,

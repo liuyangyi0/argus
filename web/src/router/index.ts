@@ -61,6 +61,12 @@ const router = createRouter({
           component: () => import('../views/ReplayView.vue'),
           meta: { title: '录像回放' },
         },
+        {
+          path: 'replay/:alertId/storyboard',
+          name: 'replay-storyboard',
+          component: () => import('../views/StoryboardReplay.vue'),
+          meta: { title: '多机位回放' },
+        },
       ]
     }
   ],
