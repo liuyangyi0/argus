@@ -1,10 +1,14 @@
 import { api, u } from './client'
+import type { TrainingMetricsResponse } from '../types/api'
 
 // ── Training ──
 export const getTrainingHistory = (params?: Record<string, any>) =>
   api.get('/baseline/training-history/json', { params }).then(u)
 export const compareModels = (data: { old_record_id: number; new_record_id: number }) =>
   api.post('/baseline/compare', data, { timeout: 120000 }).then(u)
+// Phase 2: real-labeled metrics for a single training record
+export const getTrainingMetrics = (recordId: number): Promise<TrainingMetricsResponse> =>
+  api.get(`/baseline/training-history/${recordId}/metrics`).then(u)
 
 // ── Training Jobs ──
 export const getTrainingJobs = (params?: Record<string, any>) =>

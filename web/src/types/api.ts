@@ -246,6 +246,14 @@ export interface TrainingRecord {
   val_score_p95: number | null
   quality_grade: string | null
   threshold_recommended: number | null
+  // Phase 1: real-labeled P/R/F1/AUROC/PR-AUC
+  val_precision: number | null
+  val_recall: number | null
+  val_f1: number | null
+  val_auroc: number | null
+  val_pr_auc: number | null
+  val_confusion_matrix: string | null  // JSON-encoded {tp,fp,fn,tn}
+  val_real_sample_count: number | null
   model_path: string | null
   export_path: string | null
   checkpoint_valid: boolean | null
@@ -257,6 +265,42 @@ export interface TrainingRecord {
   duration_seconds: number
   trained_at: string | null
   created_at: string | null
+}
+
+// Phase 2: per-record metrics payload for MetricsChart
+export interface TrainingMetricsResponse {
+  record_id: number
+  has_labeled_eval: boolean
+  message?: string
+  scores?: number[]
+  labels?: number[]
+  threshold_used?: number
+  optimal_f1_threshold?: number
+  sample_count?: number
+  metrics_at_threshold?: {
+    precision: number
+    recall: number
+    f1: number
+    auroc: number
+    pr_auc: number
+    confusion_matrix: { tp: number; fp: number; fn: number; tn: number }
+    threshold: number
+    n_positive: number
+    n_negative: number
+  }
+  pr_curve?: {
+    precisions: number[]
+    recalls: number[]
+    thresholds: number[]
+  }
+  stored_confusion_matrix?: { tp: number; fp: number; fn: number; tn: number } | null
+  stored_metrics?: {
+    precision: number | null
+    recall: number | null
+    f1: number | null
+    auroc: number | null
+    pr_auc: number | null
+  }
 }
 
 export interface TrainingJobInfo {

@@ -2,16 +2,18 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import {
   Card, Table, Button, Space, Select, Tag, Image, Statistic, Row, Col,
-  message, Modal, Empty, Badge, Progress, Tooltip,
+  message, Modal, Empty, Badge, Progress, Tooltip, Alert, Typography,
 } from 'ant-design-vue'
 import {
   CheckOutlined, CloseOutlined, ForwardOutlined, ReloadOutlined,
-  ExperimentOutlined,
+  ExperimentOutlined, LineChartOutlined,
 } from '@ant-design/icons-vue'
 import {
   getLabelingQueue, labelEntry, skipEntry, getLabelingStats,
   triggerRetrain, getLabelingImage,
 } from '../../api/labeling'
+import { getTrainingHistory } from '../../api/training'
+import type { TrainingRecord } from '../../types/api'
 
 const props = defineProps<{ cameras: Array<{ camera_id: string; name?: string }> }>()
 
@@ -25,6 +27,27 @@ const retrainLoading = ref(false)
 // Current entry being viewed
 const previewEntry = ref<any>(null)
 const previewVisible = ref(false)
+
+// Phase 2: latest training record F1 for the selected camera (baseline to beat)
+const latestRecord = ref<TrainingRecord | null>(null)
+const latestLoading = ref(false)
+
+async function loadLatestRecord() {
+  latestLoading.value = true
+  try {
+    const res = await getTrainingHistory(
+      selectedCamera.value ? { camera_id: selectedCamera.value } : {},
+    )
+    const records: TrainingRecord[] = (res.records || []).filter(
+      (r: TrainingRecord) => r.status === 'complete',
+    )
+    latestRecord.value = records[0] || null
+  } catch {
+    latestRecord.value = null
+  } finally {
+    latestLoading.value = false
+  }
+}
 
 const columns = [
   {
@@ -148,11 +171,13 @@ const retrainTooltip = computed(() => {
 watch(selectedCamera, () => {
   loadQueue()
   loadStats()
+  loadLatestRecord()
 })
 
 onMounted(() => {
   loadQueue()
   loadStats()
+  loadLatestRecord()
 })
 </script>
 
@@ -195,6 +220,35 @@ onMounted(() => {
         </Card>
       </Col>
     </Row>
+
+    <!-- Phase 2: current model F1 banner — "标注的影响参考" -->
+    <Alert
+      v-if="latestRecord"
+      type="info"
+      show-icon
+      style="margin-bottom: 16px"
+    >
+      <template #icon><LineChartOutlined /></template>
+      <template #message>
+        <Space>
+          <span>
+            当前模型
+            <Typography.Text code>#{{ latestRecord.id }}</Typography.Text>
+            (摄像头 {{ latestRecord.camera_id }})
+          </span>
+          <span v-if="latestRecord.val_f1 != null">
+            F1 =
+            <Tag color="purple" style="font-weight: 600">{{ latestRecord.val_f1.toFixed(4) }}</Tag>
+            (样本 {{ latestRecord.val_real_sample_count ?? '?' }})
+          </span>
+          <span v-else style="color: #999">暂无真实标注 F1（需要 ≥10 正 + ≥10 负）</span>
+        </Space>
+      </template>
+      <template #description>
+        已确认的标注会进入 <Typography.Text code>data/validation/{'{camera_id}'}/confirmed/</Typography.Text>，
+        下次训练评估时自动计入 — 本面板的 F1 在下一次训练后更新。
+      </template>
+    </Alert>
 
     <!-- Toolbar -->
     <Space style="margin-bottom: 16px">

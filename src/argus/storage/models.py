@@ -302,6 +302,11 @@ class TrainingRecord(Base):
     val_pr_auc: Mapped[float | None] = mapped_column(Float, nullable=True)
     val_confusion_matrix: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON {tp,fp,fn,tn}
     val_real_sample_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Phase 2: raw per-sample scores/labels so the frontend can re-compute
+    # P/R at arbitrary thresholds (slider) without re-running the model.
+    # JSON arrays of the same length; None when real-labeled eval was skipped.
+    val_scores_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    val_labels_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Output validation (TRN-006)
     model_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -347,6 +352,8 @@ class TrainingRecord(Base):
             "val_pr_auc": self.val_pr_auc,
             "val_confusion_matrix": self.val_confusion_matrix,
             "val_real_sample_count": self.val_real_sample_count,
+            # val_scores_json / val_labels_json are intentionally NOT included here —
+            # they can be large and are fetched on demand via the metrics endpoint.
             "model_path": self.model_path,
             "export_path": self.export_path,
             "checkpoint_valid": self.checkpoint_valid,
