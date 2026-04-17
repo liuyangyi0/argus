@@ -672,6 +672,31 @@ class TemporalConfirmation(BaseModel):
         default=3.0, ge=0.5, le=20.0,
         description="Accumulated evidence threshold to trigger alert (0.5-20.0)",
     )
+    # F3: Strict spatial continuity — reject anomalies that drift across frames
+    # (e.g. peeling paint, loose insulation whose bright pixels shift each frame).
+    spatial_continuity_enabled: bool = Field(
+        default=True,
+        description="Gate CUSUM accumulation on IoU between consecutive anomaly masks",
+    )
+    spatial_continuity_iou_threshold: float = Field(
+        default=0.7, ge=0.0, le=1.0,
+        description="Minimum IoU between consecutive anomaly masks for evidence to continue",
+    )
+    spatial_continuity_mode: Literal["decay", "reset"] = Field(
+        default="reset",
+        description="Behavior on IoU below threshold: 'reset' zeroes evidence (stricter), "
+        "'decay' halves evidence (legacy behavior)",
+    )
+    # F5: Stationary-object suppression — once a track sits still long enough,
+    # stop re-triggering alerts for it every frame (e.g. settled FOE at pool bottom).
+    stationary_suppress_enabled: bool = Field(
+        default=True,
+        description="Suppress alerts for tracks that have been stationary for a long time",
+    )
+    stationary_suppress_after_s: float = Field(
+        default=10.0, ge=1.0, le=600.0,
+        description="Seconds a track must remain stationary before it is marked suppressed",
+    )
 
 
 class SuppressionConfig(BaseModel):

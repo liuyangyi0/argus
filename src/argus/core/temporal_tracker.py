@@ -35,6 +35,10 @@ class TrackedAnomaly:
     trajectory_history: list[tuple[float, float, float]] = field(default_factory=list)
     # Each entry: (timestamp_seconds, centroid_x, centroid_y)
     area_px: int = 0  # Detected region area in pixels
+    # F5: suppression state — True once the track has been stationary long enough
+    # that the pipeline should stop emitting fresh alerts for it. Cleared when
+    # the track starts moving again.
+    suppressed: bool = False
 
 
 @dataclass
@@ -69,6 +73,12 @@ class _TrackState:
     trajectory_history: list[tuple[float, float, float]] = field(default_factory=list)
     area_px: int = 0
     max_history_length: int = 300
+    # F5: stationary suppression state. ``stationary_since`` is the wall-clock
+    # timestamp at which the track first became stationary (None while it is
+    # moving). ``suppressed`` flips to True once the track has been stationary
+    # for at least ``stationary_suppress_after_s`` seconds.
+    stationary_since: float | None = None
+    suppressed: bool = False
 
 
 class TemporalAnomalyTracker:
@@ -85,12 +95,18 @@ class TemporalAnomalyTracker:
         stationary_threshold: float = 10.0,
         fps: float = 5.0,
         trajectory_history_length: int = 300,
+        stationary_suppress_enabled: bool = True,
+        stationary_suppress_after_s: float = 10.0,
     ):
         self._match_distance = match_distance
         self._max_gap_frames = max_gap_frames
         self._stationary_threshold = stationary_threshold
         self._fps = fps
         self._trajectory_history_length = trajectory_history_length
+        # F5 config: how long a stationary track must sit still before we mark
+        # it suppressed so the grader stops re-firing alerts for it every frame.
+        self._stationary_suppress_enabled = stationary_suppress_enabled
+        self._stationary_suppress_after_s = stationary_suppress_after_s
         self._tracks: dict[int, _TrackState] = {}
         self._next_id = 1
 
@@ -112,6 +128,10 @@ class TemporalAnomalyTracker:
             track.matched_this_frame = False
 
         new_tracks_count = 0
+        # Single wall-clock sample per frame — used both for trajectory history
+        # and the F5 stationary-suppression state machine. Sampling once keeps
+        # the empty-regions code path (below) well-defined.
+        now = time.time()
 
         for region in regions:
             cx = region.centroid_x
@@ -132,7 +152,6 @@ class TemporalAnomalyTracker:
                     best_dist = dist
                     best_track_id = tid
 
-            now = time.time()
             region_area = getattr(region, "area_px", 0)
 
             if best_track_id is not None:
@@ -200,6 +219,28 @@ class TemporalAnomalyTracker:
             speed = math.sqrt(dx * dx + dy * dy)
             is_stationary = speed < self._stationary_threshold
 
+            # F5: stationary-object suppression state machine.
+            # - entering stationary: remember when it happened (stationary_since)
+            # - sustained stationary beyond the configured window: mark suppressed
+            # - resumes motion: clear both fields so the track re-arms normally
+            if self._stationary_suppress_enabled:
+                if is_stationary:
+                    if track.stationary_since is None:
+                        track.stationary_since = now
+                    elif (
+                        not track.suppressed
+                        and (now - track.stationary_since)
+                        >= self._stationary_suppress_after_s
+                    ):
+                        track.suppressed = True
+                else:
+                    track.stationary_since = None
+                    track.suppressed = False
+            else:
+                # Feature disabled — make sure we don't leak stale state.
+                track.stationary_since = None
+                track.suppressed = False
+
             duration_frames = track.last_seen_frame - track.first_seen_frame + 1
             persistence_seconds = duration_frames / self._fps if self._fps > 0 else 0.0
 
@@ -219,6 +260,7 @@ class TemporalAnomalyTracker:
                 persistence_seconds=persistence_seconds,
                 trajectory_history=list(track.trajectory_history),
                 area_px=track.area_px,
+                suppressed=track.suppressed,
             )
             active.append(tracked)
 

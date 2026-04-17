@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 
@@ -204,3 +205,89 @@ class TestTemporalAnomalyTracker:
 
         # Frames 1 to 11 = 11 frames span => 11/10 = 1.1 seconds
         assert result.active_tracks[0].persistence_seconds == pytest.approx(1.1)
+
+
+class TestStationarySuppressionF5:
+    """F5: long-settled tracks should flip to ``suppressed=True``."""
+
+    def test_stationary_track_marked_suppressed_after_interval(self):
+        """A track stationary for >= stationary_suppress_after_s flips to suppressed."""
+        tracker = TemporalAnomalyTracker(
+            stationary_threshold=10.0,
+            stationary_suppress_after_s=10.0,
+            stationary_suppress_enabled=True,
+        )
+        base = 1_000_000.0
+        with patch("argus.core.temporal_tracker.time.time") as mock_time:
+            # 15 updates spanning 14 seconds — plenty past the 10s window.
+            mock_time.side_effect = [base + i * 1.0 for i in range(15)]
+            for i in range(15):
+                result = tracker.update(
+                    [FakeRegion(100.0, 200.0, 0.8)], frame_number=i + 1,
+                )
+        assert result.active_tracks[0].suppressed is True
+        # Sanity: the track is stationary throughout.
+        assert result.active_tracks[0].is_stationary is True
+
+    def test_moving_track_not_suppressed(self):
+        """Fast-moving tracks never flip to suppressed regardless of duration."""
+        tracker = TemporalAnomalyTracker(
+            stationary_threshold=5.0,
+            match_distance=200.0,
+            stationary_suppress_after_s=1.0,
+            stationary_suppress_enabled=True,
+        )
+        base = 2_000_000.0
+        with patch("argus.core.temporal_tracker.time.time") as mock_time:
+            mock_time.side_effect = [base + i * 1.0 for i in range(15)]
+            for i in range(15):
+                result = tracker.update(
+                    [FakeRegion(100.0 + i * 40.0, 200.0, 0.8)], frame_number=i + 1,
+                )
+        assert result.active_tracks[0].is_stationary is False
+        assert result.active_tracks[0].suppressed is False
+
+    def test_suppression_clears_when_motion_resumes(self):
+        """A track that starts moving again after suppression clears back to non-suppressed."""
+        tracker = TemporalAnomalyTracker(
+            stationary_threshold=10.0,
+            match_distance=200.0,
+            stationary_suppress_after_s=5.0,
+            stationary_suppress_enabled=True,
+        )
+        base = 3_000_000.0
+        phase1 = [base + i * 1.0 for i in range(10)]          # 10s stationary
+        phase2 = [base + 10.0 + i * 1.0 for i in range(5)]    # moving phase
+        with patch("argus.core.temporal_tracker.time.time") as mock_time:
+            mock_time.side_effect = phase1 + phase2
+            # Phase 1 — stationary for 10s, suppression kicks in at 5s.
+            for i in range(10):
+                result = tracker.update(
+                    [FakeRegion(100.0, 200.0, 0.8)], frame_number=i + 1,
+                )
+            assert result.active_tracks[0].suppressed is True
+
+            # Phase 2 — track moves significantly each frame; suppression clears.
+            for i in range(5):
+                result = tracker.update(
+                    [FakeRegion(100.0 + (i + 1) * 50.0, 200.0, 0.8)],
+                    frame_number=10 + i + 1,
+                )
+        assert result.active_tracks[0].is_stationary is False
+        assert result.active_tracks[0].suppressed is False
+
+    def test_suppression_disabled_never_marks_suppressed(self):
+        """With stationary_suppress_enabled=False, suppressed stays False."""
+        tracker = TemporalAnomalyTracker(
+            stationary_threshold=10.0,
+            stationary_suppress_after_s=1.0,
+            stationary_suppress_enabled=False,
+        )
+        base = 4_000_000.0
+        with patch("argus.core.temporal_tracker.time.time") as mock_time:
+            mock_time.side_effect = [base + i * 1.0 for i in range(15)]
+            for i in range(15):
+                result = tracker.update(
+                    [FakeRegion(100.0, 200.0, 0.8)], frame_number=i + 1,
+                )
+        assert result.active_tracks[0].suppressed is False

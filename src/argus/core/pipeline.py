@@ -643,6 +643,12 @@ class DetectionPipeline:
             trajectory_history_length=(
                 self._physics_config.trajectory_history_length if self._physics_config else 300
             ),
+            stationary_suppress_enabled=getattr(
+                alert_config.temporal, "stationary_suppress_enabled", True,
+            ),
+            stationary_suppress_after_s=float(
+                getattr(alert_config.temporal, "stationary_suppress_after_s", 10.0),
+            ),
         )
 
         # P2: Trajectory analyzer (optional, phase 2)
@@ -1593,6 +1599,64 @@ class DetectionPipeline:
                 )
                 return None
 
+        # F5: Stationary-object suppression. Run the temporal tracker up-front
+        # (instead of only after a successful alert, as the physics enrichment
+        # path does below) so we can decide whether every active track has
+        # settled into a suppressed state. When every track in the frame is
+        # suppressed — and therefore the only reason anomaly scoring would
+        # re-fire is a long-settled object — we skip grader evaluation so the
+        # operator is not re-alerted. A brand-new track (i.e. a freshly
+        # entered object) cannot be suppressed in the same frame it is born,
+        # so this still lets fresh anomalies through. The result is cached so
+        # the physics-enrichment block does not re-run update() and create
+        # duplicate tracks.
+        pre_temporal = None
+        if (
+            anomaly_result.is_anomalous
+            and getattr(self, "_physics_tracker", None) is not None
+            and getattr(self, "_physics_postproc", None) is not None
+        ):
+            try:
+                pre_regions = (
+                    self._physics_postproc.extract_regions(
+                        anomaly_result.anomaly_map, threshold=0.3,
+                    )
+                    if anomaly_result.anomaly_map is not None
+                    else []
+                )
+                pre_temporal = self._physics_tracker.update(
+                    pre_regions, self._frame_counter,
+                )
+            except Exception as e:
+                logger.debug(
+                    "pipeline.temporal_tracker_failed",
+                    camera_id=frame_data.camera_id,
+                    error=str(e),
+                )
+                pre_temporal = None
+
+            if (
+                pre_temporal is not None
+                and pre_temporal.active_tracks
+                and all(t.suppressed for t in pre_temporal.active_tracks)
+            ):
+                logger.debug(
+                    "pipeline.alert_suppressed_stationary",
+                    camera_id=frame_data.camera_id,
+                    frame_number=frame_data.frame_number,
+                    track_ids=[t.track_id for t in pre_temporal.active_tracks],
+                )
+                self._update_latency(start)
+                diag.total_duration_ms = (time.monotonic() - start) * 1000
+                self._diagnostics.append(diag)
+                self._diagnostics.append_score(FrameScoreRecord(
+                    frame_number=frame_data.frame_number,
+                    timestamp=time.time(),
+                    anomaly_score=anomaly_result.anomaly_score,
+                    was_alert=False,
+                ))
+                return None
+
         # Multi-zone alert grading with semantic context
         alert = self._evaluate_zones(
             frame_data, anomaly_result, frame,
@@ -1715,11 +1779,17 @@ class DetectionPipeline:
         active_tracks_payload: list[dict] = []
         if alert is not None and anomaly_result.is_anomalous:
             try:
-                regions = self._physics_postproc.extract_regions(
-                    anomaly_result.anomaly_map,
-                    threshold=0.3,
-                ) if anomaly_result.anomaly_map is not None else []
-                temporal = self._physics_tracker.update(regions, self._frame_counter)
+                # Reuse the temporal result computed up-front for F5
+                # suppression; fall back to a fresh update only if the
+                # pre-pass bailed out (e.g. exception path above).
+                if pre_temporal is not None:
+                    temporal = pre_temporal
+                else:
+                    regions = self._physics_postproc.extract_regions(
+                        anomaly_result.anomaly_map,
+                        threshold=0.3,
+                    ) if anomaly_result.anomaly_map is not None else []
+                    temporal = self._physics_tracker.update(regions, self._frame_counter)
 
                 # Serialize active tracks for the ring buffer (drives replay trajectory)
                 active_tracks_payload = [

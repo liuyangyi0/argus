@@ -82,6 +82,7 @@ class MetricsRegistry:
         self.ws_connections: Gauge | _NoOpMetric = _NOOP
         self.db_queue_size: Gauge | _NoOpMetric = _NOOP
         self.webhook_circuit_state: Gauge | _NoOpMetric = _NOOP
+        self.spatial_continuity_resets: Counter | _NoOpMetric = _NOOP
         self.app_info: Info | _NoOpMetric = _NOOP
 
     def _init(self) -> None:
@@ -202,6 +203,15 @@ class MetricsRegistry:
         self.webhook_circuit_state = Gauge(
             f"{ns}_webhook_circuit_breaker_state",
             "Webhook circuit breaker state (0=closed, 1=open, 2=half-open)",
+            registry=reg,
+        )
+
+        # F3: number of times CUSUM evidence was hard-reset because the
+        # anomaly mask drifted below the IoU threshold between frames.
+        self.spatial_continuity_resets = Counter(
+            f"{ns}_spatial_continuity_reset_total",
+            "Count of evidence resets triggered by low spatial IoU between consecutive anomaly masks",
+            ["camera_id"],
             registry=reg,
         )
 

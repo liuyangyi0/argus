@@ -573,6 +573,174 @@ class TestPipelineStats:
 # TestExceptionSafety
 # ---------------------------------------------------------------------------
 
+class TestStationarySuppressionIntegrationF5:
+    """F5: when every active track is suppressed, grader is not invoked."""
+
+    def _run_anomaly_frame(
+        self,
+        pipeline,
+        *,
+        anomaly_score: float,
+        is_anomalous: bool,
+        anomaly_map=None,
+        alert_to_return=None,
+    ):
+        pipeline._last_heartbeat_time = 0.0
+        pipeline._prefilter.process.return_value = PreFilterResult(
+            has_change=True, change_ratio=0.1,
+        )
+
+        detection = ObjectDetectionResult(has_persons=False)
+        anomaly_result = AnomalyResult(
+            anomaly_score=anomaly_score,
+            anomaly_map=anomaly_map,
+            is_anomalous=is_anomalous,
+            threshold=0.7,
+        )
+
+        pipeline._alert_grader.evaluate.return_value = alert_to_return
+
+        with (
+            patch.object(pipeline, "_inference_executor") as mock_exec,
+            patch("argus.core.pipeline.METRICS"),
+        ):
+            from concurrent.futures import Future
+            yolo_fut = Future()
+            yolo_fut.set_result(detection)
+            anomaly_fut = Future()
+            anomaly_fut.set_result(anomaly_result)
+            mock_exec.submit.side_effect = [yolo_fut, anomaly_fut]
+
+            return pipeline.process_frame(_make_frame_data())
+
+    @staticmethod
+    def _make_tracked(track_id: int, suppressed: bool):
+        from argus.core.temporal_tracker import TrackedAnomaly
+        return TrackedAnomaly(
+            track_id=track_id,
+            first_seen_frame=1,
+            last_seen_frame=1,
+            consecutive_frames=20,
+            centroid_x=100.0,
+            centroid_y=100.0,
+            max_score=0.9,
+            avg_score=0.85,
+            velocity=(0.0, 0.0),
+            is_stationary=True,
+            persistence_seconds=4.0,
+            area_px=500,
+            suppressed=suppressed,
+        )
+
+    def test_all_suppressed_frame_skips_alert(self):
+        """If every active track is suppressed, grader.evaluate must not be called."""
+        from argus.core.temporal_tracker import TemporalAnalysis
+
+        pipeline = _build_pipeline()
+
+        # Wire fake physics plumbing so the pre-pass runs.
+        pipeline._physics_postproc = MagicMock()
+        pipeline._physics_postproc.extract_regions.return_value = [MagicMock()]
+
+        suppressed_only = TemporalAnalysis(
+            active_tracks=[self._make_tracked(1, suppressed=True)],
+            new_tracks=0,
+            lost_tracks=0,
+            severity_boost=0.0,
+        )
+        pipeline._physics_tracker = MagicMock()
+        pipeline._physics_tracker.update.return_value = suppressed_only
+
+        result = self._run_anomaly_frame(
+            pipeline,
+            anomaly_score=0.95,
+            is_anomalous=True,
+            anomaly_map=np.zeros((32, 32), dtype=np.float32),
+        )
+
+        assert result is None
+        pipeline._alert_grader.evaluate.assert_not_called()
+
+    @staticmethod
+    def _real_alert(severity: "AlertSeverity", score: float) -> "Alert":
+        from argus.alerts.grader import Alert
+        return Alert(
+            alert_id="ALT-test",
+            camera_id="test_cam",
+            zone_id="default",
+            severity=severity,
+            anomaly_score=score,
+            timestamp=time.time(),
+            frame_number=1,
+        )
+
+    def test_new_track_in_suppressed_frame_still_fires(self):
+        """Mixed suppressed + non-suppressed tracks still go through the grader."""
+        from argus.alerts.grader import AlertSeverity
+        from argus.core.temporal_tracker import TemporalAnalysis
+
+        real_alert = self._real_alert(AlertSeverity.HIGH, 0.95)
+
+        pipeline = _build_pipeline()
+        pipeline._physics_postproc = MagicMock()
+        pipeline._physics_postproc.extract_regions.return_value = [MagicMock(), MagicMock()]
+
+        mixed = TemporalAnalysis(
+            active_tracks=[
+                self._make_tracked(1, suppressed=True),
+                self._make_tracked(2, suppressed=False),
+            ],
+            new_tracks=1,
+            lost_tracks=0,
+            severity_boost=0.0,
+        )
+        pipeline._physics_tracker = MagicMock()
+        pipeline._physics_tracker.update.return_value = mixed
+
+        result = self._run_anomaly_frame(
+            pipeline,
+            anomaly_score=0.95,
+            is_anomalous=True,
+            anomaly_map=np.zeros((32, 32), dtype=np.float32),
+            alert_to_return=real_alert,
+        )
+
+        # Grader ran because not all tracks were suppressed.
+        pipeline._alert_grader.evaluate.assert_called()
+        assert result is real_alert
+
+    def test_no_active_tracks_does_not_skip(self):
+        """An empty active_tracks list must not be mistaken for 'all suppressed'."""
+        from argus.alerts.grader import AlertSeverity
+        from argus.core.temporal_tracker import TemporalAnalysis
+
+        real_alert = self._real_alert(AlertSeverity.LOW, 0.72)
+
+        pipeline = _build_pipeline()
+        pipeline._physics_postproc = MagicMock()
+        pipeline._physics_postproc.extract_regions.return_value = []
+
+        empty = TemporalAnalysis(
+            active_tracks=[],
+            new_tracks=0,
+            lost_tracks=0,
+            severity_boost=0.0,
+        )
+        pipeline._physics_tracker = MagicMock()
+        pipeline._physics_tracker.update.return_value = empty
+
+        result = self._run_anomaly_frame(
+            pipeline,
+            anomaly_score=0.72,
+            is_anomalous=True,
+            anomaly_map=np.zeros((32, 32), dtype=np.float32),
+            alert_to_return=real_alert,
+        )
+
+        pipeline._alert_grader.evaluate.assert_called()
+        assert result is real_alert
+
+
 class TestExceptionSafety:
     """process_frame should catch exceptions and return None (CRIT-03)."""
 
