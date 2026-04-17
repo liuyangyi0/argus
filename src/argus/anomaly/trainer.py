@@ -460,7 +460,6 @@ class ModelTrainer:
                         quantization=quantization,
                         val_dir=val_dir,
                         calibration_images=calibration_images,
-                        image_size=image_size,
                     )
                     actual_export_format = export_result["actual_format"]
                     actual_quantization = export_result["actual_quantization"]
@@ -1427,7 +1426,6 @@ class ModelTrainer:
         quantization: str = "fp16",
         val_dir: Path | None = None,
         calibration_images: int = 100,
-        image_size: int = 256,
     ) -> dict[str, str]:
         """Export trained model to an optimized inference format.
 
