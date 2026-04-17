@@ -45,13 +45,19 @@ def _register_training_job_processing(
     *,
     config,
     database: Database,
+    baseline_manager,
+    model_trainer,
     camera_manager: CameraManager | None = None,
 ) -> None:
-    """Attach queued training job execution to the scheduler."""
-    from argus.anomaly.baseline import BaselineManager
+    """Attach queued training job execution to the scheduler.
+
+    ``baseline_manager`` and ``model_trainer`` are constructed once in
+    ``main()`` and shared with the scheduled retraining task so both
+    paths point at the same on-disk state (and any future in-memory
+    caches).
+    """
     from argus.anomaly.backbone_trainer import BackboneTrainer
     from argus.anomaly.job_executor import TrainingJobExecutor
-    from argus.anomaly.trainer import ModelTrainer
     from argus.storage.model_registry import ModelRegistry
 
     # Hot-reload callback: when training completes, load the new model
@@ -64,17 +70,14 @@ def _register_training_job_processing(
             pipeline.reload_anomaly_model(model_path)
             logger.info("training.model_hot_reloaded", camera_id=camera_id, model_path=str(model_path))
 
-    baseline_manager = BaselineManager(baselines_dir=config.storage.baselines_dir)
-    trainer = ModelTrainer(
-        baseline_manager=baseline_manager,
-        models_dir=config.storage.models_dir,
-        exports_dir=config.storage.exports_dir,
-    )
+    # Silence unused-import warnings — caller owns these lifecycles now.
+    _ = baseline_manager
+
     backbone_trainer = BackboneTrainer(output_dir=config.storage.backbones_dir)
     model_registry = ModelRegistry(session_factory=database.get_session)
     job_executor = TrainingJobExecutor(
         database=database,
-        trainer=trainer,
+        trainer=model_trainer,
         backbone_trainer=backbone_trainer,
         model_registry=model_registry,
         baselines_dir=config.storage.baselines_dir,
@@ -246,6 +249,20 @@ def main():
     inference_buffer = InferenceBuffer(database=db, flush_seconds=60, max_size=1000)
     inference_buffer.start()
 
+    # Training/baseline singletons — shared by TrainingJobExecutor (queued
+    # jobs triggered via the dashboard) and create_retraining_task
+    # (scheduled retraining loop).  Keeping a single instance avoids
+    # silent state drift should either class grow an in-memory index.
+    from argus.anomaly.baseline import BaselineManager
+    from argus.anomaly.trainer import ModelTrainer
+
+    baseline_manager = BaselineManager(baselines_dir=config.storage.baselines_dir)
+    model_trainer = ModelTrainer(
+        baseline_manager=baseline_manager,
+        models_dir=config.storage.models_dir,
+        exports_dir=config.storage.exports_dir,
+    )
+
     health = HealthMonitor()
 
     dispatcher = AlertDispatcher(
@@ -355,6 +372,7 @@ def main():
         alert_recording_store=alert_recording_store,
         event_bus=event_bus,
         sensor_fusion=sensor_fusion,
+        inference_buffer=inference_buffer,
     )
 
     # Graceful shutdown
@@ -466,19 +484,19 @@ def main():
         health_monitor=health,
         alerts_dir=config.storage.alerts_dir,
     )
-    _register_training_job_processing(scheduler, config=config, database=db, camera_manager=manager)
+    _register_training_job_processing(
+        scheduler,
+        config=config,
+        database=db,
+        baseline_manager=baseline_manager,
+        model_trainer=model_trainer,
+        camera_manager=manager,
+    )
 
     # Scheduled retraining (C4 + A4: active learning loop)
     if config.retraining.enabled:
-        from argus.anomaly.trainer import ModelTrainer
         from argus.storage.model_registry import ModelRegistry
-        from argus.anomaly.baseline import BaselineManager
 
-        baseline_mgr = BaselineManager(baselines_dir=config.storage.baselines_dir)
-        model_trainer = ModelTrainer(
-            baseline_manager=baseline_mgr,
-            exports_dir=config.storage.exports_dir,
-        )
         model_reg = ModelRegistry(session_factory=db.get_session)
         create_retraining_task(
             scheduler=scheduler,
@@ -486,7 +504,7 @@ def main():
             camera_configs=cameras,
             trainer=model_trainer,
             model_registry=model_reg,
-            baseline_manager=baseline_mgr,
+            baseline_manager=baseline_manager,
         )
         create_backbone_retraining_task(
             scheduler=scheduler,

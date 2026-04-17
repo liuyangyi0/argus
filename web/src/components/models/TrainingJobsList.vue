@@ -62,12 +62,15 @@ async function handleConfirm(jobId: string) {
     await confirmTrainingJob(jobId, { confirmed_by: 'operator' })
     message.success('任务已确认，进入队列')
     loadJobs()
-  } catch (e: any) {
-    if (e.response?.status === 409) {
+  } catch (e) {
+    // ApiError from the interceptor: code mirrors HTTP status.
+    const status = (e as { code?: number; response?: { status?: number } })?.code
+      ?? (e as { response?: { status?: number } })?.response?.status
+    if (status === 409) {
       message.warning('任务已被其他操作员确认或状态已变更')
       loadJobs()
     } else {
-      message.error(e.response?.data?.error || '确认失败')
+      message.error(extractErrorMessage(e, '确认失败'))
     }
   }
 }
@@ -77,12 +80,14 @@ async function handleReject(jobId: string) {
     await rejectTrainingJob(jobId, { rejected_by: 'operator' })
     message.info('任务已拒绝')
     loadJobs()
-  } catch (e: any) {
-    if (e.response?.status === 409) {
+  } catch (e) {
+    const status = (e as { code?: number; response?: { status?: number } })?.code
+      ?? (e as { response?: { status?: number } })?.response?.status
+    if (status === 409) {
       message.warning('任务已被其他操作员处理或状态已变更')
       loadJobs()
     } else {
-      message.error(e.response?.data?.error || '拒绝失败')
+      message.error(extractErrorMessage(e, '拒绝失败'))
     }
   }
 }

@@ -2,21 +2,34 @@ import axios, { type AxiosResponse } from 'axios'
 import type { ApiResponse } from '../types/api'
 import { ApiError } from '../types/api'
 import { logger } from '../utils/logger'
-import { message } from 'ant-design-vue'
 
 export const api = axios.create({
   baseURL: '/api',
   timeout: 30000,
 })
 
+// The interceptor used to `message.error(...)` here — which collided with the
+// 36+ call sites that also toast in their own catch blocks, producing double
+// popups. It is now silent: it logs and normalizes failures into a rejected
+// `ApiError` (status on `code`, server's `msg`/`error`/`detail`/`message` as
+// the message). Call sites should surface errors via `extractErrorMessage(e)`
+// from `utils/error.ts`, which understands this shape.
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    const body = err.response?.data
-    const msg = body?.msg ?? body?.error ?? err.message ?? '请求失败'
-    logger.debug('[API]', msg)
-    message.error(msg)
-    return Promise.reject(err)
+    const body = err?.response?.data
+    const status = err?.response?.status ?? -1
+    let msg: string = '请求失败'
+    if (body && typeof body === 'object') {
+      const b = body as Record<string, unknown>
+      const pick = b.msg ?? b.error ?? b.detail ?? b.message
+      if (typeof pick === 'string' && pick.trim().length > 0) msg = pick
+    }
+    if (msg === '请求失败' && typeof err?.message === 'string' && err.message) {
+      msg = err.message
+    }
+    logger.debug('[API]', status, msg)
+    return Promise.reject(new ApiError(status, msg, body))
   }
 )
 

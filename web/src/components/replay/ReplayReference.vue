@@ -54,7 +54,7 @@ function resetOffset() {
         :max="30"
         :step="0.1"
         :tooltip-visible="false"
-        @change="(v: number) => (ctrl.referenceOffsetSeconds.value = v)"
+        @change="(v: number | [number, number]) => (ctrl.referenceOffsetSeconds.value = typeof v === 'number' ? v : v[0])"
       />
     </div>
     <div v-if="ctrl.referenceDate.value" class="replay-ref-date">{{ ctrl.referenceDate.value }}</div>

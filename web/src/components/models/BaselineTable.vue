@@ -11,6 +11,7 @@ import {
 
 import { useBaselineStore } from '../../stores/useBaselineStore'
 import { BASELINE_STATE_MAP } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 
 defineOptions({ name: 'BaselineTable' })
 
@@ -64,13 +65,13 @@ async function handleOptimize(record: any) {
         try {
           const res = await store.executeOptimize(record.camera_id, record.version)
           message.success(`优化完成: 保留 ${res.selected} 张, 移除 ${res.moved} 张`)
-        } catch (e: any) {
-          message.error(e.response?.data?.error || '优化失败')
+        } catch (e) {
+          message.error(extractErrorMessage(e, '优化失败'))
         }
       },
     })
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '优化预览失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '优化预览失败'))
     store.setOptimizing(null)
   }
 }
@@ -85,8 +86,8 @@ function handleMergeFP(cameraId: string) {
       try {
         const res = await store.mergeFalsePositives(cameraId)
         message.success(`误报合并完成: ${res.version}, 新增 ${res.fp_included} 张误报帧`)
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '合并失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '合并失败'))
       }
     },
   })
@@ -102,8 +103,8 @@ function handleMergeGroup(groupId: string) {
       try {
         const res = await store.mergeGroupBaseline(groupId)
         message.success(`组基线合并完成: ${res.version}, ${res.image_count} 张图片`)
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '合并失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '合并失败'))
       }
     },
   })
@@ -120,8 +121,8 @@ function handleDeleteBaseline(record: any) {
       try {
         await store.deleteBaselineVersion(record.camera_id, record.version)
         message.success(`${record.version} 已删除`)
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '删除失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '删除失败'))
       }
     },
   })

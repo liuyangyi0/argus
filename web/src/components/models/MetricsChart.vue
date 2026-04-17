@@ -10,6 +10,7 @@ import VChart from 'vue-echarts'
 import { getTrainingMetrics } from '../../api/training'
 import ConfusionMatrix from './ConfusionMatrix.vue'
 import type { TrainingMetricsResponse } from '../../types/api'
+import { extractErrorMessage } from '../../utils/error'
 
 use([
   CanvasRenderer, LineChart, ScatterChart,
@@ -33,8 +34,8 @@ async function load() {
     if (res.threshold_used != null) {
       threshold.value = res.threshold_used
     }
-  } catch (e: any) {
-    errorMsg.value = e?.response?.data?.error || '加载指标失败'
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e, '加载指标失败')
     data.value = null
   } finally {
     loading.value = false

@@ -7,6 +7,7 @@ import {
 
 import { useBaselineStore } from '../../stores/useBaselineStore'
 import { BASELINE_STATE_MAP } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 
 defineOptions({ name: 'BaselineVersionDrawer' })
 
@@ -49,8 +50,8 @@ function handleVerify(record: any) {
       try {
         await store.verifyBaselineVersion(record.camera_id, record.version, verifiedBy)
         message.success(`${record.version} 已审核通过`)
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '审核失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '审核失败'))
       }
     },
   })
@@ -66,8 +67,8 @@ function handleActivate(record: any) {
       try {
         await store.activateBaselineVersion(record.camera_id, record.version)
         message.success(`${record.version} 已激活`)
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '激活失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '激活失败'))
       }
     },
   })
@@ -96,8 +97,8 @@ function handleRetire(record: any) {
           reasonRef.value.trim() || '手动退役',
         )
         message.success(`${record.version} 已退役`)
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '退役失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '退役失败'))
       }
     },
   })
@@ -114,8 +115,8 @@ function handleDelete(record: any) {
       try {
         await store.deleteBaselineVersion(record.camera_id, record.version)
         message.success(`${record.version} 已删除`)
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '删除失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '删除失败'))
       }
     },
   })

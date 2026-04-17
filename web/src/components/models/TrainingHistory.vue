@@ -10,6 +10,7 @@ import {
 } from '@ant-design/icons-vue'
 import { getTrainingHistory, compareModels } from '../../api'
 import { GRADE_COLORS, RECOMMENDATION_COLORS, RECOMMENDATION_TEXT } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 import type { TrainingRecord } from '../../types/api'
 import MetricsChart from './MetricsChart.vue'
 
@@ -61,8 +62,8 @@ async function handleCompare() {
       new_record_id: compareForm.value.new_record_id,
     })
     compareResult.value = res
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '对比失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '对比失败'))
   } finally {
     comparing.value = false
   }

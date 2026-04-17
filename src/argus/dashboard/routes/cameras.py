@@ -702,8 +702,31 @@ async def wall_status(request: Request):
     def _build_wall_data():
         from datetime import datetime, timezone
 
+        statuses = list(camera_manager.get_status())
+        camera_ids = [cs.camera_id for cs in statuses]
+
+        # P0 perf: one batched stats call + one batched DB call replaces the
+        # previous 2*N + 1 per-camera queries. Before: 5 Hz poll * 4 clients *
+        # (2N+1) = ~200 qps against SQLite contending with AlertDispatcher
+        # INSERTs. After: ~2-3 queries per request regardless of N.
+        bp_stats = camera_manager.get_backpressure_stats()
+
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        wall_batch: dict = {}
+        if db is not None and camera_ids:
+            try:
+                wall_batch = db.get_wall_status_batch(camera_ids, since=today_start)
+            except Exception:
+                # WARNING not DEBUG: a silent failure here means the video
+                # wall shows "0 alerts today" forever, which operators will
+                # misread as a healthy system.
+                logger.warning("cameras.wall_status_batch_failed", exc_info=True)
+                wall_batch = {}
+
         cameras = []
-        for cam_status in camera_manager.get_status():
+        for cam_status in statuses:
             cam_id = cam_status.camera_id
             # Determine connection status: a camera is "online" if its
             # pipeline is running, even if not yet fully connected (USB
@@ -733,37 +756,18 @@ async def wall_status(request: Request):
             if stats is not None and getattr(stats, "current_fps", 0) > 0:
                 tile["fps"] = stats.current_fps
 
-            # Backpressure visibility (P0-2)
-            bp_stats = camera_manager.get_backpressure_stats()
+            # Backpressure visibility (P0-2) — snapshot fetched once above.
             bp = bp_stats.get(cam_id, {})
             tile["frames_dropped"] = bp.get("dropped", 0)
             tile["backpressured"] = bp.get("backpressured", False)
 
-            if db is not None:
-                try:
-                    today_count = db.get_alert_count(
-                        camera_id=cam_id,
-                        since=datetime.now(timezone.utc).replace(
-                            hour=0, minute=0, second=0, microsecond=0
-                        ),
-                    )
-                    tile["alert_count_today"] = today_count
-                except Exception:
-                    # WARNING not DEBUG: a silent failure here means the video
-                    # wall shows "0 alerts today" forever, which operators will
-                    # misread as a healthy system.
-                    logger.warning("cameras.alert_count_today_failed", camera_id=cam_id, exc_info=True)
-
-            if db is not None:
-                try:
-                    recent = db.get_alerts(camera_id=cam_id, limit=1)
-                    if recent and recent[0].workflow_status in ("new", "acknowledged", "investigating"):
-                        tile["active_alert"] = {
-                            "alert_id": recent[0].alert_id,
-                            "severity": recent[0].severity,
-                        }
-                except Exception:
-                    logger.debug("cameras.recent_alert_query_failed", camera_id=cam_id, exc_info=True)
+            # Alert aggregates from the single batched query.
+            batch_row = wall_batch.get(cam_id)
+            if batch_row is not None:
+                tile["alert_count_today"] = batch_row.get("count", 0)
+                active = batch_row.get("active")
+                if active is not None:
+                    tile["active_alert"] = active
 
             if health_monitor is not None:
                 health = health_monitor.get_camera_health(cam_id)

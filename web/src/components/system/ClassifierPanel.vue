@@ -12,6 +12,7 @@ import {
   updateClassifierVocabulary,
   type ClassifierConfigPayload,
 } from '../../api'
+import { extractErrorMessage } from '../../utils/error'
 
 defineOptions({ name: 'ClassifierPanel' })
 
@@ -38,8 +39,8 @@ async function load() {
   error.value = null
   try {
     cfg.value = await getClassifierConfig()
-  } catch (e: any) {
-    error.value = e?.response?.data?.msg || e?.message || '加载分类器配置失败'
+  } catch (e) {
+    error.value = extractErrorMessage(e, '加载分类器配置失败')
     cfg.value = null
   } finally {
     loading.value = false
@@ -56,8 +57,8 @@ async function handleToggle(checked: string | number | boolean) {
     message.success(next ? '分类器已启用' : '分类器已关闭')
     // Re-fetch so runtime counters reflect the new state.
     await load()
-  } catch (e: any) {
-    message.error(e?.response?.data?.msg || '切换失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '切换失败'))
   } finally {
     toggling.value = false
   }
@@ -183,8 +184,8 @@ async function saveDraft() {
       : '词表已保存（当前无运行中管线）')
     editing.value = false
     await load()
-  } catch (e: any) {
-    message.error(e?.response?.data?.msg || e?.message || '保存失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '保存失败'))
   } finally {
     saving.value = false
   }

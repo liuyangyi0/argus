@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useCanvasCompositor } from '../../composables/useCanvasCompositor'
-import { useHeatmapCache } from '../../composables/useHeatmapCache'
 import { getReplayMetadata, getReplaySignals, getReplayVideoUrl } from '../../api'
 import type { StoryboardCamera } from '../../types/api'
 

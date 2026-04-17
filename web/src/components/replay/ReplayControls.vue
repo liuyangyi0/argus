@@ -97,6 +97,15 @@ watch(
   () => scheduleDraw(),
 )
 
+// Also redraw when signals is swapped wholesale — e.g. initial arrival or an
+// alert switch that reuses this component. The length-only watch above won't
+// fire if the number of scores happens to match the previous value.
+watch(
+  () => ctrl.signals.value,
+  () => scheduleDraw(),
+  { flush: 'post' },
+)
+
 // ── Clip markers ──
 function clipLeft(idx: number) {
   const total = Math.max((ctrl.metadata.value?.frame_count || 1) - 1, 1)

@@ -199,15 +199,36 @@ export function useReplayController(alertId: string) {
   // playback controls
   function safePlay() {
     if (!videoEl.value) return
-    videoEl.value.play().catch((err: DOMException) => {
+    // Bail out early when the <video> has no usable source — otherwise the
+    // browser quietly resolves / rejects the play() promise and the user sees
+    // "no response" from the play button.
+    const el = videoEl.value
+    // networkState 3 = NETWORK_NO_SOURCE, readyState 0 = HAVE_NOTHING
+    if (el.error || (el.readyState === 0 && el.networkState === 3)) {
+      const msg = el.error
+        ? videoErrorMessage(el.error)
+        : '录像文件无法加载，请切换到"触发帧"查看'
+      videoError.value = msg
+      message.warning(msg)
+      playing.value = false
+      return
+    }
+    el.play().catch((err: DOMException) => {
       if (err.name === 'AbortError') return
-      videoError.value = videoErrorMessage(err)
+      const msg = videoErrorMessage(err)
+      videoError.value = msg
+      message.error(msg)
       playing.value = false
     })
   }
 
   function togglePlay() {
-    if (!videoEl.value) return
+    if (!videoEl.value) {
+      // ref not yet populated — almost certainly a race during mount; surface
+      // it rather than swallowing the click silently.
+      message.warning('播放器还未就绪，请稍候')
+      return
+    }
     if (videoEl.value.paused) {
       safePlay()
     } else {

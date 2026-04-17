@@ -102,6 +102,11 @@ let retryTimer: ReturnType<typeof setTimeout> | null = null
 import { DEFAULT_WS_RETRY_MAX, DEFAULT_WS_FALLBACK_INTERVAL_MS } from '../config/constants'
 
 const MAX_RETRIES = DEFAULT_WS_RETRY_MAX
+// After exhausting MAX_RETRIES we fall back to polling. Every FALLBACK_RECHECK_MS
+// we make one more WS attempt — success brings us back to live updates, failure
+// keeps us polling. Avoids the "must refresh the page" dead-end.
+const FALLBACK_RECHECK_MS = 60_000
+let fallbackRecheckTimer: ReturnType<typeof setTimeout> | null = null
 const globalConnected = ref(false)
 const globalReconnecting = ref(false)
 const globalRetryCount = ref(0)
@@ -134,6 +139,7 @@ function wsConnect() {
     globalFallbackMode.value = false
     globalNextRetryIn.value = 0
     if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null }
+    clearFallbackRecheck()
     retryCount = 0
     // Stop all fallback polling
     for (const sub of subscribers.values()) {
@@ -186,12 +192,13 @@ function scheduleReconnect() {
   retryCount++
   globalRetryCount.value = retryCount
   if (retryCount > MAX_RETRIES) {
-    // Fall back to per-subscriber polling
+    // Fall back to per-subscriber polling and schedule a slow WS recheck.
     globalFallbackMode.value = true
     globalReconnecting.value = false
     for (const sub of subscribers.values()) {
       startFallbackPolling(sub)
     }
+    scheduleFallbackRecheck()
     return
   }
   const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 30000)
@@ -207,6 +214,30 @@ function scheduleReconnect() {
   retryTimer = setTimeout(wsConnect, delay)
 }
 
+// In fallback mode we periodically retry WebSocket. Success (ws.onopen) resets
+// retryCount + globalFallbackMode so the normal code paths resume. Failure
+// triggers onclose → scheduleReconnect → hits MAX_RETRIES again → re-arms this.
+function scheduleFallbackRecheck() {
+  if (fallbackRecheckTimer !== null) return
+  fallbackRecheckTimer = setTimeout(() => {
+    fallbackRecheckTimer = null
+    if (subscribers.size === 0) return
+    if (!globalFallbackMode.value) return
+    // Reset retryCount so a single attempt happens; if it fails,
+    // scheduleReconnect will bump back above MAX_RETRIES and re-arm us.
+    retryCount = 0
+    globalRetryCount.value = 0
+    wsConnect()
+  }, FALLBACK_RECHECK_MS)
+}
+
+function clearFallbackRecheck() {
+  if (fallbackRecheckTimer !== null) {
+    clearTimeout(fallbackRecheckTimer)
+    fallbackRecheckTimer = null
+  }
+}
+
 function startFallbackPolling(sub: Subscriber) {
   if (!sub.fallbackPoll || sub.fallbackTimer !== null) return
   sub.fallbackPoll()
@@ -218,6 +249,8 @@ function wsDisconnect() {
     clearTimeout(retryTimer)
     retryTimer = null
   }
+  clearFallbackRecheck()
+  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null }
   if (ws) {
     ws.onclose = null
     ws.close()
@@ -301,4 +334,34 @@ export function useWebSocket(options: UseWebSocketOptions) {
     audioMuted,
     toggleAudioMute,
   }
+}
+
+// ── HMR cleanup ──
+// Module-level state (`ws`, `subscribers`, timers) outlives a hot-module swap.
+// Without this, every edit leaks a live WebSocket and stale subscribers, and
+// eventually the browser tab eats several megabytes of idle sockets.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    if (retryTimer !== null) { clearTimeout(retryTimer); retryTimer = null }
+    if (countdownTimer !== null) { clearInterval(countdownTimer); countdownTimer = null }
+    if (fallbackRecheckTimer !== null) { clearTimeout(fallbackRecheckTimer); fallbackRecheckTimer = null }
+    for (const sub of subscribers.values()) {
+      if (sub.fallbackTimer !== null) {
+        clearInterval(sub.fallbackTimer)
+        sub.fallbackTimer = null
+      }
+    }
+    subscribers.clear()
+    if (ws) {
+      ws.onopen = null
+      ws.onmessage = null
+      ws.onerror = null
+      ws.onclose = null
+      try { ws.close() } catch { /* ignore */ }
+      ws = null
+    }
+    globalConnected.value = false
+    globalReconnecting.value = false
+    globalFallbackMode.value = false
+  })
 }

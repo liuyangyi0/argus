@@ -6,6 +6,7 @@ import {
 } from 'ant-design-vue'
 import { ExperimentOutlined } from '@ant-design/icons-vue'
 import { batchInference } from '../../api'
+import { extractErrorMessage } from '../../utils/error'
 
 const props = defineProps<{
   cameras: any[]
@@ -32,8 +33,8 @@ async function handleBatchInference() {
     const res = await batchInference(batchCameraId.value, paths)
     batchResults.value = res.results || []
     message.success(`完成推理: ${res.scored}/${res.total} 张图片`)
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '批量推理失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '批量推理失败'))
   } finally {
     batchRunning.value = false
   }

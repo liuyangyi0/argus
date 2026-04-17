@@ -198,6 +198,7 @@ class DetectionPipeline:
         database: object | None = None,
         event_bus: EventBus | None = None,
         inference_executor: ThreadPoolExecutor | None = None,
+        encode_executor: ThreadPoolExecutor | None = None,
         sensor_fusion: object | None = None,
     ):
         self.camera_config = camera_config
@@ -205,6 +206,11 @@ class DetectionPipeline:
         self._on_drift = on_drift
         self._event_bus = event_bus
         self._inference_executor = inference_executor or _get_default_inference_executor()
+        # Ring-buffer JPEG encoding runs on a dedicated pool so it never
+        # starves inference futures (encode = 5-15ms each; inference = ~30ms).
+        # When no executor is injected (standalone usage), fall back to the
+        # inference pool — callers doing heavy encoding should inject one.
+        self._encode_executor = encode_executor or self._inference_executor
         self._model_version_id = model_version_id
         self._shadow_runner = shadow_runner
         self._feedback_manager = feedback_manager
@@ -1108,11 +1114,21 @@ class DetectionPipeline:
         with self._latest_frame_lock:
             self._latest_frame = frame
 
+        # Single full-resolution BGR->GRAY conversion shared by brightness
+        # detection (below) and MOG2 stabilization. Valid only for this frame.
+        frame_gray: np.ndarray | None = None
+        need_gray = self._low_light_enabled or getattr(
+            self._prefilter, "enable_stabilization", False,
+        )
+        if need_gray:
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._frame_gray = frame_gray
+
         # Low-light detection: bypass MOG2 when scene is dark
         is_low_light = False
         brightness_jump = False
         if self._low_light_enabled:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = frame_gray if frame_gray is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mean_brightness = float(gray.mean())
             is_low_light = mean_brightness < self._low_light_threshold
 
@@ -1155,6 +1171,9 @@ class DetectionPipeline:
                 else:
                     lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
                 frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                # CLAHE altered frame pixels — the cached gray no longer matches.
+                frame_gray = None
+                self._frame_gray = None
         diag.low_light = is_low_light
 
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
@@ -1183,10 +1202,10 @@ class DetectionPipeline:
         if not skip_prefilter:
             if freeze_mog2:
                 prefilter_result: PreFilterResult = self._prefilter.process(
-                    frame, learning_rate_override=0.0
+                    frame, learning_rate_override=0.0, gray_frame=frame_gray,
                 )
             else:
-                prefilter_result = self._prefilter.process(frame)
+                prefilter_result = self._prefilter.process(frame, gray_frame=frame_gray)
             if not prefilter_result.has_change:
                 self.stats.frames_skipped_no_change += 1
                 mog2_skipped = True
@@ -1202,9 +1221,9 @@ class DetectionPipeline:
                 return None
         else:
             if is_locked:
-                self._prefilter.process(frame, learning_rate_override=0.0)
+                self._prefilter.process(frame, learning_rate_override=0.0, gray_frame=frame_gray)
             else:
-                self._prefilter.process(frame)
+                self._prefilter.process(frame, gray_frame=frame_gray)
             if is_heartbeat:
                 self.stats.frames_heartbeat += 1
 
@@ -1912,17 +1931,17 @@ class DetectionPipeline:
                 )
 
         if alert is not None:
-            # Persist trajectory centroid history for visualization
+            # Persist trajectory centroid history for visualization.
+            # Read-only access: calling update([]) here would double-advance
+            # the stationary-suppress state machine and delete stale tracks.
             try:
                 if (
                     hasattr(self, '_physics_tracker')
                     and self._physics_tracker is not None
                 ):
-                    temporal_state = self._physics_tracker.update([], self._frame_counter)
-                    for track in getattr(temporal_state, 'active_tracks', []):
-                        if getattr(track, 'trajectory_history', None):
-                            alert.trajectory_points = list(track.trajectory_history)
-                            break
+                    histories = self._physics_tracker.get_trajectory_histories()
+                    if histories:
+                        alert.trajectory_points = histories[0]
             except Exception:
                 pass
 
@@ -2148,7 +2167,7 @@ class DetectionPipeline:
             if alert is not None:
                 _encode_and_append()
             else:
-                self._inference_executor.submit(_encode_and_append)
+                self._encode_executor.submit(_encode_and_append)
         except Exception:
             logger.debug(
                 "pipeline.ring_buffer_append_failed",

@@ -6,6 +6,7 @@ import {
 
 import { startCapture, startCaptureJob } from '../../api'
 import { SESSION_LABELS, SAMPLING_STRATEGIES } from '../../composables/useModelState'
+import { extractErrorMessage } from '../../utils/error'
 import type { CameraSummary } from '../../types/api'
 
 defineOptions({ name: 'BaselineCaptureModals' })
@@ -56,8 +57,8 @@ async function handleCapture() {
     message.success('采集任务已启动')
     emit('update:captureVisible', false)
     emit('captureStarted')
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '启动采集失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '启动采集失败'))
   } finally {
     captureSubmitting.value = false
   }
@@ -81,8 +82,8 @@ async function handleAdvCapture() {
     message.success('高级采集任务已启动')
     emit('update:advancedVisible', false)
     emit('captureStarted')
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '启动高级采集失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '启动高级采集失败'))
   } finally {
     advCaptureSubmitting.value = false
   }

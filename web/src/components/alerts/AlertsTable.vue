@@ -14,8 +14,19 @@ import { getAlertGroup } from '../../api'
 import { useAlertStore } from '../../stores/useAlertStore'
 import { formatRelativeTime, formatTimestamp } from '../../utils/time'
 import { scoreColor } from '../../utils/colors'
+import { extractErrorMessage } from '../../utils/error'
 
 defineOptions({ name: 'AlertsTable' })
+
+// `compact` lets the parent opt into the narrow column layout explicitly.
+// When unset we fall back to `selectedAlert` for backward compatibility, but the
+// parent should own the layout mode so we don't thrash column widths on every
+// row selection inside the table itself.
+const props = withDefaults(defineProps<{
+  compact?: boolean
+}>(), {
+  compact: undefined,
+})
 
 const emit = defineEmits<{
   (e: 'select', record: any): void
@@ -61,8 +72,8 @@ async function handleAcknowledge(id: string) {
   try {
     await store.ackAlert(id)
     message.success('已确认')
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '确认失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '确认失败'))
   }
 }
 
@@ -70,8 +81,8 @@ async function handleFalsePositive(id: string) {
   try {
     await store.fpAlert(id)
     message.success('已标记误报')
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '标记失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '标记失败'))
   }
 }
 
@@ -89,8 +100,8 @@ function handleBulkDelete() {
         const res = await store.bulkDel(keys)
         message.success(res.message || `已删除 ${res.count} 条`)
         selectedRowKeys.value = []
-      } catch (e: any) {
-        message.error(e.response?.data?.error || '批量删除失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '批量删除失败'))
       }
     },
   })
@@ -102,8 +113,8 @@ async function handleBulkAcknowledge() {
     const res = await store.bulkAck(selectedRowKeys.value as string[])
     message.success(res.message || `已确认 ${res.count} 条`)
     selectedRowKeys.value = []
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '批量确认失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '批量确认失败'))
   }
 }
 
@@ -113,8 +124,8 @@ async function handleBulkFalsePositive() {
     const res = await store.bulkFp(selectedRowKeys.value as string[])
     message.success(res.message || `已标记 ${res.count} 条为误报`)
     selectedRowKeys.value = []
-  } catch (e: any) {
-    message.error(e.response?.data?.error || '批量标记失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '批量标记失败'))
   }
 }
 
@@ -149,14 +160,19 @@ function rowClassName(record: any) {
   return ''
 }
 
+// Prefer the explicit prop, falling back to `selectedAlert` for existing call
+// sites. This guards against the column-width flicker that happened when a
+// single intra-table state change (clicking a row) rebuilt the column array.
+const isCompact = computed(() => props.compact ?? !!selectedAlert.value)
+
 const columns = computed(() => {
-  const isCompact = !!selectedAlert.value
+  const compact = isCompact.value
   const base: any[] = [
     { title: '', key: 'thumbnail', width: 52 },
     {
       title: '严重度',
       key: 'severity',
-      width: isCompact ? 60 : 72,
+      width: compact ? 60 : 72,
       filters: [
         { text: '高', value: 'high' },
         { text: '中', value: 'medium' },
@@ -164,12 +180,12 @@ const columns = computed(() => {
         { text: '提示', value: 'info' },
       ],
     },
-    { title: '分类', key: 'category', width: isCompact ? 64 : 76 },
-    { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: isCompact ? 80 : 100, ellipsis: true },
+    { title: '分类', key: 'category', width: compact ? 64 : 76 },
+    { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: compact ? 80 : 100, ellipsis: true },
     { title: '分数', key: 'score', width: 64 },
     { title: '时间', key: 'time', width: 80 },
   ]
-  if (!isCompact) {
+  if (!compact) {
     base.splice(3, 0, { title: '区域', dataIndex: 'zone_id', key: 'zone_id', width: 80, ellipsis: true })
     base.push(
       { title: '状态', key: 'status', width: 90 },
