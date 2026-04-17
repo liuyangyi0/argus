@@ -271,6 +271,15 @@ class AlertDispatcher:
             seg_total_area = getattr(alert, "segmentation_total_area_px", 0)
             seg_objects = getattr(alert, "segmentation_objects", None)
             has_segmentation = bool(seg_count)
+            import json as _json
+
+            traj_json = None
+            if alert.trajectory_points:
+                traj_json = _json.dumps(
+                    [{"t": round(t, 4), "x": round(x, 1), "y": round(y, 1)}
+                     for t, x, y in alert.trajectory_points]
+                )
+
             self._db.save_alert(
                 alert_id=alert.alert_id,
                 timestamp=datetime.fromtimestamp(alert.timestamp, tz=timezone.utc),
@@ -299,6 +308,9 @@ class AlertDispatcher:
                 segmentation_count=seg_count if has_segmentation else None,
                 segmentation_total_area_px=seg_total_area if has_segmentation else None,
                 segmentation_objects=seg_objects if has_segmentation else None,
+                category=getattr(alert, "category", None),
+                severity_adjusted_by_classifier=getattr(alert, "severity_adjusted_by_classifier", None),
+                trajectory_points=traj_json,
             )
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))

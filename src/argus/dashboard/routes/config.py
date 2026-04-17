@@ -553,6 +553,48 @@ async def get_segmenter_config(request: Request):
     })
 
 
+@router.get("/imaging")
+async def get_imaging_config(request: Request):
+    """Return the multi-modal imaging config + runtime status."""
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    cfg = getattr(config, "imaging", None)
+    if cfg is None:
+        return api_unavailable("成像配置不可用")
+
+    # Check runtime status: how many pipelines have imaging processor
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    total_pipelines = 0
+    pipelines_with_imaging = 0
+    if camera_manager is not None:
+        try:
+            for cam_status in camera_manager.get_status():
+                pipeline = camera_manager.get_pipeline(cam_status.camera_id)
+                if pipeline is not None:
+                    total_pipelines += 1
+                    if getattr(pipeline, "_imaging_processor", None) is not None:
+                        pipelines_with_imaging += 1
+        except Exception:
+            pass
+
+    return api_success({
+        "enabled": cfg.enabled,
+        "mode": cfg.mode,
+        "camera_sdk": cfg.camera_sdk,
+        "nir_strobe_enabled": cfg.nir_strobe_enabled,
+        "polarization_processing": cfg.polarization_processing,
+        "fusion_channels": cfg.fusion_channels,
+        "deglare_method": cfg.deglare_method,
+        "dolp_threshold": cfg.dolp_threshold,
+        "runtime": {
+            "total_pipelines": total_pipelines,
+            "pipelines_with_imaging": pipelines_with_imaging,
+        },
+    })
+
+
 @router.get("/cross-camera")
 async def get_cross_camera_config(request: Request):
     """Return the full cross-camera correlation config + runtime readiness.

@@ -45,6 +45,13 @@ async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
             except Exception:
                 trajectories = []
 
+        points = None
+        if alert.trajectory_points:
+            try:
+                points = _json.loads(alert.trajectory_points)
+            except Exception:
+                points = None
+
         primary = None
         if alert.trajectory_model is not None:
             primary = {
@@ -65,6 +72,22 @@ async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
 
         return api_success({
             "alert_id": alert_id,
+            # Legacy flat fields — kept so older clients do not break
+            "speed_ms": alert.speed_ms,
+            "speed_px_per_sec": alert.speed_px_per_sec,
+            "trajectory_model": alert.trajectory_model,
+            "points": points,
+            "origin": {
+                "x_mm": alert.origin_x_mm,
+                "y_mm": alert.origin_y_mm,
+                "z_mm": alert.origin_z_mm,
+            } if alert.origin_x_mm is not None else None,
+            "landing": {
+                "x_mm": alert.landing_x_mm,
+                "y_mm": alert.landing_y_mm,
+                "z_mm": alert.landing_z_mm,
+            } if alert.landing_x_mm is not None else None,
+            # New multi-track view
             "primary": primary,
             "trajectories": trajectories,
             "classification": {

@@ -125,6 +125,11 @@ class AlertRecord(Base):
     segmentation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     segmentation_total_area_px: Mapped[int | None] = mapped_column(Integer, nullable=True)
     segmentation_objects: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Alert category auto-classification
+    category: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    severity_adjusted_by_classifier: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Trajectory centroid history (JSON array of {t, x, y})
+    trajectory_points: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
@@ -180,6 +185,9 @@ class AlertRecord(Base):
             "segmentation_count": self.segmentation_count,
             "segmentation_total_area_px": self.segmentation_total_area_px,
             "segmentation_objects": segmentation_objects_parsed,
+            "category": self.category,
+            "severity_adjusted_by_classifier": self.severity_adjusted_by_classifier,
+            "trajectory_points": _json.loads(self.trajectory_points) if self.trajectory_points else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

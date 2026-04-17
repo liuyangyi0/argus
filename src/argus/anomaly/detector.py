@@ -81,6 +81,8 @@ class AnomalibDetector:
         self._reload_lock = threading.Lock()
         self._ssim_lock = threading.Lock()  # protects SSIM baseline calibration state
         self._minmax_broken = False  # True when PostProcessor MinMax is not fit
+        # Multi-channel fusion support (Plan A stores tensor, Plan B will use it)
+        self._latest_fused_tensor: np.ndarray | None = None
 
     def load(self) -> bool:
         """Load the Anomalib model for inference.
@@ -325,15 +327,28 @@ class AnomalibDetector:
         calibrated = 1.0 - p_value
         return max(0.0, min(calibrated, 1.0))
 
-    def predict(self, frame: np.ndarray) -> AnomalyResult:
+    def predict(
+        self,
+        frame: np.ndarray,
+        fused_tensor: np.ndarray | None = None,
+    ) -> AnomalyResult:
         """Run anomaly detection on a frame.
 
         Args:
             frame: BGR image from camera (after person masking).
+            fused_tensor: Optional multi-channel tensor from ModalityFusion
+                (e.g. 4-ch RGB+DoLP or 5-ch RGB+DoLP+NIR).  Plan A (current):
+                ignored — detector uses 3-ch visible frame only.  Plan B
+                (future): will be passed to a model trained on multi-channel
+                input for improved detection under specular reflection.
 
         Returns:
             AnomalyResult with anomaly score and heatmap.
         """
+        # Plan A: fused_tensor is stored for future multi-channel model
+        # support but not yet consumed by the detector.
+        if fused_tensor is not None:
+            self._latest_fused_tensor = fused_tensor
         if self._loaded and self._engine is not None:
             return self._predict_anomalib(frame)
         return self._predict_ssim_fallback(frame)
@@ -841,7 +856,11 @@ class MultiScaleDetector:
     def calibrate_raw_scores(self, baseline_dir: Path | None = None) -> None:
         return self._base.calibrate_raw_scores(baseline_dir)
 
-    def predict(self, frame: np.ndarray) -> AnomalyResult:
+    def predict(
+        self,
+        frame: np.ndarray,
+        fused_tensor: np.ndarray | None = None,
+    ) -> AnomalyResult:
         """Run multi-scale detection: tiles + full frame, return best score.
 
         Falls back to single-scale for SSIM mode (no trained model) since
@@ -851,6 +870,9 @@ class MultiScaleDetector:
         Pyramid mode: runs 3 levels (512/768/1024) and merges results,
         capturing anomalies at different spatial scales.
         """
+        # Forward fused_tensor to base detector (Plan A: stored, not consumed)
+        if fused_tensor is not None:
+            self._base._latest_fused_tensor = fused_tensor
         if frame is None or frame.size == 0:
             return self._base.predict(frame)
 

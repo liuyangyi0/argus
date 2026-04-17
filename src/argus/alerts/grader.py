@@ -40,6 +40,16 @@ HANDLING_POLICIES: dict[AlertSeverity, str] = {
 }
 
 
+class AlertCategory(str, Enum):
+    PROJECTILE = "projectile"
+    STATIC_FOREIGN = "static_foreign"
+    SCENE_CHANGE = "scene_change"
+    ENVIRONMENTAL = "environmental"
+    PERSON_INTRUSION = "person_intrusion"
+    EQUIPMENT_DISPLACEMENT = "equipment_displacement"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class Alert:
     """A graded alert ready for dispatch."""
@@ -65,6 +75,8 @@ class Alert:
     classification_label: str | None = None
     classification_confidence: float | None = None
     severity_adjusted_by_classifier: bool = False
+    # Alert category classification
+    category: str = "unknown"
     # D2: Instance segmentation
     segmentation_count: int = 0
     segmentation_total_area_px: int = 0
@@ -85,6 +97,8 @@ class Alert:
     landing_x_mm: float | None = None
     landing_y_mm: float | None = None
     landing_z_mm: float | None = None
+    # Trajectory centroid history for visualization (max 300 points)
+    trajectory_points: list[tuple[float, float, float]] | None = None
     # Per-track trajectory fits (primary + others) serialised as JSON for persistence
     trajectories_json: str | None = None
     # Set by pipeline after alert recording is solidified to disk

@@ -564,6 +564,9 @@ class DetectionPipeline:
 
         # M1: Multi-modal imaging preprocessing (optional)
         self._imaging_processor = None
+        self._modality_fusion = None
+        self._fusion_channels: int = 3
+        self._latest_nir_frame: np.ndarray | None = None
         if self._imaging_config and self._imaging_config.enabled and self._imaging_config.polarization_processing:
             try:
                 from argus.imaging.polarization import PolarizationProcessor
@@ -572,10 +575,19 @@ class DetectionPipeline:
                     deglare_method=self._imaging_config.deglare_method,
                     dolp_threshold=self._imaging_config.dolp_threshold,
                 )
+                self._fusion_channels = self._imaging_config.fusion_channels
+                # Initialise modality fusion when extra channels are requested
+                if self._fusion_channels > 3:
+                    from argus.imaging.fusion import ModalityFusion
+
+                    self._modality_fusion = ModalityFusion(
+                        fusion_channels=self._fusion_channels,
+                    )
                 logger.info(
                     "pipeline.imaging_processor_configured",
                     camera_id=camera_config.camera_id,
                     method=imaging_config.deglare_method,
+                    fusion_channels=self._fusion_channels,
                 )
             except Exception as e:
                 logger.warning(
@@ -586,6 +598,14 @@ class DetectionPipeline:
 
         # Frame quality assessment: reduce false positives from degraded input
         self._frame_quality_assessor = FrameQualityAssessor()
+
+    def set_nir_frame(self, nir_frame: np.ndarray) -> None:
+        """Inject a NIR strobe frame for modality fusion.
+
+        Called by the camera manager when a NIR frame is available
+        (Phase 3: alternating visible/NIR capture).
+        """
+        self._latest_nir_frame = nir_frame
 
         # Cached postprocessor for physics enrichment (avoid per-frame allocation)
         from argus.core.anomaly_postprocess import AnomalyMapProcessor
@@ -817,11 +837,43 @@ class DetectionPipeline:
             )
             return None
 
-    def _predict_anomaly(self, frame: np.ndarray) -> AnomalyResult:
+    def _categorize_alert(self, alert, simplex_result, detection_result) -> str:
+        """Auto-categorize alert based on detection characteristics."""
+        _ENV_LABELS = {"insect", "bird", "shadow", "reflection", "crane", "overhead-bridge", "scaffold"}
+
+        if alert.speed_px_per_sec and alert.speed_px_per_sec > 50:
+            if alert.trajectory_model in ("free_fall", "projectile", "projectile_drag"):
+                return "projectile"
+
+        if detection_result and getattr(detection_result, "has_persons", False):
+            return "person_intrusion"
+
+        if alert.classification_label and alert.classification_label.lower() in _ENV_LABELS:
+            return "environmental"
+
+        if simplex_result and getattr(simplex_result, "has_detection", False):
+            return "static_foreign"
+
+        if detection_result and getattr(detection_result, "non_person_objects", None):
+            if len(detection_result.non_person_objects) > 0:
+                return "equipment_displacement"
+
+        return "scene_change"
+
+    def _predict_anomaly(
+        self, frame: np.ndarray, fused_tensor: np.ndarray | None = None,
+    ) -> AnomalyResult:
         """Run anomaly detection, using ensemble if active, else single detector.
 
         When the ensemble is active, converts EnsembleResult back to AnomalyResult
         for downstream compatibility. Falls back to single detector on any error.
+
+        Args:
+            frame: 3-channel BGR visible-light frame.
+            fused_tensor: Optional multi-channel tensor from ModalityFusion
+                (e.g. 4-ch RGB+DoLP or 5-ch RGB+DoLP+NIR).  Currently the
+                detector truncates to 3 channels (Plan A); Plan B will pass
+                the full tensor to a model trained on multi-channel input.
         """
         if self._ensemble_detector is not None:
             try:
@@ -841,7 +893,7 @@ class DetectionPipeline:
                     camera_id=self.camera_config.camera_id,
                     msg="Ensemble predict failed — falling back to single detector",
                 )
-        return self._anomaly_detector.predict(frame)
+        return self._anomaly_detector.predict(frame, fused_tensor=fused_tensor)
 
     def initialize(self) -> bool:
         """Initialize all pipeline components. Returns True on success."""
@@ -898,6 +950,13 @@ class DetectionPipeline:
         self.stats.update_fps()
         self._frame_counter += 1
         frame = frame_data.frame
+
+        # NIR strobe: if this frame was captured under NIR illumination,
+        # store it for modality fusion and skip detection (NIR frames are
+        # auxiliary — detection runs on visible-light frames only).
+        if frame_data.is_nir:
+            self._latest_nir_frame = frame
+            return None
 
         # DET-008: Build diagnostics record for this frame
         diag = FrameDiagnostics(
@@ -966,12 +1025,29 @@ class DetectionPipeline:
         ))
 
         # Stage 0.5: Multi-modal imaging preprocessing (if enabled)
+        fused_tensor: np.ndarray | None = None
         if self._imaging_processor is not None:
             try:
                 t_img = time.monotonic()
-                from argus.imaging.polarization import PolarizationProcessor
                 pol_result = self._imaging_processor.process(frame)
                 frame = pol_result.deglared  # Use reflection-removed image
+
+                # Fuse modalities when extra channels are configured
+                if self._modality_fusion is not None:
+                    nir = self._latest_nir_frame  # May be None until Phase 3
+                    fused = self._modality_fusion.fuse(
+                        visible=frame,
+                        dolp=pol_result.dolp,
+                        nir=nir,
+                    )
+                    fused_tensor = fused.tensor
+                    logger.debug(
+                        "pipeline.modality_fusion",
+                        channels=fused.channels,
+                        has_dolp=True,
+                        has_nir=nir is not None,
+                    )
+
                 diag.stages.append(StageResult(
                     stage_name="imaging_deglare",
                     duration_ms=(time.monotonic() - t_img) * 1000,
@@ -1113,7 +1189,7 @@ class DetectionPipeline:
                 self._object_detector.detect, frame,
             )
             anomaly_future: Future = self._inference_executor.submit(
-                self._predict_anomaly, frame,
+                self._predict_anomaly, frame, fused_tensor,
             )
             try:
                 detection_result: ObjectDetectionResult = yolo_future.result(timeout=30.0)
@@ -1177,7 +1253,7 @@ class DetectionPipeline:
                 self._object_detector.detect, frame,
             )
             anomaly_future = self._inference_executor.submit(
-                self._predict_anomaly, frame,
+                self._predict_anomaly, frame, fused_tensor,
             )
             try:
                 detection_result = yolo_future.result(timeout=30.0)
@@ -1717,6 +1793,25 @@ class DetectionPipeline:
                 )
 
         if alert is not None:
+            # Persist trajectory centroid history for visualization
+            try:
+                if (
+                    hasattr(self, '_physics_tracker')
+                    and self._physics_tracker is not None
+                ):
+                    temporal_state = self._physics_tracker.update([], self._frame_counter)
+                    for track in getattr(temporal_state, 'active_tracks', []):
+                        if getattr(track, 'trajectory_history', None):
+                            alert.trajectory_points = list(track.trajectory_history)
+                            break
+            except Exception:
+                pass
+
+            # Auto-categorize alert based on detection characteristics
+            alert.category = self._categorize_alert(
+                alert, simplex_result, detection_result,
+            )
+
             alert.model_version_id = self._model_version_id
             self.stats.alerts_emitted += 1
             if self._on_alert:
