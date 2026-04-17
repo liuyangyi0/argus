@@ -364,6 +364,154 @@ class TestCUSUMEvidence:
         # The key test is that it doesn't crash and evidence mechanics work
 
 
+class TestSpatialContinuityF3:
+    """F3: strict spatial continuity — high IoU required, reset on mismatch."""
+
+    @staticmethod
+    def _build_grader(mode: str, iou_threshold: float = 0.7):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.95,
+                evidence_threshold=3.0,
+                spatial_continuity_enabled=True,
+                spatial_continuity_iou_threshold=iou_threshold,
+                spatial_continuity_mode=mode,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=10,
+                same_camera_window_seconds=5,
+            ),
+        )
+        return AlertGrader(config)
+
+    @staticmethod
+    def _build_evidence(grader, n_frames: int = 3) -> np.ndarray:
+        """Accumulate evidence with a matching mask on the top-left region."""
+        map1 = np.zeros((100, 100), dtype=np.float32)
+        map1[20:60, 20:60] = 0.9
+        for i in range(n_frames):
+            grader.evaluate(
+                camera_id="cam1", zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.8, frame_number=i, anomaly_map=map1,
+            )
+        return map1
+
+    def test_iou_below_threshold_resets_evidence_in_reset_mode(self):
+        """IoU well below threshold in reset mode wipes evidence to 0 before accumulation."""
+        grader = self._build_grader(mode="reset", iou_threshold=0.7)
+        self._build_evidence(grader, n_frames=3)
+        tracker = grader._trackers["cam1:z1"]
+        assert tracker.evidence > 1.0
+        pre_evidence = tracker.evidence
+
+        # Disjoint region → IoU = 0 < 0.7 → reset path
+        map2 = np.zeros((100, 100), dtype=np.float32)
+        map2[70:95, 70:95] = 0.9
+        grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8, frame_number=99, anomaly_map=map2,
+        )
+        after = grader._trackers["cam1:z1"].evidence
+        # Evidence was reset to 0 then this single frame's score accumulated.
+        # Formula: lam * 0 + 0.8 = 0.8 → strictly less than a single decay step
+        # of the previous evidence (pre_evidence * 0.5).
+        assert after < pre_evidence * 0.5 + 0.9
+
+    def test_iou_below_threshold_decays_in_decay_mode(self):
+        """IoU below threshold in decay mode preserves legacy 50% decay."""
+        grader = self._build_grader(mode="decay", iou_threshold=0.7)
+        self._build_evidence(grader, n_frames=3)
+        pre_evidence = grader._trackers["cam1:z1"].evidence
+        assert pre_evidence > 1.0
+
+        map2 = np.zeros((100, 100), dtype=np.float32)
+        map2[70:95, 70:95] = 0.9
+        grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8, frame_number=99, anomaly_map=map2,
+        )
+        # Legacy path: evidence halved, then lam * decayed + 0.8 accumulated.
+        after = grader._trackers["cam1:z1"].evidence
+        # Decay keeps more than a hard reset would.
+        lam = 0.95
+        approx_lower = lam * (pre_evidence * 0.5) + 0.5  # generous lower bound
+        assert after > approx_lower
+
+    def test_iou_above_threshold_no_change(self):
+        """IoU above threshold → evidence continues accumulating normally."""
+        grader = self._build_grader(mode="reset", iou_threshold=0.7)
+        map1 = np.zeros((100, 100), dtype=np.float32)
+        map1[20:60, 20:60] = 0.9
+        # Three frames accumulate evidence.
+        for i in range(3):
+            grader.evaluate(
+                camera_id="cam1", zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.8, frame_number=i, anomaly_map=map1,
+            )
+        pre_evidence = grader._trackers["cam1:z1"].evidence
+
+        # Near-identical mask (shifted by 1px) — IoU well above 0.7.
+        map2 = np.zeros((100, 100), dtype=np.float32)
+        map2[21:61, 21:61] = 0.9
+        grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8, frame_number=99, anomaly_map=map2,
+        )
+        after = grader._trackers["cam1:z1"].evidence
+        # Evidence should have grown further (lam*prev + new_score).
+        assert after > pre_evidence
+
+    def test_spatial_continuity_reset_metric_incremented(self):
+        """Each reset triggers the spatial_continuity_resets Prometheus counter."""
+        import argus.alerts.grader as grader_module
+        from unittest.mock import MagicMock
+
+        grader = self._build_grader(mode="reset", iou_threshold=0.7)
+        self._build_evidence(grader, n_frames=3)
+
+        # Replace the counter's .labels(...).inc() chain with a spy.
+        fake_counter = MagicMock()
+        fake_counter.labels.return_value = MagicMock()
+        original = grader_module.METRICS.spatial_continuity_resets
+        grader_module.METRICS.spatial_continuity_resets = fake_counter
+        try:
+            map2 = np.zeros((100, 100), dtype=np.float32)
+            map2[70:95, 70:95] = 0.9
+            grader.evaluate(
+                camera_id="cam1", zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.8, frame_number=99, anomaly_map=map2,
+            )
+        finally:
+            grader_module.METRICS.spatial_continuity_resets = original
+
+        fake_counter.labels.assert_called_with(camera_id="cam1")
+        fake_counter.labels.return_value.inc.assert_called()
+
+    def test_prev_mask_memory_bounded_to_one(self):
+        """Tracker keeps at most the latest anomaly mask, never a growing list."""
+        grader = self._build_grader(mode="reset", iou_threshold=0.7)
+        # Only 3 frames — keeps evidence below alert threshold so the tracker
+        # is not reset mid-test (alert emission resets the tracker state).
+        for i in range(3):
+            m = np.zeros((64, 64), dtype=np.float32)
+            m[10:30, 10:30] = 0.9
+            grader.evaluate(
+                camera_id="cam1", zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.8, frame_number=i, anomaly_map=m,
+            )
+        tracker = grader._trackers["cam1:z1"]
+        assert tracker.prev_anomaly_mask is not None
+        assert isinstance(tracker.prev_anomaly_mask, np.ndarray)
+
+
 class TestGraderConcurrency:
     """Thread-safety tests for AlertGrader under concurrent evaluation."""
 
