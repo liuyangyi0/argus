@@ -89,7 +89,9 @@ class MOG2PreFilter:
     # faster (~2ms vs 32ms) while retaining sub-pixel vibration detection.
     _ALIGN_WIDTH = 320
 
-    def _align_frame(self, frame: np.ndarray) -> np.ndarray:
+    def _align_frame(
+        self, frame: np.ndarray, gray_frame: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Compensate camera micro-vibration using phase correlation.
 
         Computes sub-pixel translation between consecutive frames in the
@@ -99,6 +101,10 @@ class MOG2PreFilter:
 
         Only compensates small shifts (<5px) that indicate vibration,
         not genuine scene motion.
+
+        When ``gray_frame`` (single-channel) is supplied the caller has
+        already computed a BGR->GRAY conversion for this frame; we downscale
+        that instead of re-running cvtColor on the full BGR input.
         """
         h, w = frame.shape[:2]
 
@@ -106,12 +112,20 @@ class MOG2PreFilter:
         if w > self._ALIGN_WIDTH:
             scale = self._ALIGN_WIDTH / w
             small_h = int(h * scale)
-            small = cv2.resize(frame, (self._ALIGN_WIDTH, small_h),
-                               interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            if gray_frame is not None:
+                small_gray = cv2.resize(gray_frame, (self._ALIGN_WIDTH, small_h),
+                                        interpolation=cv2.INTER_AREA)
+                gray = small_gray.astype(np.float32)
+            else:
+                small = cv2.resize(frame, (self._ALIGN_WIDTH, small_h),
+                                   interpolation=cv2.INTER_AREA)
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
         else:
             scale = 1.0
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            if gray_frame is not None:
+                gray = gray_frame.astype(np.float32)
+            else:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
         if self._hanning is None or self._hanning.shape != gray.shape:
             self._hanning = cv2.createHanningWindow(
@@ -149,13 +163,21 @@ class MOG2PreFilter:
 
         return frame
 
-    def process(self, frame: np.ndarray, learning_rate_override: float | None = None) -> PreFilterResult:
+    def process(
+        self,
+        frame: np.ndarray,
+        learning_rate_override: float | None = None,
+        gray_frame: np.ndarray | None = None,
+    ) -> PreFilterResult:
         """Apply background subtraction and determine if the frame has changed.
 
         Args:
             frame: BGR image from camera.
             learning_rate_override: If provided, override the default learning
                 rate for this call. Use 0.0 to freeze the background model.
+            gray_frame: Pre-computed full-resolution BGR->GRAY conversion of
+                ``frame``. When supplied, stabilization reuses it instead of
+                re-running cvtColor on the full BGR input.
 
         Returns:
             PreFilterResult with change detection outcome.
@@ -164,7 +186,7 @@ class MOG2PreFilter:
         # HIGH-02: Skip stabilization when learning is frozen (lock active)
         # to avoid introducing shadow artifacts from alignment during freeze
         if self.enable_stabilization and learning_rate_override != 0.0:
-            frame = self._align_frame(frame)
+            frame = self._align_frame(frame, gray_frame=gray_frame)
 
         # Median blur suppresses radiation-induced salt-and-pepper noise on CMOS
         # sensors in nuclear environments. 3x3 kernel adds <1ms latency.

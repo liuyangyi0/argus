@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import {
-  Card, Tag, Switch, Button, Tooltip, Space, Typography, message, Alert,
-  Select, Slider,
+  Card, Tag, Switch, Button, Space, Typography, message, Alert,
 } from 'ant-design-vue'
 import { ReloadOutlined, WarningOutlined } from '@ant-design/icons-vue'
 
@@ -11,6 +10,7 @@ import {
   toggleModule,
   type ImagingConfigPayload,
 } from '../../api'
+import { extractErrorMessage } from '../../utils/error'
 
 defineOptions({ name: 'ImagingPanel' })
 
@@ -24,8 +24,8 @@ async function load() {
   error.value = null
   try {
     cfg.value = await getImagingConfig()
-  } catch (e: any) {
-    error.value = e?.response?.data?.msg || e?.message || '加载成像配置失败'
+  } catch (e) {
+    error.value = extractErrorMessage(e, '加载成像配置失败')
     cfg.value = null
   } finally {
     loading.value = false
@@ -41,8 +41,8 @@ async function handleToggle(checked: string | number | boolean) {
     cfg.value.enabled = next
     message.success(next ? '多模态成像已启用' : '多模态成像已关闭')
     await load()
-  } catch (e: any) {
-    message.error(e?.response?.data?.msg || '切换失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '切换失败'))
   } finally {
     toggling.value = false
   }
@@ -56,8 +56,8 @@ async function handlePolarizationToggle(checked: string | number | boolean) {
     await toggleModule('imaging.polarization_processing', next)
     cfg.value.polarization_processing = next
     message.success(next ? '偏振处理已启用' : '偏振处理已关闭')
-  } catch (e: any) {
-    message.error(e?.response?.data?.msg || '切换失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '切换失败'))
   } finally {
     toggling.value = false
   }

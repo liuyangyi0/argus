@@ -16,6 +16,7 @@ import {
   toggleModule,
   type CrossCameraConfigPayload,
 } from '../../api'
+import { extractErrorMessage } from '../../utils/error'
 
 defineOptions({ name: 'CrossCameraPanel' })
 
@@ -53,8 +54,8 @@ async function load() {
   error.value = null
   try {
     cfg.value = await getCrossCameraConfig()
-  } catch (e: any) {
-    error.value = e?.response?.data?.msg || e?.message || '加载跨相机配置失败'
+  } catch (e) {
+    error.value = extractErrorMessage(e, '加载跨相机配置失败')
     cfg.value = null
   } finally {
     loading.value = false
@@ -91,8 +92,8 @@ async function handleToggle(checked: string | number | boolean) {
       ? '跨相机关联已启用（已运行的摄像头需要重启才会生效）'
       : '跨相机关联已关闭')
     await load()
-  } catch (e: any) {
-    message.error(e?.response?.data?.msg || '切换失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '切换失败'))
   } finally {
     toggling.value = false
   }
@@ -142,8 +143,8 @@ async function saveDraft() {
       : '配置已保存（关联器未运行，需重启摄像头生效）')
     editing.value = false
     await load()
-  } catch (e: any) {
-    message.error(e?.response?.data?.msg || e?.message || '保存失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '保存失败'))
   } finally {
     saving.value = false
   }

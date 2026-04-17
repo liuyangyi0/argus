@@ -299,3 +299,16 @@ class TemporalAnomalyTracker:
         """Clear all tracks."""
         self._tracks.clear()
         self._next_id = 1
+
+    def get_trajectory_histories(self) -> list[list[tuple[float, float, float]]]:
+        """Return a snapshot of every active track's trajectory history.
+
+        Read-only view: does not advance the state machine, touch
+        ``matched_this_frame``, or prune stale tracks. Use this when a
+        caller needs trajectory points without recording a frame update.
+        """
+        return [
+            list(track.trajectory_history)
+            for track in self._tracks.values()
+            if track.trajectory_history
+        ]

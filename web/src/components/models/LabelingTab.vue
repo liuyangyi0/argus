@@ -14,6 +14,7 @@ import {
 } from '../../api/labeling'
 import { getTrainingHistory } from '../../api/training'
 import type { TrainingRecord } from '../../types/api'
+import { extractErrorMessage } from '../../utils/error'
 
 const props = defineProps<{ cameras: Array<{ camera_id: string; name?: string }> }>()
 
@@ -120,8 +121,8 @@ async function handleLabel(entryId: number, label: 'normal' | 'anomaly') {
     entries.value = entries.value.filter((e) => e.id !== entryId)
     if (previewEntry.value?.id === entryId) previewVisible.value = false
     loadStats()
-  } catch (e: any) {
-    message.error('标注失败: ' + (e.response?.data?.msg || e.message))
+  } catch (e) {
+    message.error('标注失败: ' + extractErrorMessage(e))
   }
 }
 
@@ -150,8 +151,8 @@ async function handleTriggerRetrain() {
     })
     message.success(`训练任务已创建: ${result.job_id}，需要工程师确认`)
     loadStats()
-  } catch (e: any) {
-    message.error(e.response?.data?.msg || '触发训练失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '触发训练失败'))
   } finally {
     retrainLoading.value = false
   }
