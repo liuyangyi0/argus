@@ -44,6 +44,11 @@ class ZoneConfig(BaseModel):
     zone_type: Literal["include", "exclude"] = "include"
     priority: ZonePriority = ZonePriority.STANDARD
     anomaly_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    require_corroboration: bool = Field(
+        default=False,
+        description="F4: Drop uncorroborated alerts entirely for this zone instead of "
+        "severity downgrade. Strict mode for zones that must have cross-camera confirmation.",
+    )
 
 
 class MOG2Config(BaseModel):
@@ -706,6 +711,35 @@ class SuppressionConfig(BaseModel):
     same_camera_window_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
 
 
+class EarlyWarningConfig(BaseModel):
+    """F1: Single-frame fast-path bypass of CUSUM evidence accumulation.
+
+    When a single frame has an extremely high anomaly score AND corroborating
+    evidence from YOLO detection or open-vocabulary classifier, emit the alert
+    immediately rather than waiting for CUSUM evidence to accumulate. Suppression
+    windows still apply to prevent storms.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable single-frame early-warning fast path",
+    )
+    score_threshold: float = Field(
+        default=0.95, ge=0.5, le=0.99,
+        description="Adjusted anomaly score (post zone multiplier) required to fire the fast path",
+    )
+    require_detection_or_classifier: bool = Field(
+        default=True,
+        description="Require corroborating YOLO detection or classifier label before firing. "
+        "Set False to allow pure-anomaly-only early warning (more false positives).",
+    )
+    classifier_min_confidence: float = Field(
+        default=0.9, ge=0.1, le=0.99,
+        description="If the classifier fired, its confidence must be >= this value to qualify "
+        "as early-warning corroboration.",
+    )
+
+
 class WebhookConfig(BaseModel):
     enabled: bool = False
     url: str = ""
@@ -732,6 +766,7 @@ class AlertConfig(BaseModel):
     severity_thresholds: SeverityThresholds = Field(default_factory=SeverityThresholds)
     temporal: TemporalConfirmation = Field(default_factory=TemporalConfirmation)
     suppression: SuppressionConfig = Field(default_factory=SuppressionConfig)
+    early_warning: EarlyWarningConfig = Field(default_factory=EarlyWarningConfig)
     calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     zone_multipliers: dict[str, float] = Field(
         default_factory=lambda: {"critical": 1.2, "standard": 1.0, "low_priority": 0.8}

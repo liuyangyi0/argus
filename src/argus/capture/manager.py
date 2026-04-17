@@ -735,6 +735,18 @@ class CameraManager:
                 alert.corroborated = result.corroborated
                 alert.correlation_partner = result.partner_camera
                 if not result.corroborated:
+                    # F4: Force-corroboration mode — drop the alert entirely
+                    # instead of downgrading, when the zone demands it.
+                    if self._zone_requires_corroboration(alert.camera_id, alert.zone_id):
+                        logger.info(
+                            "alerts.suppressed_uncorroborated",
+                            alert_id=alert.alert_id,
+                            camera_id=alert.camera_id,
+                            zone_id=alert.zone_id,
+                            partner=result.partner_camera,
+                        )
+                        return
+
                     downgrade = (
                         self._cross_camera_config.uncorroborated_severity_downgrade
                         if self._cross_camera_config
@@ -960,6 +972,22 @@ class CameraManager:
             return severity
         new_idx = max(0, idx - levels)
         return cls._SEVERITY_ORDER[new_idx]
+
+    def _zone_requires_corroboration(self, camera_id: str, zone_id: str) -> bool:
+        """Return True when the zone's F4 ``require_corroboration`` flag is set.
+
+        Missing camera or zone (e.g. synthetic "default" zone_id) safely
+        returns False so we fall back to the existing downgrade behaviour.
+        """
+        cam_config = next(
+            (c for c in self._cameras if c.camera_id == camera_id), None,
+        )
+        if cam_config is None:
+            return False
+        for zone in cam_config.zones:
+            if zone.zone_id == zone_id:
+                return bool(getattr(zone, "require_corroboration", False))
+        return False
 
     # --- 5.3: Process-level watchdog ---
 

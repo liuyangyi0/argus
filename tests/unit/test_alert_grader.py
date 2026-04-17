@@ -10,6 +10,7 @@ from argus.alerts.grader import AlertGrader, _AnomalyTracker
 from argus.config.schema import (
     AlertConfig,
     AlertSeverity,
+    EarlyWarningConfig,
     SeverityThresholds,
     SuppressionConfig,
     TemporalConfirmation,
@@ -596,3 +597,208 @@ class TestGraderConcurrency:
 
         # Stale tracker should have been pruned (last_seen 2h ago > 1h default)
         assert "cam_old:z_old" not in grader._trackers
+
+
+class TestEarlyWarningFastPath:
+    """F1: single-frame early-warning bypass of CUSUM evidence accumulation."""
+
+    def _ew_config(self, **ew_overrides) -> AlertConfig:
+        ew_defaults = dict(
+            enabled=True,
+            score_threshold=0.95,
+            require_detection_or_classifier=True,
+            classifier_min_confidence=0.9,
+        )
+        ew_defaults.update(ew_overrides)
+        return make_config(
+            # Strict CUSUM threshold so only the fast path can fire on one frame.
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.95,
+                evidence_threshold=10.0,
+            ),
+            early_warning=EarlyWarningConfig(**ew_defaults),
+        )
+
+    def _metal_detection(self) -> list[dict]:
+        return [{"class_name": "wrench", "confidence": 0.88, "bbox": [0, 0, 10, 10]}]
+
+    def test_early_warning_fires_immediately_on_high_score_with_detection(self):
+        """anomaly=0.97 + non-person YOLO detection → alert on first frame (no CUSUM wait)."""
+        grader = AlertGrader(self._ew_config())
+        alert = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.97,
+            frame_number=1,
+            detection_type="hybrid",
+            detected_objects=self._metal_detection(),
+        )
+        assert alert is not None
+        assert alert.severity == AlertSeverity.HIGH
+        assert alert.triggered_by_early_warning is True
+
+    def test_early_warning_not_fired_without_detection_or_classifier(self):
+        """anomaly=0.97 alone (no detection, no classifier) → fall back to CUSUM (no alert yet)."""
+        grader = AlertGrader(self._ew_config())
+        alert = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.97,
+            frame_number=1,
+            detection_type="anomaly",
+            detected_objects=None,
+        )
+        # Fast path declined; CUSUM threshold (10.0) not met on single frame.
+        assert alert is None
+
+    def test_early_warning_respects_suppression_window(self):
+        """Two high-confidence frames within same_zone_window_seconds → second suppressed."""
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.95,
+                evidence_threshold=10.0,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+            ),
+            early_warning=EarlyWarningConfig(
+                enabled=True,
+                score_threshold=0.95,
+                require_detection_or_classifier=True,
+                classifier_min_confidence=0.9,
+            ),
+        )
+        grader = AlertGrader(config)
+        first = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.97, frame_number=1,
+            detection_type="hybrid",
+            detected_objects=self._metal_detection(),
+        )
+        assert first is not None
+        assert first.triggered_by_early_warning is True
+
+        second = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.98, frame_number=2,
+            detection_type="hybrid",
+            detected_objects=self._metal_detection(),
+        )
+        assert second is None
+
+    def test_early_warning_disabled_falls_back_to_cusum(self):
+        """enabled=False → fast path never runs, even with all corroboration."""
+        grader = AlertGrader(self._ew_config(enabled=False))
+        # With the strict evidence_threshold=10.0, CUSUM won't fire on one frame.
+        alert = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.98, frame_number=1,
+            detection_type="hybrid",
+            detected_objects=self._metal_detection(),
+        )
+        assert alert is None
+
+    def test_early_warning_marks_alert_flag(self):
+        """Fired early-warning alert carries triggered_by_early_warning=True."""
+        grader = AlertGrader(self._ew_config())
+        alert = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.97, frame_number=1,
+            detection_type="hybrid",
+            detected_objects=self._metal_detection(),
+        )
+        assert alert is not None
+        assert alert.triggered_by_early_warning is True
+        # And a regular CUSUM fire should NOT carry the flag.
+        cusum_grader = AlertGrader(make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80, evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=10, same_camera_window_seconds=5,
+            ),
+        ))
+        cusum_alert = cusum_grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.75, frame_number=1,
+        )
+        assert cusum_alert is not None
+        assert cusum_alert.triggered_by_early_warning is False
+
+    def test_early_warning_fires_on_classifier_corroboration(self):
+        """High anomaly + high-confidence classifier label → early-warning fires."""
+        grader = AlertGrader(self._ew_config())
+        alert = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.97, frame_number=1,
+            detection_type="anomaly",
+            detected_objects=None,
+            classification_label="wrench",
+            classification_confidence=0.95,
+        )
+        assert alert is not None
+        assert alert.triggered_by_early_warning is True
+        assert alert.classification_label == "wrench"
+
+    def test_early_warning_rejects_low_confidence_classifier(self):
+        """Classifier confidence below classifier_min_confidence → fast path declines."""
+        grader = AlertGrader(self._ew_config(classifier_min_confidence=0.9))
+        alert = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.97, frame_number=1,
+            detection_type="anomaly",
+            detected_objects=None,
+            classification_label="wrench",
+            classification_confidence=0.75,
+        )
+        assert alert is None
+
+    def test_early_warning_ignores_person_only_detections(self):
+        """person-only detections don't justify fast path (still need CUSUM)."""
+        grader = AlertGrader(self._ew_config())
+        alert = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.97, frame_number=1,
+            detection_type="object",
+            detected_objects=[{"class_name": "person", "confidence": 0.95}],
+        )
+        assert alert is None
+
+    def test_early_warning_score_below_threshold_declines(self):
+        """Score below early_warning.score_threshold → fast path declines."""
+        grader = AlertGrader(self._ew_config(score_threshold=0.95))
+        alert = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.90, frame_number=1,
+            detection_type="hybrid",
+            detected_objects=self._metal_detection(),
+        )
+        assert alert is None
+
+    def test_early_warning_without_detection_guard_fires_on_pure_anomaly(self):
+        """With require_detection_or_classifier=False, pure-anomaly frame qualifies."""
+        grader = AlertGrader(self._ew_config(require_detection_or_classifier=False))
+        alert = grader.evaluate(
+            camera_id="cam1", zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.97, frame_number=1,
+            detection_type="anomaly",
+            detected_objects=None,
+        )
+        assert alert is not None
+        assert alert.triggered_by_early_warning is True
