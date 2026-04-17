@@ -41,17 +41,31 @@ class ComparisonResult:
     winner: str  # "A", "B", or "tie"
     reason: str  # explanation of why winner was chosen
 
+    # Phase 1: P/R/F1/AUROC/PR-AUC — populated when positive_dir/negative_dir provided
+    model_a_f1: float | None = None
+    model_b_f1: float | None = None
+    model_a_precision: float | None = None
+    model_b_precision: float | None = None
+    model_a_recall: float | None = None
+    model_b_recall: float | None = None
+    model_a_auroc: float | None = None
+    model_b_auroc: float | None = None
+    model_a_pr_auc: float | None = None
+    model_b_pr_auc: float | None = None
+
 
 class ModelComparator:
     """Compare two anomaly detection models on the same validation set.
 
-    Winner criteria (lower is better for normal images):
-    1. Lower max score (fewer false positives)
+    Winner criteria (in order):
+    0. Higher F1 on real-labeled data (positive_dir + negative_dir) — Phase 1
+    1. Lower max score on normal images (fewer false positives)
     2. Lower mean score (more confident on normal images)
-    3. If scores similar (within 5%): prefer lower latency
+    3. If similar: prefer lower latency
     """
 
     SIMILARITY_THRESHOLD = 0.05  # 5% relative difference = "similar"
+    F1_SIMILARITY_THRESHOLD = 0.02  # F1 < 2% absolute diff = "similar", fall through
 
     def compare(
         self,
@@ -59,8 +73,16 @@ class ModelComparator:
         model_b_path: Path,
         val_dir: Path,
         image_size: tuple[int, int] = (256, 256),
+        positive_dir: Path | None = None,
+        negative_dir: Path | None = None,
+        threshold: float = 0.7,
     ) -> ComparisonResult:
-        """Run both models on validation images and compare scores + latency."""
+        """Run both models on validation images and compare scores + latency.
+
+        When positive_dir and negative_dir are both provided, additionally compute
+        P/R/F1/AUROC/PR-AUC on real labeled data; F1 becomes the primary winner
+        criterion (when the absolute diff > F1_SIMILARITY_THRESHOLD).
+        """
         images = self._load_images(val_dir, image_size)
         if not images:
             raise ValueError(f"No images found in {val_dir}")
@@ -70,6 +92,7 @@ class ModelComparator:
             model_a=str(model_a_path),
             model_b=str(model_b_path),
             num_images=len(images),
+            has_labeled_eval=positive_dir is not None and negative_dir is not None,
         )
 
         # Run model A
@@ -92,8 +115,17 @@ class ModelComparator:
         stats_a = self._compute_stats(scores_a)
         stats_b = self._compute_stats(scores_b)
 
+        # Phase 1: labeled evaluation for F1 winner criterion
+        labeled_a = None
+        labeled_b = None
+        if positive_dir is not None and negative_dir is not None:
+            labeled_a = self._evaluate_labeled(detector_a, positive_dir, negative_dir, threshold)
+            labeled_b = self._evaluate_labeled(detector_b, positive_dir, negative_dir, threshold)
+
         # Determine winner
-        winner, reason = self._pick_winner(stats_a, stats_b, latency_a, latency_b)
+        winner, reason = self._pick_winner(
+            stats_a, stats_b, latency_a, latency_b, labeled_a, labeled_b,
+        )
 
         result = ComparisonResult(
             model_a_path=str(model_a_path),
@@ -112,6 +144,16 @@ class ModelComparator:
             model_b_latency_ms=latency_b,
             winner=winner,
             reason=reason,
+            model_a_f1=labeled_a["f1"] if labeled_a else None,
+            model_b_f1=labeled_b["f1"] if labeled_b else None,
+            model_a_precision=labeled_a["precision"] if labeled_a else None,
+            model_b_precision=labeled_b["precision"] if labeled_b else None,
+            model_a_recall=labeled_a["recall"] if labeled_a else None,
+            model_b_recall=labeled_b["recall"] if labeled_b else None,
+            model_a_auroc=labeled_a["auroc"] if labeled_a else None,
+            model_b_auroc=labeled_b["auroc"] if labeled_b else None,
+            model_a_pr_auc=labeled_a["pr_auc"] if labeled_a else None,
+            model_b_pr_auc=labeled_b["pr_auc"] if labeled_b else None,
         )
 
         logger.info(
@@ -167,17 +209,46 @@ class ModelComparator:
             "p95": float(np.percentile(arr, 95)),
         }
 
+    def _evaluate_labeled(
+        self,
+        detector: AnomalibDetector,
+        positive_dir: Path,
+        negative_dir: Path,
+        threshold: float,
+    ) -> dict | None:
+        """Run detector over labeled dirs and compute P/R/F1/AUROC/PR-AUC.
+
+        Returns None when sample count is insufficient.
+        """
+        from argus.validation.recall_test import evaluate_metrics
+        return evaluate_metrics(
+            detector,
+            positive_dir=positive_dir,
+            negative_dir=negative_dir,
+            threshold=threshold,
+        )
+
     def _pick_winner(
         self,
         stats_a: dict[str, float],
         stats_b: dict[str, float],
         latency_a: float,
         latency_b: float,
+        labeled_a: dict | None = None,
+        labeled_b: dict | None = None,
     ) -> tuple[str, str]:
-        """Determine winner based on max score, mean score, and latency.
+        """Determine winner. When labeled P/R/F1 is available, F1 leads.
 
         Returns (winner, reason) where winner is "A", "B", or "tie".
         """
+        # Criterion 0 (Phase 1): Higher F1 on real labeled data
+        if labeled_a is not None and labeled_b is not None:
+            f1_a, f1_b = labeled_a["f1"], labeled_b["f1"]
+            if abs(f1_a - f1_b) > self.F1_SIMILARITY_THRESHOLD:
+                if f1_a > f1_b:
+                    return "A", f"Higher F1 on labeled data ({f1_a:.4f} vs {f1_b:.4f})"
+                return "B", f"Higher F1 on labeled data ({f1_b:.4f} vs {f1_a:.4f})"
+
         max_a, max_b = stats_a["max"], stats_b["max"]
         mean_a, mean_b = stats_a["mean"], stats_b["mean"]
 
