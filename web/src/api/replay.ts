@@ -1,4 +1,5 @@
 import { api, u } from './client'
+import type { StoryboardResponse } from '../types/api'
 
 // ── Replay (FR-033) ──
 export const getReplayMetadata = (alertId: string) =>
@@ -24,3 +25,7 @@ export const addReplayClip = (
 ) => api.post(`/replay/${alertId}/clips`, data).then(u)
 export const deleteReplayClip = (alertId: string, index: number) =>
   api.delete(`/replay/${alertId}/clips/${index}`).then(u)
+
+// ── Multi-camera Storyboard ──
+export const getStoryboard = (alertId: string): Promise<StoryboardResponse> =>
+  api.get(`/replay/storyboard/${alertId}`).then(u)

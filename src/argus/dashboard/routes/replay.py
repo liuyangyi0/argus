@@ -20,8 +20,15 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
+from argus.storage.models import AlertRecord
 
 router = APIRouter()
+
+# Maximum cameras to return in a storyboard; keeps the grid usable.
+_MAX_STORYBOARD_CAMERAS = 4
+# Window used to match a correlation-partner alert to the primary alert
+# when no event_group_id linkage exists.
+_CORRELATION_WINDOW_SECONDS = 5.0
 
 
 def _get_recording_store(request: Request):
@@ -429,6 +436,119 @@ def delete_clip(request: Request, alert_id: str, index: int):
 
     clips = store.list_clips(alert_id) or []
     return api_success({"clips": clips})
+
+
+def _alert_trigger_timestamp(alert: AlertRecord) -> float:
+    """Epoch-seconds trigger timestamp for an alert record.
+
+    AlertRecord stores ``timestamp`` as a naive ``datetime`` (written via
+    :meth:`datetime.utcnow`-style helpers across the codebase), so we read it
+    as UTC to produce a stable epoch value. This is what downstream clients
+    use to align videos across cameras.
+    """
+    ts = alert.timestamp
+    if ts is None:
+        return 0.0
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.timestamp()
+
+
+def _storyboard_item(primary_ts: float, alert: AlertRecord) -> dict:
+    """Shape a single AlertRecord as a storyboard camera entry."""
+    ts = _alert_trigger_timestamp(alert)
+    return {
+        "alert_id": alert.alert_id,
+        "camera_id": alert.camera_id,
+        "trigger_timestamp": ts,
+        "metadata_url": f"/api/replay/{alert.alert_id}/metadata",
+        "video_url": f"/api/replay/{alert.alert_id}/video",
+        "signals_url": f"/api/replay/{alert.alert_id}/signals",
+        "trigger_offset_s": ts - primary_ts,
+    }
+
+
+@router.get("/storyboard/{alert_id}")
+def replay_storyboard(request: Request, alert_id: str):
+    """Return a synchronised multi-camera storyboard for an alert.
+
+    The storyboard bundles the primary alert with any correlated or
+    event-grouped alerts from *other* cameras so the frontend can play them
+    on a shared master timeline. Each entry includes the per-camera
+    ``trigger_offset_s`` (seconds from the primary alert) used for alignment.
+
+    Resolution rules (deduped, capped at :data:`_MAX_STORYBOARD_CAMERAS`):
+
+    1. The primary alert itself (always first, offset 0).
+    2. If ``correlation_partner`` is set, the closest alert from that camera
+       whose trigger falls within ±5 s of the primary alert.
+    3. If ``event_group_id`` is set, all alerts in the same event group from
+       cameras different from the primary's camera.
+    """
+    db = _get_db(request)
+    if db is None:
+        return api_unavailable("数据库未配置")
+
+    primary = db.get_alert(alert_id)
+    if primary is None:
+        return api_not_found("告警不存在")
+
+    primary_ts = _alert_trigger_timestamp(primary)
+    items: list[dict] = [_storyboard_item(primary_ts, primary)]
+    seen_alert_ids: set[str] = {primary.alert_id}
+    seen_camera_ids: set[str] = {primary.camera_id}
+
+    # Rule 2: correlation_partner — find the closest matching alert from the
+    # partner camera within the ±5 s window. We search the DB directly to
+    # avoid loading the whole alerts table.
+    if primary.correlation_partner:
+        with db.get_session() as session:
+            from sqlalchemy import select
+            candidates = session.scalars(
+                select(AlertRecord)
+                .where(AlertRecord.camera_id == primary.correlation_partner)
+                .where(AlertRecord.alert_id != primary.alert_id)
+            ).all()
+        best: AlertRecord | None = None
+        best_delta = _CORRELATION_WINDOW_SECONDS
+        for cand in candidates:
+            delta = abs(_alert_trigger_timestamp(cand) - primary_ts)
+            if delta <= best_delta:
+                best = cand
+                best_delta = delta
+        if best is not None and best.alert_id not in seen_alert_ids:
+            items.append(_storyboard_item(primary_ts, best))
+            seen_alert_ids.add(best.alert_id)
+            seen_camera_ids.add(best.camera_id)
+
+    # Rule 3: event_group_id — include every alert in the same group from a
+    # camera we have not added yet.
+    if primary.event_group_id and len(items) < _MAX_STORYBOARD_CAMERAS:
+        with db.get_session() as session:
+            from sqlalchemy import select
+            group_alerts = session.scalars(
+                select(AlertRecord)
+                .where(AlertRecord.event_group_id == primary.event_group_id)
+                .where(AlertRecord.alert_id != primary.alert_id)
+                .order_by(AlertRecord.timestamp.asc())
+            ).all()
+        for cand in group_alerts:
+            if len(items) >= _MAX_STORYBOARD_CAMERAS:
+                break
+            if cand.alert_id in seen_alert_ids:
+                continue
+            if cand.camera_id in seen_camera_ids:
+                # Spec: only include alerts from *different* cameras.
+                continue
+            items.append(_storyboard_item(primary_ts, cand))
+            seen_alert_ids.add(cand.alert_id)
+            seen_camera_ids.add(cand.camera_id)
+
+    return api_success({
+        "primary_alert_id": primary.alert_id,
+        "cameras": items,
+        "count": len(items),
+    })
 
 
 def _compute_key_frames(signals: dict) -> list[dict]:
