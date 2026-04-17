@@ -460,6 +460,7 @@ class ModelTrainer:
                         quantization=quantization,
                         val_dir=val_dir,
                         calibration_images=calibration_images,
+                        image_size=image_size,
                     )
                     actual_export_format = export_result["actual_format"]
                     actual_quantization = export_result["actual_quantization"]
@@ -1386,6 +1387,37 @@ class ModelTrainer:
         return engine, model
 
     @staticmethod
+    def _reshape_openvino_static(export_path: Path, image_size: int) -> bool:
+        """Lock the OpenVINO IR batch dimension to 1.
+
+        anomalib's engine.export(input_size=...) only fixes spatial dims;
+        the batch dim stays dynamic ("?"), which makes CPU inference trip
+        on Broadcast ops. Call this right after engine.export() so the IR
+        is ready for single-image CPU inference. INT8 quantization
+        preserves the reshape because nncf reads the already-static model.
+        """
+        try:
+            import openvino as ov
+        except ImportError:
+            return False
+        xml = next(export_path.rglob("model.xml"), None) if export_path.is_dir() else None
+        if xml is None or not xml.exists():
+            return False
+        try:
+            ov_model = ov.Core().read_model(xml)
+            ov_model.reshape({0: [1, 3, image_size, image_size]})
+            ov.save_model(ov_model, str(xml))
+            logger.info(
+                "training.openvino_batch_fixed",
+                shape=[1, 3, image_size, image_size],
+                path=str(xml),
+            )
+            return True
+        except Exception as e:
+            logger.warning("training.openvino_reshape_failed", error=str(e))
+            return False
+
+    @staticmethod
     def _export_model(
         engine,
         model,
@@ -1395,6 +1427,7 @@ class ModelTrainer:
         quantization: str = "fp16",
         val_dir: Path | None = None,
         calibration_images: int = 100,
+        image_size: int = 256,
     ) -> dict[str, str]:
         """Export trained model to an optimized inference format.
 
@@ -1445,6 +1478,10 @@ class ModelTrainer:
             else:
                 raise
         logger.info("training.exported", format=actual_format, path=export_path)
+
+        # Lock batch dim to 1 so CPU inference doesn't trip on Broadcast ops.
+        if actual_format == "openvino":
+            ModelTrainer._reshape_openvino_static(Path(export_path), image_size)
 
         # INT8 post-training quantization (B2)
         actual_quantization = quantization
@@ -1683,6 +1720,8 @@ class ModelTrainer:
                 export_path=export_path,
                 checkpoint=str(ckpt),
             )
+            if export_format == "openvino":
+                self._reshape_openvino_static(Path(export_path), image_size)
         except Exception as e:
             logger.error("reexport.failed", error=str(e))
             return {"status": "error", "error": f"导出失败: {e}"}
