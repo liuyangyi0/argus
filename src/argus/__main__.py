@@ -128,6 +128,12 @@ def _setup_file_logging(config, log_level: int) -> None:
     root_logger.addHandler(file_handler)
     root_logger.setLevel(log_level)
 
+    # APScheduler emits INFO per job fire ("Running job" + "executed successfully").
+    # On a 30s cadence across N scheduled jobs this dominates steady-state logs
+    # with no information value — bump to WARNING so only real issues surface.
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
+
 
 _SEVERITY_COLORS = {
     AlertSeverity.INFO: "\033[36m",    # cyan
