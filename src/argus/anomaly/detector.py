@@ -473,8 +473,26 @@ class AnomalibDetector:
                 raw_score=raw_score_out,
             )
         except Exception as e:
-            logger.error("anomaly.predict_failed", error=str(e), error_type=type(e).__name__)
+            # Rate-limit: a silent regression (e.g. the Dinomaly2 dynamic-shape
+            # crash fixed in #19) can fire this per-frame and flood logs with
+            # tens of thousands of duplicates. Log at 1/10/100 then every 1000th
+            # failure; the status record is still updated every frame so the
+            # /api/models/status endpoint keeps a precise consecutive_failures.
             self.status.mark_inference_failure(f"{type(e).__name__}: {e}")
+            n = self.status.consecutive_failures
+            if n == 1 or n == 10 or n == 100 or (n % 1000 == 0 and n > 0):
+                logger.error(
+                    "anomaly.predict_failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    consecutive_failures=n,
+                )
+            else:
+                logger.debug(
+                    "anomaly.predict_failed",
+                    error=str(e),
+                    consecutive_failures=n,
+                )
             return self._safe_result()
 
     def _safe_result(self) -> AnomalyResult:

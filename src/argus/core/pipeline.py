@@ -1139,7 +1139,7 @@ class DetectionPipeline:
                 delta = abs(mean_brightness - self._prev_brightness)
                 if delta >= self._brightness_jump_threshold:
                     brightness_jump = True
-                    logger.info(
+                    logger.debug(
                         "pipeline.brightness_jump",
                         camera_id=frame_data.camera_id,
                         delta=round(delta, 1),
@@ -1444,7 +1444,7 @@ class DetectionPipeline:
                 if not self._simplex_reference_set:
                     self._simplex.set_reference(frame)
                     self._simplex_reference_set = True
-                    logger.info(
+                    logger.debug(
                         "pipeline.simplex_reference_set",
                         camera_id=frame_data.camera_id,
                     )
@@ -1500,7 +1500,7 @@ class DetectionPipeline:
                         )
                         diag.anomaly_score = fallback_score
                         diag.is_anomalous = True
-                        logger.info(
+                        logger.debug(
                             "pipeline.simplex_safety_detection",
                             camera_id=frame_data.camera_id,
                             anomalib_score=round(original_anomalib_score, 4),
@@ -1595,7 +1595,7 @@ class DetectionPipeline:
                     },
                 ))
                 if classification_result:
-                    logger.info(
+                    logger.debug(
                         "pipeline.classified",
                         camera_id=frame_data.camera_id,
                         label=classification_result[0],
@@ -1613,7 +1613,7 @@ class DetectionPipeline:
         if classification_result is not None:
             label, _conf = classification_result
             if hasattr(self, "_classifier_suppress") and label in self._classifier_suppress:
-                logger.info(
+                logger.debug(
                     "pipeline.classifier_label_suppressed",
                     camera_id=frame_data.camera_id,
                     label=label,
