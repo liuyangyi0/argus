@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -134,6 +134,225 @@ class BaselineManager:
         if not base_dir.is_dir():
             return 0
         return len(list(base_dir.glob("*.png"))) + len(list(base_dir.glob("*.jpg")))
+
+    # ── Per-image CRUD (for manual baseline maintenance) ──
+
+    # Accept only baseline_NNNNN.png / .jpg / .jpeg filenames. The 5-digit
+    # prefix matches what save_frame() writes; the optional fp_ prefix below
+    # is covered by the broader regex because merge_fp_into_baseline uses
+    # its own naming. We also accept legacy "img_NNNNN" / "fp_*" patterns
+    # so the UI can still enumerate/delete older files — but uploads always
+    # use the canonical baseline_NNNNN.{ext} name.
+    _IMAGE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_\-]+\.(png|jpg|jpeg)$")
+    _CANONICAL_FILENAME_RE = re.compile(r"^baseline_\d{5}\.(png|jpg|jpeg)$")
+    _ALLOWED_EXTS = frozenset({"png", "jpg", "jpeg"})
+
+    @staticmethod
+    def _safe_filename(filename: str) -> bool:
+        """Reject filenames that could escape the version directory."""
+        if not filename or len(filename) > 128:
+            return False
+        if "/" in filename or "\\" in filename or "\x00" in filename:
+            return False
+        if ".." in filename:
+            return False
+        return bool(BaselineManager._IMAGE_FILENAME_RE.match(filename))
+
+    def _version_dir(self, camera_id: str, version: str, zone_id: str = "default") -> Path:
+        """Resolve the on-disk directory for a specific version (no legacy flat fallback)."""
+        return self.baselines_dir / camera_id / zone_id / version
+
+    def _is_active_version(self, camera_id: str, version: str, zone_id: str = "default") -> bool:
+        """True if the version is in ACTIVE lifecycle state."""
+        if not self._lifecycle:
+            return False
+        rec = self._lifecycle.get_version(camera_id, zone_id, version)
+        return bool(rec and rec.state == BaselineState.ACTIVE)
+
+    def list_images(
+        self, camera_id: str, version: str, zone_id: str = "default"
+    ) -> list[dict]:
+        """List images in a specific baseline version directory.
+
+        Returns:
+            List of ``{filename, size_bytes, created_at}`` sorted by filename.
+            Empty list if the version directory doesn't exist.
+        """
+        version_dir = self._version_dir(camera_id, version, zone_id)
+        if not version_dir.is_dir():
+            return []
+
+        results: list[dict] = []
+        for entry in sorted(version_dir.iterdir()):
+            if not entry.is_file():
+                continue
+            suffix = entry.suffix.lower().lstrip(".")
+            if suffix not in self._ALLOWED_EXTS:
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            created_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+            results.append({
+                "filename": entry.name,
+                "size_bytes": int(stat.st_size),
+                "created_at": created_at,
+            })
+        return results
+
+    def delete_image(
+        self,
+        camera_id: str,
+        version: str,
+        filename: str,
+        zone_id: str = "default",
+    ) -> bool:
+        """Delete one image file from a baseline version.
+
+        Safety:
+            - Filename must match the allowed pattern (no traversal).
+            - ACTIVE versions are immutable — deletion is rejected.
+
+        Returns:
+            True on successful deletion; False if filename is invalid,
+            file doesn't exist, or the version is ACTIVE.
+        """
+        if not self._safe_filename(filename):
+            logger.warning(
+                "baseline.image_delete_rejected_unsafe",
+                camera_id=camera_id,
+                version=version,
+                filename=filename,
+            )
+            return False
+
+        if self._is_active_version(camera_id, version, zone_id):
+            logger.warning(
+                "baseline.image_delete_rejected_active",
+                camera_id=camera_id,
+                version=version,
+            )
+            return False
+
+        version_dir = self._version_dir(camera_id, version, zone_id)
+        target = version_dir / filename
+        # Containment check — resolve and confirm parent is the version dir.
+        try:
+            resolved_target = target.resolve()
+            resolved_parent = version_dir.resolve()
+        except OSError:
+            return False
+        if resolved_target.parent != resolved_parent:
+            logger.warning(
+                "baseline.image_delete_rejected_outside_version_dir",
+                camera_id=camera_id,
+                version=version,
+                filename=filename,
+            )
+            return False
+
+        if not target.is_file():
+            return False
+
+        try:
+            target.unlink()
+        except OSError as exc:
+            logger.warning(
+                "baseline.image_delete_failed",
+                camera_id=camera_id,
+                version=version,
+                filename=filename,
+                error=str(exc),
+            )
+            return False
+
+        logger.info(
+            "baseline.image_deleted",
+            camera_id=camera_id,
+            zone_id=zone_id,
+            version=version,
+            filename=filename,
+        )
+        return True
+
+    def add_image_from_bytes(
+        self,
+        camera_id: str,
+        version: str,
+        data: bytes,
+        ext: str,
+        zone_id: str = "default",
+    ) -> str:
+        """Write raw image bytes as a new baseline image.
+
+        Args:
+            data: Raw image bytes (png/jpg/jpeg).
+            ext: Extension without leading dot, e.g. ``"png"``, ``"jpg"``.
+
+        Returns:
+            The new filename (e.g. ``"baseline_00042.png"``).
+
+        Raises:
+            ValueError: If the version is ACTIVE, ext is invalid, or the
+                byte stream doesn't decode as a real image.
+        """
+        ext_norm = ext.lower().lstrip(".")
+        if ext_norm == "jpeg":
+            ext_norm = "jpg"
+        if ext_norm not in {"png", "jpg"}:
+            raise ValueError(f"不支持的图片格式: {ext}")
+
+        if not data:
+            raise ValueError("图片内容为空")
+
+        if self._is_active_version(camera_id, version, zone_id):
+            raise ValueError("生产中的基线版本不可上传图片，请先退役")
+
+        version_dir = self._version_dir(camera_id, version, zone_id)
+        if not version_dir.is_dir():
+            raise ValueError(f"基线版本不存在: {camera_id}/{zone_id}/{version}")
+
+        # Verify the payload decodes as a real image before writing — rejects
+        # mislabeled uploads, corrupt files, and non-image junk.
+        arr = np.frombuffer(data, dtype=np.uint8)
+        decoded = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if decoded is None:
+            raise ValueError("图片内容损坏或格式不受支持")
+
+        # Find next index — scan existing baseline_NNNNN.* files and pick max + 1.
+        max_idx = -1
+        for existing in version_dir.glob("baseline_*.*"):
+            suffix = existing.suffix.lower().lstrip(".")
+            if suffix not in self._ALLOWED_EXTS:
+                continue
+            stem = existing.stem  # e.g. "baseline_00042"
+            try:
+                idx = int(stem.split("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if idx > max_idx:
+                max_idx = idx
+        next_idx = max_idx + 1
+        if next_idx > 99999:
+            raise ValueError("基线版本图片数量已达上限")
+
+        filename = f"baseline_{next_idx:05d}.{ext_norm}"
+        target = version_dir / filename
+        # Atomic write: to temp then rename.
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(target)
+
+        logger.info(
+            "baseline.image_added",
+            camera_id=camera_id,
+            zone_id=zone_id,
+            version=version,
+            filename=filename,
+            size_bytes=len(data),
+        )
+        return filename
 
     def get_all_baselines(self) -> list[dict]:
         """List all baselines with metadata."""

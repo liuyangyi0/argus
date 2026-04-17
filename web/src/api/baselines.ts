@@ -35,3 +35,67 @@ export const retireBaseline = (data: { camera_id: string; zone_id?: string; vers
   api.post('/baseline/retire', data).then(u)
 export const deleteBaselineVersion = (data: { camera_id: string; zone_id?: string; version: string; user?: string }) =>
   api.post('/baseline/version/delete', data).then(u)
+
+// ── Baseline Version Images (per-image CRUD) ──
+export interface BaselineImageInfo {
+  filename: string
+  size_bytes: number
+  created_at: string
+}
+
+export interface BaselineImageListResponse {
+  camera_id: string
+  zone_id: string
+  version: string
+  state: string | null
+  is_active: boolean
+  total: number
+  total_bytes: number
+  images: BaselineImageInfo[]
+}
+
+export const listBaselineImages = (
+  cameraId: string,
+  version: string,
+  zoneId: string = 'default',
+): Promise<BaselineImageListResponse> =>
+  api.get(`/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images`, {
+    params: { zone_id: zoneId },
+  }).then(u)
+
+export const deleteBaselineImage = (
+  cameraId: string,
+  version: string,
+  filename: string,
+  zoneId: string = 'default',
+): Promise<{ filename: string }> =>
+  api.delete(
+    `/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images/${encodeURIComponent(filename)}`,
+    { params: { zone_id: zoneId } },
+  ).then(u)
+
+export const uploadBaselineImage = (
+  cameraId: string,
+  version: string,
+  file: File,
+  zoneId: string = 'default',
+): Promise<{ filename: string; size_bytes: number }> => {
+  const form = new FormData()
+  form.append('file', file)
+  return api.post(
+    `/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images`,
+    form,
+    { params: { zone_id: zoneId }, headers: { 'Content-Type': 'multipart/form-data' } },
+  ).then(u)
+}
+
+/**
+ * Compose the static URL used for thumbnail <img src> — the server serves the
+ * raw image bytes here with a short cache-control.
+ */
+export const baselineImageContentUrl = (
+  cameraId: string,
+  version: string,
+  filename: string,
+  zoneId: string = 'default',
+): string => `/api/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images/${encodeURIComponent(filename)}/content?zone_id=${encodeURIComponent(zoneId)}`
