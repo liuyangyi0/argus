@@ -25,12 +25,14 @@ from argus.dashboard.routes.audit import router as audit_router
 from argus.dashboard.routes.backup import router as backup_router
 from argus.dashboard.routes.cameras import router as cameras_router
 from argus.dashboard.routes.config import router as config_router
+from argus.dashboard.routes.sensors import router as sensors_router
 from argus.dashboard.routes.system import router as system_router
 from argus.dashboard.routes.tasks import router as tasks_router
 from argus.dashboard.routes.reports import router as reports_router
 from argus.dashboard.routes.users import router as users_router
 from argus.dashboard.routes.zones import router as zones_router
 from argus.dashboard.websocket import ConnectionManager, verify_ws_token
+from argus.sensors.fusion import SensorFusion
 from argus.streaming.go2rtc_manager import Go2RTCManager
 
 if TYPE_CHECKING:
@@ -51,6 +53,7 @@ def create_app(
     config_path: str | None = None,
     task_manager: object | None = None,
     go2rtc_instance: Go2RTCManager | None = None,
+    sensor_fusion: SensorFusion | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
     from argus.anomaly.baseline_lifecycle import BaselineLifecycle
@@ -132,6 +135,21 @@ def create_app(
     app.state.go2rtc = go2rtc
     app.state.baseline_lifecycle = BaselineLifecycle(database) if database else None
 
+    # External sensor fusion — generic (camera_id, zone_id) -> multiplier store.
+    # When __main__ provides a shared instance, reuse it so the HTTP API and
+    # the camera pipelines point at the same store. Otherwise build a local
+    # one from config (the path used by tests and standalone dashboard mode).
+    if sensor_fusion is not None:
+        app.state.sensor_fusion = sensor_fusion
+    else:
+        from argus.config.schema import SensorFusionConfig
+
+        fusion_cfg = getattr(config, "sensor_fusion", None) or SensorFusionConfig()
+        app.state.sensor_fusion = SensorFusion(
+            enabled=fusion_cfg.enabled,
+            default_valid_for_s=fusion_cfg.default_valid_for_s,
+        )
+
     if task_manager is not None and getattr(task_manager, "_on_change", None) is None:
         task_manager._on_change = ws_manager.broadcast
 
@@ -200,6 +218,7 @@ def create_app(
     app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
     app.include_router(users_router, prefix="/api/users", tags=["users"])
     app.include_router(reports_router, prefix="/api/reports", tags=["reports"])
+    app.include_router(sensors_router, prefix="/api/sensors", tags=["sensors"])
 
     from argus.dashboard.routes.models import router as models_router
     app.include_router(models_router, prefix="/api/models", tags=["models"])

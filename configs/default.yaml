@@ -277,5 +277,8 @@ baseline_capture:
   pause_on_anomaly_lock: true
   post_capture_review: true
   review_flag_percentile: 0.99
+sensor_fusion:
+  enabled: false
+  default_valid_for_s: 60.0
 camera_groups: []
 log_level: INFO
