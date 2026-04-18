@@ -1,25 +1,27 @@
 <script setup lang="ts">
-import { ref, watch, onMounted } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { Badge, Button, Form, Input, InputNumber, Modal, Select, Space, Table, Typography, message } from 'ant-design-vue'
+import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons-vue'
+
+import { addCamera, deleteCamera, getCameraConfig, getCameras, getRegions, getUsbDevices, startCamera, stopCamera, updateCamera } from '../api'
+import { useWebSocket } from '../composables/useWebSocket'
+import { extractErrorMessage } from '../utils/error'
 
 defineOptions({ name: 'CamerasPage' })
-import { Table, Badge, Button, Typography, Space, Modal, Form, Input, Select, InputNumber, message } from 'ant-design-vue'
-import { PlusOutlined, DeleteOutlined, EditOutlined } from '@ant-design/icons-vue'
-import { getCameras, startCamera, stopCamera, getUsbDevices, addCamera, updateCamera, getCameraConfig, deleteCamera } from '../api'
-import { useWebSocket } from '../composables/useWebSocket'
 
 const router = useRouter()
 const cameras = ref<any[]>([])
 const loading = ref(true)
 
-// ── Modal state ──
 const modalVisible = ref(false)
-const editingId = ref<string | null>(null)  // null = add mode, string = edit mode
+const editingId = ref<string | null>(null)
 const modalLoading = ref(false)
 
 const defaultForm = () => ({
   camera_id: '',
   name: '',
+  region_id: undefined as number | undefined,
   source: '',
   protocol: 'rtsp',
   fps_target: 5,
@@ -29,36 +31,44 @@ const defaultForm = () => ({
   gige_pixel_format: 'Mono8',
   gige_capture_script: '',
 })
+
 const cameraForm = ref(defaultForm())
 
 const usbDevices = ref<{ index: number; name: string; width: number; height: number }[]>([])
 const usbLoading = ref(false)
+const regionOptions = ref<{ id: number; name: string }[]>([])
+const regionsLoading = ref(false)
 
 watch(() => cameraForm.value.protocol, async (proto) => {
-  if (proto === 'usb') {
-    usbLoading.value = true
-    try {
-      const res = await getUsbDevices()
-      usbDevices.value = res.devices ?? res
-      if (usbDevices.value.length > 0 && !editingId.value) {
-        cameraForm.value.source = String(usbDevices.value[0].index)
-      }
-    } catch { usbDevices.value = [] }
-    finally { usbLoading.value = false }
+  if (proto !== 'usb') return
+
+  usbLoading.value = true
+  try {
+    const res = await getUsbDevices()
+    usbDevices.value = res.devices ?? res
+    if (usbDevices.value.length > 0 && !editingId.value) {
+      cameraForm.value.source = String(usbDevices.value[0].index)
+    }
+  } catch {
+    usbDevices.value = []
+  } finally {
+    usbLoading.value = false
   }
 })
 
-// ── Source placeholder ──
 function sourcePlaceholder(): string {
   switch (cameraForm.value.protocol) {
-    case 'usb': return '选择 USB 摄像头'
-    case 'file': return 'data/video.mp4'
-    case 'gige': return '192.168.66.223'
-    default: return 'rtsp://admin:pass@192.168.1.100:554/stream'
+    case 'usb':
+      return '选择 USB 摄像头'
+    case 'file':
+      return 'data/video.mp4'
+    case 'gige':
+      return '192.168.66.223'
+    default:
+      return 'rtsp://admin:pass@192.168.1.100:554/stream'
   }
 }
 
-// ── Data fetching ──
 async function fetchData() {
   try {
     const res = await getCameras()
@@ -69,29 +79,49 @@ async function fetchData() {
   }
 }
 
-const { } = useWebSocket({
+async function fetchRegions() {
+  regionsLoading.value = true
+  try {
+    const res = await getRegions()
+    regionOptions.value = (res.regions || []).map((region: any) => ({
+      id: region.id,
+      name: region.name,
+    }))
+  } catch (e) {
+    message.error(extractErrorMessage(e, '加载区域列表失败'))
+  } finally {
+    regionsLoading.value = false
+  }
+}
+
+const {} = useWebSocket({
   topics: ['cameras'],
   onMessage(topic, data) {
-    if (topic === 'cameras') {
-      if (data && typeof data === 'object' && !Array.isArray(data) && data.camera_id) {
-        const idx = cameras.value.findIndex((c: any) => c.camera_id === data.camera_id)
-        if (idx >= 0) {
-          cameras.value[idx] = { ...cameras.value[idx], ...data }
-        } else {
-          cameras.value.push(data)
-        }
-      } else if (Array.isArray(data)) {
-        cameras.value = data
+    if (topic !== 'cameras') return
+
+    if (data && typeof data === 'object' && !Array.isArray(data) && data.camera_id) {
+      const idx = cameras.value.findIndex((camera: any) => camera.camera_id === data.camera_id)
+      if (idx >= 0) {
+        cameras.value[idx] = { ...cameras.value[idx], ...data }
+      } else {
+        cameras.value.push(data)
       }
+      return
+    }
+
+    if (Array.isArray(data)) {
+      cameras.value = data
     }
   },
   fallbackPoll: fetchData,
   fallbackInterval: 10000,
 })
 
-onMounted(fetchData)
+onMounted(() => {
+  fetchData()
+  fetchRegions()
+})
 
-// ── Camera lifecycle ──
 async function handleStart(id: string) {
   await startCamera(id)
   fetchData()
@@ -114,14 +144,13 @@ function handleDelete(id: string) {
         await deleteCamera(id)
         message.success('摄像头已删除')
         fetchData()
-      } catch (e: any) {
-        message.error(e.message || '删除失败')
+      } catch (e) {
+        message.error(extractErrorMessage(e, '删除失败'))
       }
     },
   })
 }
 
-// ── Add / Edit ──
 function openAddModal() {
   editingId.value = null
   cameraForm.value = defaultForm()
@@ -137,6 +166,7 @@ async function openEditModal(cameraId: string) {
     cameraForm.value = {
       camera_id: cfg.camera_id,
       name: cfg.name,
+      region_id: cfg.region_id || undefined,
       source: cfg.source,
       protocol: cfg.protocol,
       fps_target: cfg.fps_target,
@@ -146,8 +176,8 @@ async function openEditModal(cameraId: string) {
       gige_pixel_format: cfg.gige_pixel_format || 'Mono8',
       gige_capture_script: cfg.gige_capture_script || '',
     }
-  } catch (e: any) {
-    message.error(e.message || '获取配置失败')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '获取配置失败'))
     modalVisible.value = false
   } finally {
     modalLoading.value = false
@@ -157,8 +187,14 @@ async function openEditModal(cameraId: string) {
 async function handleSubmit() {
   try {
     const form = new FormData()
-    Object.entries(cameraForm.value).forEach(([k, v]) => {
-      if (v !== '' && v !== null && v !== undefined) form.append(k, String(v))
+    Object.entries(cameraForm.value).forEach(([key, value]) => {
+      if (key === 'region_id') {
+        form.append(key, value == null ? '' : String(value))
+        return
+      }
+      if (value !== '' && value !== null && value !== undefined) {
+        form.append(key, String(value))
+      }
     })
 
     if (editingId.value) {
@@ -168,23 +204,21 @@ async function handleSubmit() {
       await addCamera(form)
       message.success('摄像头已添加')
     }
+
     modalVisible.value = false
     cameraForm.value = defaultForm()
     editingId.value = null
     fetchData()
-  } catch (e: any) {
-    message.error(e.message || (editingId.value ? '更新失败' : '添加失败'))
+  } catch (e) {
+    message.error(extractErrorMessage(e, editingId.value ? '更新失败' : '添加失败'))
   }
 }
 
 const columns = [
-  {
-    title: '状态',
-    key: 'status',
-    width: 80,
-  },
+  { title: '状态', key: 'status', width: 80 },
   { title: '摄像头 ID', dataIndex: 'camera_id', key: 'camera_id' },
   { title: '名称', dataIndex: 'name', key: 'name' },
+  { title: '区域', dataIndex: 'region_name', key: 'region_name', width: 140 },
   {
     title: '已采集帧',
     key: 'frames',
@@ -193,19 +227,16 @@ const columns = [
   {
     title: '延迟',
     key: 'latency',
-    customRender: ({ record }: any) =>
-      record.stats ? `${record.stats.avg_latency_ms?.toFixed(1)}ms` : '—',
+    customRender: ({ record }: any) => (
+      record.stats ? `${record.stats.avg_latency_ms?.toFixed(1)}ms` : '-'
+    ),
   },
   {
     title: '告警数',
     key: 'alerts',
     customRender: ({ record }: any) => record.stats?.alerts_emitted || 0,
   },
-  {
-    title: '操作',
-    key: 'action',
-    width: 260,
-  },
+  { title: '操作', key: 'action', width: 260 },
 ]
 </script>
 
@@ -218,14 +249,13 @@ const columns = [
       </Button>
     </div>
 
-    <!-- Add / Edit Camera Modal -->
     <Modal
       v-model:open="modalVisible"
       :title="editingId ? '编辑摄像头' : '新增摄像头'"
-      @ok="handleSubmit"
       :ok-text="editingId ? '保存' : '添加'"
       cancel-text="取消"
       :confirm-loading="modalLoading"
+      @ok="handleSubmit"
     >
       <Form layout="vertical" style="margin-top: 16px">
         <Form.Item label="摄像头 ID" required>
@@ -233,6 +263,18 @@ const columns = [
         </Form.Item>
         <Form.Item label="名称" required>
           <Input v-model:value="cameraForm.name" placeholder="反应堆厂房入口" />
+        </Form.Item>
+        <Form.Item label="区域">
+          <Select
+            v-model:value="cameraForm.region_id"
+            :loading="regionsLoading"
+            allow-clear
+            placeholder="请选择区域"
+          >
+            <Select.Option v-for="region in regionOptions" :key="region.id" :value="region.id">
+              {{ region.name }}
+            </Select.Option>
+          </Select>
         </Form.Item>
         <Form.Item label="视频源" required>
           <Select
@@ -242,12 +284,13 @@ const columns = [
             :placeholder="usbLoading ? '正在检测...' : '选择 USB 摄像头'"
             :not-found-content="usbLoading ? '检测中...' : '未检测到 USB 摄像头'"
           >
-            <Select.Option v-for="d in usbDevices" :key="d.index" :value="String(d.index)">
-              {{ d.name }} ({{ d.width }}x{{ d.height }})
+            <Select.Option v-for="device in usbDevices" :key="device.index" :value="String(device.index)">
+              {{ device.name }} ({{ device.width }}x{{ device.height }})
             </Select.Option>
           </Select>
           <Input v-else v-model:value="cameraForm.source" :placeholder="sourcePlaceholder()" />
         </Form.Item>
+
         <Space>
           <Form.Item label="协议">
             <Select v-model:value="cameraForm.protocol" style="width: 140px">
@@ -269,11 +312,10 @@ const columns = [
           </Form.Item>
         </Space>
 
-        <!-- GigE Vision Parameters -->
         <template v-if="cameraForm.protocol === 'gige'">
           <Typography.Text type="secondary" style="display: block; margin: 8px 0 12px">GigE Vision 参数</Typography.Text>
           <Space>
-            <Form.Item label="曝光 (µs, 0=自动)">
+            <Form.Item label="曝光 (μs, 0=自动)">
               <InputNumber v-model:value="cameraForm.gige_exposure" :min="0" :max="1000000" style="width: 140px" />
             </Form.Item>
             <Form.Item label="增益 (dB, 0=自动)">
@@ -313,7 +355,10 @@ const columns = [
           <Badge :status="record.connected ? 'success' : 'default'" />
           {{ record.connected ? '在线' : '离线' }}
         </template>
-        <template v-if="column.key === 'action'">
+        <template v-else-if="column.key === 'region_name'">
+          {{ record.region_name || '-' }}
+        </template>
+        <template v-else-if="column.key === 'action'">
           <Space @click.stop>
             <Button v-if="!record.connected" type="primary" size="small" @click="handleStart(record.camera_id)">
               启动

@@ -560,6 +560,21 @@ class CameraConfig(BaseModel):
 
     camera_id: str
     name: str
+    region_id: int | None = Field(default=None, description="Linked business region id")
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_region_field(cls, data):
+        """Gracefully handle older configs that still store region_name."""
+        if isinstance(data, dict) and "region_id" not in data and "region_name" in data:
+            legacy = data.get("region_name")
+            if isinstance(legacy, int):
+                data["region_id"] = legacy
+            elif isinstance(legacy, str) and legacy.strip().isdigit():
+                data["region_id"] = int(legacy.strip())
+            else:
+                data["region_id"] = None
+        return data
 
     @field_validator("camera_id")
     @classmethod

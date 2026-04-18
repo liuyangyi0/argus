@@ -119,6 +119,46 @@ def _find_camera_config(request: Request, camera_id: str):
     return None
 
 
+def _get_region_info(request: Request, region_id: int | None) -> dict:
+    """Resolve region display info from the database."""
+    if region_id is None:
+        return {
+            "region_id": None,
+            "region_name": None,
+            "region_owner": None,
+            "region_phone": None,
+            "region_email": None,
+        }
+
+    db = getattr(request.app.state, "db", None)
+    if not db:
+        return {
+            "region_id": region_id,
+            "region_name": None,
+            "region_owner": None,
+            "region_phone": None,
+            "region_email": None,
+        }
+
+    region = db.get_region(region_id)
+    if region is None:
+        return {
+            "region_id": region_id,
+            "region_name": None,
+            "region_owner": None,
+            "region_phone": None,
+            "region_email": None,
+        }
+
+    return {
+        "region_id": region.id,
+        "region_name": region.name,
+        "region_owner": region.owner,
+        "region_phone": region.phone,
+        "region_email": region.email,
+    }
+
+
 def _get_lifecycle_stages(request: Request, camera_id: str, *, cam_status=None) -> list[dict]:
     """Determine camera's current lifecycle stage for Pipeline Stepper.
 
@@ -202,10 +242,18 @@ async def add_camera(request: Request):
     form = await parse_request_form(request)
     camera_id = form.get("camera_id", "").strip()
     name = form.get("name", "").strip()
+    region_id_raw = form.get("region_id", "").strip()
     source = form.get("source", "").strip()
     protocol = form.get("protocol", "rtsp")
     fps_target = int(form.get("fps_target", 5))
     resolution_str = form.get("resolution", "1920,1080")
+
+    region_id = None
+    if region_id_raw:
+        try:
+            region_id = int(region_id_raw)
+        except ValueError:
+            return api_validation_error("区域 ID 无效")
 
     if not camera_id or not name or not source:
         return api_validation_error("请填写所有必填字段")
@@ -241,6 +289,7 @@ async def add_camera(request: Request):
     cam_config = CameraConfig(
         camera_id=camera_id,
         name=name,
+        region_id=region_id,
         source=source,
         protocol=protocol,
         fps_target=fps_target,
@@ -329,9 +378,11 @@ async def get_camera_config(request: Request, camera_id: str):
         return api_not_found(f"摄像头 {camera_id} 不存在")
 
     gige = cam_config.gige
+    region_info = _get_region_info(request, getattr(cam_config, "region_id", None))
     return api_success({
         "camera_id": cam_config.camera_id,
         "name": cam_config.name,
+        **region_info,
         "source": cam_config.source,
         "protocol": cam_config.protocol,
         "fps_target": cam_config.fps_target,
@@ -360,6 +411,15 @@ async def update_camera(request: Request, camera_id: str):
     # Update fields (only if provided)
     if form.get("name"):
         cam_config.name = form["name"].strip()
+    if "region_id" in form:
+        region_id_raw = form.get("region_id", "").strip()
+        if region_id_raw:
+            try:
+                cam_config.region_id = int(region_id_raw)
+            except ValueError:
+                return api_validation_error("区域 ID 无效")
+        else:
+            cam_config.region_id = None
     if form.get("source"):
         cam_config.source = form["source"].strip()
     if form.get("protocol"):
@@ -393,6 +453,7 @@ async def update_camera(request: Request, camera_id: str):
             )
             if manager_cam is not None and manager_cam is not cam_config:
                 manager_cam.name = cam_config.name
+                manager_cam.region_id = getattr(cam_config, "region_id", None)
                 manager_cam.source = cam_config.source
                 manager_cam.protocol = cam_config.protocol
                 manager_cam.fps_target = cam_config.fps_target
@@ -504,6 +565,7 @@ def cameras_json(request: Request):
         {
             "camera_id": s.camera_id,
             "name": s.name,
+            **_get_region_info(request, getattr(_find_camera_config(request, s.camera_id), "region_id", None)),
             "connected": s.connected,
             "running": s.running,
             "stats": {
@@ -555,6 +617,7 @@ def camera_detail_json(request: Request, camera_id: str):
     return api_success({
         "camera_id": camera_id,
         "name": camera_config.name,
+        **_get_region_info(request, getattr(camera_config, "region_id", None)),
         "connected": status.connected if status is not None else False,
         "running": status.running if status is not None else False,
         "stats": stats,
