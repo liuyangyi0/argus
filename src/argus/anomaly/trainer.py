@@ -1391,7 +1391,7 @@ class ModelTrainer:
         model,
         export_format: str,
         export_path: str,
-        image_size: int,
+        image_size: int = 256,
         quantization: str = "fp16",
         val_dir: Path | None = None,
         calibration_images: int = 100,

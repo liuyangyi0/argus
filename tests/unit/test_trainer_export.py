@@ -33,7 +33,8 @@ class TestExportStaticInputShape:
         mock_engine.export.assert_called_once()
         kwargs = mock_engine.export.call_args.kwargs
         assert kwargs["input_size"] == (256, 256)
-        assert kwargs["onnx_kwargs"] == {"dynamo": False}
+        # dynamic_axes={} required for static IR — see d1884c6 (PR #22 fix)
+        assert kwargs["onnx_kwargs"] == {"dynamo": False, "dynamic_axes": {}}
 
     def test_onnx_export_also_locks_shape(self, tmp_path):
         mock_engine = MagicMock()

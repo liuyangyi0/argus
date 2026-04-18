@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { Card, Slider, Statistic, Row, Col, Spin, Typography, Alert, Button } from 'ant-design-vue'
-import { ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
+import { Card, Slider, Statistic, Row, Col, Spin, Typography, Alert, Button, Empty } from 'ant-design-vue'
+import { ReloadOutlined, ThunderboltOutlined, InfoCircleOutlined } from '@ant-design/icons-vue'
 import { use } from 'echarts/core'
 import { LineChart, ScatterChart } from 'echarts/charts'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -16,6 +16,10 @@ use([
   CanvasRenderer, LineChart, ScatterChart,
   GridComponent, TooltipComponent, MarkLineComponent, LegendComponent, MarkPointComponent,
 ])
+
+// Empty.PRESENTED_IMAGE_SIMPLE is a function returning a VNode; exposing via
+// a const so template bindings stay reactive-friendly under <script setup>.
+const emptyImage = Empty.PRESENTED_IMAGE_SIMPLE
 
 const props = defineProps<{ recordId: number | null }>()
 
@@ -214,9 +218,64 @@ function applyStoredThreshold() {
     <Alert v-if="errorMsg" type="error" :message="errorMsg" style="margin-bottom: 12px" />
 
     <div v-if="!data || !data.has_labeled_eval" class="no-data">
-      <Typography.Text type="secondary">
-        {{ data?.message || '暂无真实标注评估数据。需要 ≥10 张人工确认异物 + ≥10 张 false_positives。' }}
-      </Typography.Text>
+      <Empty :image="emptyImage">
+        <template #description>
+          <Typography.Title :level="5" style="margin-bottom: 4px">
+            本次训练未产生真实评估数据
+          </Typography.Title>
+          <Typography.Text type="secondary">
+            {{ data?.message || '后端检测到 data/validation/ 或 data/foe_objects/ 样本不足，评估步骤已被跳过（详见后端日志 validation.real_labeled_skipped / validation.synthetic_skipped）。' }}
+          </Typography.Text>
+        </template>
+      </Empty>
+
+      <Alert
+        type="info"
+        show-icon
+        style="margin-top: 16px; text-align: left"
+      >
+        <template #icon><InfoCircleOutlined /></template>
+        <template #message>
+          <strong>如何生成评估指标</strong>
+        </template>
+        <template #description>
+          <div style="margin-top: 8px">
+            <Typography.Paragraph style="margin-bottom: 6px">
+              真实评估数据由两类目录驱动，后端每次训练完自动读取：
+            </Typography.Paragraph>
+            <ul style="margin: 0 0 8px 18px; padding: 0; line-height: 1.8">
+              <li>
+                <strong>真实人工标注（最推荐）</strong>
+                <ul style="margin: 2px 0 0 18px; padding: 0">
+                  <li>
+                    阳性样本（确认异物）：
+                    <code>data/validation/&lt;camera_id&gt;/confirmed/</code>
+                  </li>
+                  <li>
+                    阴性样本（被否决的误报）：
+                    <code>data/baselines/&lt;camera_id&gt;/false_positives/</code>
+                  </li>
+                  <li>每个目录至少 <strong>10</strong> 张 PNG/JPG，才会启用 P/R/F1/AUROC/PR-AUC。</li>
+                </ul>
+              </li>
+              <li style="margin-top: 6px">
+                <strong>合成 FOE 对象（可选，补充）</strong>
+                <ul style="margin: 2px 0 0 18px; padding: 0">
+                  <li>
+                    透明背景的异物 PNG：<code>data/foe_objects/*.png</code>
+                  </li>
+                  <li>启用 holdout AUROC + synthetic recall 两个步骤。</li>
+                </ul>
+              </li>
+            </ul>
+            <Typography.Text type="secondary" style="font-size: 12px">
+              两类目录缺失时训练依然会完成，但指标图表无数据。详见后端模块
+              <code>src/argus/anomaly/training_validator.py</code> 的模块 docstring
+              与日志关键字 <code>validation.real_labeled_skipped</code>。
+            </Typography.Text>
+          </div>
+        </template>
+      </Alert>
     </div>
 
     <div v-else>
@@ -323,10 +382,18 @@ function applyStoredThreshold() {
 
 <style scoped>
 .no-data {
-  text-align: center;
-  padding: 32px;
-  color: #999;
+  padding: 32px 24px;
   background: rgba(0, 0, 0, 0.02);
   border-radius: 6px;
+}
+.no-data :deep(.ant-empty) {
+  margin-bottom: 0;
+}
+.no-data code {
+  background: rgba(0, 0, 0, 0.05);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: Consolas, 'Courier New', monospace;
 }
 </style>

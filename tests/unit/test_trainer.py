@@ -238,7 +238,8 @@ class TestExportModel:
             model=model,
             export_type="openvino",
             export_root=str(tmp_path),
-            onnx_kwargs={"dynamo": False},
+            onnx_kwargs={"dynamo": False, "dynamic_axes": {}},
+            input_size=(256, 256),
         )
 
     def test_torch_export_keeps_default_kwargs(self, tmp_path):

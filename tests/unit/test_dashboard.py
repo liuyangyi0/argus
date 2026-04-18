@@ -1057,6 +1057,31 @@ class TestCameraManagerModelRouting:
         runner.set_version_tag.assert_called_once_with("v2")
         pipeline.set_model_version_id.assert_called_once_with("v2")
 
+    def test_reload_model_failure_broadcasts_activation_failed(self):
+        """Reload failure should emit a models-topic event; detector keeps old engine."""
+        events: list[tuple[str, dict]] = []
+        manager = CameraManager(
+            cameras=[],
+            alert_config=AlertConfig(),
+            on_status_change=lambda topic, data: events.append((topic, data)),
+        )
+        pipeline = MagicMock()
+        pipeline.reload_anomaly_model.return_value = False
+        pipeline._model_version_id = "v1-old"
+        manager._pipelines["cam_01"] = pipeline
+
+        ok = manager.reload_model("cam_01", "data/models/cam_01/model.xml", version_tag="v2")
+
+        assert ok is False
+        assert len(events) == 1
+        topic, data = events[0]
+        assert topic == "models"
+        assert data["event"] == "model.activation_failed"
+        assert data["camera_id"] == "cam_01"
+        assert data["attempted_version"] == "v2"
+        assert data["current_version"] == "v1-old"
+        assert data["reason"] == "hot_reload_failed"
+
 
 class TestSchedulerWiring:
     def test_register_training_job_processing_wires_executor(self, monkeypatch):

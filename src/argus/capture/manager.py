@@ -546,13 +546,34 @@ class CameraManager:
         *,
         version_tag: str | None = None,
     ) -> bool:
-        """Hot-reload a camera's anomaly model and refresh exposed status."""
+        """Hot-reload a camera's anomaly model and refresh exposed status.
+
+        On failure the detector's atomic swap keeps the old engine alive
+        (see ``AnomalibDetector.hot_reload``). We additionally broadcast a
+        ``model.activation_failed`` event on the ``models`` WebSocket topic
+        so the operator knows the camera is still running the previous
+        model version despite the "activated" label in the registry.
+        """
         pipeline = self._pipelines.get(camera_id)
         if pipeline is None:
+            self._broadcast_activation_failed(
+                camera_id=camera_id,
+                attempted_version=version_tag,
+                current_version=None,
+                reason="camera_not_found",
+            )
             return False
 
         success = pipeline.reload_anomaly_model(model_path)
         if not success:
+            current_version = getattr(pipeline, "_model_version_id", None)
+            self._broadcast_activation_failed(
+                camera_id=camera_id,
+                attempted_version=version_tag,
+                current_version=current_version,
+                reason="hot_reload_failed",
+                model_path=model_path,
+            )
             return False
 
         runner = self._runners.get(camera_id)
@@ -563,6 +584,32 @@ class CameraManager:
 
         self._notify_camera_status(camera_id)
         return True
+
+    def _broadcast_activation_failed(
+        self,
+        *,
+        camera_id: str,
+        attempted_version: str | None,
+        current_version: str | None,
+        reason: str,
+        model_path: str | None = None,
+    ) -> None:
+        """Broadcast a ``model.activation_failed`` event to WebSocket clients."""
+        if not self._on_status_change:
+            return
+        payload: dict = {
+            "event": "model.activation_failed",
+            "camera_id": camera_id,
+            "attempted_version": attempted_version,
+            "current_version": current_version,
+            "reason": reason,
+        }
+        if model_path is not None:
+            payload["model_path"] = model_path
+        try:
+            self._on_status_change("models", payload)
+        except Exception:
+            logger.debug("manager.activation_failed_broadcast_failed", exc_info=True)
 
     def get_latest_anomaly_map(self, camera_id: str) -> np.ndarray | None:
         """Get the latest anomaly heatmap from a camera for overlay stream."""

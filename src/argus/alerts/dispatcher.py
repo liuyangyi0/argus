@@ -311,6 +311,7 @@ class AlertDispatcher:
                 category=getattr(alert, "category", None),
                 severity_adjusted_by_classifier=getattr(alert, "severity_adjusted_by_classifier", None),
                 trajectory_points=traj_json,
+                model_version_id=getattr(alert, "model_version_id", None),
             )
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))
