@@ -29,6 +29,7 @@ from argus.dashboard.routes.sensors import router as sensors_router
 from argus.dashboard.routes.system import router as system_router
 from argus.dashboard.routes.tasks import router as tasks_router
 from argus.dashboard.routes.reports import router as reports_router
+from argus.dashboard.routes.regions import router as regions_router
 from argus.dashboard.routes.users import router as users_router
 from argus.dashboard.routes.zones import router as zones_router
 from argus.dashboard.websocket import ConnectionManager, verify_ws_token
@@ -217,6 +218,7 @@ def create_app(
     app.include_router(audit_router, prefix="/api/audit", tags=["audit"])
     app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
     app.include_router(users_router, prefix="/api/users", tags=["users"])
+    app.include_router(regions_router, prefix="/api/regions", tags=["regions"])
     app.include_router(reports_router, prefix="/api/reports", tags=["reports"])
     app.include_router(sensors_router, prefix="/api/sensors", tags=["sensors"])
 
