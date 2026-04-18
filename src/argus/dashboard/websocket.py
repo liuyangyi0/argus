@@ -12,6 +12,8 @@ Topics:
 - wall:        Video wall aggregated score/status (UX v2 §2)
 - degradation: Degradation events new/resolved (UX v2 §5)
 - heatmap:     Per-camera anomaly heatmap data for frontend Canvas overlay
+- audio_alert: Audio alert playback events
+- models:      Model lifecycle events (activation success/failure, reload notices)
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ logger = structlog.get_logger()
 
 VALID_TOPICS = frozenset({
     "health", "cameras", "alerts", "tasks", "wall", "degradation", "heatmap",
-    "audio_alert",
+    "audio_alert", "models",
 })
 
 

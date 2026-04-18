@@ -297,6 +297,71 @@ class ModelRegistry:
 
         logger.info("model_registry.activated", model_version_id=model_version_id)
 
+    def retire(
+        self,
+        model_version_id: str,
+        reason: str | None = None,
+        triggered_by: str = "system",
+    ) -> ModelRecord | None:
+        """Retire a model version (any stage → retired).
+
+        Used for direct rollback of a just-registered CANDIDATE when a downstream
+        step (e.g. packaging) fails. Unlike ``promote``, this does not require
+        the transition to be in ``VALID_TRANSITIONS`` — retirement is always
+        safe, including from terminal ``retired`` state (no-op) and from any
+        intermediate stage.
+
+        Args:
+            model_version_id: Model version to retire.
+            reason: Human-readable reason (recorded in the version event).
+            triggered_by: Who triggered the retirement (default: ``system``).
+
+        Returns:
+            The updated ModelRecord, or ``None`` if the version does not exist.
+        """
+        with self._session_factory() as session:
+            record = (
+                session.query(ModelRecord)
+                .filter_by(model_version_id=model_version_id)
+                .first()
+            )
+            if record is None:
+                logger.warning(
+                    "model_registry.retire_not_found",
+                    model_version_id=model_version_id,
+                )
+                return None
+
+            if record.stage == ModelStage.RETIRED.value:
+                # Idempotent — already retired.
+                return record
+
+            from_stage = record.stage
+            record.stage = ModelStage.RETIRED.value
+            record.is_active = False
+            record.canary_camera_id = None
+
+            session.add(ModelVersionEvent(
+                camera_id=record.camera_id,
+                from_version=model_version_id,
+                to_version=model_version_id,
+                from_stage=from_stage,
+                to_stage=ModelStage.RETIRED.value,
+                triggered_by=triggered_by,
+                reason=reason,
+            ))
+            session.commit()
+            session.refresh(record)
+
+        logger.info(
+            "model_registry.retired",
+            model_version_id=model_version_id,
+            from_stage=from_stage,
+            reason=reason,
+            triggered_by=triggered_by,
+        )
+        return record
+
     def delete_model(self, model_version_id: str) -> None:
         """Delete a model record from the database."""
         with self._session_factory() as session:

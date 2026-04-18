@@ -155,6 +155,9 @@ class Database:
             ("alerts", "category", "VARCHAR(30)"),
             ("alerts", "severity_adjusted_by_classifier", "BOOLEAN"),
             ("alerts", "trajectory_points", "TEXT"),
+            # Model lineage — lets us answer "which model fired this alert?"
+            # after a model switch.
+            ("alerts", "model_version_id", "VARCHAR(128)"),
             # Inference record enrichment (deployment stage + zone)
             ("inference_records", "deployment_stage", "VARCHAR(20)"),
             ("inference_records", "zone_id", "VARCHAR(50) DEFAULT 'default' NOT NULL"),
@@ -228,6 +231,9 @@ class Database:
         category: str | None = None,
         severity_adjusted_by_classifier: bool | None = None,
         trajectory_points: str | None = None,
+        # Model lineage — supplied by the dispatcher from alert.model_version_id
+        # so every alert row points at the model that produced it.
+        model_version_id: str | None = None,
         _max_retries: int = 3,
     ) -> AlertRecord:
         """Save an alert to the database with retry on transient failures.
@@ -286,6 +292,7 @@ class Database:
                         category=category,
                         severity_adjusted_by_classifier=severity_adjusted_by_classifier,
                         trajectory_points=trajectory_points,
+                        model_version_id=model_version_id,
                     )
                     session.add(record)
                     session.commit()

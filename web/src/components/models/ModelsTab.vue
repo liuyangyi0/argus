@@ -2,6 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { Statistic, Card, message } from 'ant-design-vue'
 import { getModelRegistry } from '../../api'
+import { useWebSocket } from '../../composables/useWebSocket'
 import ModelTable from './ModelTable.vue'
 import EventLog from './EventLog.vue'
 import BatchInference from './BatchInference.vue'
@@ -20,6 +21,31 @@ async function loadAllModels() {
     message.error('加载模型列表失败')
   }
 }
+
+// Listen for model.activation_failed — pipeline.reload_anomaly_model returned
+// False, so despite the registry showing "activated" the camera is still
+// running the previous engine (atomic swap kept the old one).  Warn the
+// operator explicitly so they don't assume the new version is live.
+useWebSocket({
+  topics: ['models'],
+  onMessage: (_topic, data) => {
+    const payload = data as {
+      event?: string
+      camera_id?: string
+      attempted_version?: string | null
+      current_version?: string | null
+    }
+    if (payload?.event !== 'model.activation_failed') return
+    const cam = payload.camera_id ?? '?'
+    const attempted = payload.attempted_version ?? '新版本'
+    const current = payload.current_version ?? '旧版本'
+    message.warning({
+      content: `摄像头 ${cam} 激活 ${attempted} 失败，仍在使用 ${current}，请检查模型文件`,
+      duration: 8,
+    })
+    loadAllModels()
+  },
+})
 
 const totalModels = computed(() => allModels.value.length)
 const activeModels = computed(() => allModels.value.filter((m: any) => m.is_active).length)

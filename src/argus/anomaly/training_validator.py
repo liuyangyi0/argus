@@ -1,13 +1,70 @@
-"""Three-step training validation pipeline.
+"""Four-step training validation pipeline.
 
-Every trained model must pass ALL three validation steps before it can
-be marked as complete:
+Every trained model runs the following validation steps after training
+completes. All steps gracefully degrade when sample directories are missing
+or under-populated; "skipped" is counted as a pass so a missing sample set
+never blocks deployment — it just means the corresponding metric is
+unobservable, and the frontend must clearly tell the operator **why** and
+**how to unlock it**.
 
-1. Holdout AUROC: Compute AUROC on holdout set (normal vs synthetic anomalies)
-2. Synthetic Recall: Run recall evaluation on generated synthetic anomaly set
-3. Historical Alert Replay: Re-score recent alerts to check for regression
+Steps
+-----
 
-Nuclear environment: any failure blocks model deployment.
+1. ``holdout_auroc`` — Compute AUROC on a holdout normal set versus
+   synthetic anomalies. Uses ``data/foe_objects/*.png`` to generate
+   synthetic positives; falls back to noise-injection when synthetic
+   generation yields <5 usable images.
+2. ``synthetic_recall`` — Evaluate recall on the synthetic anomaly set.
+   Skipped when fewer than 10 synthetic images are available.
+3. ``historical_replay`` — Re-score recent alerts (last ``replay_days``)
+   from ``alert_records`` to catch regressions. Skipped when there are
+   <10 alerts or no snapshots on disk.
+4. ``real_labeled_metrics`` — Phase 1 P/R/F1/AUROC/PR-AUC on real human
+   labeled data. Positives from ``data/validation/<camera_id>/confirmed/``
+   and negatives from ``data/baselines/<camera_id>/false_positives/``.
+   Skipped when either directory is missing or has fewer than 10 samples.
+
+Data directory reference
+------------------------
+
++----------------------------------------------------+-----------+---------+
+| Directory                                          | Purpose   | Min qty |
++====================================================+===========+=========+
+| ``data/foe_objects/*.png``                         | Synthetic | >=1 PNG |
+|                                                    | anomaly   | (>=5    |
+|                                                    | objects   | usable  |
+|                                                    |           | gen'd)  |
++----------------------------------------------------+-----------+---------+
+| ``data/validation/<camera_id>/confirmed/``         | Real      | >=10    |
+|                                                    | positives |         |
++----------------------------------------------------+-----------+---------+
+| ``data/baselines/<camera_id>/false_positives/``    | Real      | >=10    |
+|                                                    | negatives |         |
++----------------------------------------------------+-----------+---------+
+
+Supported image extensions: ``.png .jpg .jpeg .bmp .tiff``. Both
+``confirmed/`` and ``false_positives/`` may contain a single level of
+subdirectories (e.g. for date-based grouping).
+
+Diagnostic logs
+---------------
+
+When any step is skipped, a structured ``structlog`` event is emitted so
+operators know exactly what to fix:
+
+* ``validation.synthetic_skipped`` — ``data/foe_objects/`` missing or
+  empty. ``hint`` field explains how to unlock synthetic evaluation.
+* ``validation.synthetic_too_few`` — generation produced <5 usable images.
+* ``validation.real_labeled_skipped`` — real-labeled directories missing
+  or under-populated. Emits ``positive_dir``, ``n_positive``,
+  ``negative_dir``, ``n_negative``, ``min_required``, and ``hint``.
+* ``validation.real_labeled_failed`` — evaluator raised. Includes the
+  same location fields for triage.
+
+The frontend ``web/src/components/models/MetricsChart.vue`` reads
+``has_labeled_eval`` from ``GET /api/training-history/{id}/metrics``.
+When false it renders an ``<Empty>`` block plus an ``<Alert type="info">``
+listing the directories above — never a blank chart.
 """
 
 from __future__ import annotations
@@ -167,7 +224,12 @@ class TrainingValidator:
         # Generate synthetic images once, reuse for step 1 (AUROC) and step 2 (Recall)
         synthetic_dir = None
         tmpdir_obj = None
-        if self._foe_objects_dir.exists() and any(self._foe_objects_dir.glob("*.png")):
+        foe_png_count = (
+            sum(1 for _ in self._foe_objects_dir.glob("*.png"))
+            if self._foe_objects_dir.exists()
+            else 0
+        )
+        if foe_png_count > 0:
             try:
                 from argus.validation.synthetic import generate_synthetic
                 tmpdir_obj = tempfile.TemporaryDirectory()
@@ -180,10 +242,38 @@ class TrainingValidator:
                     seed=42,
                 )
                 if n_generated < 5:
+                    logger.warning(
+                        "validation.synthetic_too_few",
+                        generated=n_generated,
+                        foe_objects_dir=str(self._foe_objects_dir),
+                        foe_png_count=foe_png_count,
+                        hint=(
+                            "Synthetic anomaly generation produced <5 usable images. "
+                            "Add more PNG objects (ideally with transparent background) "
+                            f"to {self._foe_objects_dir} to improve holdout AUROC quality."
+                        ),
+                    )
                     synthetic_dir = None
             except Exception as e:
-                logger.warning("validation.synthetic_generation_failed", error=str(e))
+                logger.warning(
+                    "validation.synthetic_generation_failed",
+                    foe_objects_dir=str(self._foe_objects_dir),
+                    error=str(e),
+                )
                 synthetic_dir = None
+        else:
+            logger.info(
+                "validation.synthetic_skipped",
+                foe_objects_dir=str(self._foe_objects_dir),
+                foe_dir_exists=self._foe_objects_dir.exists(),
+                hint=(
+                    "Synthetic anomaly generation skipped: "
+                    f"{self._foe_objects_dir} is missing or contains no *.png files. "
+                    "Holdout AUROC will fall back to noise-injection; synthetic recall "
+                    "will be skipped. Drop anomaly object PNGs (transparent background "
+                    "preferred) into this directory to enable full synthetic evaluation."
+                ),
+            )
 
         try:
             step1 = self._validate_auroc(
@@ -581,7 +671,38 @@ class TrainingValidator:
         directory is missing or has fewer than 10 samples. min_f1=0.0 means this
         step never fails training (advisory only) — tighten later once a baseline
         F1 is established.
+
+        When skipped, logs an actionable diagnostic identifying which directory
+        is missing or under-populated so operators know how to unlock the step.
         """
+        # Pre-flight probe: inspect directories up-front so we can log precise
+        # reasons even when evaluate_real_labeled silently returns None. This is
+        # the observability half of "graceful degradation + clear empty state".
+        data_root = Path("data")
+        positive_dir = data_root / "validation" / camera_id / "confirmed"
+        negative_dir = data_root / "baselines" / camera_id / "false_positives"
+        min_samples = 10
+
+        def _count_images(directory: Path) -> int:
+            if not directory.is_dir():
+                return 0
+            exts = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
+            total = 0
+            for p in directory.iterdir():
+                if p.is_file() and p.suffix.lower() in exts:
+                    total += 1
+                elif p.is_dir():
+                    total += sum(
+                        1 for q in p.iterdir()
+                        if q.is_file() and q.suffix.lower() in exts
+                    )
+            return total
+
+        pos_count = _count_images(positive_dir)
+        neg_count = _count_images(negative_dir)
+        pos_exists = positive_dir.is_dir()
+        neg_exists = negative_dir.is_dir()
+
         try:
             from argus.validation.recall_test import evaluate_real_labeled
 
@@ -591,7 +712,15 @@ class TrainingValidator:
                 threshold=threshold,
             )
         except Exception as e:
-            logger.error("validation.real_labeled_failed", error=str(e))
+            logger.error(
+                "validation.real_labeled_failed",
+                camera_id=camera_id,
+                positive_dir=str(positive_dir),
+                negative_dir=str(negative_dir),
+                n_positive=pos_count,
+                n_negative=neg_count,
+                error=str(e),
+            )
             return StepResult(
                 name="real_labeled_metrics",
                 passed=True,
@@ -600,11 +729,62 @@ class TrainingValidator:
             )
 
         if metrics is None:
+            # Diagnose exactly why the evaluator bailed and tell the operator
+            # where to put samples. Three reasons possible:
+            #   (a) positive_dir missing            → no human-confirmed anomalies yet
+            #   (b) negative_dir missing            → no confirmed false positives yet
+            #   (c) both exist but under-populated  → need to label more
+            missing_dirs: list[str] = []
+            under_populated: list[str] = []
+            if not pos_exists:
+                missing_dirs.append(str(positive_dir))
+            elif pos_count < min_samples:
+                under_populated.append(f"{positive_dir} has {pos_count}/{min_samples} positives")
+            if not neg_exists:
+                missing_dirs.append(str(negative_dir))
+            elif neg_count < min_samples:
+                under_populated.append(f"{negative_dir} has {neg_count}/{min_samples} negatives")
+
+            if missing_dirs:
+                reason = f"Missing directories: {', '.join(missing_dirs)}"
+            elif under_populated:
+                reason = "Insufficient samples — " + "; ".join(under_populated)
+            else:
+                reason = (
+                    f"need ≥{min_samples} positives (found {pos_count}) and "
+                    f"≥{min_samples} negatives (found {neg_count})"
+                )
+
+            logger.warning(
+                "validation.real_labeled_skipped",
+                camera_id=camera_id,
+                reason=reason,
+                positive_dir=str(positive_dir),
+                positive_exists=pos_exists,
+                n_positive=pos_count,
+                negative_dir=str(negative_dir),
+                negative_exists=neg_exists,
+                n_negative=neg_count,
+                min_required=min_samples,
+                hint=(
+                    "Add human-confirmed anomaly images to "
+                    f"data/validation/{camera_id}/confirmed/ and dismissed-FP images to "
+                    f"data/baselines/{camera_id}/false_positives/ to enable "
+                    "P/R/F1/AUROC/PR-AUC metrics. Synthetic anomaly PNG objects "
+                    "can also be dropped in data/foe_objects/ to unlock "
+                    "holdout AUROC + synthetic recall steps."
+                ),
+            )
+
             return StepResult(
                 name="real_labeled_metrics",
                 passed=True,
                 skipped=True,
-                skip_reason="No real-labeled data (need ≥10 positives and ≥10 negatives)",
+                skip_reason=(
+                    f"No real-labeled data (need ≥{min_samples} positives and "
+                    f"≥{min_samples} negatives; found {pos_count}/{neg_count}). "
+                    f"See logs for actionable hint."
+                ),
             )
 
         detail = {
