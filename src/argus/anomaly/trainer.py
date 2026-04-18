@@ -1386,37 +1386,6 @@ class ModelTrainer:
         return engine, model
 
     @staticmethod
-    def _reshape_openvino_static(export_path: Path, image_size: int) -> bool:
-        """Lock the OpenVINO IR batch dimension to 1.
-
-        anomalib's engine.export(input_size=...) only fixes spatial dims;
-        the batch dim stays dynamic ("?"), which makes CPU inference trip
-        on Broadcast ops. Call this right after engine.export() so the IR
-        is ready for single-image CPU inference. INT8 quantization
-        preserves the reshape because nncf reads the already-static model.
-        """
-        try:
-            import openvino as ov
-        except ImportError:
-            return False
-        xml = next(export_path.rglob("model.xml"), None) if export_path.is_dir() else None
-        if xml is None or not xml.exists():
-            return False
-        try:
-            ov_model = ov.Core().read_model(xml)
-            ov_model.reshape({0: [1, 3, image_size, image_size]})
-            ov.save_model(ov_model, str(xml))
-            logger.info(
-                "training.openvino_batch_fixed",
-                shape=[1, 3, image_size, image_size],
-                path=str(xml),
-            )
-            return True
-        except Exception as e:
-            logger.warning("training.openvino_reshape_failed", error=str(e))
-            return False
-
-    @staticmethod
     def _export_model(
         engine,
         model,
@@ -1442,15 +1411,25 @@ class ModelTrainer:
         actual_format = export_format
         export_kwargs = {}
         if export_format in {"openvino", "onnx"}:
-            # PyTorch 2.11 + anomalib currently trips over dynamic_axes when
-            # torch.onnx.export uses the dynamo exporter. Force the stable path.
-            export_kwargs["onnx_kwargs"] = {"dynamo": False}
-            # Lock the exported graph to a static [1,3,H,W] input shape. Without
-            # this, anomalib emits a dynamic-axes ONNX/OpenVINO IR whose internal
-            # Broadcast ops resolve at inference time — Dinomaly2 fails with
-            # "Broadcast Check failed Value -1 not in range". The detector
-            # already resizes every frame to image_size before inference, so
-            # static export matches actual usage and costs nothing.
+            # Force stable ONNX export path + static [1,3,H,W] input shape.
+            #
+            # 1. ``dynamo=False``: PyTorch 2.11 + anomalib's dynamo exporter
+            #    trips over dynamic_axes, so pin to the classic torchscript
+            #    exporter.
+            # 2. ``dynamic_axes={}``: Emit a fully static ONNX graph.  Without
+            #    this anomalib defaults to ``{"input": {0: "batch"}}`` which
+            #    produces an OpenVINO IR with dynamic batch ``?``.  Dinomaly2
+            #    IR then explodes at CPU inference with
+            #    ``Broadcast Check failed, Value -1 not in range``.
+            #    Post-export ``ov.Model.reshape({0:[1,...]})`` also SIGSEGVs
+            #    in the OpenVINO 2026.1 DINOv2 path, so the only viable fix
+            #    is to never emit dynamic axes in the first place.
+            # 3. ``input_size=(H,W)``: Matches the single resolution the
+            #    detector ever feeds at inference.
+            export_kwargs["onnx_kwargs"] = {
+                "dynamo": False,
+                "dynamic_axes": {},
+            }
             export_kwargs["input_size"] = (image_size, image_size)
         try:
             engine.export(
@@ -1476,10 +1455,6 @@ class ModelTrainer:
             else:
                 raise
         logger.info("training.exported", format=actual_format, path=export_path)
-
-        # Lock batch dim to 1 so CPU inference doesn't trip on Broadcast ops.
-        if actual_format == "openvino":
-            ModelTrainer._reshape_openvino_static(Path(export_path), image_size)
 
         # INT8 post-training quantization (B2)
         actual_quantization = quantization
@@ -1699,9 +1674,15 @@ class ModelTrainer:
             model = self._instantiate_model(model_type)
             export_kwargs = {}
             if export_format in {"openvino", "onnx"}:
-                export_kwargs["onnx_kwargs"] = {"dynamo": False}
-                # Lock static [1,3,H,W] input shape so Broadcast ops don't
-                # fail at inference time (see _export_model for context).
+                # Force static ONNX graph (dynamic_axes={}) so the resulting
+                # OpenVINO IR has a fixed [1,3,H,W] input shape.  See
+                # _export_model for the full rationale — post-export
+                # ov.Model.reshape() SIGSEGVs in OpenVINO 2026.1 on DINOv2
+                # backbones, so static-at-export is the only safe path.
+                export_kwargs["onnx_kwargs"] = {
+                    "dynamo": False,
+                    "dynamic_axes": {},
+                }
                 export_kwargs["input_size"] = (image_size, image_size)
 
             engine = Engine(default_root_dir=str(model_dir), max_epochs=1)
@@ -1718,8 +1699,6 @@ class ModelTrainer:
                 export_path=export_path,
                 checkpoint=str(ckpt),
             )
-            if export_format == "openvino":
-                self._reshape_openvino_static(Path(export_path), image_size)
         except Exception as e:
             logger.error("reexport.failed", error=str(e))
             return {"status": "error", "error": f"导出失败: {e}"}
