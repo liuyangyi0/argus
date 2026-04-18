@@ -83,6 +83,7 @@ class DriftDetector:
         current = np.array(self._window)
         ks_stat, p_value = self._ks_2samp(self._reference, current)
 
+        was_drifted = self._status.is_drifted
         self._status = DriftStatus(
             is_drifted=(ks_stat > self._ks_threshold and p_value < self._p_value_threshold),
             ks_statistic=float(ks_stat),
@@ -93,7 +94,11 @@ class DriftDetector:
             last_check_time=time.time(),
         )
 
-        if self._status.is_drifted:
+        # Log and fire the callback only on state transitions. Previously
+        # this ran on every check (roughly every check_interval samples),
+        # producing identical log lines whenever drift persisted — a
+        # single training run could emit 800+ duplicate warnings.
+        if self._status.is_drifted and not was_drifted:
             logger.warning(
                 "drift.detected",
                 ks=round(ks_stat, 4),
@@ -106,6 +111,13 @@ class DriftDetector:
                     self._on_drift(self._status)
                 except Exception as e:
                     logger.error("drift.callback_failed", error=str(e))
+        elif not self._status.is_drifted and was_drifted:
+            logger.info(
+                "drift.cleared",
+                ks=round(ks_stat, 4),
+                ref_mean=round(self._status.reference_mean, 4),
+                cur_mean=round(self._status.current_mean, 4),
+            )
 
     @staticmethod
     def _ks_2samp(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:

@@ -87,7 +87,11 @@ class InferenceBuffer:
             if len(self._buffer) >= self._max_size:
                 self._buffer.popleft()
                 now = time.monotonic()
-                if now - self._last_overflow_warn > 60.0:
+                # Rate-limit overflow warnings: if drop persists, one line
+                # every 5 min is enough to flag the condition without
+                # flooding the log (each sustained overflow previously
+                # produced ~1 line/min = 55+ identical warnings per hour).
+                if now - self._last_overflow_warn > 300.0:
                     self._last_overflow_warn = now
                     logger.warning(
                         "inference_buffer.overflow",
