@@ -42,6 +42,8 @@ export class ApiError extends Error {
 export interface CameraSummary {
   camera_id: string
   name: string
+  region_id?: number | null
+  region_name?: string | null
   connected: boolean
   running: boolean
   stats: CameraStats | null
