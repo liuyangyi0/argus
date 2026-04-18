@@ -23,6 +23,7 @@ from argus.storage.models import (
     InferenceRecord,
     LabelingQueueRecord,
     LabelingQueueStatus,
+    Region,
     TrainingJobRecord,
     TrainingRecord,
     User,
@@ -39,6 +40,14 @@ _USER_UPDATABLE_FIELDS = {
     "password_hash",
     "active",
     "last_login",
+}
+
+_REGION_UPDATABLE_FIELDS = {
+    "name",
+    "owner",
+    "email",
+    "phone",
+    "notification_methods",
 }
 
 
@@ -974,6 +983,83 @@ class Database:
             return session.scalar(select(sa_func.count()).select_from(User)) or 0
 
     # ── Alert recordings ──
+
+    def create_region(
+        self,
+        name: str,
+        owner: str,
+        email: str | None = None,
+        phone: str | None = None,
+        notification_methods: str = "",
+    ) -> Region:
+        """Create a managed region/contact entry."""
+        with self.get_session() as session:
+            region = Region(
+                name=name,
+                owner=owner,
+                email=email,
+                phone=phone,
+                notification_methods=notification_methods,
+            )
+            session.add(region)
+            session.commit()
+            session.refresh(region)
+            logger.info("database.region_created", region_id=region.id, name=name)
+            return region
+
+    def get_region(self, region_id: int) -> Region | None:
+        """Get a region by primary key."""
+        with self.get_session() as session:
+            return session.scalar(select(Region).where(Region.id == region_id))
+
+    def get_region_by_name(self, name: str) -> Region | None:
+        """Get a region by unique name."""
+        with self.get_session() as session:
+            return session.scalar(select(Region).where(Region.name == name))
+
+    def get_regions(
+        self,
+        *,
+        name: str | None = None,
+        owner: str | None = None,
+        phone: str | None = None,
+        email: str | None = None,
+    ) -> list[Region]:
+        """Return regions filtered by fuzzy query fields."""
+        with self.get_session() as session:
+            stmt = select(Region).order_by(Region.created_at.desc(), Region.id.desc())
+            if name:
+                stmt = stmt.where(Region.name.like(f"%{name}%"))
+            if owner:
+                stmt = stmt.where(Region.owner.like(f"%{owner}%"))
+            if phone:
+                stmt = stmt.where(Region.phone.like(f"%{phone}%"))
+            if email:
+                stmt = stmt.where(Region.email.like(f"%{email}%"))
+            return list(session.scalars(stmt).all())
+
+    def update_region(self, region_id: int, **kwargs) -> bool:
+        """Update editable fields on a region."""
+        with self.get_session() as session:
+            region = session.scalar(select(Region).where(Region.id == region_id))
+            if region is None:
+                return False
+            for key, value in kwargs.items():
+                if key in _REGION_UPDATABLE_FIELDS and hasattr(region, key):
+                    setattr(region, key, value)
+            session.commit()
+            return True
+
+    def delete_region(self, region_id: int) -> bool:
+        """Delete a region by primary key."""
+        with self.get_session() as session:
+            region = session.scalar(select(Region).where(Region.id == region_id))
+            if region is None:
+                return False
+            session.delete(region)
+            session.commit()
+            logger.info("database.region_deleted", region_id=region_id, name=region.name)
+            return True
 
     def save_alert_recording(self, record: AlertRecordingRecord) -> AlertRecordingRecord:
         """Save an alert recording metadata record."""
