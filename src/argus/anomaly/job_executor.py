@@ -323,7 +323,11 @@ class TrainingJobExecutor:
         if result.validation_report is not None:
             val_report_dict = result.validation_report.to_dict()
 
-        # Package model (if packager configured)
+        # Package model (if packager configured).
+        # If packaging fails after a CANDIDATE has been registered, we must
+        # retire that CANDIDATE and re-raise so the outer handler marks the
+        # job FAILED — otherwise the registry is left with a ghost version
+        # pointing at a half-assembled (or missing) package.
         artifacts_path = result.model_path
         if self._packager and result.model_path:
             try:
@@ -345,11 +349,50 @@ class TrainingJobExecutor:
                     training_params=params,
                 )
                 artifacts_path = str(pkg_path)
-            except Exception as e:
-                logger.error("job_executor.packaging_failed", error=str(e))
-                _packaging_error = str(e)
-            else:
                 _packaging_error = None
+            except Exception as e:
+                err_str = str(e)
+                logger.error(
+                    "job_executor.packaging_failed",
+                    job_id=job.job_id,
+                    camera_id=camera_id,
+                    model_version_id=model_version_id,
+                    error=err_str,
+                )
+
+                # Roll back the CANDIDATE that was just registered so we don't
+                # leave a ghost version in the registry.
+                if self._registry is not None and model_version_id:
+                    try:
+                        self._registry.retire(
+                            model_version_id,
+                            reason=f"packaging_failed: {err_str}",
+                        )
+                    except Exception as retire_err:  # pragma: no cover — defensive
+                        logger.error(
+                            "job_executor.registry_retire_failed",
+                            model_version_id=model_version_id,
+                            error=str(retire_err),
+                        )
+
+                # Persist the packaging error on the job's metrics BEFORE
+                # re-raising. The outer handler in ``_execute_job`` only
+                # updates ``status``/``error``/``completed_at``/``duration``,
+                # so metrics written here survive.
+                try:
+                    self._db.update_training_job(
+                        job.job_id,
+                        metrics=json.dumps({"packaging_error": err_str}),
+                    )
+                except Exception as db_err:  # pragma: no cover — defensive
+                    logger.error(
+                        "job_executor.metrics_update_failed",
+                        job_id=job.job_id,
+                        error=str(db_err),
+                    )
+
+                # Re-raise so ``_execute_job`` marks the job FAILED.
+                raise
         else:
             _packaging_error = None
 

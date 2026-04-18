@@ -130,6 +130,11 @@ class AlertRecord(Base):
     severity_adjusted_by_classifier: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # Trajectory centroid history (JSON array of {t, x, y})
     trajectory_points: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Model version lineage — points at the active model that produced this alert,
+    # so audits can answer "which model fired this?" even after a model switch.
+    model_version_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
@@ -188,6 +193,7 @@ class AlertRecord(Base):
             "category": self.category,
             "severity_adjusted_by_classifier": self.severity_adjusted_by_classifier,
             "trajectory_points": _json.loads(self.trajectory_points) if self.trajectory_points else None,
+            "model_version_id": self.model_version_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
