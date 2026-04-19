@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { inject, computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { CaretRightOutlined, PauseOutlined } from '@ant-design/icons-vue'
+import { CameraOutlined, CaretRightOutlined, PauseOutlined } from '@ant-design/icons-vue'
 import { formatPlaybackTime } from '../../utils/time'
 import type { useReplayController } from '../../composables/useReplayController'
 
@@ -203,6 +203,16 @@ const remainingRecordingSeconds = computed(() => {
           @click="ctrl.showTrajectory.value = !ctrl.showTrajectory.value"
           title="轨迹叠加"
         >轨迹</button>
+        <!-- 会把当前可见画面导出为 PNG 并触发浏览器下载，文件名包含摄像头、告警/回放 id、帧号和时间戳。 -->
+        <button
+          class="toggle-btn capture-btn"
+          :disabled="!ctrl.canvasEl.value"
+          @click="ctrl.captureCurrentFrame"
+          title="抓取当前画面并下载 PNG"
+        >
+          <CameraOutlined />
+          <span>抓图</span>
+        </button>
       </div>
 
       <span class="ctrl-frame-info">
@@ -368,6 +378,15 @@ const remainingRecordingSeconds = computed(() => {
 .toggle-btn:disabled {
   opacity: .4;
   cursor: not-allowed;
+}
+.capture-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.capture-btn:hover:not(:disabled) {
+  border-color: #f59e0b;
+  color: #f59e0b;
 }
 .ctrl-frame-info {
   margin-left: auto;

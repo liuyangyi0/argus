@@ -15,6 +15,11 @@ watch(videoRef, (el) => {
   ctrl.videoEl.value = el
 }, { immediate: true })
 
+// Expose the final composited canvas so controls can export the visible frame.
+watch(canvasRef, (el) => {
+  ctrl.canvasEl.value = el
+}, { immediate: true })
+
 // Create heatmap cache (auto-starts preloading)
 const alertId = ctrl.metadata.value?.alert_id ?? ''
 const frameCount = ctrl.metadata.value?.frame_count ?? 0
@@ -73,6 +78,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   compositor.stop()
+  if (ctrl.canvasEl.value === canvasRef.value) ctrl.canvasEl.value = null
+  if (ctrl.videoEl.value === videoRef.value) ctrl.videoEl.value = null
   // hmCache disposes itself via its own onBeforeUnmount
   resizeObs?.disconnect()
 })

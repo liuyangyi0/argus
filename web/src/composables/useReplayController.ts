@@ -22,8 +22,9 @@ export function useReplayController(alertId: string) {
   const speed = ref(1)
   const loading = ref(true)
 
-  // video dom ref
+  // video/canvas dom refs
   const videoEl = ref<HTMLVideoElement | null>(null)
+  const canvasEl = ref<HTMLCanvasElement | null>(null)
   const videoError = ref('')
   const pendingSeekIndex = ref<number | null>(null)
 
@@ -252,6 +253,51 @@ export function useReplayController(alertId: string) {
   function goToStart() { seekTo(0) }
   function goToEnd() { seekTo((metadata.value?.frame_count || 1) - 1) }
 
+  function snapshotFilename(): string {
+    const sanitize = (value: unknown, fallback: string) => {
+      const text = String(value || fallback).trim() || fallback
+      return text.replace(/[^\w.-]+/g, '_')
+    }
+    const cameraId = sanitize(metadata.value?.camera_id, 'camera')
+    const replayId = sanitize(metadata.value?.alert_id || alertId, 'replay')
+    const frameNo = String(currentIndex.value + 1).padStart(6, '0')
+    const frameTs = signals.value?.timestamps?.[currentIndex.value]
+    const date = typeof frameTs === 'number' ? new Date(frameTs * 1000) : new Date()
+    const stamp = Number.isNaN(date.getTime())
+      ? new Date().toISOString()
+      : date.toISOString()
+    return `snapshot_${cameraId}_${replayId}_f${frameNo}_${stamp.replace(/[:.]/g, '-')}.png`
+  }
+
+  async function captureCurrentFrame() {
+    const canvas = canvasEl.value
+    if (!canvas || canvas.width === 0 || canvas.height === 0) {
+      message.warning('当前画面还未就绪，请稍候')
+      return
+    }
+
+    try {
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((result) => {
+          if (result) resolve(result)
+          else reject(new Error('empty snapshot'))
+        }, 'image/png')
+      })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = snapshotFilename()
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      message.success('抓图已保存')
+    } catch (err) {
+      console.error('[replay] snapshot failed:', err)
+      message.error('抓图失败，请确认视频允许当前页面截图')
+    }
+  }
+
   async function handlePinFrame() {
     const label = prompt('帧标签:')
     if (!label) return
@@ -330,14 +376,14 @@ export function useReplayController(alertId: string) {
 
   return {
     metadata, signals, trajectoryFits, currentIndex, playing, speed, loading,
-    videoEl, videoError, pendingSeekIndex,
+    videoEl, canvasEl, videoError, pendingSeekIndex,
     showHeatmap, showBoxes, showTrajectory, showHud, heatmapOpacity,
     referenceFrame, referenceDate, loadingRef, selectedRefOption,
     referenceOffsetSeconds,
     clipStart, clipEnd, persistedClips,
     fps, videoUrl, hasHeatmaps, currentTimestamp,
     loadData, loadReference, togglePlay, stepFrame, seekTo, goToStart, goToEnd,
-    handlePinFrame, handleKeydown, onRefOptionChange,
+    captureCurrentFrame, handlePinFrame, handleKeydown, onRefOptionChange,
     commitClip, removeClip,
   }
 }
