@@ -9,3 +9,7 @@ const themeStore = useThemeStore()
   </a-config-provider>
 </template>
 
+
+<style>
+
+</style>

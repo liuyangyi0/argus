@@ -728,6 +728,23 @@ class Region(Base):
     )
 
 
+class NotificationTemplate(Base):
+    """Reusable alert notification template stored as operational data."""
+
+    __tablename__ = "notification_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    method: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    subject: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class ModelVersionEvent(Base):
     """Structured version transition event for audit trail."""
 

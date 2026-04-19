@@ -8,6 +8,7 @@ import SystemAuditPanel from '../components/system/SystemAuditPanel.vue'
 import SystemDegradationPanel from '../components/system/SystemDegradationPanel.vue'
 import SystemUserPanel from '../components/system/SystemUserPanel.vue'
 import SystemRegionPanel from '../components/system/SystemRegionPanel.vue'
+import SystemNotificationTemplatePanel from '../components/system/SystemNotificationTemplatePanel.vue'
 import ModuleTogglePanel from '../components/system/ModuleTogglePanel.vue'
 import ClassifierPanel from '../components/system/ClassifierPanel.vue'
 import SegmenterPanel from '../components/system/SegmenterPanel.vue'
@@ -85,6 +86,9 @@ function onTabChange(key: string | number) {
       </Tabs.TabPane>
       <Tabs.TabPane key="regions" tab="区域管理">
         <SystemRegionPanel v-if="activeTab === 'regions'" />
+      </Tabs.TabPane>
+      <Tabs.TabPane key="notification-templates" tab="通知内容配置">
+        <SystemNotificationTemplatePanel v-if="activeTab === 'notification-templates'" />
       </Tabs.TabPane>
     </Tabs>
   </main>

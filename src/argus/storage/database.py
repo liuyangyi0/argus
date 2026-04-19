@@ -23,6 +23,7 @@ from argus.storage.models import (
     InferenceRecord,
     LabelingQueueRecord,
     LabelingQueueStatus,
+    NotificationTemplate,
     Region,
     TrainingJobRecord,
     TrainingRecord,
@@ -49,6 +50,55 @@ _REGION_UPDATABLE_FIELDS = {
     "phone",
     "notification_methods",
 }
+
+_NOTIFICATION_TEMPLATE_UPDATABLE_FIELDS = {
+    "name",
+    "method",
+    "subject",
+    "content",
+    "enabled",
+}
+
+_STARTER_NOTIFICATION_TEMPLATES = [
+    {
+        "name": "邮箱告警模板",
+        "method": "email",
+        "subject": "[{severity}] {camera_name} 告警",
+        "content": (
+            "告警编号: {alert_id}\n"
+            "摄像头: {camera_name}\n"
+            "区域: {region_name}\n"
+            "严重度: {severity}\n"
+            "告警类型: {category}\n"
+            "异常分数: {anomaly_score}\n"
+            "发生时间: {timestamp}\n"
+            "请尽快登录 Argus 查看现场画面。"
+        ),
+    },
+    {
+        "name": "短信告警模板",
+        "method": "sms",
+        "subject": "",
+        "content": "{camera_name} 在 {timestamp} 触发 {severity} 告警，区域 {region_name}，请及时处理。",
+    },
+    {
+        "name": "Webhook 告警模板",
+        "method": "webhook",
+        "subject": "",
+        "content": (
+            '{\n'
+            '  "alert_id": "{alert_id}",\n'
+            '  "camera_id": "{camera_id}",\n'
+            '  "camera_name": "{camera_name}",\n'
+            '  "region_name": "{region_name}",\n'
+            '  "severity": "{severity}",\n'
+            '  "category": "{category}",\n'
+            '  "anomaly_score": "{anomaly_score}",\n'
+            '  "timestamp": "{timestamp}"\n'
+            '}'
+        ),
+    },
+]
 
 
 class Database:
@@ -103,6 +153,7 @@ class Database:
 
         # Auto-migrate: add missing columns to existing tables
         self._auto_migrate()
+        self._seed_notification_templates()
 
         logger.info("database.initialized", url=self._database_url)
 
@@ -190,6 +241,22 @@ class Database:
                             table=table, column=column, error=str(e),
                             exc_info=True,
                         )
+
+    def _seed_notification_templates(self) -> None:
+        """Create starter notification templates in the database once."""
+        with self.get_session() as session:
+            count = session.scalar(
+                select(sa_func.count()).select_from(NotificationTemplate)
+            ) or 0
+            if count > 0:
+                return
+            for item in _STARTER_NOTIFICATION_TEMPLATES:
+                session.add(NotificationTemplate(**item))
+            session.commit()
+            logger.info(
+                "database.notification_templates_seeded",
+                count=len(_STARTER_NOTIFICATION_TEMPLATES),
+            )
 
     def get_session(self) -> Session:
         """Get a new database session."""
@@ -1059,6 +1126,91 @@ class Database:
             session.delete(region)
             session.commit()
             logger.info("database.region_deleted", region_id=region_id, name=region.name)
+            return True
+
+    # ── Notification templates ──
+
+    def create_notification_template(
+        self,
+        *,
+        name: str,
+        method: str,
+        subject: str | None = None,
+        content: str,
+        enabled: bool = True,
+    ) -> NotificationTemplate:
+        """Create a reusable alert notification template."""
+        with self.get_session() as session:
+            template = NotificationTemplate(
+                name=name,
+                method=method,
+                subject=subject,
+                content=content,
+                enabled=enabled,
+            )
+            session.add(template)
+            session.commit()
+            session.refresh(template)
+            logger.info(
+                "database.notification_template_created",
+                template_id=template.id,
+                method=method,
+                name=name,
+            )
+            return template
+
+    def get_notification_template(self, template_id: int) -> NotificationTemplate | None:
+        """Get a notification template by id."""
+        with self.get_session() as session:
+            return session.scalar(
+                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
+            )
+
+    def get_notification_templates(self, method: str | None = None) -> list[NotificationTemplate]:
+        """Return notification templates, optionally filtered by method."""
+        with self.get_session() as session:
+            stmt = select(NotificationTemplate).order_by(
+                NotificationTemplate.method.asc(),
+                NotificationTemplate.updated_at.desc(),
+                NotificationTemplate.id.desc(),
+            )
+            if method:
+                stmt = stmt.where(NotificationTemplate.method == method)
+            return list(session.scalars(stmt).all())
+
+    def update_notification_template(self, template_id: int, **kwargs) -> bool:
+        """Update editable fields on a notification template."""
+        with self.get_session() as session:
+            template = session.scalar(
+                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
+            )
+            if template is None:
+                return False
+
+            for key, value in kwargs.items():
+                if key in _NOTIFICATION_TEMPLATE_UPDATABLE_FIELDS and hasattr(template, key):
+                    setattr(template, key, value)
+            session.commit()
+            return True
+
+    def delete_notification_template(self, template_id: int) -> bool:
+        """Delete a notification template by id."""
+        with self.get_session() as session:
+            template = session.scalar(
+                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
+            )
+            if template is None:
+                return False
+            method = template.method
+            name = template.name
+            session.delete(template)
+            session.commit()
+            logger.info(
+                "database.notification_template_deleted",
+                template_id=template_id,
+                method=method,
+                name=name,
+            )
             return True
 
     def save_alert_recording(self, record: AlertRecordingRecord) -> AlertRecordingRecord:

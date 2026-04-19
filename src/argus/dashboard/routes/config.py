@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 
 import structlog
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 
 from argus.core.model_discovery import resolve_runtime_model_path
@@ -40,6 +40,64 @@ class ThresholdUpdateRequest(BaseModel):
 class ModelReloadRequest(BaseModel):
     camera_id: str
     model_path: str
+
+
+_NOTIFICATION_TEMPLATE_METHODS = {"email", "sms", "webhook"}
+
+
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "启用", "是"}
+    return bool(value)
+
+
+def _notification_template_to_dict(template) -> dict:
+    return {
+        "id": template.id,
+        "name": template.name,
+        "method": template.method,
+        "subject": template.subject or "",
+        "content": template.content,
+        "enabled": bool(template.enabled),
+        "created_at": template.created_at.isoformat() if template.created_at else None,
+        "updated_at": template.updated_at.isoformat() if template.updated_at else None,
+    }
+
+
+def _normalize_notification_template_payload(body: dict) -> tuple[dict | None, str | None]:
+    if not isinstance(body, dict):
+        return None, "请求体必须是 JSON 对象"
+
+    name = str(body.get("name", "")).strip()
+    method = str(body.get("method", "")).strip()
+    subject = str(body.get("subject", "")).strip()
+    content = str(body.get("content", "")).strip()
+    enabled = _coerce_bool(body.get("enabled"), True)
+
+    if not name:
+        return None, "模板名称不能为空"
+    if len(name) > 100:
+        return None, "模板名称不能超过 100 个字符"
+    if method not in _NOTIFICATION_TEMPLATE_METHODS:
+        return None, "通知方式无效"
+    if len(subject) > 200:
+        return None, "模板标题不能超过 200 个字符"
+    if not content:
+        return None, "模板内容不能为空"
+    if len(content) > 4000:
+        return None, "模板内容不能超过 4000 个字符"
+
+    return {
+        "name": name,
+        "method": method,
+        "subject": subject or None,
+        "content": content,
+        "enabled": enabled,
+    }, None
 
 
 @router.post("/detection-params")
@@ -160,6 +218,88 @@ async def test_webhook(request: Request):
         )
     except Exception as e:
         return api_internal_error(str(e))
+
+
+@router.get("/notification-templates")
+async def list_notification_templates(
+    request: Request,
+    method: str | None = Query(None),
+):
+    """Return notification templates stored in the database."""
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    method_filter = (method or "").strip() or None
+    if method_filter and method_filter not in _NOTIFICATION_TEMPLATE_METHODS:
+        return api_validation_error("通知方式无效")
+
+    templates = db.get_notification_templates(method=method_filter)
+    return api_success({"templates": [_notification_template_to_dict(item) for item in templates]})
+
+
+@router.post("/notification-templates")
+async def create_notification_template(request: Request):
+    """Create a notification template."""
+    from argus.dashboard.auth import require_role
+
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("需要管理员或工程师权限")
+
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    body = await request.json()
+    payload, error = _normalize_notification_template_payload(body)
+    if error:
+        return api_validation_error(error)
+
+    assert payload is not None
+    template = db.create_notification_template(**payload)
+    return api_success({"template": _notification_template_to_dict(template)})
+
+
+@router.put("/notification-templates/{template_id}")
+async def update_notification_template(request: Request, template_id: int):
+    """Update a notification template."""
+    from argus.dashboard.auth import require_role
+
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("需要管理员或工程师权限")
+
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+    if db.get_notification_template(template_id) is None:
+        return api_not_found("模板不存在")
+
+    body = await request.json()
+    payload, error = _normalize_notification_template_payload(body)
+    if error:
+        return api_validation_error(error)
+
+    assert payload is not None
+    db.update_notification_template(template_id, **payload)
+    template = db.get_notification_template(template_id)
+    assert template is not None
+    return api_success({"template": _notification_template_to_dict(template)})
+
+
+@router.delete("/notification-templates/{template_id}")
+async def delete_notification_template(request: Request, template_id: int):
+    """Delete a notification template."""
+    from argus.dashboard.auth import require_role
+
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("需要管理员或工程师权限")
+
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+    if not db.delete_notification_template(template_id):
+        return api_not_found("模板不存在")
+    return api_success({"id": template_id})
 
 
 @router.get("/storage/info")

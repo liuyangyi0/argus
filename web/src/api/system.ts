@@ -159,8 +159,48 @@ export const restartCamera = (cameraId: string) =>
   api.post(`/config/camera/${cameraId}/restart`).then(u)
 
 // ── Webhook / Notifications ──
+export type NotificationTemplateMethod = 'email' | 'sms' | 'webhook'
+
+export interface NotificationTemplateItem {
+  id: number
+  name: string
+  method: NotificationTemplateMethod
+  subject: string
+  content: string
+  enabled: boolean
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface NotificationTemplatePayload {
+  name: string
+  method: NotificationTemplateMethod
+  subject?: string
+  content: string
+  enabled: boolean
+}
+
 export const updateNotifications = (data: any) => api.post('/config/notifications', data).then(u)
 export const testWebhook = () => api.post('/config/test-webhook').then(u)
+export const getNotificationTemplates = (method?: NotificationTemplateMethod) =>
+  api
+    .get<ApiResponse<{ templates: NotificationTemplateItem[] }>>('/config/notification-templates', {
+      params: { method },
+    })
+    .then(unwrap)
+export const createNotificationTemplate = (data: NotificationTemplatePayload) =>
+  api
+    .post<ApiResponse<{ template: NotificationTemplateItem }>>('/config/notification-templates', data)
+    .then(unwrap)
+export const updateNotificationTemplate = (templateId: number, data: NotificationTemplatePayload) =>
+  api
+    .put<ApiResponse<{ template: NotificationTemplateItem }>>(
+      `/config/notification-templates/${templateId}`,
+      data,
+    )
+    .then(unwrap)
+export const deleteNotificationTemplate = (templateId: number) =>
+  api.delete<ApiResponse<{ id: number }>>(`/config/notification-templates/${templateId}`).then(unwrap)
 
 // ── Backup management ──
 export const listBackups = () => api.get('/backup/list/json').then(u)
