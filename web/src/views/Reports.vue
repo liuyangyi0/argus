@@ -66,7 +66,11 @@ const trendOption = computed(() => {
   const d = trendData.value
   return {
     tooltip: { trigger: 'axis' as const },
-    legend: { data: ['高', '中', '低', '提示'], textStyle: { color: 'var(--ink-3)' } },
+    legend: { data: ['高', '中', '低', '提示'], textStyle: { color: 'var(--ink-3)' }, 
+    top: '3%', // 垂直居中
+    right: '3%', // 距离右侧10%的位置 
+    orient: 'horizontal', // 垂直布局（默认是水平布局）
+    },
     grid: { left: 40, right: 16, top: 40, bottom: 24 },
     xAxis: { type: 'category' as const, data: d.labels, axisLabel: { color: 'var(--ink-4)' } },
     yAxis: { type: 'value' as const, axisLabel: { color: 'var(--ink-4)' }, minInterval: 1 },
@@ -84,7 +88,11 @@ const severityOption = computed(() => {
   const d = severityData.value
   return {
     tooltip: { trigger: 'item' as const },
-    legend: { bottom: 0, textStyle: { color: 'var(--ink-3)' } },
+    legend: { bottom: 0, textStyle: { color: 'var(--ink-3)' },
+      top: '3%', // 垂直居中
+      right: '3%', // 距离右侧10%的位置 
+      orient: 'horizontal', // 垂直布局（默认是水平布局） 
+    },
     series: [{
       type: 'pie' as const,
       radius: ['40%', '70%'],
@@ -132,8 +140,8 @@ const fpOption = computed(() => {
 </script>
 
 <template>
-  <main class="glass" style="margin: 12px; padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
-    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px;">
+  <main class="glass" style=" padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
       <Typography.Title :level="3" style="margin: 0; color: var(--ink)">报表统计</Typography.Title>
       <Select v-model:value="days" style="width: 120px" @change="handleDaysChange">
         <Select.Option :value="7">最近 7 天</Select.Option>
@@ -145,7 +153,7 @@ const fpOption = computed(() => {
     </div>
 
     <!-- Compliance report download -->
-    <Card size="small" style="margin-bottom: 24px;">
+    <Card size="small" style="margin-bottom: 12px;">
       <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
         <Typography.Text strong style="color: var(--ink); white-space: nowrap;">生成合规报告</Typography.Text>
         <Select v-model:value="complianceDays" style="width: 120px" size="small">
@@ -168,7 +176,7 @@ const fpOption = computed(() => {
 
     <Spin :spinning="loading">
       <!-- Summary stats -->
-      <Row :gutter="16" style="margin-bottom: 24px" v-if="stats">
+      <Row :gutter="16"  style="margin-bottom: 12px;" v-if="stats">
         <Col :span="6"><Card size="small"><Statistic title="告警总数" :value="stats.total_alerts" /></Card></Col>
         <Col :span="6"><Card size="small"><Statistic title="高严重度" :value="stats.by_severity?.high ?? 0" :value-style="{ color: SEVERITY_COLORS.high }" /></Card></Col>
         <Col :span="6"><Card size="small"><Statistic title="误报率" :value="stats.false_positive_rate" suffix="%" :value-style="{ color: '#d97706' }" /></Card></Col>
@@ -176,13 +184,27 @@ const fpOption = computed(() => {
       </Row>
 
       <!-- Daily trend -->
-      <Card title="每日告警趋势" size="small" style="margin-bottom: 16px">
+      <!--<Card title="每日告警趋势" size="small" style="margin-bottom: 16px">
         <VChart v-if="trendData" :option="trendOption" :autoresize="true" style="height: 280px" />
         <Empty v-else description="暂无数据" />
-      </Card>
+      </Card>-->
+      <Row  :gutter="16" >
+        <Col :span="12">
+          <Card title="每日告警趋势" size="small" style="margin-bottom: 16px">
+              <VChart v-if="trendData" :option="trendOption" :autoresize="true" style="height: 220px" />
+              <Empty v-else description="暂无数据" />
+           </Card>
+        </Col>
+        <Col :span="12">
+          <Card title="误报率趋势" size="small">
+            <VChart v-if="fpData" :option="fpOption" :autoresize="true" style="height: 220px" />
+            <Empty v-else description="暂无数据" />
+          </Card>
+        </Col>
+      </Row>
 
       <!-- Severity + Camera distribution side by side -->
-      <Row :gutter="16" style="margin-bottom: 16px">
+      <Row :gutter="16" >
         <Col :span="12">
           <Card title="按严重度分布" size="small">
             <VChart v-if="severityData" :option="severityOption" :autoresize="true" style="height: 260px" />
@@ -198,10 +220,10 @@ const fpOption = computed(() => {
       </Row>
 
       <!-- FP trend -->
-      <Card title="误报率趋势" size="small">
+      <!-- <Card title="误报率趋势" size="small">
         <VChart v-if="fpData" :option="fpOption" :autoresize="true" style="height: 220px" />
         <Empty v-else description="暂无数据" />
-      </Card>
+      </Card> -->
     </Spin>
   </main>
 </template>
