@@ -17,7 +17,7 @@ import {
   Typography,
   message,
 } from 'ant-design-vue'
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons-vue'
+import { PlusOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 
 import {
   createNotificationTemplate,

@@ -140,3 +140,34 @@
   background: #94a3b8;
 }
 
+/* Keep Ant Design Vue button icons optically centered with text. */
+.ant-btn.ant-btn.ant-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.ant-btn.ant-btn.ant-btn > span {
+  display: inline-flex;
+  align-items: center;
+}
+
+.ant-btn.ant-btn.ant-btn .anticon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+.ant-btn.ant-btn.ant-btn svg {
+  display: block;
+}
+
+.ant-btn.ant-btn.ant-btn > .anticon + span,
+.ant-btn.ant-btn.ant-btn > span + .anticon,
+.ant-btn.ant-btn.ant-btn:not(.ant-btn-icon-only) .ant-btn-loading-icon > .anticon {
+  margin-inline-start: 0;
+  margin-inline-end: 0;
+}
