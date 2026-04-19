@@ -104,7 +104,7 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  margin: 12px;
+  /* margin: 12px; */
   border-radius: var(--r-lg, 12px);
   background: var(--argus-surface, rgba(255,255,255,0.85));
   backdrop-filter: blur(16px);
