@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, reactive, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import {
   Table, Tag, Button, Space, Typography, Tooltip,
@@ -37,6 +37,10 @@ const { alerts, loading, totalAlerts, selectedAlert } = storeToRefs(store)
 
 // Bulk selection lives here because the bulk action bar is part of the table region.
 const selectedRowKeys = ref<(string | number)[]>([])
+const tablePagination = reactive({
+  current: 1,
+  pageSize: 20,
+})
 
 // Event group popover state
 const groupAlerts = ref<any[]>([])
@@ -160,6 +164,42 @@ function rowClassName(record: any) {
   return ''
 }
 
+const tablePaginationConfig = computed(() => {
+  if (selectedAlert.value) {
+    return {
+      pageSize: 50,
+      simple: true,
+      size: 'small' as const,
+    }
+  }
+
+  return {
+    current: tablePagination.current,
+    pageSize: tablePagination.pageSize,
+    total: totalAlerts.value,
+    showSizeChanger: true,
+    pageSizeOptions: ['10', '20', '50', '100'],
+    showTotal: (t: number) => `共 ${t} 条`,
+  }
+})
+
+function handleTableChange(pagination: { current?: number; pageSize?: number }) {
+  if (selectedAlert.value) return
+
+  const nextPageSize = pagination.pageSize ?? tablePagination.pageSize
+  tablePagination.current = nextPageSize === tablePagination.pageSize
+    ? pagination.current ?? tablePagination.current
+    : 1
+  tablePagination.pageSize = nextPageSize
+}
+
+watch(totalAlerts, (total) => {
+  const maxPage = Math.max(1, Math.ceil(total / tablePagination.pageSize))
+  if (tablePagination.current > maxPage) {
+    tablePagination.current = maxPage
+  }
+})
+
 // Prefer the explicit prop, falling back to `selectedAlert` for existing call
 // sites. This guards against the column-width flicker that happened when a
 // single intra-table state change (clicking a row) rebuilt the column array.
@@ -229,13 +269,14 @@ const columns = computed(() => {
       row-key="alert_id"
       size="small"
       :row-selection="{ selectedRowKeys, onChange: (keys: (string | number)[]) => { selectedRowKeys = keys } }"
-      :pagination="selectedAlert ? { pageSize: 50, simple: true, size: 'small' } : { pageSize: 20, total: totalAlerts, showTotal: (t: number) => `共 ${t} 条` }"
+      :pagination="tablePaginationConfig"
       :custom-row="(record: any) => ({
         onClick: () => handleRowClick(record),
         class: rowClassName(record),
       })"
       :scroll="{ x: 800, y: selectedAlert ? 'calc(100vh - 160px)' : undefined }"
       style="cursor: pointer"
+      @change="handleTableChange"
     >
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'thumbnail'">
