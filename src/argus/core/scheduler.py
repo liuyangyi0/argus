@@ -103,9 +103,12 @@ def create_maintenance_tasks(
     health_monitor: HealthMonitor | None = None,
     alerts_dir: str | Path = "data/alerts",
     retention_days: int = 90,
+    inference_records_dir: str | Path = "data/inference_records",
+    inference_retention_days: int = 7,
 ) -> None:
     """Register standard maintenance tasks."""
     alerts_path = Path(alerts_dir)
+    inference_path = Path(inference_records_dir)
 
     # Check for stale cameras every 30 seconds
     if health_monitor:
@@ -154,12 +157,53 @@ def create_maintenance_tasks(
         scheduler.add_interval_task("cleanup_alerts", cleanup_alerts, hours=6)
 
         def cleanup_inference_records():
+            """Clean inference records from both DB and disk.
+
+            Historical bug: this task only cleaned DB rows, never touched
+            the date-partitioned directories under inference_records_dir,
+            so at 30fps they grew unbounded until the partition hit 100%
+            and inference_store.write_failed started firing. Now we also
+            prune old date directories (``YYYY-MM-DD`` naming).
+            """
             try:
-                count = database.delete_old_inference_records(days=30)
+                count = database.delete_old_inference_records(days=inference_retention_days)
                 if count > 0:
-                    logger.info("maintenance.inference_cleaned", deleted=count)
+                    logger.info(
+                        "maintenance.inference_cleaned",
+                        deleted=count,
+                        retention_days=inference_retention_days,
+                    )
             except Exception as e:
                 logger.error("maintenance.inference_cleanup_failed", error=str(e))
+
+            # Prune old date directories from disk
+            if inference_path.is_dir():
+                cutoff = (datetime.now() - timedelta(days=inference_retention_days)).strftime("%Y-%m-%d")
+                removed_dirs = 0
+                freed_bytes = 0
+                for date_dir in inference_path.iterdir():
+                    if not date_dir.is_dir() or not date_dir.name[:10].replace("-", "").isdigit():
+                        continue
+                    if date_dir.name >= cutoff:
+                        continue
+                    try:
+                        size = sum(f.stat().st_size for f in date_dir.rglob("*") if f.is_file())
+                        shutil.rmtree(date_dir, ignore_errors=True)
+                        freed_bytes += size
+                        removed_dirs += 1
+                    except OSError as e:
+                        logger.warning(
+                            "maintenance.inference_dir_delete_failed",
+                            path=str(date_dir),
+                            error=str(e),
+                        )
+                if removed_dirs > 0:
+                    logger.info(
+                        "maintenance.inference_dirs_cleaned",
+                        dirs=removed_dirs,
+                        freed_mb=round(freed_bytes / (1024 * 1024), 1),
+                        cutoff=cutoff,
+                    )
 
         scheduler.add_interval_task("cleanup_inference", cleanup_inference_records, hours=6)
 
