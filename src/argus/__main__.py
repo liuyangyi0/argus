@@ -489,6 +489,7 @@ def main():
         database=db,
         health_monitor=health,
         alerts_dir=config.storage.alerts_dir,
+        inference_records_dir=config.storage.inference_records_dir,
     )
     _register_training_job_processing(
         scheduler,
