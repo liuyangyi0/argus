@@ -49,6 +49,7 @@ _REGION_UPDATABLE_FIELDS = {
     "email",
     "phone",
     "notification_methods",
+    "notification_template_ids",
 }
 
 _NOTIFICATION_TEMPLATE_UPDATABLE_FIELDS = {
@@ -224,6 +225,7 @@ class Database:
             # Baseline version enrichment (secondary verifier + group)
             ("baseline_versions", "verified_by_secondary", "VARCHAR(100)"),
             ("baseline_versions", "group_id", "VARCHAR(100)"),
+            ("regions", "notification_template_ids", "VARCHAR(500) DEFAULT '' NOT NULL"),
         ]
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
@@ -1058,6 +1060,7 @@ class Database:
         email: str | None = None,
         phone: str | None = None,
         notification_methods: str = "",
+        notification_template_ids: str = "",
     ) -> Region:
         """Create a managed region/contact entry."""
         with self.get_session() as session:
@@ -1067,6 +1070,7 @@ class Database:
                 email=email,
                 phone=phone,
                 notification_methods=notification_methods,
+                notification_template_ids=notification_template_ids,
             )
             session.add(region)
             session.commit()
@@ -1177,6 +1181,21 @@ class Database:
             if method:
                 stmt = stmt.where(NotificationTemplate.method == method)
             return list(session.scalars(stmt).all())
+
+    def get_notification_templates_by_ids(self, template_ids: list[int]) -> list[NotificationTemplate]:
+        """Return notification templates ordered by the given ids."""
+        if not template_ids:
+            return []
+
+        with self.get_session() as session:
+            rows = list(
+                session.scalars(
+                    select(NotificationTemplate).where(NotificationTemplate.id.in_(template_ids))
+                ).all()
+            )
+
+        template_map = {item.id: item for item in rows}
+        return [template_map[template_id] for template_id in template_ids if template_id in template_map]
 
     def update_notification_template(self, template_id: int, **kwargs) -> bool:
         """Update editable fields on a notification template."""
