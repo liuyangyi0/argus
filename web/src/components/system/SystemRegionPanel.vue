@@ -1,23 +1,40 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { Button, Card, Form, Input, Modal, Popconfirm, Select, Table, Tag, message } from 'ant-design-vue'
 
-import type { RegionItem, RegionPayload } from '../../api'
-import { createRegion, deleteRegion, getRegions, updateRegion } from '../../api'
+import type {
+  NotificationTemplateItem,
+  NotificationTemplateMethod,
+  RegionItem,
+  RegionPayload,
+} from '../../api'
+import {
+  createRegion,
+  deleteRegion,
+  getNotificationTemplates,
+  getRegions,
+  updateRegion,
+} from '../../api'
 import { extractErrorMessage } from '../../utils/error'
 
 type ModalMode = 'create' | 'edit'
+type RegionNotificationMethod = 'email' | 'phone' | 'sms' | 'webhook'
 
 interface RegionFormState {
   name: string
   owner: string
   email: string
   phone: string
-  notification_methods: string[]
+  notification_methods: RegionNotificationMethod[]
+  notification_template_ids: number[]
 }
 
+const TEMPLATE_METHODS: NotificationTemplateMethod[] = ['email', 'sms', 'webhook']
+
 const regions = ref<RegionItem[]>([])
+const notificationTemplates = ref<NotificationTemplateItem[]>([])
 const regionsLoading = ref(false)
+const templatesLoading = ref(false)
 const submitLoading = ref(false)
 const busyRow = ref<number | null>(null)
 
@@ -33,7 +50,7 @@ const modalMode = ref<ModalMode>('create')
 const editingRegionId = ref<number | null>(null)
 const regionForm = ref<RegionFormState>(createEmptyForm())
 
-const notificationMethodOptions = [
+const notificationMethodOptions: { label: string; value: RegionNotificationMethod; color: string }[] = [
   { label: '邮箱', value: 'email', color: 'blue' },
   { label: '电话', value: 'phone', color: 'green' },
   { label: '短信', value: 'sms', color: 'orange' },
@@ -42,11 +59,47 @@ const notificationMethodOptions = [
 
 const notificationMethodLabelMap = Object.fromEntries(
   notificationMethodOptions.map((item) => [item.value, item.label]),
-) as Record<string, string>
+) as Record<RegionNotificationMethod, string>
 
 const notificationMethodColorMap = Object.fromEntries(
   notificationMethodOptions.map((item) => [item.value, item.color]),
-) as Record<string, string>
+) as Record<RegionNotificationMethod, string>
+
+function getNotificationMethodLabel(method: string) {
+  return notificationMethodLabelMap[method as RegionNotificationMethod] || method
+}
+
+function getNotificationMethodColor(method: string) {
+  return notificationMethodColorMap[method as RegionNotificationMethod] || 'default'
+}
+
+const templateNameMap = computed(() => new Map(notificationTemplates.value.map((item) => [item.id, item])))
+
+const availableNotificationTemplateOptions = computed(() => {
+  const selectedMethods = regionForm.value.notification_methods.filter(
+    (method): method is NotificationTemplateMethod => TEMPLATE_METHODS.includes(method as NotificationTemplateMethod),
+  )
+  if (!regionForm.value.notification_methods.length) {
+    return notificationTemplates.value
+  }
+  if (!selectedMethods.length) {
+    return []
+  }
+  return notificationTemplates.value.filter((item) => selectedMethods.includes(item.method))
+})
+
+const notificationTemplateFieldExtra = computed(() => {
+  if (!regionForm.value.notification_methods.length) {
+    return '可选择多个通知内容配置，保存后将与当前区域关联。'
+  }
+  const selectedMethods = regionForm.value.notification_methods.filter(
+    (method): method is NotificationTemplateMethod => TEMPLATE_METHODS.includes(method as NotificationTemplateMethod),
+  )
+  if (!selectedMethods.length) {
+    return '当前只选择了电话方式，没有可关联的通知内容配置。'
+  }
+  return '只显示与已选通知方式匹配的通知内容配置，可多选。'
+})
 
 const regionColumns = [
   { title: '区域名称', dataIndex: 'name', key: 'name', width: 180 },
@@ -54,6 +107,7 @@ const regionColumns = [
   { title: '邮箱', dataIndex: 'email', key: 'email', width: 220 },
   { title: '电话', dataIndex: 'phone', key: 'phone', width: 160 },
   { title: '告警通知方式', key: 'notification_methods', width: 220 },
+  { title: '通知内容配置', key: 'notification_templates', width: 320 },
   { title: '操作', key: 'action', width: 160, fixed: 'right' as const },
 ]
 
@@ -64,6 +118,7 @@ function createEmptyForm(): RegionFormState {
     email: '',
     phone: '',
     notification_methods: [],
+    notification_template_ids: [],
   }
 }
 
@@ -76,13 +131,32 @@ function buildQueryParams() {
   }
 }
 
+function filterTemplateOptionsByMethods(methods: RegionNotificationMethod[]) {
+  const selectedMethods = methods.filter(
+    (method): method is NotificationTemplateMethod => TEMPLATE_METHODS.includes(method as NotificationTemplateMethod),
+  )
+  if (!methods.length) {
+    return notificationTemplates.value
+  }
+  if (!selectedMethods.length) {
+    return []
+  }
+  return notificationTemplates.value.filter((item) => selectedMethods.includes(item.method))
+}
+
+function syncTemplateSelectionWithMethods(methods: RegionNotificationMethod[]) {
+  const allowedIds = new Set(filterTemplateOptionsByMethods(methods).map((item) => item.id))
+  regionForm.value.notification_template_ids = regionForm.value.notification_template_ids.filter((id) => allowedIds.has(id))
+}
+
 function buildPayload(): RegionPayload | null {
   const payload: RegionPayload = {
     name: regionForm.value.name.trim(),
     owner: regionForm.value.owner.trim(),
     email: regionForm.value.email.trim() || undefined,
     phone: regionForm.value.phone.trim() || undefined,
-    notification_methods: regionForm.value.notification_methods,
+    notification_methods: [...regionForm.value.notification_methods],
+    notification_template_ids: [...regionForm.value.notification_template_ids],
   }
 
   if (!payload.name) {
@@ -106,6 +180,12 @@ function buildPayload(): RegionPayload | null {
     return null
   }
 
+  const availableIds = new Set(availableNotificationTemplateOptions.value.map((item) => item.id))
+  if (payload.notification_template_ids.some((id) => !availableIds.has(id))) {
+    message.warning('所选通知内容配置与当前通知方式不匹配，请重新选择')
+    return null
+  }
+
   return payload
 }
 
@@ -118,6 +198,19 @@ async function loadRegions() {
     message.error(extractErrorMessage(e, '加载区域列表失败'))
   } finally {
     regionsLoading.value = false
+  }
+}
+
+async function loadNotificationTemplates() {
+  templatesLoading.value = true
+  try {
+    const res = await getNotificationTemplates()
+    notificationTemplates.value = res.templates
+    syncTemplateSelectionWithMethods(regionForm.value.notification_methods)
+  } catch (e) {
+    message.error(extractErrorMessage(e, '加载通知内容配置失败'))
+  } finally {
+    templatesLoading.value = false
   }
 }
 
@@ -136,13 +229,21 @@ function openEditModal(region: RegionItem) {
     owner: region.owner,
     email: region.email || '',
     phone: region.phone || '',
-    notification_methods: [...(region.notification_methods || [])],
+    notification_methods: [...(region.notification_methods || [])] as RegionNotificationMethod[],
+    notification_template_ids: [...(region.notification_template_ids || [])],
   }
+  syncTemplateSelectionWithMethods(regionForm.value.notification_methods)
   modalOpen.value = true
 }
 
 function handleEdit(record: Record<string, any>) {
   openEditModal(record as RegionItem)
+}
+
+function handleNotificationMethodsChange(value: unknown) {
+  const methods = (Array.isArray(value) ? value : []) as RegionNotificationMethod[]
+  regionForm.value.notification_methods = methods
+  syncTemplateSelectionWithMethods(methods)
 }
 
 async function handleSubmit() {
@@ -198,7 +299,7 @@ function handleReset() {
 }
 
 onMounted(() => {
-  loadRegions()
+  void Promise.all([loadRegions(), loadNotificationTemplates()])
 })
 </script>
 
@@ -237,7 +338,7 @@ onMounted(() => {
         :data-source="regions"
         :loading="regionsLoading"
         :pagination="false"
-        :scroll="{ x: 1080 }"
+        :scroll="{ x: 1320 }"
         row-key="id"
         size="small"
       >
@@ -253,9 +354,22 @@ onMounted(() => {
               <Tag
                 v-for="method in record.notification_methods"
                 :key="method"
-                :color="notificationMethodColorMap[method] || 'default'"
+                :color="getNotificationMethodColor(method)"
               >
-                {{ notificationMethodLabelMap[method] || method }}
+                {{ getNotificationMethodLabel(method) }}
+              </Tag>
+            </template>
+            <template v-else>-</template>
+          </template>
+          <template v-else-if="column.key === 'notification_templates'">
+            <template v-if="record.notification_templates?.length">
+              <Tag
+                v-for="template in record.notification_templates"
+                :key="template.id"
+                class="template-tag"
+                :color="getNotificationMethodColor(template.method)"
+              >
+                {{ template.name }}{{ template.enabled ? '' : '（停用）' }}
               </Tag>
             </template>
             <template v-else>-</template>
@@ -276,7 +390,7 @@ onMounted(() => {
       :confirm-loading="submitLoading"
       ok-text="保存"
       cancel-text="取消"
-      width="640px"
+      width="700px"
       @ok="handleSubmit"
     >
       <Form layout="vertical" style="margin-top: 16px">
@@ -297,6 +411,7 @@ onMounted(() => {
             v-model:value="regionForm.notification_methods"
             mode="multiple"
             placeholder="请选择告警通知方式"
+            @change="handleNotificationMethodsChange"
           >
             <Select.Option
               v-for="option in notificationMethodOptions"
@@ -307,7 +422,63 @@ onMounted(() => {
             </Select.Option>
           </Select>
         </Form.Item>
+        <Form.Item label="通知内容配置" :extra="notificationTemplateFieldExtra">
+          <Select
+            v-model:value="regionForm.notification_template_ids"
+            mode="multiple"
+            show-search
+            :loading="templatesLoading"
+            :disabled="!availableNotificationTemplateOptions.length && !!regionForm.notification_methods.length"
+            option-filter-prop="label"
+            placeholder="请选择通知内容配置"
+          >
+            <Select.Option
+              v-for="template in availableNotificationTemplateOptions"
+              :key="template.id"
+              :value="template.id"
+              :label="`${template.name} ${getNotificationMethodLabel(template.method)} ${template.enabled ? '' : '停用'}`"
+            >
+              {{ template.name }}
+              <span class="template-option-meta">
+                {{ getNotificationMethodLabel(template.method) }}{{ template.enabled ? '' : ' / 停用' }}
+              </span>
+            </Select.Option>
+          </Select>
+        </Form.Item>
+        <Form.Item
+          v-if="regionForm.notification_template_ids.length"
+          label="已选通知内容配置"
+        >
+          <div class="selected-template-list">
+            <Tag
+              v-for="templateId in regionForm.notification_template_ids"
+              :key="templateId"
+              class="template-tag"
+              :color="getNotificationMethodColor(templateNameMap.get(templateId)?.method || '')"
+            >
+              {{ templateNameMap.get(templateId)?.name || `模板 #${templateId}` }}
+            </Tag>
+          </div>
+        </Form.Item>
       </Form>
     </Modal>
   </div>
 </template>
+
+<style scoped>
+.template-tag {
+  margin-bottom: 6px;
+}
+
+.template-option-meta {
+  margin-left: 8px;
+  color: var(--ink-5);
+  font-size: 12px;
+}
+
+.selected-template-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+</style>

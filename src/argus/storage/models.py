@@ -722,6 +722,7 @@ class Region(Base):
     email: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True, default=None)
     notification_methods: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    notification_template_ids: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now(), nullable=False

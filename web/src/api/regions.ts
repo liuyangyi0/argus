@@ -1,4 +1,12 @@
+import type { NotificationTemplateMethod } from './system'
 import { api, u } from './client'
+
+export interface RegionNotificationTemplateItem {
+  id: number
+  name: string
+  method: NotificationTemplateMethod
+  enabled: boolean
+}
 
 export interface RegionItem {
   id: number
@@ -7,6 +15,8 @@ export interface RegionItem {
   email: string
   phone: string
   notification_methods: string[]
+  notification_template_ids: number[]
+  notification_templates: RegionNotificationTemplateItem[]
   notification_methods_text?: string
   created_at?: string | null
   updated_at?: string | null
@@ -25,6 +35,7 @@ export interface RegionPayload {
   email?: string
   phone?: string
   notification_methods: string[]
+  notification_template_ids: number[]
 }
 
 export const getRegions = (params?: RegionQueryParams) =>
