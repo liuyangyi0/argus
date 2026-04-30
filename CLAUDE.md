@@ -61,6 +61,8 @@ npm run build
 
 ## 踩坑记录
 
+每条雷区都对应一个 lint/集成测试守门，CI 失败时直接跳到对应测试看断言信息。
+
 ### ❌ 禁止使用 Starlette `BaseHTTPMiddleware`
 
 **绝对不要** 在本项目中使用 `starlette.middleware.base.BaseHTTPMiddleware`。
@@ -69,14 +71,28 @@ npm run build
 
 **正确做法**：所有 middleware 必须实现为纯 ASGI middleware，直接透传 `scope`、`receive`、`send`。
 
+**守门测试**：`tests/lint/test_no_base_http_middleware.py`
+
 ### ❌ ORM 新增字段必须同步更新自动迁移逻辑
 
-在 `src/argus/storage/models.py` 中新增字段后，必须同时检查 `src/argus/storage/database.py` 中的自动迁移逻辑，否则已有数据库可能出现缺列错误。
+在 `src/argus/storage/models.py` 中新增字段后，必须同时检查 `src/argus/storage/database.py` 中的 `_AUTO_MIGRATIONS` 列表（模块级常量），否则已有数据库可能出现缺列错误。
+
+**守门测试**：`tests/lint/test_orm_auto_migrate.py` —— 同时校验 `_AUTO_MIGRATIONS` 中的每条都对应一个真实 ORM 列、跑空 DB 做 round-trip、丢失列后能恢复。
 
 ### ❌ 新摄像头协议必须同步接入 go2rtc 注册路径
 
 新增摄像头协议时，必须同时检查 go2rtc 注册逻辑和应用启动阶段，否则浏览器侧会回退到低效的视频路径。
 
+**守门测试**：尚未自动化（计划中），新协议 PR 需手动确认 `__main__.py` 的 `start_and_register_cameras()` 已覆盖。
+
 ### ❌ MJPEG 编码必须使用专用线程池
 
-`cv2.imencode()` 等 CPU 密集操作不要丢到默认线程池；应继续使用摄像头路由中的专用线程池，避免拖慢普通 API。
+`cv2.imencode()` 等 CPU 密集操作不要丢到默认线程池；应继续使用摄像头路由中的 `_STREAM_EXECUTOR` 专用线程池，避免拖慢普通 API。
+
+**守门测试**：`tests/lint/test_mjpeg_dedicated_executor.py` —— 校验 `_STREAM_EXECUTOR` 存在 + 禁止 `asyncio.to_thread(cv2.imencode, ...)` 反模式。
+
+### ❌ OpenVINO IR 必须是静态形状
+
+anomalib 默认导出可能产生动态 batch/spatial 维度的 IR，CPU 推理时直接 `Broadcast Check failed, Value -1 not in range`。`ModelTrainer.export()` 必须传 `input_size=(H, W)` + `onnx_kwargs={'dynamo': False, 'dynamic_axes': {}}`。
+
+**守门测试**：`tests/unit/test_trainer_export.py::TestAssertOpenvinoStatic` —— `_assert_openvino_static()` 在导出后立刻校验 `partial_shape.is_static`，失败时点名 trainer 而不是把锅甩给后续推理。
