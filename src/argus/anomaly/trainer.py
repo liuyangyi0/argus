@@ -1456,6 +1456,14 @@ class ModelTrainer:
                 raise
         logger.info("training.exported", format=actual_format, path=export_path)
 
+        # Fail-loud guard against a regression of the dynamic-shape IR.
+        # If anomalib's defaults ever drift and produce an IR with a dynamic
+        # batch/spatial dim, CPU inference later crashes with
+        # 'Broadcast Check failed, Value -1 not in range' — point the finger
+        # here instead of at the first live inference.
+        if actual_format == "openvino":
+            ModelTrainer._assert_openvino_static(Path(export_path))
+
         # INT8 post-training quantization (B2)
         actual_quantization = quantization
         if quantization == "int8" and actual_format == "openvino":
@@ -1479,6 +1487,31 @@ class ModelTrainer:
             "actual_format": actual_format,
             "actual_quantization": actual_quantization,
         }
+
+    @staticmethod
+    def _assert_openvino_static(export_path: Path) -> None:
+        """Raise if the exported OpenVINO IR has any dynamic input dim."""
+        try:
+            import openvino as ov
+        except ImportError:
+            return
+        xml_files = sorted(export_path.rglob("*.xml"))
+        if not xml_files:
+            return
+        xml = xml_files[0]
+        ov_model = ov.Core().read_model(str(xml))
+        for input_tensor in ov_model.inputs:
+            shape = input_tensor.partial_shape
+            if not shape.is_static:
+                name = input_tensor.any_name
+                raise RuntimeError(
+                    f"Exported OpenVINO IR {xml} has non-static input shape "
+                    f"{shape} on '{name}'. CPU inference will crash with "
+                    "'Broadcast Check failed, Value -1 not in range'. "
+                    "Ensure engine.export() receives "
+                    "onnx_kwargs={'dynamo': False, 'dynamic_axes': {}} and "
+                    "input_size=(H, W)."
+                )
 
     @staticmethod
     def _quantize_int8(
