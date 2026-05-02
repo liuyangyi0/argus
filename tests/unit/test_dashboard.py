@@ -11,7 +11,9 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette import requests as starlette_requests
 
-from argus.__main__ import _register_training_job_processing
+from argus.runtime.training_job_wiring import (
+    register_training_job_processing as _register_training_job_processing,
+)
 from argus.capture.manager import CameraManager
 from argus.config.loader import load_config, save_config
 from argus.config.schema import AlertConfig, ArgusConfig, CameraConfig
@@ -1101,7 +1103,10 @@ class TestSchedulerWiring:
         monkeypatch.setattr("argus.anomaly.backbone_trainer.BackboneTrainer", backbone_trainer_cls)
         monkeypatch.setattr("argus.storage.model_registry.ModelRegistry", registry_cls)
         monkeypatch.setattr("argus.anomaly.job_executor.TrainingJobExecutor", executor_cls)
-        monkeypatch.setattr("argus.__main__.create_job_processing_task", register_task)
+        monkeypatch.setattr(
+            "argus.runtime.training_job_wiring.create_job_processing_task",
+            register_task,
+        )
 
         _register_training_job_processing(
             scheduler,
