@@ -18,6 +18,9 @@ data/inference_records/
 data/active_learning/
 data/recordings/
 data/backups/
+data/backbones/
+data/model_packages/
+data/argus.db*
 
 data/.watchdog
 
@@ -46,3 +49,12 @@ Thumbs.db
 htmlcov/
 .pytest_cache/
 /.claude/
+
+# Model weights and inference artifacts
+*.pt
+*.onnx
+*.engine
+openvino_cache/
+
+# Debug residue
+*.errors.txt

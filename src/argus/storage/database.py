@@ -60,6 +60,84 @@ _NOTIFICATION_TEMPLATE_UPDATABLE_FIELDS = {
     "enabled",
 }
 
+# Module-level so tests can import it and verify every (table, column) pair has
+# a matching ORM declaration in models.py — see tests/lint/test_orm_auto_migrate.py.
+# When you add a new column to an ORM model, append it here AND keep this in sync
+# with the SQL type. Tuple shape: (table_name, column_name, column_sql_type).
+_AUTO_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("alerts", "workflow_status", "VARCHAR(20) DEFAULT 'new'"),
+    ("alerts", "assigned_to", "VARCHAR(100)"),
+    ("alerts", "resolved_at", "DATETIME"),
+    # NOTE: an entry for ("training_records", "group_id", "VARCHAR(100)") was
+    # removed after tests/lint/test_orm_auto_migrate.py flagged it as orphaned —
+    # no ORM column or query references training_records.group_id. Existing
+    # SQLite databases that received the migration retain the column harmlessly.
+    # If a future feature needs to track baseline group on training records,
+    # add the field to TrainingRecord *and* re-add the migration entry here.
+    # Phase 1: real-labeled P/R/F1/AUROC/PR-AUC metrics
+    ("training_records", "val_precision", "REAL"),
+    ("training_records", "val_recall", "REAL"),
+    ("training_records", "val_f1", "REAL"),
+    ("training_records", "val_auroc", "REAL"),
+    ("training_records", "val_pr_auc", "REAL"),
+    ("training_records", "val_confusion_matrix", "TEXT"),
+    ("training_records", "val_real_sample_count", "INTEGER"),
+    # Phase 2: raw per-sample scores/labels for threshold slider
+    ("training_records", "val_scores_json", "TEXT"),
+    ("training_records", "val_labels_json", "TEXT"),
+    ("models", "backbone_version_id", "VARCHAR(128)"),
+    # Model release pipeline
+    ("models", "stage", "VARCHAR(20) DEFAULT 'candidate'"),
+    ("models", "component_type", "VARCHAR(20) DEFAULT 'full'"),
+    ("models", "model_path", "VARCHAR(500)"),
+    ("models", "canary_camera_id", "VARCHAR(50)"),
+    # Alert recording MP4 migration (d47d70f)
+    ("alert_recordings", "video_codec", "VARCHAR(10) DEFAULT 'h264'"),
+    ("alert_recordings", "width", "INTEGER"),
+    ("alert_recordings", "height", "INTEGER"),
+    # Alert aggregation
+    ("alerts", "event_group_id", "VARCHAR(64)"),
+    ("alerts", "event_group_count", "INTEGER DEFAULT 1"),
+    # Physics enrichment (speed, trajectory, localization)
+    ("alerts", "speed_ms", "REAL"),
+    ("alerts", "speed_px_per_sec", "REAL"),
+    ("alerts", "trajectory_model", "VARCHAR(20)"),
+    ("alerts", "origin_x_mm", "REAL"),
+    ("alerts", "origin_y_mm", "REAL"),
+    ("alerts", "origin_z_mm", "REAL"),
+    ("alerts", "landing_x_mm", "REAL"),
+    ("alerts", "landing_y_mm", "REAL"),
+    ("alerts", "landing_z_mm", "REAL"),
+    # Multi-track trajectory fits (JSON with per-track mm + px fields)
+    ("alerts", "trajectories_json", "TEXT"),
+    # Classification enrichment
+    ("alerts", "classification_label", "VARCHAR(100)"),
+    ("alerts", "classification_confidence", "REAL"),
+    # Cross-camera corroboration
+    ("alerts", "corroborated", "BOOLEAN"),
+    ("alerts", "correlation_partner", "VARCHAR(50)"),
+    # Segmentation enrichment (D2 — SAM2 instance segmentation).
+    # segmentation_objects stores JSON text: bbox/area/centroid/conf
+    # per object, masks are NOT persisted.
+    ("alerts", "segmentation_count", "INTEGER"),
+    ("alerts", "segmentation_total_area_px", "INTEGER"),
+    ("alerts", "segmentation_objects", "TEXT"),
+    ("alerts", "category", "VARCHAR(30)"),
+    ("alerts", "severity_adjusted_by_classifier", "BOOLEAN"),
+    ("alerts", "trajectory_points", "TEXT"),
+    # Model lineage — lets us answer "which model fired this alert?"
+    # after a model switch.
+    ("alerts", "model_version_id", "VARCHAR(128)"),
+    # Inference record enrichment (deployment stage + zone)
+    ("inference_records", "deployment_stage", "VARCHAR(20)"),
+    ("inference_records", "zone_id", "VARCHAR(50) DEFAULT 'default' NOT NULL"),
+    # Baseline version enrichment (secondary verifier + group)
+    ("baseline_versions", "verified_by_secondary", "VARCHAR(100)"),
+    ("baseline_versions", "group_id", "VARCHAR(100)"),
+    # Region notification template wiring (merged from upstream 0795438)
+    ("regions", "notification_template_ids", "VARCHAR(500) DEFAULT '' NOT NULL"),
+]
+
 _STARTER_NOTIFICATION_TEMPLATES = [
     {
         "name": "邮箱告警模板",
@@ -160,73 +238,7 @@ class Database:
 
     def _auto_migrate(self) -> None:
         """Add missing columns to existing SQLite tables (lightweight migration)."""
-        migrations = [
-            ("alerts", "workflow_status", "VARCHAR(20) DEFAULT 'new'"),
-            ("alerts", "assigned_to", "VARCHAR(100)"),
-            ("alerts", "resolved_at", "DATETIME"),
-            ("training_records", "group_id", "VARCHAR(100)"),
-            # Phase 1: real-labeled P/R/F1/AUROC/PR-AUC metrics
-            ("training_records", "val_precision", "REAL"),
-            ("training_records", "val_recall", "REAL"),
-            ("training_records", "val_f1", "REAL"),
-            ("training_records", "val_auroc", "REAL"),
-            ("training_records", "val_pr_auc", "REAL"),
-            ("training_records", "val_confusion_matrix", "TEXT"),
-            ("training_records", "val_real_sample_count", "INTEGER"),
-            # Phase 2: raw per-sample scores/labels for threshold slider
-            ("training_records", "val_scores_json", "TEXT"),
-            ("training_records", "val_labels_json", "TEXT"),
-            ("models", "backbone_version_id", "VARCHAR(128)"),
-            # Model release pipeline
-            ("models", "stage", "VARCHAR(20) DEFAULT 'candidate'"),
-            ("models", "component_type", "VARCHAR(20) DEFAULT 'full'"),
-            ("models", "model_path", "VARCHAR(500)"),
-            ("models", "canary_camera_id", "VARCHAR(50)"),
-            # Alert recording MP4 migration (d47d70f)
-            ("alert_recordings", "video_codec", "VARCHAR(10) DEFAULT 'h264'"),
-            ("alert_recordings", "width", "INTEGER"),
-            ("alert_recordings", "height", "INTEGER"),
-            # Alert aggregation
-            ("alerts", "event_group_id", "VARCHAR(64)"),
-            ("alerts", "event_group_count", "INTEGER DEFAULT 1"),
-            # Physics enrichment (speed, trajectory, localization)
-            ("alerts", "speed_ms", "REAL"),
-            ("alerts", "speed_px_per_sec", "REAL"),
-            ("alerts", "trajectory_model", "VARCHAR(20)"),
-            ("alerts", "origin_x_mm", "REAL"),
-            ("alerts", "origin_y_mm", "REAL"),
-            ("alerts", "origin_z_mm", "REAL"),
-            ("alerts", "landing_x_mm", "REAL"),
-            ("alerts", "landing_y_mm", "REAL"),
-            ("alerts", "landing_z_mm", "REAL"),
-            # Multi-track trajectory fits (JSON with per-track mm + px fields)
-            ("alerts", "trajectories_json", "TEXT"),
-            # Classification enrichment
-            ("alerts", "classification_label", "VARCHAR(100)"),
-            ("alerts", "classification_confidence", "REAL"),
-            # Cross-camera corroboration
-            ("alerts", "corroborated", "BOOLEAN"),
-            ("alerts", "correlation_partner", "VARCHAR(50)"),
-            # Segmentation enrichment (D2 — SAM2 instance segmentation).
-            # segmentation_objects stores JSON text: bbox/area/centroid/conf
-            # per object, masks are NOT persisted.
-            ("alerts", "segmentation_count", "INTEGER"),
-            ("alerts", "segmentation_total_area_px", "INTEGER"),
-            ("alerts", "segmentation_objects", "TEXT"),
-            ("alerts", "category", "VARCHAR(30)"),
-            ("alerts", "severity_adjusted_by_classifier", "BOOLEAN"),
-            ("alerts", "trajectory_points", "TEXT"),
-            # Model lineage — lets us answer "which model fired this alert?"
-            # after a model switch.
-            ("alerts", "model_version_id", "VARCHAR(128)"),
-            # Inference record enrichment (deployment stage + zone)
-            ("inference_records", "deployment_stage", "VARCHAR(20)"),
-            ("inference_records", "zone_id", "VARCHAR(50) DEFAULT 'default' NOT NULL"),
-            # Baseline version enrichment (secondary verifier + group)
-            ("baseline_versions", "verified_by_secondary", "VARCHAR(100)"),
-            ("baseline_versions", "group_id", "VARCHAR(100)"),
-            ("regions", "notification_template_ids", "VARCHAR(500) DEFAULT '' NOT NULL"),
-        ]
+        migrations = list(_AUTO_MIGRATIONS)
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
                 try:

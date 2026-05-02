@@ -253,18 +253,24 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 - `/cameras`
 - `/cameras/:id`
 - `/alerts`
+- `/reports`
 - `/models`
 - `/system`
 
-另有 `/training` 重定向到 `/models?tab=training`，并不是独立页面。
+另有：
+
+- `/training` 重定向到 `/models?tab=training`，不是独立页面。
+- `/replay/:alertId` 和 `/replay/:alertId/storyboard` 是从告警跳转的参数化子路由，由 `views/ReplayView.vue` 和 `views/StoryboardReplay.vue` 渲染，不在侧栏出现。
 
 ### 8.1 页面职责
 
 - Overview：系统总览、状态聚合、摄像头概况。
 - Cameras / CameraDetail：摄像头清单、播放、诊断和控制。
 - Alerts：告警列表、筛选、工作流操作和回放详情。
+- Reports：报表与统计分析。
 - Models：基线、训练与评估、模型发布、A/B 对比、标注队列、阈值预览。
 - System：系统概览、配置管理、备份、审计、降级历史、音频告警、用户管理、存储清理。
+- ReplayView / StoryboardReplay：从告警进入的录像回放视图，分别是单机位回放和多机位故事板回放。
 
 ### 8.2 前后端边界
 
