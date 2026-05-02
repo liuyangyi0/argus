@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+import logging
 import signal
 import sys
 import threading
 import time
-
-import logging
+from pathlib import Path
 
 import structlog
 
@@ -17,19 +16,26 @@ from argus.alerts.dispatcher import AlertDispatcher
 from argus.alerts.grader import Alert
 from argus.capture.manager import CameraManager
 from argus.config.loader import load_config
-from argus.config.schema import AlertSeverity
 from argus.core.event_bus import EventBus
 from argus.core.health import HealthMonitor
 from argus.core.metrics import METRICS
 from argus.core.scheduler import (
     TaskScheduler,
     create_backbone_retraining_task,
-    create_job_processing_task,
     create_maintenance_tasks,
     create_retraining_task,
 )
 from argus.dashboard.app import create_app
 from argus.dashboard.tasks import TaskManager
+from argus.runtime.logging_setup import (
+    RESET as _RESET,
+    SEVERITY_COLORS as _SEVERITY_COLORS,
+    log_gpu_environment as _log_gpu_environment,
+    setup_file_logging as _setup_file_logging,
+)
+from argus.runtime.training_job_wiring import (
+    register_training_job_processing as _register_training_job_processing,
+)
 from argus.storage.audit import AuditLogger
 from argus.storage.backup import BackupManager
 from argus.storage.alert_recording import AlertRecordingStore
@@ -38,139 +44,6 @@ from argus.storage.inference_buffer import InferenceBuffer
 from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
-
-
-def _register_training_job_processing(
-    scheduler: TaskScheduler,
-    *,
-    config,
-    database: Database,
-    baseline_manager,
-    model_trainer,
-    camera_manager: CameraManager | None = None,
-) -> None:
-    """Attach queued training job execution to the scheduler.
-
-    ``baseline_manager`` and ``model_trainer`` are constructed once in
-    ``main()`` and shared with the scheduled retraining task so both
-    paths point at the same on-disk state (and any future in-memory
-    caches).
-    """
-    from argus.anomaly.backbone_trainer import BackboneTrainer
-    from argus.anomaly.job_executor import TrainingJobExecutor
-    from argus.storage.model_registry import ModelRegistry
-
-    # Hot-reload callback: when training completes, load the new model
-    # into the running detection pipeline for the trained camera.
-    def _on_model_trained(camera_id: str, model_path: Path) -> None:
-        if camera_manager is None:
-            return
-        pipeline = camera_manager.get_pipeline(camera_id)
-        if pipeline is not None:
-            pipeline.reload_anomaly_model(model_path)
-            logger.info("training.model_hot_reloaded", camera_id=camera_id, model_path=str(model_path))
-
-    # Silence unused-import warnings — caller owns these lifecycles now.
-    _ = baseline_manager
-
-    backbone_trainer = BackboneTrainer(output_dir=config.storage.backbones_dir)
-    model_registry = ModelRegistry(session_factory=database.get_session)
-    job_executor = TrainingJobExecutor(
-        database=database,
-        trainer=model_trainer,
-        backbone_trainer=backbone_trainer,
-        model_registry=model_registry,
-        baselines_dir=config.storage.baselines_dir,
-        on_model_trained=_on_model_trained,
-    )
-    create_job_processing_task(scheduler, job_executor)
-
-
-def _setup_file_logging(config, log_level: int) -> None:
-    """Configure rotating file log output alongside console."""
-    from logging.handlers import RotatingFileHandler
-    from pathlib import Path
-
-    log_cfg = config.logging
-    log_dir = Path(log_cfg.log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create a rotating file handler
-    file_handler = RotatingFileHandler(
-        filename=str(log_dir / "argus.log"),
-        maxBytes=log_cfg.max_file_size_mb * 1024 * 1024,
-        backupCount=log_cfg.backup_count,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(log_level)
-
-    # Use JSON format for machine-parseable logs
-    if log_cfg.log_format == "json":
-        formatter = structlog.stdlib.ProcessorFormatter(
-            processor=structlog.processors.JSONRenderer(),
-            foreign_pre_chain=[
-                structlog.stdlib.add_log_level,
-                structlog.processors.TimeStamper(fmt="iso"),
-            ],
-        )
-    else:
-        formatter = structlog.stdlib.ProcessorFormatter(
-            processor=structlog.dev.ConsoleRenderer(colors=False),
-            foreign_pre_chain=[
-                structlog.stdlib.add_log_level,
-            ],
-        )
-
-    file_handler.setFormatter(formatter)
-
-    # Add handler to root logger so all libraries also log to file
-    root_logger = logging.getLogger()
-    root_logger.addHandler(file_handler)
-    root_logger.setLevel(log_level)
-
-    # APScheduler emits INFO per job fire ("Running job" + "executed successfully").
-    # On a 30s cadence across N scheduled jobs this dominates steady-state logs
-    # with no information value — bump to WARNING so only real issues surface.
-    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
-    logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
-
-
-_SEVERITY_COLORS = {
-    AlertSeverity.INFO: "\033[36m",    # cyan
-    AlertSeverity.LOW: "\033[33m",     # yellow
-    AlertSeverity.MEDIUM: "\033[91m",  # light red
-    AlertSeverity.HIGH: "\033[31;1m",  # bold red
-}
-_RESET = "\033[0m"
-
-
-def _log_gpu_environment() -> None:
-    """Log GPU/CUDA availability at startup for operator visibility."""
-    import cv2
-
-    # PyTorch / CUDA
-    try:
-        import torch
-        if torch.cuda.is_available():
-            dev = torch.cuda.get_device_properties(0)
-            logger.info(
-                "env.cuda_available",
-                device=torch.cuda.get_device_name(0),
-                memory_mb=getattr(dev, 'total_memory', getattr(dev, 'total_mem', 0)) // (1024 * 1024),
-                cuda_version=torch.version.cuda,
-                torch_version=torch.__version__,
-            )
-        else:
-            logger.warning("env.cuda_unavailable", msg="CUDA not available — inference will run on CPU (slow)")
-    except ImportError:
-        logger.warning("env.torch_missing", msg="PyTorch not installed — GPU acceleration disabled")
-
-    # OpenCV CUDA
-    cuda_count = cv2.cuda.getCudaEnabledDeviceCount() if hasattr(cv2, "cuda") else 0
-    if cuda_count > 0:
-        logger.info("env.opencv_cuda", devices=cuda_count)
-    else:
-        logger.info("env.opencv_cuda_unavailable", msg="OpenCV CUDA not available — cv2 ops will use CPU")
 
 
 def main():

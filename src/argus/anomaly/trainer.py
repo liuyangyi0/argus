@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 import structlog
 
+from argus.anomaly import _trainer_export as _te
 from argus.anomaly.baseline import BaselineManager
 from argus.storage.models import BaselineState
 
@@ -138,64 +139,6 @@ class TrainingResult:
 def _list_images(directory: Path) -> list[Path]:
     """Return sorted list of .png and .jpg files in directory."""
     return sorted(list(directory.glob("*.png")) + list(directory.glob("*.jpg")))
-
-
-def _build_calibration_dataset(
-    ov_model,
-    val_dir: Path | None,
-    max_images: int = 100,
-) -> list[np.ndarray]:
-    """Build a calibration dataset for INT8 quantization from validation images.
-
-    Returns a list of preprocessed numpy arrays matching the model's input shape.
-    Each element is a single-batch NCHW float32 tensor ready for NNCF.
-    """
-    if val_dir is None or not val_dir.exists():
-        return []
-
-    val_normal = val_dir / "normal" if (val_dir / "normal").exists() else val_dir
-    images = _list_images(val_normal)
-    if not images:
-        return []
-
-    # Determine model input shape from the OpenVINO model
-    input_layer = ov_model.input(0)
-    input_shape = input_layer.shape  # e.g., [1, 3, 256, 256]
-
-    # Handle dynamic shapes — fall back to 256x256
-    try:
-        _, channels, height, width = [
-            int(d) if not isinstance(d, int) and hasattr(d, 'get_length') and d.get_length() != -1
-            else int(d) if isinstance(d, int)
-            else 256
-            for d in input_shape
-        ]
-    except (ValueError, TypeError):
-        channels, height, width = 3, 256, 256
-
-    calibration_data = []
-    for img_path in images[:max_images]:
-        frame = cv2.imread(str(img_path))
-        if frame is None:
-            continue
-
-        # Resize and convert BGR -> RGB
-        resized = cv2.resize(frame, (width, height))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
-        # HWC -> NCHW float32, normalized to [0, 1]
-        blob = rgb.astype(np.float32) / 255.0
-        blob = blob.transpose(2, 0, 1)  # HWC -> CHW
-        blob = np.expand_dims(blob, axis=0)  # CHW -> NCHW
-
-        calibration_data.append(blob)
-
-    logger.info(
-        "training.calibration_dataset_built",
-        images=len(calibration_data),
-        input_shape=f"{1}x{channels}x{height}x{width}",
-    )
-    return calibration_data
 
 
 class ModelTrainer:
@@ -1385,237 +1328,11 @@ class ModelTrainer:
 
         return engine, model
 
-    @staticmethod
-    def _export_model(
-        engine,
-        model,
-        export_format: str,
-        export_path: str,
-        image_size: int = 256,
-        quantization: str = "fp16",
-        val_dir: Path | None = None,
-        calibration_images: int = 100,
-    ) -> dict[str, str]:
-        """Export trained model to an optimized inference format.
-
-        CRIT-02/HIGH-12: Use correct Anomalib 2.x export API (export_mode parameter).
-
-        If quantization == "int8" and export_format == "openvino", runs NNCF
-        post-training quantization on the exported FP model using validation
-        images as calibration data.
-
-        Returns:
-            dict with ``actual_format`` and ``actual_quantization`` reflecting
-            what was actually produced (may differ from request on fallback).
-        """
-        actual_format = export_format
-        export_kwargs = {}
-        if export_format in {"openvino", "onnx"}:
-            # Force stable ONNX export path + static [1,3,H,W] input shape.
-            #
-            # 1. ``dynamo=False``: PyTorch 2.11 + anomalib's dynamo exporter
-            #    trips over dynamic_axes, so pin to the classic torchscript
-            #    exporter.
-            # 2. ``dynamic_axes={}``: Emit a fully static ONNX graph.  Without
-            #    this anomalib defaults to ``{"input": {0: "batch"}}`` which
-            #    produces an OpenVINO IR with dynamic batch ``?``.  Dinomaly2
-            #    IR then explodes at CPU inference with
-            #    ``Broadcast Check failed, Value -1 not in range``.
-            #    Post-export ``ov.Model.reshape({0:[1,...]})`` also SIGSEGVs
-            #    in the OpenVINO 2026.1 DINOv2 path, so the only viable fix
-            #    is to never emit dynamic axes in the first place.
-            # 3. ``input_size=(H,W)``: Matches the single resolution the
-            #    detector ever feeds at inference.
-            export_kwargs["onnx_kwargs"] = {
-                "dynamo": False,
-                "dynamic_axes": {},
-            }
-            export_kwargs["input_size"] = (image_size, image_size)
-        try:
-            engine.export(
-                model=model,
-                export_type=export_format,
-                export_root=export_path,
-                **export_kwargs,
-            )
-        except Exception as e:
-            if export_format != "torch":
-                logger.warning(
-                    "training.export_fallback",
-                    original_format=export_format,
-                    error=str(e),
-                    msg="Falling back to torch export",
-                )
-                actual_format = "torch"
-                engine.export(
-                    model=model,
-                    export_type="torch",
-                    export_root=export_path,
-                )
-            else:
-                raise
-        logger.info("training.exported", format=actual_format, path=export_path)
-
-        # Fail-loud guard against a regression of the dynamic-shape IR.
-        # If anomalib's defaults ever drift and produce an IR with a dynamic
-        # batch/spatial dim, CPU inference later crashes with
-        # 'Broadcast Check failed, Value -1 not in range' — point the finger
-        # here instead of at the first live inference.
-        if actual_format == "openvino":
-            ModelTrainer._assert_openvino_static(Path(export_path))
-
-        # INT8 post-training quantization (B2)
-        actual_quantization = quantization
-        if quantization == "int8" and actual_format == "openvino":
-            int8_ok = ModelTrainer._quantize_int8(
-                export_path=Path(export_path),
-                val_dir=val_dir,
-                calibration_images=calibration_images,
-            )
-            if not int8_ok:
-                actual_quantization = "fp32"
-                logger.warning(
-                    "training.quantization_downgraded",
-                    requested="int8",
-                    actual="fp32",
-                )
-        elif quantization == "int8" and actual_format != "openvino":
-            # INT8 only supported with OpenVINO; record actual state
-            actual_quantization = "fp32"
-
-        return {
-            "actual_format": actual_format,
-            "actual_quantization": actual_quantization,
-        }
-
-    @staticmethod
-    def _assert_openvino_static(export_path: Path) -> None:
-        """Raise if the exported OpenVINO IR has any dynamic input dim."""
-        try:
-            import openvino as ov
-        except ImportError:
-            return
-        xml_files = sorted(export_path.rglob("*.xml"))
-        if not xml_files:
-            return
-        xml = xml_files[0]
-        ov_model = ov.Core().read_model(str(xml))
-        for input_tensor in ov_model.inputs:
-            shape = input_tensor.partial_shape
-            if not shape.is_static:
-                name = input_tensor.any_name
-                raise RuntimeError(
-                    f"Exported OpenVINO IR {xml} has non-static input shape "
-                    f"{shape} on '{name}'. CPU inference will crash with "
-                    "'Broadcast Check failed, Value -1 not in range'. "
-                    "Ensure engine.export() receives "
-                    "onnx_kwargs={'dynamo': False, 'dynamic_axes': {}} and "
-                    "input_size=(H, W)."
-                )
-
-    @staticmethod
-    def _quantize_int8(
-        export_path: Path,
-        val_dir: Path | None = None,
-        calibration_images: int = 100,
-    ) -> bool:
-        """Apply INT8 post-training quantization to an exported OpenVINO model.
-
-        Uses NNCF's quantize() with calibration data from validation images.
-        Falls back gracefully if nncf is not installed.
-
-        Returns:
-            True if quantization succeeded, False otherwise.
-        """
-        try:
-            import nncf
-        except ImportError:
-            logger.warning(
-                "training.int8_skipped",
-                reason="nncf not installed — run: pip install argus[quantize]",
-            )
-            return False
-
-        try:
-            import openvino as ov
-        except ImportError:
-            logger.warning(
-                "training.int8_skipped",
-                reason="openvino not installed",
-            )
-            return False
-
-        # Find the exported .xml model file
-        xml_files = sorted(export_path.rglob("*.xml"))
-        if not xml_files:
-            logger.warning("training.int8_skipped", reason="No .xml model found in export path")
-            return False
-
-        model_xml = xml_files[0]
-        logger.info("training.int8_quantizing", model=str(model_xml))
-
-        try:
-            # Load FP model
-            core = ov.Core()
-            ov_model = core.read_model(model_xml)
-
-            # Build calibration dataset from validation images
-            cal_images = _build_calibration_dataset(
-                ov_model=ov_model,
-                val_dir=val_dir,
-                max_images=calibration_images,
-            )
-
-            if not cal_images:
-                logger.warning(
-                    "training.int8_skipped",
-                    reason="No calibration images available",
-                )
-                return False
-
-            # Run NNCF post-training quantization
-            quantized_model = nncf.quantize(
-                ov_model,
-                nncf.Dataset(cal_images),
-                subset_size=min(len(cal_images), calibration_images),
-                model_type=nncf.ModelType.TRANSFORMER,
-                preset=nncf.QuantizationPreset.MIXED,
-            )
-
-            # Backup FP model before overwriting with INT8 version
-            model_bin = model_xml.with_suffix(".bin")
-            fp_backup_xml = model_xml.with_name(model_xml.stem + "_fp32.xml")
-            fp_backup_bin = model_xml.with_name(model_xml.stem + "_fp32.bin")
-            try:
-                shutil.copy2(str(model_xml), str(fp_backup_xml))
-                if model_bin.exists():
-                    shutil.copy2(str(model_bin), str(fp_backup_bin))
-                logger.info(
-                    "training.int8_fp_backup",
-                    xml=str(fp_backup_xml),
-                    bin=str(fp_backup_bin),
-                )
-            except OSError as backup_err:
-                logger.warning("training.int8_backup_failed", error=str(backup_err))
-
-            # Save INT8 model — overwrite the FP model files
-            ov.save_model(quantized_model, str(model_xml))
-
-            logger.info(
-                "training.int8_complete",
-                model=str(model_xml),
-                original_size_mb=round(model_bin.stat().st_size / 1024 / 1024, 1)
-                if model_bin.exists() else None,
-            )
-            return True
-
-        except Exception as e:
-            logger.error("training.int8_failed", error=str(e))
-            logger.warning(
-                "training.int8_fallback",
-                msg="Keeping FP model — INT8 quantization failed",
-            )
-            return False
+    # ── Export & Quantize ──
+    # The implementations live in argus.anomaly._trainer_export. They are
+    # re-mounted as static methods at the bottom of this module so existing
+    # call sites (ModelTrainer._export_model / _assert_openvino_static /
+    # _quantize_int8) continue to work unchanged.
 
     # ── Re-export & Re-calibrate ──
 
@@ -1860,3 +1577,12 @@ class ModelTrainer:
         except Exception as e:
             logger.error("recalibrate.failed", error=str(e))
             return {"status": "error", "error": f"校准失败: {e}"}
+
+
+# Re-mount export/quantize helpers as ModelTrainer static methods so existing
+# call sites (ModelTrainer._export_model, ModelTrainer._assert_openvino_static,
+# ModelTrainer._quantize_int8) keep working after the implementation moved to
+# argus.anomaly._trainer_export. See that module for the implementations.
+ModelTrainer._export_model = staticmethod(_te.export_model)
+ModelTrainer._assert_openvino_static = staticmethod(_te.assert_openvino_static)
+ModelTrainer._quantize_int8 = staticmethod(_te.quantize_int8)
