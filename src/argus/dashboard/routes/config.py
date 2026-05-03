@@ -136,14 +136,28 @@ async def update_detection_params(request: Request):
     if form.get("supp_zone"):
         supp.same_zone_window_seconds = float(form["supp_zone"])
 
+    # Determine which sections changed so we can tell the pipelines to
+    # refresh their derived caches AND tell the UI which knobs took effect.
+    severity_changed = any(form.get(k) for k in ("sev_info", "sev_low", "sev_medium", "sev_high"))
+    temporal_changed = any(form.get(k) for k in ("temp_gap", "temp_overlap"))
+    suppression_changed = bool(form.get("supp_zone"))
+    anomaly_threshold = float(form["anomaly_threshold"]) if form.get("anomaly_threshold") else None
+
     # Apply to pipelines
     updated = 0
+    section_hot: dict[str, bool] = {}
     for cam_cfg in config.cameras:
         pipeline = camera_manager._pipelines.get(cam_cfg.camera_id)
         if not pipeline:
             continue
-        if form.get("anomaly_threshold"):
-            pipeline.update_thresholds(anomaly_threshold=float(form["anomaly_threshold"]))
+        applied = pipeline.update_thresholds(
+            anomaly_threshold=anomaly_threshold,
+            severity_changed=severity_changed,
+            temporal_changed=temporal_changed,
+            suppression_changed=suppression_changed,
+        ) or {}
+        for k, v in applied.items():
+            section_hot[k] = section_hot.get(k, True) and bool(v)
         updated += 1
 
     logger.info("config.detection_params_updated", pipelines=updated)
@@ -157,8 +171,26 @@ async def update_detection_params(request: Request):
             detail=f"更新检测参数，影响 {updated} 条流水线",
             ip_address=client_ip,
         )
+
+    # 痛点 9: per-section hot-reload status drives the SystemConfigPanel toast.
+    def _summary(touched: bool, key: str) -> dict:
+        if not touched:
+            return {"changed": False, "hot_reloaded": False, "applied": 0, "total": updated}
+        return {
+            "changed": True,
+            "hot_reloaded": section_hot.get(key, False),
+            "applied": updated if section_hot.get(key, False) else 0,
+            "total": updated,
+        }
+
     return api_success(
-        {"pipelines_updated": updated},
+        {
+            "pipelines_updated": updated,
+            "anomaly_threshold": _summary(anomaly_threshold is not None, "anomaly_threshold"),
+            "severity": _summary(severity_changed, "severity"),
+            "temporal": _summary(temporal_changed, "temporal"),
+            "suppression": _summary(suppression_changed, "suppression"),
+        },
         headers=htmx_toast_headers("检测参数已更新"),
     )
 
