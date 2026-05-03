@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import {
   Card, Button, Form, Select, Input, Modal, Space, Checkbox,
   message, Badge,
@@ -8,6 +9,8 @@ import { PlusOutlined } from '@ant-design/icons-vue'
 import { createTrainingJob } from '../../api'
 import { MODEL_TYPES } from '../../composables/useModelState'
 import { extractErrorMessage } from '../../utils/error'
+import DatasetSelector from '../baseline/DatasetSelector.vue'
+import type { DatasetSelection } from '../../types/api'
 
 const props = defineProps<{
   cameras: any[]
@@ -18,7 +21,10 @@ const emit = defineEmits<{
   refresh: []
 }>()
 
+const route = useRoute()
+
 const createModalVisible = ref(false)
+const datasetSelection = ref<DatasetSelection | null>(null)
 const createForm = ref({
   job_type: 'anomaly_head',
   camera_id: undefined as string | undefined,
@@ -28,6 +34,28 @@ const createForm = ref({
 })
 const createLoading = ref(false)
 
+// 痛点 5: deep-link from CollectionsView "用这批训练" pre-fills the selector.
+onMounted(() => {
+  const raw = route.query.preselect
+  if (typeof raw === 'string' && raw.length > 0) {
+    try {
+      const decoded = JSON.parse(atob(raw))
+      datasetSelection.value = decoded
+      if (decoded?.items?.[0]?.camera_id) {
+        createForm.value.camera_id = decoded.items[0].camera_id
+      }
+      createModalVisible.value = true
+    } catch {
+      // ignore malformed deep-link
+    }
+  }
+})
+
+// Reset selection when camera changes (selector also enforces this internally).
+watch(() => createForm.value.camera_id, () => {
+  datasetSelection.value = null
+})
+
 async function handleCreate() {
   if (createForm.value.job_type === 'anomaly_head' && !createForm.value.camera_id) {
     message.warning('请先选择摄像头')
@@ -36,14 +64,18 @@ async function handleCreate() {
   createLoading.value = true
   try {
     const { skip_validation, ...rest } = createForm.value
-    const payload = {
+    const payload: any = {
       ...rest,
       ...(skip_validation ? { hyperparameters: { skip_baseline_validation: true } } : {}),
+    }
+    if (datasetSelection.value && datasetSelection.value.items.length > 0) {
+      payload.dataset_selection = datasetSelection.value
     }
     await createTrainingJob(payload)
     message.success('训练任务已创建，等待确认')
     createModalVisible.value = false
     createForm.value = { job_type: 'anomaly_head', camera_id: undefined, model_type: 'patchcore', zone_id: 'default', skip_validation: false }
+    datasetSelection.value = null
     emit('refresh')
   } catch (e: any) {
     message.error(extractErrorMessage(e, '创建失败'))
@@ -105,6 +137,15 @@ async function handleCreate() {
           <Input v-model:value="createForm.zone_id" placeholder="default" :disabled="createLoading" />
           <div style="color: #8890a0; font-size: 12px; margin-top: 4px">
             区域ID对应配置中定义的检测区域，默认为 "default"（全画面）
+          </div>
+        </Form.Item>
+        <Form.Item v-if="createForm.job_type === 'anomaly_head'" label="数据集（可选，多选合并）">
+          <DatasetSelector
+            v-model="datasetSelection"
+            :camera-id="createForm.camera_id"
+          />
+          <div style="color: #8890a0; font-size: 12px; margin-top: 4px">
+            不勾选则使用当前激活的基线版本。选择多项时多个版本的图像会合并训练。
           </div>
         </Form.Item>
         <Form.Item>

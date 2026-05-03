@@ -1,7 +1,29 @@
-import { api, u } from './client'
+import type { ApiResponse, BaselineCollection } from '../types/api'
+import { api, u, unwrap } from './client'
 
 // ── Baselines ──
 export const getBaselines = () => api.get('/baseline/list/json').then(u)
+
+// 痛点 5: full collections inventory (incl. failed_* dirs and acceptance_rate)
+export const getBaselineCollections = () =>
+  api
+    .get<ApiResponse<{ collections: BaselineCollection[] }>>('/baseline/collections/json')
+    .then(unwrap)
+export const activateCollection = (
+  camera_id: string, zone_id: string, version: string,
+) =>
+  api.post(`/baseline/collections/${encodeURIComponent(camera_id)}/${encodeURIComponent(zone_id)}/${encodeURIComponent(version)}/activate`).then(u)
+export const retireCollection = (
+  camera_id: string, zone_id: string, version: string,
+) =>
+  api.post(`/baseline/collections/${encodeURIComponent(camera_id)}/${encodeURIComponent(zone_id)}/${encodeURIComponent(version)}/retire`).then(u)
+export const deleteCollection = (
+  camera_id: string, zone_id: string, version: string, opts?: { confirm?: boolean },
+) =>
+  api.delete(
+    `/baseline/collections/${encodeURIComponent(camera_id)}/${encodeURIComponent(zone_id)}/${encodeURIComponent(version)}`,
+    { params: opts?.confirm ? { confirm: true } : undefined },
+  ).then(u)
 export const optimizeBaseline = (data: { camera_id: string; zone_id?: string; target_ratio?: number }) =>
   api.post('/baseline/optimize/json', data).then(u)
 export const previewOptimize = (params: { camera_id: string; zone_id?: string; target_ratio?: number }) =>

@@ -4,6 +4,7 @@ import { useRouter, useRoute } from 'vue-router'
 import DegradationBar from '../components/DegradationBar.vue'
 import ErrorBoundary from '../components/ErrorBoundary.vue'
 import { useWebSocket } from '../composables/useWebSocket'
+import { useSystemMode } from '../composables/useSystemMode'
 
 const router = useRouter()
 const route = useRoute()
@@ -15,6 +16,7 @@ const isExact = (path: string) => route.path === path || route.path.startsWith(p
 // Sub-menu definitions (mirrors router children for Models / System)
 const modelsChildren: Array<{ path: string; label: string }> = [
   { path: '/models/baseline', label: '基线管理' },
+  { path: '/models/collections', label: '采集集合' },
   { path: '/models/training', label: '训练与评估' },
   { path: '/models/registry', label: '模型与发布' },
   { path: '/models/comparison', label: 'A/B 对比' },
@@ -61,6 +63,9 @@ function toggleSystem() {
 const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFallbackMode, retryCount: wsRetryCount, nextRetryIn: wsNextRetryIn } = useWebSocket({
   topics: ['health'],
 })
+
+// 痛点 4: global pipeline mode banner (capturing / training / maintenance)
+const { showBanner: showModeBanner, bannerLabel: modeBannerLabel, bannerColor: modeBannerColor } = useSystemMode()
 
 // Global keyboard shortcuts
 const shortcutHelpVisible = ref(false)
@@ -199,6 +204,14 @@ onUnmounted(() => {
       </div>
 
       <ErrorBoundary>
+        <!-- 痛点 4: pipeline mode banner (visible only when not in normal state) -->
+        <div
+          v-if="showModeBanner"
+          class="mode-banner"
+          :style="{ backgroundColor: modeBannerColor }"
+        >
+          {{ modeBannerLabel }}
+        </div>
         <DegradationBar />
         <!-- Flex row container for route views -->
         <div style="display: flex; flex-direction: row; flex: 1; min-height: 0; gap: 12px;">
@@ -331,4 +344,14 @@ onUnmounted(() => {
 .shortcut-help ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
 .shortcut-help li { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--ink-3); }
 .shortcut-help kbd { background: #fff; border: 1px solid var(--line-2); padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px; }
+
+/* 痛点 4: pipeline mode banner */
+.mode-banner {
+  color: #fff;
+  padding: 6px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  letter-spacing: 0.3px;
+}
 </style>

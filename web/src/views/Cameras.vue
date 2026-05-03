@@ -5,8 +5,13 @@ import { Badge, Button, Form, Input, InputNumber, Modal, Select, Space, Table, T
 import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons-vue'
 
 import { addCamera, deleteCamera, getCameraConfig, getCameras, getRegions, getUsbDevices, startCamera, stopCamera, updateCamera } from '../api'
+import { testCameraConnection, testCameraConnectionDraft } from '../api/cameras'
 import { useWebSocket } from '../composables/useWebSocket'
 import { extractErrorMessage } from '../utils/error'
+import HealthBadge from '../components/common/HealthBadge.vue'
+import ModeBadge from '../components/common/ModeBadge.vue'
+import ConnectionTestResult from '../components/common/ConnectionTestResult.vue'
+import type { ConnectionTestResult as ConnTestResult } from '../types/api'
 
 defineOptions({ name: 'CamerasPage' })
 
@@ -184,6 +189,41 @@ async function openEditModal(cameraId: string) {
   }
 }
 
+// 痛点 8: post-save connectivity probe state shown above the modal form
+const probeState = ref<'idle' | 'testing' | 'done'>('idle')
+const probeResult = ref<ConnTestResult | null>(null)
+
+async function runProbe(cameraId: string) {
+  probeState.value = 'testing'
+  probeResult.value = null
+  try {
+    probeResult.value = await testCameraConnection(cameraId)
+  } catch {
+    probeResult.value = { ok: false, error: 'probe_request_failed' }
+  } finally {
+    probeState.value = 'done'
+  }
+}
+
+async function runDraftProbe() {
+  if (!cameraForm.value.source) {
+    message.warning('请先填写视频源')
+    return
+  }
+  probeState.value = 'testing'
+  probeResult.value = null
+  try {
+    probeResult.value = await testCameraConnectionDraft({
+      source: cameraForm.value.source,
+      protocol: cameraForm.value.protocol,
+    })
+  } catch {
+    probeResult.value = { ok: false, error: 'probe_request_failed' }
+  } finally {
+    probeState.value = 'done'
+  }
+}
+
 async function handleSubmit() {
   try {
     const form = new FormData()
@@ -197,6 +237,7 @@ async function handleSubmit() {
       }
     })
 
+    const cameraId = cameraForm.value.camera_id
     if (editingId.value) {
       const res = await updateCamera(editingId.value, form)
       message.success(res.message || '配置已更新')
@@ -205,10 +246,25 @@ async function handleSubmit() {
       message.success('摄像头已添加')
     }
 
-    modalVisible.value = false
-    cameraForm.value = defaultForm()
-    editingId.value = null
     fetchData()
+
+    // 痛点 8: live-probe the camera before closing the modal so the user
+    // immediately sees whether the source is reachable.
+    if (cameraId) {
+      await runProbe(cameraId)
+      if (probeResult.value?.ok) {
+        modalVisible.value = false
+        cameraForm.value = defaultForm()
+        editingId.value = null
+        probeState.value = 'idle'
+        probeResult.value = null
+      }
+      // Connection failed → keep modal open so the user sees the reason
+    } else {
+      modalVisible.value = false
+      cameraForm.value = defaultForm()
+      editingId.value = null
+    }
   } catch (e) {
     message.error(extractErrorMessage(e, editingId.value ? '更新失败' : '添加失败'))
   }
@@ -216,6 +272,8 @@ async function handleSubmit() {
 
 const columns = [
   { title: '状态', key: 'status', width: 80 },
+  { title: '健康度', key: 'health', width: 100 },
+  { title: '运行模式', key: 'pipeline_mode', width: 110 },
   { title: '摄像头 ID', dataIndex: 'camera_id', key: 'camera_id' },
   { title: '名称', dataIndex: 'name', key: 'name' },
   { title: '区域', dataIndex: 'region_name', key: 'region_name', width: 140 },
@@ -258,6 +316,12 @@ const columns = [
       @ok="handleSubmit"
     >
       <Form layout="vertical" style="margin-top: 16px">
+        <ConnectionTestResult
+          v-if="probeState !== 'idle'"
+          :state="probeState"
+          :result="probeResult"
+          style="margin-bottom: 12px"
+        />
         <Form.Item label="摄像头 ID" required>
           <Input v-model:value="cameraForm.camera_id" placeholder="cam_02" :disabled="!!editingId" />
         </Form.Item>
@@ -289,6 +353,14 @@ const columns = [
             </Select.Option>
           </Select>
           <Input v-else v-model:value="cameraForm.source" :placeholder="sourcePlaceholder()" />
+          <Button
+            size="small"
+            style="margin-top: 6px"
+            :loading="probeState === 'testing'"
+            @click="runDraftProbe"
+          >
+            测试连接
+          </Button>
         </Form.Item>
 
         <Space>
@@ -354,6 +426,13 @@ const columns = [
         <template v-if="column.key === 'status'">
           <Badge :status="record.connected ? 'success' : 'default'" />
           {{ record.connected ? '在线' : '离线' }}
+        </template>
+        <template v-else-if="column.key === 'health'">
+          <HealthBadge :health="record.health" :connected="record.connected" />
+        </template>
+        <template v-else-if="column.key === 'pipeline_mode'">
+          <ModeBadge :mode="record.pipeline_mode" />
+          <span v-if="!record.pipeline_mode || record.pipeline_mode === 'active'" style="color: var(--ink-3); font-size: 12px">—</span>
         </template>
         <template v-else-if="column.key === 'region_name'">
           {{ record.region_name || '-' }}
