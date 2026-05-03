@@ -126,6 +126,12 @@ const router = createRouter({
               component: () => import('../views/models/ThresholdView.vue'),
               meta: { title: '阈值预览' },
             },
+            {
+              path: 'collections',
+              name: 'models-collections',
+              component: () => import('../views/CollectionsView.vue'),
+              meta: { title: '采集集合' },
+            },
           ],
         },
         {

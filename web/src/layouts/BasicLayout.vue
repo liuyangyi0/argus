@@ -16,6 +16,7 @@ const isExact = (path: string) => route.path === path || route.path.startsWith(p
 // Sub-menu definitions (mirrors router children for Models / System)
 const modelsChildren: Array<{ path: string; label: string }> = [
   { path: '/models/baseline', label: '基线管理' },
+  { path: '/models/collections', label: '采集集合' },
   { path: '/models/training', label: '训练与评估' },
   { path: '/models/registry', label: '模型与发布' },
   { path: '/models/comparison', label: 'A/B 对比' },
