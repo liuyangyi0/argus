@@ -324,6 +324,101 @@ def create_backbone_retraining_task(
     )
 
 
+def _resolve_dataset_selection_for_retrain(
+    *,
+    strategy: str,
+    camera_id: str,
+    zone_id: str,
+    baseline_lifecycle,
+    database,
+    lookback_days: int | None,
+):
+    """Build a DatasetSelection for the requested ``dataset_strategy``.
+
+    Returns ``None`` for ``current_only`` (legacy single-version path) or when
+    a multi-version strategy is requested but the supporting infrastructure
+    (lifecycle / database) is not wired in. Each unsupported case logs once
+    so operators can see why their config did not take effect.
+    """
+    if strategy == "current_only":
+        return None
+
+    if baseline_lifecycle is None:
+        logger.warning(
+            "retraining.dataset_strategy_unwired",
+            camera_id=camera_id,
+            requested=strategy,
+            reason="baseline_lifecycle not provided",
+            fallback="current_only",
+        )
+        return None
+
+    since: datetime | None = None
+    if strategy == "since_last_train":
+        if database is None:
+            logger.warning(
+                "retraining.dataset_strategy_unwired",
+                camera_id=camera_id,
+                requested=strategy,
+                reason="database not provided",
+                fallback="current_only",
+            )
+            return None
+        try:
+            records = database.get_training_history(camera_id=camera_id, limit=5)
+        except AttributeError:
+            # Older database stub without get_training_history — fail soft.
+            logger.warning(
+                "retraining.dataset_strategy_unwired",
+                camera_id=camera_id,
+                requested=strategy,
+                reason="database.get_training_history missing",
+                fallback="current_only",
+            )
+            return None
+        last_complete = next(
+            (r for r in records if (getattr(r, "status", "") or "").upper() == "COMPLETE"),
+            None,
+        )
+        if last_complete is not None:
+            since = getattr(last_complete, "trained_at", None)
+        # Optional lookback cap
+        if lookback_days is not None and lookback_days > 0:
+            cap = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            if since is None or since < cap:
+                since = cap
+    elif strategy != "all_active":
+        logger.warning(
+            "retraining.dataset_strategy_unknown",
+            camera_id=camera_id,
+            requested=strategy,
+            fallback="current_only",
+        )
+        return None
+
+    eligible = baseline_lifecycle.get_eligible_versions(
+        camera_id, zone_id, since=since,
+    )
+    if not eligible:
+        logger.info(
+            "retraining.dataset_strategy_no_eligible_versions",
+            camera_id=camera_id,
+            strategy=strategy,
+            since=since.isoformat() if since else None,
+        )
+        return None
+
+    from argus.anomaly.dataset_selection import (
+        DatasetSelection,
+        DatasetSelectionItem,
+    )
+    items = [
+        DatasetSelectionItem(camera_id=camera_id, zone_id=zone_id, version=rec.version)
+        for rec in eligible
+    ]
+    return DatasetSelection(items=items)
+
+
 def create_retraining_task(
     scheduler: TaskScheduler,
     config,
@@ -332,12 +427,23 @@ def create_retraining_task(
     model_registry,
     baseline_manager,
     feedback_manager=None,
+    baseline_lifecycle=None,
+    database=None,
 ) -> None:
     """Register a scheduled retraining task that closes the active learning loop.
 
     For each camera, checks if enough new baseline images have been added
     (e.g. from false-positive feedback) and triggers retraining if threshold met.
     Optionally auto-deploys if quality grade is sufficient.
+
+    The ``dataset_strategy`` config knob controls which baseline versions are
+    fed into each retraining run:
+    - ``current_only``: legacy single-version path (uses the active baseline).
+    - ``all_active``: merge every VERIFIED + ACTIVE version for this
+      camera/zone — requires ``baseline_lifecycle``.
+    - ``since_last_train``: like ``all_active`` but only versions captured
+      after the most recent successful TrainingRecord — requires both
+      ``baseline_lifecycle`` and ``database``.
     """
     if not config.retraining.enabled:
         return
@@ -377,18 +483,20 @@ def create_retraining_task(
                     )
                     continue
 
-                # 痛点 2: dataset_strategy controls which baseline versions feed
-                # the auto-retrain. current_only keeps the legacy single-version
-                # behaviour; multi-version strategies are reserved for a follow-up
-                # implementation that walks baseline_lifecycle / training_records.
+                # 痛点 2: dataset_strategy decides which baseline versions feed
+                # this retraining run. We resolve the selection (or None for
+                # the legacy single-version path) and let trainer.train pick up
+                # baseline_dir_override / image_count_override so the merge
+                # is identical to a manual multi-version training job.
                 strategy = getattr(retrain_cfg, "dataset_strategy", "current_only")
-                if strategy != "current_only":
-                    logger.warning(
-                        "retraining.dataset_strategy_unimplemented",
-                        camera_id=camera_id,
-                        requested=strategy,
-                        fallback="current_only",
-                    )
+                selection = _resolve_dataset_selection_for_retrain(
+                    strategy=strategy,
+                    camera_id=camera_id,
+                    zone_id="default",
+                    baseline_lifecycle=baseline_lifecycle,
+                    database=database,
+                    lookback_days=getattr(retrain_cfg, "dataset_lookback_days", None),
+                )
 
                 logger.info(
                     "retraining.triggered",
@@ -396,9 +504,10 @@ def create_retraining_task(
                     new_images=new_images,
                     total_images=current_count,
                     dataset_strategy=strategy,
+                    selection_size=(len(selection.items) if selection else 0),
                 )
 
-                result = trainer.train(
+                train_kwargs = dict(
                     camera_id=camera_id,
                     zone_id="default",
                     model_type=cam.anomaly.model_type,
@@ -409,6 +518,27 @@ def create_retraining_task(
                     quantization=cam.anomaly.quantization,
                     anomaly_config=cam.anomaly,
                 )
+
+                if selection is not None and selection.items:
+                    # Multi-version path: merge versions into a tmp dir via the
+                    # same _DatasetMerger used by the manual training UI.
+                    from argus.anomaly.trainer import (
+                        _DatasetMerger,
+                        _build_merger_items,
+                    )
+                    resolved_dirs = baseline_manager.resolve_dataset_dirs(selection)
+                    image_count = baseline_manager.count_images_multi(resolved_dirs)
+                    merger_items = _build_merger_items(selection, resolved_dirs)
+                    with _DatasetMerger(merger_items) as merged_root:
+                        result = trainer.train(
+                            **train_kwargs,
+                            baseline_dir_override=merged_root,
+                            image_count_override=image_count,
+                            baseline_versions_label=selection.version_summary(),
+                        )
+                else:
+                    # Single-version legacy path
+                    result = trainer.train(**train_kwargs)
 
                 grade = getattr(result, "quality_grade", "F") or "F"
                 logger.info(
@@ -448,6 +578,7 @@ def create_retraining_task(
                     and getattr(result, "status", None) is not None
                     and result.status.value == "COMPLETE"
                 ):
+                    version_id = None
                     try:
                         version_id = model_registry.register(
                             camera_id=camera_id,
@@ -456,17 +587,56 @@ def create_retraining_task(
                             image_count=current_count,
                             quality_grade=grade,
                         )
-                        model_registry.activate(version_id, allow_bypass=True)
-                        logger.info(
-                            "retraining.auto_deployed",
-                            camera_id=camera_id,
-                            version_id=version_id,
-                            grade=grade,
-                        )
+                        # P1 fix: never bypass the candidate→shadow→canary→production
+                        # gate from a non-interactive scheduler. Auto-deploy now
+                        # only succeeds when the operator (or an explicit canary
+                        # promotion job) has already advanced this version to
+                        # PRODUCTION/RETIRED. Otherwise we log + audit and leave
+                        # the run as a CANDIDATE for human review.
+                        try:
+                            model_registry.activate(
+                                version_id, triggered_by="auto_retrain",
+                            )
+                            logger.info(
+                                "retraining.auto_deployed",
+                                camera_id=camera_id,
+                                version_id=version_id,
+                                grade=grade,
+                            )
+                        except ValueError as gate_err:
+                            logger.warning(
+                                "retraining.activation_blocked_by_stage_gate",
+                                camera_id=camera_id,
+                                version_id=version_id,
+                                grade=grade,
+                                error=str(gate_err),
+                                msg=(
+                                    "Auto-deploy refused: model still at "
+                                    "candidate stage. Promote via the release "
+                                    "pipeline (shadow → canary → production) "
+                                    "before activation."
+                                ),
+                            )
+                            audit = (
+                                getattr(scheduler, "_audit_logger", None)
+                                or getattr(scheduler, "audit_logger", None)
+                            )
+                            if audit is not None:
+                                try:
+                                    audit.log(
+                                        user="auto_retrain",
+                                        action="auto_retrain_activation_blocked",
+                                        target_type="model_version",
+                                        target_id=str(version_id),
+                                        detail=str(gate_err)[:200],
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
                     except Exception as e:
                         logger.error(
                             "retraining.deploy_failed",
                             camera_id=camera_id,
+                            version_id=version_id,
                             error=str(e),
                         )
                 elif retrain_cfg.auto_deploy:

@@ -23,7 +23,6 @@ from argus.storage.models import (
     InferenceRecord,
     LabelingQueueRecord,
     LabelingQueueStatus,
-    NotificationTemplate,
     Region,
     TrainingJobRecord,
     TrainingRecord,
@@ -46,18 +45,7 @@ _USER_UPDATABLE_FIELDS = {
 _REGION_UPDATABLE_FIELDS = {
     "name",
     "owner",
-    "email",
     "phone",
-    "notification_methods",
-    "notification_template_ids",
-}
-
-_NOTIFICATION_TEMPLATE_UPDATABLE_FIELDS = {
-    "name",
-    "method",
-    "subject",
-    "content",
-    "enabled",
 }
 
 # Module-level so tests can import it and verify every (table, column) pair has
@@ -137,51 +125,17 @@ _AUTO_MIGRATIONS: list[tuple[str, str, str]] = [
     # Baseline version enrichment (secondary verifier + group)
     ("baseline_versions", "verified_by_secondary", "VARCHAR(100)"),
     ("baseline_versions", "group_id", "VARCHAR(100)"),
-    # Region notification template wiring (merged from upstream 0795438)
-    ("regions", "notification_template_ids", "VARCHAR(500) DEFAULT '' NOT NULL"),
+    # NOTE: ("regions", "notification_template_ids", ...) was removed in 2026-05
+    # along with the entire email-notification surface. Existing SQLite databases
+    # retain the column harmlessly — SQLite cannot DROP COLUMN, so the legacy
+    # data stays in the file but is no longer mapped or read by the ORM.
 ]
 
-_STARTER_NOTIFICATION_TEMPLATES = [
-    {
-        "name": "邮箱告警模板",
-        "method": "email",
-        "subject": "[{severity}] {camera_name} 告警",
-        "content": (
-            "告警编号: {alert_id}\n"
-            "摄像头: {camera_name}\n"
-            "区域: {region_name}\n"
-            "严重度: {severity}\n"
-            "告警类型: {category}\n"
-            "异常分数: {anomaly_score}\n"
-            "发生时间: {timestamp}\n"
-            "请尽快登录 Argus 查看现场画面。"
-        ),
-    },
-    {
-        "name": "短信告警模板",
-        "method": "sms",
-        "subject": "",
-        "content": "{camera_name} 在 {timestamp} 触发 {severity} 告警，区域 {region_name}，请及时处理。",
-    },
-    {
-        "name": "Webhook 告警模板",
-        "method": "webhook",
-        "subject": "",
-        "content": (
-            '{\n'
-            '  "alert_id": "{alert_id}",\n'
-            '  "camera_id": "{camera_id}",\n'
-            '  "camera_name": "{camera_name}",\n'
-            '  "region_name": "{region_name}",\n'
-            '  "severity": "{severity}",\n'
-            '  "category": "{category}",\n'
-            '  "anomaly_score": "{anomaly_score}",\n'
-            '  "timestamp": "{timestamp}"\n'
-            '}'
-        ),
-    },
+# Tables that were dropped in code and should be removed from any pre-existing
+# SQLite database on next startup. Idempotent — DROP TABLE IF EXISTS.
+_DROP_TABLES: list[str] = [
+    "notification_templates",
 ]
-
 
 class Database:
     """SQLite database manager for alert persistence.
@@ -233,11 +187,29 @@ class Database:
             except Exception as e:
                 logger.error("database.integrity_check_error", error=str(e))
 
-        # Auto-migrate: add missing columns to existing tables
+        # Auto-migrate: add missing columns + drop deprecated tables
         self._auto_migrate()
-        self._seed_notification_templates()
+        self._drop_deprecated_tables()
 
         logger.info("database.initialized", url=self._database_url)
+
+    def _drop_deprecated_tables(self) -> None:
+        """Idempotently DROP TABLE for surfaces that were retired (e.g. the
+        email notification template system in 2026-05). Required so an old
+        SQLite file does not keep orphan tables around forever."""
+        if not _DROP_TABLES:
+            return
+        with self._engine.connect() as conn:
+            for table in _DROP_TABLES:
+                try:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+                    conn.commit()
+                    logger.info("database.dropped_deprecated_table", table=table)
+                except Exception as e:
+                    logger.warning(
+                        "database.drop_deprecated_table_failed",
+                        table=table, error=str(e),
+                    )
 
     def _auto_migrate(self) -> None:
         """Add missing columns to existing SQLite tables (lightweight migration)."""
@@ -258,22 +230,6 @@ class Database:
                             table=table, column=column, error=str(e),
                             exc_info=True,
                         )
-
-    def _seed_notification_templates(self) -> None:
-        """Create starter notification templates in the database once."""
-        with self.get_session() as session:
-            count = session.scalar(
-                select(sa_func.count()).select_from(NotificationTemplate)
-            ) or 0
-            if count > 0:
-                return
-            for item in _STARTER_NOTIFICATION_TEMPLATES:
-                session.add(NotificationTemplate(**item))
-            session.commit()
-            logger.info(
-                "database.notification_templates_seeded",
-                count=len(_STARTER_NOTIFICATION_TEMPLATES),
-            )
 
     def get_session(self) -> Session:
         """Get a new database session."""
@@ -1072,21 +1028,11 @@ class Database:
         self,
         name: str,
         owner: str,
-        email: str | None = None,
         phone: str | None = None,
-        notification_methods: str = "",
-        notification_template_ids: str = "",
     ) -> Region:
         """Create a managed region/contact entry."""
         with self.get_session() as session:
-            region = Region(
-                name=name,
-                owner=owner,
-                email=email,
-                phone=phone,
-                notification_methods=notification_methods,
-                notification_template_ids=notification_template_ids,
-            )
+            region = Region(name=name, owner=owner, phone=phone)
             session.add(region)
             session.commit()
             session.refresh(region)
@@ -1109,7 +1055,6 @@ class Database:
         name: str | None = None,
         owner: str | None = None,
         phone: str | None = None,
-        email: str | None = None,
     ) -> list[Region]:
         """Return regions filtered by fuzzy query fields."""
         with self.get_session() as session:
@@ -1120,8 +1065,6 @@ class Database:
                 stmt = stmt.where(Region.owner.like(f"%{owner}%"))
             if phone:
                 stmt = stmt.where(Region.phone.like(f"%{phone}%"))
-            if email:
-                stmt = stmt.where(Region.email.like(f"%{email}%"))
             return list(session.scalars(stmt).all())
 
     def update_region(self, region_id: int, **kwargs) -> bool:
@@ -1145,106 +1088,6 @@ class Database:
             session.delete(region)
             session.commit()
             logger.info("database.region_deleted", region_id=region_id, name=region.name)
-            return True
-
-    # ── Notification templates ──
-
-    def create_notification_template(
-        self,
-        *,
-        name: str,
-        method: str,
-        subject: str | None = None,
-        content: str,
-        enabled: bool = True,
-    ) -> NotificationTemplate:
-        """Create a reusable alert notification template."""
-        with self.get_session() as session:
-            template = NotificationTemplate(
-                name=name,
-                method=method,
-                subject=subject,
-                content=content,
-                enabled=enabled,
-            )
-            session.add(template)
-            session.commit()
-            session.refresh(template)
-            logger.info(
-                "database.notification_template_created",
-                template_id=template.id,
-                method=method,
-                name=name,
-            )
-            return template
-
-    def get_notification_template(self, template_id: int) -> NotificationTemplate | None:
-        """Get a notification template by id."""
-        with self.get_session() as session:
-            return session.scalar(
-                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
-            )
-
-    def get_notification_templates(self, method: str | None = None) -> list[NotificationTemplate]:
-        """Return notification templates, optionally filtered by method."""
-        with self.get_session() as session:
-            stmt = select(NotificationTemplate).order_by(
-                NotificationTemplate.method.asc(),
-                NotificationTemplate.updated_at.desc(),
-                NotificationTemplate.id.desc(),
-            )
-            if method:
-                stmt = stmt.where(NotificationTemplate.method == method)
-            return list(session.scalars(stmt).all())
-
-    def get_notification_templates_by_ids(self, template_ids: list[int]) -> list[NotificationTemplate]:
-        """Return notification templates ordered by the given ids."""
-        if not template_ids:
-            return []
-
-        with self.get_session() as session:
-            rows = list(
-                session.scalars(
-                    select(NotificationTemplate).where(NotificationTemplate.id.in_(template_ids))
-                ).all()
-            )
-
-        template_map = {item.id: item for item in rows}
-        return [template_map[template_id] for template_id in template_ids if template_id in template_map]
-
-    def update_notification_template(self, template_id: int, **kwargs) -> bool:
-        """Update editable fields on a notification template."""
-        with self.get_session() as session:
-            template = session.scalar(
-                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
-            )
-            if template is None:
-                return False
-
-            for key, value in kwargs.items():
-                if key in _NOTIFICATION_TEMPLATE_UPDATABLE_FIELDS and hasattr(template, key):
-                    setattr(template, key, value)
-            session.commit()
-            return True
-
-    def delete_notification_template(self, template_id: int) -> bool:
-        """Delete a notification template by id."""
-        with self.get_session() as session:
-            template = session.scalar(
-                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
-            )
-            if template is None:
-                return False
-            method = template.method
-            name = template.name
-            session.delete(template)
-            session.commit()
-            logger.info(
-                "database.notification_template_deleted",
-                template_id=template_id,
-                method=method,
-                name=name,
-            )
             return True
 
     def save_alert_recording(self, record: AlertRecordingRecord) -> AlertRecordingRecord:
