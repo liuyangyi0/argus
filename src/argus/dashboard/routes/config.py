@@ -21,6 +21,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
+from argus.dashboard.auth import current_username
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 from argus.dashboard.model_runtime import find_registered_model_by_path
 
@@ -107,7 +108,7 @@ async def update_detection_params(request: Request):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="update_config",
             target_type="detection_params",
             detail=f"更新检测参数，影响 {updated} 条流水线",
@@ -325,7 +326,7 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="clear_lock",
             target_type="camera",
             target_id=camera_id,

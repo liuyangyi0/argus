@@ -448,6 +448,7 @@ def create_retraining_task(
                     and getattr(result, "status", None) is not None
                     and result.status.value == "COMPLETE"
                 ):
+                    version_id = None
                     try:
                         version_id = model_registry.register(
                             camera_id=camera_id,
@@ -456,17 +457,56 @@ def create_retraining_task(
                             image_count=current_count,
                             quality_grade=grade,
                         )
-                        model_registry.activate(version_id, allow_bypass=True)
-                        logger.info(
-                            "retraining.auto_deployed",
-                            camera_id=camera_id,
-                            version_id=version_id,
-                            grade=grade,
-                        )
+                        # P1 fix: never bypass the candidate→shadow→canary→production
+                        # gate from a non-interactive scheduler. Auto-deploy now
+                        # only succeeds when the operator (or an explicit canary
+                        # promotion job) has already advanced this version to
+                        # PRODUCTION/RETIRED. Otherwise we log + audit and leave
+                        # the run as a CANDIDATE for human review.
+                        try:
+                            model_registry.activate(
+                                version_id, triggered_by="auto_retrain",
+                            )
+                            logger.info(
+                                "retraining.auto_deployed",
+                                camera_id=camera_id,
+                                version_id=version_id,
+                                grade=grade,
+                            )
+                        except ValueError as gate_err:
+                            logger.warning(
+                                "retraining.activation_blocked_by_stage_gate",
+                                camera_id=camera_id,
+                                version_id=version_id,
+                                grade=grade,
+                                error=str(gate_err),
+                                msg=(
+                                    "Auto-deploy refused: model still at "
+                                    "candidate stage. Promote via the release "
+                                    "pipeline (shadow → canary → production) "
+                                    "before activation."
+                                ),
+                            )
+                            audit = (
+                                getattr(scheduler, "_audit_logger", None)
+                                or getattr(scheduler, "audit_logger", None)
+                            )
+                            if audit is not None:
+                                try:
+                                    audit.log(
+                                        user="auto_retrain",
+                                        action="auto_retrain_activation_blocked",
+                                        target_type="model_version",
+                                        target_id=str(version_id),
+                                        detail=str(gate_err)[:200],
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
                     except Exception as e:
                         logger.error(
                             "retraining.deploy_failed",
                             camera_id=camera_id,
+                            version_id=version_id,
                             error=str(e),
                         )
                 elif retrain_cfg.auto_deploy:

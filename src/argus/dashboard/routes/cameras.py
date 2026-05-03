@@ -12,12 +12,14 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response, StreamingResponse
 from argus.dashboard.api_response import (
     api_conflict,
+    api_forbidden,
     api_internal_error,
     api_not_found,
     api_success,
     api_unavailable,
     api_validation_error,
 )
+from argus.dashboard.auth import require_role
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 
 logger = structlog.get_logger()
@@ -563,6 +565,8 @@ def _probe_source_blocking(source: str | int, timeout: float = 5.0) -> dict:
 @router.post("/{camera_id}/test-connection")
 async def test_camera_connection(request: Request, camera_id: str):
     """痛点 8: live-probe an already-configured camera in 5 seconds."""
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("权限不足")
     cam_config = _find_camera_config(request, camera_id)
     if cam_config is None:
         return api_not_found(f"摄像头 {camera_id} 不存在")
@@ -580,6 +584,8 @@ async def test_camera_connection_draft(request: Request):
 
     Body: { "source": str | int, "protocol"?: str }
     """
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("权限不足")
     try:
         body = await request.json()
     except Exception:
