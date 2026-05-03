@@ -1,4 +1,4 @@
-import type { ApiResponse, AlertsPayload } from '../types/api'
+import type { ApiResponse, AlertsPayload, FeedbackStats } from '../types/api'
 import { api, unwrap, u } from './client'
 
 export const getAlerts = (params?: Record<string, any>) =>
@@ -6,6 +6,15 @@ export const getAlerts = (params?: Record<string, any>) =>
 export const getAlert = (id: string) => api.get(`/alerts/${id}/detail`).then(u)
 export const acknowledgeAlert = (id: string) => api.post(`/alerts/${id}/acknowledge`).then(u)
 export const markFalsePositive = (id: string) => api.post(`/alerts/${id}/false-positive`).then(u)
+// 痛点 10: explicit "this WAS a real anomaly" — feeds confirmed feedback to validation set
+export const confirmRealAnomaly = (id: string) =>
+  api.post(`/alerts/${id}/confirm-anomaly`).then(u)
+export const getFeedbackStats = (camera_id?: string) =>
+  api
+    .get<ApiResponse<FeedbackStats>>('/alerts/feedback-stats', {
+      params: camera_id ? { camera_id } : undefined,
+    })
+    .then(unwrap)
 export const updateAlertWorkflow = (id: string, data: Record<string, any>) =>
   api.post(`/alerts/${id}/workflow`, data).then(u)
 export const bulkAcknowledge = (ids: string[]) =>

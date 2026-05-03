@@ -98,11 +98,23 @@ const jobColumns = [
   { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 100 },
   { title: '触发方式', dataIndex: 'trigger_type', key: 'trigger_type', width: 100 },
   { title: '状态', dataIndex: 'status', key: 'status', width: 100 },
+  { title: '原因', key: 'reason', width: 90 },
   { title: '骨干版本', dataIndex: 'base_model_version', key: 'base_model_version', width: 130, ellipsis: true },
   { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 170 },
   { title: '耗时(秒)', dataIndex: 'duration_seconds', key: 'duration_seconds', width: 90 },
   { title: '操作', key: 'actions', width: 200, fixed: 'right' as const },
 ]
+
+// 痛点 7: failure-reason modal so users can see why a job failed
+import ErrorDetailModal from '../common/ErrorDetailModal.vue'
+const errorModalOpen = ref(false)
+const errorModalTitle = ref('')
+const errorModalText = ref<string | null>(null)
+function showError(record: TrainingJobInfo) {
+  errorModalTitle.value = `任务 ${record.job_id} 失败原因`
+  errorModalText.value = record.error || '（未记录失败原因）'
+  errorModalOpen.value = true
+}
 
 // Elapsed time ticker — only runs when jobs are in "running" state
 const nowTick = ref(Date.now())
@@ -201,6 +213,16 @@ defineExpose({ loadJobs })
               {{ (TRAINING_STATUS_MAP[record.status] || {}).text || record.status }}
             </Tag>
           </template>
+          <template v-else-if="column.key === 'reason'">
+            <Button
+              v-if="record.status === 'failed'"
+              size="small"
+              type="link"
+              danger
+              @click="showError(record as TrainingJobInfo)"
+            >查看原因</Button>
+            <span v-else style="color: var(--ink-3); font-size: 12px">—</span>
+          </template>
           <template v-else-if="column.key === 'camera_id'">
             {{ record.camera_id || '全部' }}
           </template>
@@ -237,6 +259,12 @@ defineExpose({ loadJobs })
         </template>
       </Table>
     </Card>
+
+    <ErrorDetailModal
+      v-model:open="errorModalOpen"
+      :title="errorModalTitle"
+      :error="errorModalText"
+    />
 
     <!-- Detail drawer -->
     <Drawer
