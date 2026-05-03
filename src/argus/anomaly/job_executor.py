@@ -31,8 +31,12 @@ if TYPE_CHECKING:
     from argus.anomaly.model_package import ModelPackager
     from argus.anomaly.trainer import ModelTrainer
     from argus.anomaly.training_validator import TrainingValidator
+    from argus.capture.manager import CameraManager
     from argus.storage.database import Database
     from argus.storage.model_registry import ModelRegistry
+
+from argus.core.pipeline import PipelineMode
+from argus.core.pipeline_mode_guard import GlobalPipelineModeGuard
 
 logger = structlog.get_logger()
 
@@ -96,6 +100,7 @@ class TrainingJobExecutor:
         baselines_dir: Path = Path("data/baselines"),
         model_packages_dir: Path = Path("data/model_packages"),
         on_model_trained: Callable[[str, Path], None] | None = None,
+        camera_manager: "CameraManager | None" = None,
     ):
         self._db = database
         self._trainer = trainer
@@ -107,6 +112,23 @@ class TrainingJobExecutor:
         self._model_packages_dir = model_packages_dir
         self._model_packages_dir.mkdir(parents=True, exist_ok=True)
         self._on_model_trained = on_model_trained
+        self._camera_manager = camera_manager
+
+    def _training_mode_guard(self, reason: str):
+        """Return a GlobalPipelineModeGuard or a no-op when no manager is wired.
+
+        Switching every camera to TRAINING during a job (痛点 3) frees the
+        shared GPU; the guard restores each camera's previous mode on exit
+        even if training raises.
+        """
+        if self._camera_manager is None:
+            from contextlib import nullcontext
+            return nullcontext()
+        return GlobalPipelineModeGuard(
+            self._camera_manager,
+            PipelineMode.TRAINING,
+            reason=reason,
+        )
 
     def _safe_hot_reload(self, camera_id: str, model_path: Path) -> None:
         """Reload model into pipeline in a background thread."""
@@ -224,13 +246,14 @@ class TrainingJobExecutor:
             if cam_dir.is_dir() and not cam_dir.name.startswith("."):
                 camera_ids.append(cam_dir.name)
 
-        result = self._backbone_trainer.train(
-            camera_ids=camera_ids,
-            baselines_dir=self._baselines_dir,
-            backbone_type=params.get("backbone_type", "dinov2_vitb14"),
-            epochs=params.get("epochs", 5),
-            lr=params.get("lr", 1e-5),
-        )
+        with self._training_mode_guard(reason=f"backbone_train:{job.job_id}"):
+            result = self._backbone_trainer.train(
+                camera_ids=camera_ids,
+                baselines_dir=self._baselines_dir,
+                backbone_type=params.get("backbone_type", "dinov2_vitb14"),
+                epochs=params.get("epochs", 5),
+                lr=params.get("lr", 1e-5),
+            )
 
         if not result.success:
             raise RuntimeError(result.error or "Backbone training failed")
@@ -287,17 +310,18 @@ class TrainingJobExecutor:
             raise ValueError(f"Invalid hyperparameters: {'; '.join(param_errors)}")
 
         # Run training (trainer already has validation wired in)
-        result = self._trainer.train(
-            camera_id=camera_id,
-            #zone_id=job.zone_id or "default",
-            zone_id="default", # 基线采集图片默认存储路径是 baselines/{camera_id}/default，所以这里默认使用 default zone
-            model_type=job.model_type or params.get("model_type", "patchcore"),
-            image_size=params.get("image_size", 256),
-            export_format=params.get("export_format", "openvino"),
-            quantization=params.get("quantization", "fp16"),
-            backbone_checkpoint=backbone_checkpoint,
-            skip_baseline_validation=params.get("skip_baseline_validation", False),
-        )
+        with self._training_mode_guard(reason=f"head_train:{job.job_id}"):
+            result = self._trainer.train(
+                camera_id=camera_id,
+                #zone_id=job.zone_id or "default",
+                zone_id="default", # 基线采集图片默认存储路径是 baselines/{camera_id}/default，所以这里默认使用 default zone
+                model_type=job.model_type or params.get("model_type", "patchcore"),
+                image_size=params.get("image_size", 256),
+                export_format=params.get("export_format", "openvino"),
+                quantization=params.get("quantization", "fp16"),
+                backbone_checkpoint=backbone_checkpoint,
+                skip_baseline_validation=params.get("skip_baseline_validation", False),
+            )
 
         if result.status.value != TrainingStatus.COMPLETE.value:
             raise RuntimeError(result.error or f"Training failed with status {result.status}")
