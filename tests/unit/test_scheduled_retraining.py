@@ -187,7 +187,12 @@ class TestCreateRetrainingTask:
         callback()
 
         registry.register.assert_called_once()
-        registry.activate.assert_called_once_with("cam_01-patchcore-20260406-001", allow_bypass=True)
+        # P1 fix: scheduler must NEVER bypass the stage gate. Use the same
+        # release pipeline path as a manual activation, identified by
+        # triggered_by="auto_retrain" so audit logs can attribute it.
+        registry.activate.assert_called_once_with(
+            "cam_01-patchcore-20260406-001", triggered_by="auto_retrain",
+        )
 
     def test_skip_deploy_on_bad_grade(self):
         from argus.core.scheduler import create_retraining_task
@@ -222,6 +227,55 @@ class TestCreateRetrainingTask:
 
         registry.register.assert_not_called()
         registry.activate.assert_not_called()
+
+    def test_auto_deploy_respects_stage_gate(self):
+        """P1: when registry refuses activation because the version is still
+        a CANDIDATE, the scheduler must log + audit + continue, NOT bypass."""
+        from argus.core.scheduler import create_retraining_task
+
+        scheduler = MagicMock()
+        audit_logger = MagicMock()
+        scheduler._audit_logger = audit_logger
+        config = self._make_config(
+            min_new_baselines=5, auto_deploy=True, auto_deploy_min_grade="B"
+        )
+        trainer = MagicMock()
+        result = MagicMock()
+        result.quality_grade = "A"
+        result.status.value = "COMPLETE"
+        result.model_path = "/tmp/model"
+        trainer.train.return_value = result
+
+        baseline_mgr = MagicMock()
+        baseline_mgr.count_images.return_value = 50
+
+        registry = MagicMock()
+        registry.list_models.return_value = []
+        registry.register.return_value = "cam_01-patchcore-20260406-001"
+        registry.activate.side_effect = ValueError(
+            "Cannot activate model at stage 'candidate'."
+        )
+
+        create_retraining_task(
+            scheduler=scheduler,
+            config=config,
+            camera_configs=[self._make_camera()],
+            trainer=trainer,
+            model_registry=registry,
+            baseline_manager=baseline_mgr,
+        )
+
+        callback = scheduler.add_interval_task.call_args[0][1]
+        callback()  # Must NOT raise
+
+        registry.activate.assert_called_once_with(
+            "cam_01-patchcore-20260406-001", triggered_by="auto_retrain",
+        )
+        # Audit must record the blocked attempt for forensics
+        audit_logger.log.assert_called_once()
+        kwargs = audit_logger.log.call_args.kwargs
+        assert kwargs["action"] == "auto_retrain_activation_blocked"
+        assert kwargs["target_id"] == "cam_01-patchcore-20260406-001"
 
     def test_camera_failure_isolation(self):
         """One camera failing should not block others."""

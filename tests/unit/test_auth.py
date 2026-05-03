@@ -7,6 +7,7 @@ import pytest
 from argus.dashboard.auth import (
     PERMISSION_MAP,
     create_session_token,
+    current_username,
     has_permission,
     hash_password,
     require_role,
@@ -196,3 +197,27 @@ class TestRequireRole:
     def test_no_user_returns_false(self):
         req = _FakeRequest(None)
         assert require_role(req, "admin") is False
+
+
+class TestCurrentUsername:
+    """Audit logs must read username from request.state.user, never hardcode."""
+
+    def test_returns_username_when_logged_in(self):
+        req = _FakeRequest({"username": "alice", "role": "operator"})
+        assert current_username(req) == "alice"
+
+    def test_returns_unknown_for_anonymous(self):
+        req = _FakeRequest(None)
+        assert current_username(req) == "unknown"
+
+    def test_returns_unknown_when_username_missing(self):
+        req = _FakeRequest({"role": "operator"})
+        assert current_username(req) == "unknown"
+
+    def test_returns_unknown_when_username_empty(self):
+        req = _FakeRequest({"username": "", "role": "operator"})
+        assert current_username(req) == "unknown"
+
+    def test_returns_unknown_when_state_user_is_not_dict(self):
+        req = _FakeRequest("some_string_garbage")  # robustness against bad middleware
+        assert current_username(req) == "unknown"

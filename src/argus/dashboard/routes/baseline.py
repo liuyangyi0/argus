@@ -28,6 +28,7 @@ from argus.dashboard.api_response import (
 from argus.capture.baseline_job import run_baseline_capture_job, BaselineCaptureJobConfig
 from argus.config.schema import BaselineCaptureConfig
 from argus.core.model_discovery import resolve_runtime_model_path
+from argus.dashboard.auth import current_username, require_role
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 from argus.dashboard.model_runtime import activate_model_version, find_registered_model_by_path
 
@@ -194,6 +195,8 @@ def collections_activate(
     request: Request, camera_id: str, zone_id: str, version: str,
 ):
     """Set a version as the current baseline (痛点 5)."""
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("权限不足")
     config = request.app.state.config
     if not config:
         return api_unavailable("配置不可用")
@@ -214,6 +217,8 @@ def collections_retire(
     request: Request, camera_id: str, zone_id: str, version: str,
 ):
     """Mark a baseline version as retired via the lifecycle state machine."""
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("权限不足")
     lifecycle = _get_lifecycle(request)
     if lifecycle is None:
         return api_unavailable("baseline lifecycle 未启用")
@@ -231,6 +236,8 @@ def collections_delete(
     confirm: bool = False,
 ):
     """Delete a baseline version directory. Active versions require ``confirm=true``."""
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("权限不足")
     config = request.app.state.config
     if not config:
         return api_unavailable("配置不可用")
@@ -566,7 +573,7 @@ async def deploy_model(request: Request):
         client_ip = request.client.host if request.client else ""
         if audit:
             audit.log(
-                user="operator",
+                user=current_username(request),
                 action="deploy_model",
                 target_type="camera",
                 target_id=camera_id,
@@ -1025,7 +1032,7 @@ async def optimize_baseline_json(request: Request):
     if audit:
         client_ip = request.client.host if request.client else ""
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="optimize_baseline",
             target_type="baseline",
             target_id=f"{camera_id}/{zone_id}",
@@ -1416,7 +1423,7 @@ async def delete_version_image(
     if audit:
         client_ip = request.client.host if request.client else ""
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="delete_baseline_image",
             target_type="baseline",
             target_id=f"{camera_id}/{zone_id}/{version}",
@@ -1510,7 +1517,7 @@ async def upload_version_image(
     if audit:
         client_ip = request.client.host if request.client else ""
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="upload_baseline_image",
             target_type="baseline",
             target_id=f"{camera_id}/{zone_id}/{version}",

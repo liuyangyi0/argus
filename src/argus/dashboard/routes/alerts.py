@@ -23,6 +23,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
+from argus.dashboard.auth import current_username, require_permission, require_role
 from argus.dashboard.forms import parse_request_form
 
 if TYPE_CHECKING:
@@ -319,7 +320,7 @@ async def bulk_acknowledge(request: Request):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="bulk_acknowledge",
             target_type="alert",
             target_id=",".join(alert_ids[:10]),
@@ -349,7 +350,7 @@ async def bulk_false_positive(request: Request):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="bulk_false_positive",
             target_type="alert",
             target_id=",".join(alert_ids[:10]),
@@ -382,7 +383,7 @@ async def bulk_delete(request: Request):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="bulk_delete",
             target_type="alert",
             target_id=",".join(alert_ids[:10]),
@@ -534,7 +535,7 @@ def acknowledge_alert(request: Request, alert_id: str):
         client_ip = request.client.host if request.client else ""
         if audit:
             audit.log(
-                user="operator",
+                user=current_username(request),
                 action="acknowledge_alert",
                 target_type="alert",
                 target_id=alert_id,
@@ -552,6 +553,8 @@ def confirm_real_anomaly(request: Request, alert_id: str):
     flows into the validation set via FeedbackManager so the next training
     run sees this case as a confirmed positive sample.
     """
+    if not require_permission(request, "handle_alerts"):
+        return api_forbidden("权限不足")
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
@@ -565,7 +568,7 @@ def confirm_real_anomaly(request: Request, alert_id: str):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="confirm_anomaly",
             target_type="alert",
             target_id=alert_id,
@@ -579,6 +582,8 @@ def confirm_real_anomaly(request: Request, alert_id: str):
 @router.get("/feedback-stats")
 def feedback_stats(request: Request, camera_id: str | None = None):
     """痛点 10: aggregate FP / Confirmed counts for the alerts dashboard card."""
+    if not require_role(request, "admin", "engineer", "operator"):
+        return api_forbidden("权限不足")
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
@@ -613,7 +618,7 @@ def mark_false_positive(request: Request, alert_id: str):
         client_ip = request.client.host if request.client else ""
         if audit:
             audit.log(
-                user="operator",
+                user=current_username(request),
                 action="mark_false_positive",
                 target_type="alert",
                 target_id=alert_id,
@@ -645,7 +650,7 @@ def delete_alert(request: Request, alert_id: str):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="delete_alert",
             target_type="alert",
             target_id=alert_id,
@@ -704,7 +709,7 @@ def _submit_workflow_feedback(
             zone_id=getattr(alert, "zone_id", "default") or "default",
             category=category,
             notes=notes,
-            submitted_by="operator",
+            submitted_by=current_username(request),
             anomaly_score=alert.anomaly_score,
             snapshot_path=alert.snapshot_path,
         )
@@ -770,7 +775,7 @@ def _add_fp_snapshot_to_baseline(request: Request, alert_id: str) -> None:
     if audit:
         client_ip = request.client.host if request.client else ""
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="fp_add_to_baseline",
             target_type="baseline",
             target_id=f"{camera_id}/{zone_id}",
