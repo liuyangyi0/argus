@@ -98,7 +98,87 @@ class TestBaselineCaptureJob:
             )
 
         base_dir = Path(basic_job_config.storage_path) / basic_job_config.camera_id / "default"
+        # Active versions must not retain the failed run
         assert list(base_dir.glob("v*")) == []
+
+    def test_capture_runtime_error_preserves_failed_dir_with_meta(
+        self,
+        basic_job_config,
+        mock_camera_manager,
+        monkeypatch,
+    ):
+        """痛点 7: a crashing capture must leave a `failed_*` directory with
+        capture_meta.json carrying `status='failed'` and `error` so the user
+        can inspect what went wrong instead of seeing nothing."""
+        class BrokenSampler:
+            def should_accept(self, frame):
+                raise RuntimeError("sampler exploded")
+
+            def get_sleep_interval(self):
+                return 0.0
+
+            def on_frame_saved(self, frame, index):
+                return None
+
+        monkeypatch.setattr(
+            "argus.capture.baseline_job._create_sampler",
+            lambda config: type("Selection", (), {
+                "sampler": BrokenSampler(),
+                "effective_strategy": "active",
+                "warning": None,
+            })(),
+        )
+
+        pause_ev = threading.Event()
+        pause_ev.set()
+        abort_ev = threading.Event()
+
+        with pytest.raises(RuntimeError, match="sampler exploded"):
+            run_baseline_capture_job(
+                lambda p, m: None,
+                job_config=basic_job_config,
+                camera_manager=mock_camera_manager,
+                pause_event=pause_ev,
+                abort_event=abort_ev,
+            )
+
+        base_dir = Path(basic_job_config.storage_path) / basic_job_config.camera_id / "default"
+        failed_dirs = list(base_dir.glob("failed_*"))
+        assert len(failed_dirs) == 1, f"expected one failed_* dir, got {failed_dirs}"
+        meta = json.loads((failed_dirs[0] / "capture_meta.json").read_text())
+        assert meta["status"] == "failed"
+        assert "sampler exploded" in meta["error"]
+
+    def test_capture_switches_pipeline_to_collection_during_loop(
+        self,
+        basic_job_config,
+        mock_camera_manager,
+    ):
+        """PR3 contract: capture must call set_pipeline_mode(COLLECTION) on
+        enter and set_pipeline_mode(<previous>) on exit (PipelineModeGuard)."""
+        from argus.core.pipeline import PipelineMode
+
+        # Mock the manager so it reports an explicit current mode and tracks calls
+        mock_camera_manager.get_pipeline_mode.return_value = PipelineMode.ACTIVE.value
+        mock_camera_manager.set_pipeline_mode.return_value = True
+
+        pause_ev = threading.Event()
+        pause_ev.set()
+        abort_ev = threading.Event()
+
+        run_baseline_capture_job(
+            lambda p, m: None,
+            job_config=basic_job_config,
+            camera_manager=mock_camera_manager,
+            pause_event=pause_ev,
+            abort_event=abort_ev,
+        )
+
+        # First call switches to COLLECTION; the last call must restore ACTIVE
+        calls = mock_camera_manager.set_pipeline_mode.call_args_list
+        assert len(calls) >= 2
+        assert calls[0].args == ("test_cam", PipelineMode.COLLECTION)
+        assert calls[-1].args == ("test_cam", PipelineMode.ACTIVE)
 
     def test_active_sampler_respects_duration_based_interval(self, basic_job_config):
         basic_job_config.sampling_strategy = "active"

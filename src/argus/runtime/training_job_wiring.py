@@ -67,5 +67,6 @@ def register_training_job_processing(
         model_registry=model_registry,
         baselines_dir=config.storage.baselines_dir,
         on_model_trained=_on_model_trained,
+        camera_manager=camera_manager,
     )
     create_job_processing_task(scheduler, job_executor)
