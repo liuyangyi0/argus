@@ -297,6 +297,9 @@ def main():
         ws_mgr = getattr(app.state, "ws_manager", None)
         if ws_mgr is not None:
             manager._on_status_change = ws_mgr.broadcast
+            # P1 fix: same hookup for alert dispatch — without this the
+            # dashboard never receives real-time alert pushes (only poll).
+            dispatcher.set_websocket_broadcaster(ws_mgr.broadcast)
         if app.state.baseline_lifecycle is not None:
             app.state.baseline_lifecycle._audit = audit_logger
         app.state.backup_manager = backup_mgr
@@ -385,6 +388,8 @@ def main():
             trainer=model_trainer,
             model_registry=model_reg,
             baseline_manager=baseline_manager,
+            baseline_lifecycle=getattr(app.state, "baseline_lifecycle", None),
+            database=db,
         )
         create_backbone_retraining_task(
             scheduler=scheduler,

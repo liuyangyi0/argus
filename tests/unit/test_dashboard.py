@@ -666,8 +666,13 @@ class TestCameraControlRoutes:
 
 
 class TestModelPublishRoutes:
-    def test_activate_model_syncs_runtime(self, db, health, alerts_dir, tmp_path):
-        """Activating a registered model should also hot-reload the running camera."""
+    def test_activate_promoted_model_syncs_runtime(self, db, health, alerts_dir, tmp_path):
+        """Activating a model that has walked the release pipeline (now at
+        PRODUCTION stage) should hot-reload the running camera.
+
+        P1 fix (2026-05): registered models default to CANDIDATE and cannot be
+        directly activated — promotion is required first.
+        """
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("model")
@@ -677,6 +682,10 @@ class TestModelPublishRoutes:
 
         registry = ModelRegistry(session_factory=db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        # Walk the release pipeline so the version reaches PRODUCTION.
+        registry.promote(version_id, "shadow", triggered_by="test")
+        registry.promote(version_id, "canary", triggered_by="test", canary_camera_id="cam_01")
+        registry.promote(version_id, "production", triggered_by="test")
 
         camera_manager = MagicMock()
         camera_manager.reload_model.return_value = True
@@ -697,12 +706,46 @@ class TestModelPublishRoutes:
         data = payload["data"]
         assert data["activated"] == version_id
         assert data["runtime_synced"] is True
-        # _resolve_model_file resolves the directory to the actual model file
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
             str(model_dir / "model.xml"),
             version_tag=version_id,
         )
+
+    def test_activate_candidate_model_rejected_by_stage_gate(
+        self, db, health, alerts_dir, tmp_path,
+    ):
+        """P1 fix: a CANDIDATE model cannot be activated directly. The route
+        must surface a 400 telling the user to promote it through shadow →
+        canary → production first."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "model.xml").write_text("model")
+        baseline_dir = tmp_path / "baseline"
+        baseline_dir.mkdir()
+        (baseline_dir / "img.png").write_bytes(b"img")
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        # Stage stays at default 'candidate'.
+
+        camera_manager = MagicMock()
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post(f"/api/models/{version_id}/activate")
+
+        assert response.status_code == 400
+        body = response.json()
+        # Must mention release pipeline so the operator knows what to do.
+        msg = (body.get("msg") or body.get("message") or "").lower()
+        assert "candidate" in msg or "stage" in msg or "shadow" in msg
+        camera_manager.reload_model.assert_not_called()
 
     def test_config_reload_model_uses_manager_reload(self, db, health, alerts_dir, tmp_path, monkeypatch):
         """Config reload-model route should use the shared runtime reload path."""
@@ -865,6 +908,11 @@ class TestModelPublishRoutes:
 
         registry = ModelRegistry(session_factory=db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        # P1 fix: stage gate now blocks CANDIDATE activation. Promote so the
+        # deploy path under test can hot-reload the runtime model.
+        registry.promote(version_id, "shadow", triggered_by="test")
+        registry.promote(version_id, "canary", triggered_by="test", canary_camera_id="cam_01")
+        registry.promote(version_id, "production", triggered_by="test")
 
         camera_manager = MagicMock()
         camera_manager._pipelines = {"cam_01": MagicMock()}

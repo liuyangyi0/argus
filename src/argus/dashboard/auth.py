@@ -103,6 +103,21 @@ def require_role(request: Request, *roles: str) -> bool:
     return user.get("role", "viewer") in roles
 
 
+def current_username(request: Request) -> str:
+    """Return the logged-in username for audit logs.
+
+    Resolves from ``request.state.user`` (populated by the auth middleware).
+    Returns ``"unknown"`` for anonymous / token-less calls so audit trails
+    never contain hardcoded ``"operator"`` placeholders.
+    """
+    user = getattr(request.state, "user", None) or {}
+    if isinstance(user, dict):
+        username = user.get("username")
+        if isinstance(username, str) and username:
+            return username
+    return "unknown"
+
+
 # ── UX v2 §11.1: Permission matrix (4-tier RBAC) ──
 
 PERMISSION_MAP: dict[str, list[str]] = {

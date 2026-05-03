@@ -118,6 +118,38 @@ class BaselineLifecycle:
                 .where(BaselineVersionRecord.state == BaselineState.ACTIVE)
             )
 
+    def get_eligible_versions(
+        self,
+        camera_id: str,
+        zone_id: str = "default",
+        *,
+        since: datetime | None = None,
+    ) -> list[BaselineVersionRecord]:
+        """Return baseline versions eligible for auto-retraining.
+
+        Eligible = state in (VERIFIED, ACTIVE). DRAFT versions have not been
+        approved yet; RETIRED ones were explicitly removed from the active pool.
+
+        When ``since`` is provided, only versions created strictly after that
+        timestamp are returned — used by the ``since_last_train`` retraining
+        strategy to pick up newly-captured data without re-feeding history.
+        """
+        with self._db.get_session() as session:
+            stmt = (
+                select(BaselineVersionRecord)
+                .where(BaselineVersionRecord.camera_id == camera_id)
+                .where(BaselineVersionRecord.zone_id == zone_id)
+                .where(
+                    BaselineVersionRecord.state.in_(
+                        [BaselineState.VERIFIED, BaselineState.ACTIVE]
+                    )
+                )
+                .order_by(BaselineVersionRecord.version.asc())
+            )
+            if since is not None:
+                stmt = stmt.where(BaselineVersionRecord.created_at > since)
+            return list(session.scalars(stmt).all())
+
     def get_trainable_versions(
         self, camera_id: str, zone_id: str = "default"
     ) -> list[BaselineVersionRecord]:

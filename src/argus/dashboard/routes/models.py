@@ -152,7 +152,13 @@ async def activate_model(request: Request, version_id: str):
             "runtime_synced": runtime_synced,
         })
     except ValueError as e:
-        return api_not_found(str(e))
+        # P1 fix (2026-05): registry rejects activation of candidate models.
+        # Distinguish "not found" from "stage gate" so the UI can guide users
+        # through the promotion flow instead of pretending the version vanished.
+        msg = str(e)
+        if "stage" in msg.lower() or "shadow" in msg.lower() or "production" in msg.lower():
+            return api_validation_error(msg)
+        return api_not_found(msg)
 
 
 @router.post("/{version_id}/rollback")

@@ -18,7 +18,6 @@ const SECTION_TITLES: Record<string, string> = {
   'system-cross-camera': '跨相机',
   'system-users': '用户管理',
   'system-regions': '区域管理',
-  'system-notification-templates': '通知内容配置',
 }
 
 const sectionTitle = computed(() => {

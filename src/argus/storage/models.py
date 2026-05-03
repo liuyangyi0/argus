@@ -723,34 +723,21 @@ class User(Base):
 
 
 class Region(Base):
-    """Managed region/contact entry for alert notifications."""
+    """Managed region / responsible-party entry.
+
+    Email + notification template fields were removed in 2026-05 along with
+    the rest of the email notification surface — the dispatcher never had
+    SMTP and the on-disk template system was a shell. ``phone`` is kept as
+    a contact-card field; webhook notifications continue to be configured
+    on AlertConfig directly (no per-region template).
+    """
 
     __tablename__ = "regions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
     owner: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    email: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True, default=None)
-    notification_methods: Mapped[str] = mapped_column(String(200), nullable=False, default="")
-    notification_template_ids: Mapped[str] = mapped_column(String(500), nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
-    )
-
-
-class NotificationTemplate(Base):
-    """Reusable alert notification template stored as operational data."""
-
-    __tablename__ = "notification_templates"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    method: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
-    subject: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now(), nullable=False

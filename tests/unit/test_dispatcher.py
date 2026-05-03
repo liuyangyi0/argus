@@ -240,3 +240,41 @@ class TestDiskSpaceCheck:
             assert len(jpg_files) == 0
         finally:
             d.close()
+
+
+class TestWebSocketBroadcaster:
+    """P1 fix (2026-05): __main__.py builds the dispatcher before the dashboard
+    app starts, so the WebSocket broadcaster has to be wired in afterwards."""
+
+    def test_set_websocket_broadcaster_invokes_on_dispatch(self, db, tmp_path):
+        config = AlertConfig()
+        captured: list[tuple[str, dict]] = []
+
+        d = AlertDispatcher(config=config, database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            # Constructed without on_alert (matches production order in __main__).
+            assert d._on_alert_ws is None
+
+            # Dashboard wires up later via the new setter.
+            d.set_websocket_broadcaster(lambda topic, payload: captured.append((topic, payload)))
+            assert d._on_alert_ws is not None
+
+            d.dispatch(make_alert(severity=AlertSeverity.HIGH))
+            time.sleep(0.05)  # let background db worker finish
+
+            topics = [t for t, _ in captured]
+            assert "alerts" in topics  # main alert push
+            assert "audio_alert" in topics  # audio channel piggybacks on the same callback
+        finally:
+            d.close()
+
+    def test_set_websocket_broadcaster_can_clear(self, db, tmp_path):
+        d = AlertDispatcher(config=AlertConfig(), database=db, alerts_dir=tmp_path / "alerts")
+        try:
+            d.set_websocket_broadcaster(lambda t, p: None)
+            d.set_websocket_broadcaster(None)
+            assert d._on_alert_ws is None
+            # Subsequent dispatch must not raise NPE on the empty callback.
+            d.dispatch(make_alert())
+        finally:
+            d.close()
