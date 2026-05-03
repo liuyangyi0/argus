@@ -8,12 +8,15 @@ report, recommend threshold, and record results.
 from __future__ import annotations
 
 import gc
+import os
 import random
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING, Sequence
 
 import cv2
 import numpy as np
@@ -22,6 +25,85 @@ import structlog
 from argus.anomaly import _trainer_export as _te
 from argus.anomaly.baseline import BaselineManager
 from argus.storage.models import BaselineState
+
+if TYPE_CHECKING:
+    from argus.anomaly.dataset_selection import DatasetSelection
+
+
+_IMAGE_EXTS = ("*.png", "*.jpg", "*.jpeg")
+
+
+class _DatasetMerger:
+    """Symlink (fallback to copy) multiple baseline dirs into one temp root.
+
+    Anomalib's Folder datamodule expects a single root, so multi-version
+    training (痛点 2) merges all selected versions into a tmp dir before
+    handing it off. Filenames carry a ``{camera}_{zone}_{version}_`` prefix
+    to avoid collisions when two captures use the same per-frame index.
+
+    Win11 普通用户态 ``os.symlink`` raises OSError(WinError 1314) without
+    Developer Mode; in that case we fall back to ``shutil.copy2`` for the
+    rest of the run. Cleanup is guaranteed via ``__exit__``.
+    """
+
+    def __init__(self, items: Sequence[tuple[str, Path]]) -> None:
+        # items: list of (label_prefix, source_dir) tuples
+        self._items = list(items)
+        self._tmp: Path | None = None
+        self._used_copy = False
+        self._linked = 0
+        self._copied = 0
+
+    def __enter__(self) -> Path:
+        self._tmp = Path(tempfile.mkdtemp(prefix="argus_train_"))
+        symlink_supported = True
+        for label, src_dir in self._items:
+            for pattern in _IMAGE_EXTS:
+                for img in src_dir.glob(pattern):
+                    target = self._tmp / f"{label}_{img.name}"
+                    if symlink_supported:
+                        try:
+                            os.symlink(img, target)
+                            self._linked += 1
+                            continue
+                        except (OSError, NotImplementedError):
+                            # Win11 user-mode falls here; switch to copy for
+                            # ALL subsequent files (no point retrying).
+                            symlink_supported = False
+                            self._used_copy = True
+                    try:
+                        shutil.copy2(img, target)
+                        self._copied += 1
+                    except OSError as e:
+                        logger.warning(
+                            "dataset_merger.skip_failed_image",
+                            path=str(img),
+                            error=str(e),
+                        )
+        logger.info(
+            "dataset_merger.merged",
+            sources=len(self._items),
+            linked=self._linked,
+            copied=self._copied,
+            tmp=str(self._tmp),
+        )
+        return self._tmp
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._tmp is not None and self._tmp.exists():
+            shutil.rmtree(self._tmp, ignore_errors=True)
+
+
+def _build_merger_items(
+    selection: "DatasetSelection",
+    resolved_dirs: list[Path],
+) -> list[tuple[str, Path]]:
+    """Pair each resolved dir with a unique filename prefix from selection."""
+    items: list[tuple[str, Path]] = []
+    for sel_item, src_dir in zip(selection.items, resolved_dirs):
+        label = f"{sel_item.camera_id}_{sel_item.zone_id}_{sel_item.version}"
+        items.append((label, src_dir))
+    return items
 
 logger = structlog.get_logger()
 
@@ -255,6 +337,9 @@ class ModelTrainer:
         group_id: str | None = None,
         backbone_checkpoint: str | None = None,
         skip_baseline_validation: bool = False,
+        baseline_dir_override: Path | None = None,
+        image_count_override: int | None = None,
+        baseline_versions_label: str | None = None,
     ) -> TrainingResult:
         """Train an anomaly detection model for a specific camera/zone.
 
@@ -263,6 +348,15 @@ class ModelTrainer:
         Args:
             anomaly_config: Optional AnomalyConfig with model-specific parameters
                 (e.g. dinomaly_backbone, dinomaly_encoder_layers for dinomaly2).
+            baseline_dir_override: Override the resolved baseline directory.
+                Used by multi-version training (痛点 2): the caller merges
+                several baseline versions into a tmp dir via _DatasetMerger
+                and passes that tmp path here. When set, ``image_count_override``
+                must also be supplied and the lifecycle gate is skipped (the
+                caller has pre-validated each version).
+            image_count_override: Image count for the override directory.
+            baseline_versions_label: Human/JSON label describing the version
+                set (e.g. ``v001+v003``); persisted to TrainingRecord.
         """
         start = time.monotonic()
 
@@ -270,14 +364,18 @@ class ModelTrainer:
             if progress_callback:
                 progress_callback(pct, msg)
 
-        if group_id:
+        if baseline_dir_override is not None:
+            baseline_dir = baseline_dir_override
+        elif group_id:
             baseline_dir = self._baseline_manager.get_group_baseline_dir(group_id, zone_id)
         else:
             baseline_dir = self._baseline_manager.get_baseline_dir(camera_id, zone_id)
 
-        # Lifecycle gate: only Verified or Active baselines can be used for training
+        # Lifecycle gate: only Verified or Active baselines can be used for
+        # training. Skipped for multi-version override because the caller
+        # (job_executor) already validated each constituent version.
         lifecycle = getattr(self._baseline_manager, "_lifecycle", None)
-        if lifecycle and baseline_dir.exists():
+        if lifecycle and baseline_dir.exists() and baseline_dir_override is None:
             version_name = baseline_dir.name
             lifecycle_camera = f"group:{group_id}" if group_id else camera_id
             ver_rec = lifecycle.get_version(lifecycle_camera, zone_id, version_name)
@@ -287,7 +385,10 @@ class ModelTrainer:
                     error=f"基���版本 {version_name} 处于 Draft 状态，未通过审核，不能用于训练",
                 )
 
-        image_count = self._baseline_manager.count_images(camera_id, zone_id)
+        if image_count_override is not None:
+            image_count = image_count_override
+        else:
+            image_count = self._baseline_manager.count_images(camera_id, zone_id)
 
         # Dinomaly2 supports few-shot mode with fewer images
         min_images = MIN_BASELINE_IMAGES
