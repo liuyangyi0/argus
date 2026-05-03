@@ -560,11 +560,19 @@ async def deploy_model(request: Request):
             camera_id=camera_id,
         )
     if registry_record is not None:
-        _, success = activate_model_version(
-            request,
-            registry_record.model_version_id,
-            triggered_by="dashboard",
-        )
+        try:
+            _, success = activate_model_version(
+                request,
+                registry_record.model_version_id,
+                triggered_by="dashboard",
+            )
+        except ValueError as e:
+            # P1 fix: registry.activate now refuses to skip the stage gate.
+            # Surface the message so the user knows to promote first.
+            return api_validation_error(
+                f"模型仍处于 candidate 阶段，无法直接部署。"
+                f"请先通过 shadow → canary → production 发布流程晋升。错误: {e}"
+            )
     else:
         success = camera_manager.reload_model(camera_id, str(resolved))
 
