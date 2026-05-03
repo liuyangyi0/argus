@@ -127,7 +127,6 @@ def _get_region_info(request: Request, region_id: int | None) -> dict:
             "region_name": None,
             "region_owner": None,
             "region_phone": None,
-            "region_email": None,
         }
 
     db = getattr(request.app.state, "db", None)
@@ -137,7 +136,6 @@ def _get_region_info(request: Request, region_id: int | None) -> dict:
             "region_name": None,
             "region_owner": None,
             "region_phone": None,
-            "region_email": None,
         }
 
     region = db.get_region(region_id)
@@ -147,7 +145,6 @@ def _get_region_info(request: Request, region_id: int | None) -> dict:
             "region_name": None,
             "region_owner": None,
             "region_phone": None,
-            "region_email": None,
         }
 
     return {
@@ -155,7 +152,6 @@ def _get_region_info(request: Request, region_id: int | None) -> dict:
         "region_name": region.name,
         "region_owner": region.owner,
         "region_phone": region.phone,
-        "region_email": region.email,
     }
 
 

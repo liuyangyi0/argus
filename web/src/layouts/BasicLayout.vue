@@ -37,7 +37,6 @@ const systemChildren: Array<{ path: string; label: string }> = [
   { path: '/system/cross-camera', label: '跨相机' },
   { path: '/system/users', label: '用户管理' },
   { path: '/system/regions', label: '区域管理' },
-  { path: '/system/notification-templates', label: '通知内容配置' },
 ]
 
 const modelsOpen = ref(isActive('/models'))

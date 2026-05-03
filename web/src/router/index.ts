@@ -27,7 +27,6 @@ const SYSTEM_TAB_TO_PATH: Record<string, string> = {
   'cross-camera': 'cross-camera',
   users: 'users',
   regions: 'regions',
-  'notification-templates': 'notification-templates',
 }
 
 function redirectFromTabQuery(prefix: string, mapping: Record<string, string>, defaultChild: string) {
@@ -220,12 +219,6 @@ const router = createRouter({
               name: 'system-regions',
               component: () => import('../views/system/RegionsView.vue'),
               meta: { title: '区域管理' },
-            },
-            {
-              path: 'notification-templates',
-              name: 'system-notification-templates',
-              component: () => import('../views/system/NotificationTemplatesView.vue'),
-              meta: { title: '通知内容配置' },
             },
           ],
         },
