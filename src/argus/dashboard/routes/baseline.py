@@ -109,6 +109,150 @@ def _reset_current_marker_after_delete(base_dir: Path, deleted_version: str) -> 
     marker.unlink(missing_ok=True)
 
 
+@router.get("/collections/json")
+def baseline_collections_json(request: Request):
+    """痛点 5: full collection inventory (incl. failed_* dirs) for the
+    Collections management page and DatasetSelector.
+
+    Returns one row per (camera_id, zone_id, version) directory under
+    ``data/baselines/`` with status (ok | partial | failed), captured_at,
+    acceptance_rate, session_label and image_count. Failed directories
+    are surfaced too so users can inspect what went wrong.
+    """
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
+    baselines_dir = Path(config.storage.baselines_dir)
+    if not baselines_dir.exists():
+        return api_success({"collections": []})
+
+    lifecycle = _get_lifecycle(request)
+    rows: list[dict] = []
+
+    for cam_dir in sorted(baselines_dir.iterdir()):
+        if not cam_dir.is_dir():
+            continue
+        camera_id = cam_dir.name
+        for zone_dir in sorted(cam_dir.iterdir()):
+            if not zone_dir.is_dir():
+                continue
+            zone_id = zone_dir.name
+            current_marker = zone_dir / "current.txt"
+            current_version = (
+                current_marker.read_text().strip()
+                if current_marker.exists() else None
+            )
+            for version_dir in sorted(zone_dir.iterdir()):
+                if not version_dir.is_dir():
+                    continue
+                if version_dir.name in {"__pycache__"}:
+                    continue
+                meta = _read_capture_meta(version_dir)
+                image_count = _count_version_images(version_dir)
+                # Failed dirs are renamed `failed_<ts>_v00x`; trust capture_meta
+                # status when present, otherwise infer from prefix.
+                status = meta.get("status") or (
+                    "failed" if version_dir.name.startswith("failed_") else "ok"
+                )
+                stats_block = meta.get("stats") or {}
+                acceptance = None
+                if isinstance(stats_block, dict):
+                    accepted = stats_block.get("accepted")
+                    grabbed = stats_block.get("total_grabbed")
+                    if accepted is not None and grabbed:
+                        try:
+                            acceptance = round(float(accepted) / float(grabbed), 4)
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            acceptance = None
+                version_state = None
+                if lifecycle and not version_dir.name.startswith("failed_"):
+                    ver_rec = lifecycle.get_version(camera_id, zone_id, version_dir.name)
+                    version_state = ver_rec.state if ver_rec else None
+                rows.append({
+                    "camera_id": camera_id,
+                    "zone_id": zone_id,
+                    "version": version_dir.name,
+                    "image_count": image_count,
+                    "status": status,
+                    "captured_at": meta.get("captured_at"),
+                    "session_label": meta.get("session_label", ""),
+                    "acceptance_rate": acceptance,
+                    "error": meta.get("error"),
+                    "state": version_state,
+                    "is_current": (
+                        current_version == version_dir.name
+                        if current_version else False
+                    ),
+                })
+
+    return api_success({"collections": rows})
+
+
+@router.post("/collections/{camera_id}/{zone_id}/{version}/activate")
+def collections_activate(
+    request: Request, camera_id: str, zone_id: str, version: str,
+):
+    """Set a version as the current baseline (痛点 5)."""
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+    baselines_dir = Path(config.storage.baselines_dir)
+    target = baselines_dir / camera_id / zone_id / version
+    if not target.is_dir():
+        return api_not_found(f"版本不存在: {camera_id}/{zone_id}/{version}")
+    if version.startswith("failed_"):
+        return api_validation_error("不能激活失败的采集版本")
+    from argus.anomaly.baseline import BaselineManager
+    bm = BaselineManager(baselines_dir=str(baselines_dir))
+    bm.set_current_version(camera_id, zone_id, version)
+    return api_success({"camera_id": camera_id, "zone_id": zone_id, "version": version})
+
+
+@router.post("/collections/{camera_id}/{zone_id}/{version}/retire")
+def collections_retire(
+    request: Request, camera_id: str, zone_id: str, version: str,
+):
+    """Mark a baseline version as retired via the lifecycle state machine."""
+    lifecycle = _get_lifecycle(request)
+    if lifecycle is None:
+        return api_unavailable("baseline lifecycle 未启用")
+    try:
+        from argus.storage.models import BaselineState
+        lifecycle.transition(camera_id, zone_id, version, BaselineState.RETIRED)
+    except Exception as e:  # noqa: BLE001
+        return api_validation_error(f"状态转换失败: {e}")
+    return api_success({"camera_id": camera_id, "zone_id": zone_id, "version": version})
+
+
+@router.delete("/collections/{camera_id}/{zone_id}/{version}")
+def collections_delete(
+    request: Request, camera_id: str, zone_id: str, version: str,
+    confirm: bool = False,
+):
+    """Delete a baseline version directory. Active versions require ``confirm=true``."""
+    config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+    baselines_dir = Path(config.storage.baselines_dir)
+    target = baselines_dir / camera_id / zone_id / version
+    if not target.is_dir():
+        return api_not_found(f"版本不存在: {camera_id}/{zone_id}/{version}")
+    current_marker = target.parent / "current.txt"
+    is_active = (
+        current_marker.exists() and current_marker.read_text().strip() == version
+    )
+    if is_active and not confirm:
+        return api_validation_error(
+            "该版本是当前激活基线，请先激活其它版本或带 confirm=true 强制删除"
+        )
+    import shutil as _shutil
+    _shutil.rmtree(target, ignore_errors=False)
+    if is_active:
+        _reset_current_marker_after_delete(target.parent, version)
+    return api_success({"camera_id": camera_id, "zone_id": zone_id, "version": version})
+
+
 @router.get("/list/json")
 def baseline_list_json(request: Request):
     """JSON API: list baselines by camera with version info."""

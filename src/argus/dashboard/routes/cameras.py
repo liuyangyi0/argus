@@ -514,6 +514,90 @@ async def stop_camera(request: Request, camera_id: str):
     return api_success({}, headers=htmx_toast_headers("摄像头已停止"))
 
 
+def _probe_source_blocking(source: str | int, timeout: float = 5.0) -> dict:
+    """Open a video source with a hard timeout and grab one frame.
+
+    Returns {ok, latency_ms, resolution, error}. Used by the test-connection
+    endpoints (痛点 8: surface camera reachability before saving) without
+    spinning up a full pipeline.
+    """
+    import threading
+
+    result: dict = {"ok": False}
+    start = time.monotonic()
+
+    def _worker() -> None:
+        cap = None
+        try:
+            # CAP_DSHOW for USB indices, default backend for URLs/files
+            if isinstance(source, int):
+                cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+            else:
+                # Convert pure-int strings to int for USB index detection
+                try:
+                    cap = cv2.VideoCapture(int(source), cv2.CAP_DSHOW)
+                except ValueError:
+                    cap = cv2.VideoCapture(str(source))
+            if not cap.isOpened():
+                result["error"] = "open_failed"
+                return
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                result["error"] = "no_frame"
+                return
+            result["ok"] = True
+            result["resolution"] = [int(frame.shape[1]), int(frame.shape[0])]
+        except Exception as e:  # noqa: BLE001
+            result["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            if cap is not None:
+                cap.release()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        # cv2.VideoCapture doesn't honour SIGTERM mid-open on Windows; we
+        # report timeout and let the thread clean up in the background.
+        result.setdefault("error", "timeout")
+    result["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
+    return result
+
+
+@router.post("/{camera_id}/test-connection")
+async def test_camera_connection(request: Request, camera_id: str):
+    """痛点 8: live-probe an already-configured camera in 5 seconds."""
+    cam_config = _find_camera_config(request, camera_id)
+    if cam_config is None:
+        return api_not_found(f"摄像头 {camera_id} 不存在")
+
+    try:
+        result = await asyncio.to_thread(_probe_source_blocking, cam_config.source, 5.0)
+    except RuntimeError:
+        return api_unavailable("服务正在关闭")
+    return api_success(result)
+
+
+@router.post("/test-connection-draft")
+async def test_camera_connection_draft(request: Request):
+    """痛点 8: probe arbitrary source/url before the camera is saved.
+
+    Body: { "source": str | int, "protocol"?: str }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return api_validation_error("无效的JSON请求")
+    source = body.get("source")
+    if source is None or source == "":
+        return api_validation_error("source 不能为空")
+    try:
+        result = await asyncio.to_thread(_probe_source_blocking, source, 5.0)
+    except RuntimeError:
+        return api_unavailable("服务正在关闭")
+    return api_success(result)
+
+
 @router.get("/usb-devices")
 async def usb_devices(request: Request):
     """Probe USB camera indices 0-9 and return available devices."""
@@ -561,13 +645,26 @@ def cameras_json(request: Request):
     if not camera_manager:
         return api_success({"cameras": []})
 
-    return api_success({"cameras": [
-        {
+    health_monitor = getattr(request.app.state, "health_monitor", None)
+
+    def _row(s):
+        # 痛点 8: include health + pipeline_mode so the list page can render
+        # connectivity badges and (痛点 4) mode badges without a second roundtrip.
+        health = (
+            health_monitor.get_camera_health(s.camera_id)
+            if health_monitor is not None else None
+        )
+        pipeline_mode = camera_manager.get_pipeline_mode(s.camera_id)
+        if not isinstance(pipeline_mode, str):
+            pipeline_mode = None
+        return {
             "camera_id": s.camera_id,
             "name": s.name,
             **_get_region_info(request, getattr(_find_camera_config(request, s.camera_id), "region_id", None)),
             "connected": s.connected,
             "running": s.running,
+            "pipeline_mode": pipeline_mode,
+            "health": health,
             "stats": {
                 "frames_captured": s.stats.frames_captured,
                 "frames_analyzed": s.stats.frames_analyzed,
@@ -576,8 +673,8 @@ def cameras_json(request: Request):
                 "avg_latency_ms": round(s.stats.avg_latency_ms, 1),
             } if s.stats else None,
         }
-        for s in camera_manager.get_status()
-    ]})
+
+    return api_success({"cameras": [_row(s) for s in camera_manager.get_status()]})
 
 
 @router.get("/{camera_id}/detail/json")

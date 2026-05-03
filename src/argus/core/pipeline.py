@@ -2471,12 +2471,50 @@ class DetectionPipeline:
             self._zone_mask_cache.clear()
         logger.info("pipeline.zones_updated", camera_id=self.camera_config.camera_id, zones=len(zones))
 
-    def update_thresholds(self, anomaly_threshold: float | None = None) -> None:
-        """Hot-update detection thresholds without restart."""
+    def update_thresholds(
+        self,
+        anomaly_threshold: float | None = None,
+        *,
+        severity_changed: bool = False,
+        temporal_changed: bool = False,
+        suppression_changed: bool = False,
+    ) -> dict[str, bool]:
+        """Hot-update detection thresholds without restart (痛点 9).
+
+        AlertGrader holds a reference to the shared AlertConfig object, so
+        modifications to ``alerts.severity_thresholds`` / ``alerts.temporal``
+        / ``alerts.suppression`` are observed automatically. The boolean
+        flags here only refresh pipeline-level derived caches (e.g.
+        heartbeat seconds) that snapshot config values once.
+
+        Returns a per-section ``{section: True}`` map that the route layer
+        can surface to the UI as ``hot_reloaded`` indicators.
+        """
+        applied: dict[str, bool] = {}
         with self._config_lock:
             if anomaly_threshold is not None:
                 self._anomaly_detector.threshold = anomaly_threshold
-        logger.info("pipeline.thresholds_updated", camera_id=self.camera_config.camera_id)
+                applied["anomaly_threshold"] = True
+            if temporal_changed:
+                # Refresh derived heartbeat caches from the (already-mutated)
+                # alert_config.temporal reference.
+                try:
+                    new_max_gap = self._alert_grader._config.temporal.max_gap_seconds
+                    self._heartbeat_seconds = new_max_gap
+                    self._low_light_heartbeat_seconds = new_max_gap / 2
+                    applied["temporal"] = True
+                except AttributeError:
+                    applied["temporal"] = False
+            if severity_changed:
+                applied["severity"] = True  # AlertGrader reads via self._config ref
+            if suppression_changed:
+                applied["suppression"] = True  # ditto
+        logger.info(
+            "pipeline.thresholds_updated",
+            camera_id=self.camera_config.camera_id,
+            applied=list(applied.keys()),
+        )
+        return applied
 
     def get_diagnostics_buffer(self) -> DiagnosticsBuffer:
         """Get the per-frame diagnostics ring buffer (DET-008)."""

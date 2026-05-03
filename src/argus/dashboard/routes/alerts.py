@@ -230,7 +230,7 @@ async def alert_workflow_transition(request: Request, alert_id: str):
         notes = f"[{category}]"
 
     valid_statuses = {
-        "acknowledged", "investigating", "resolved", "closed",
+        "acknowledged", "confirmed_anomaly", "investigating", "resolved", "closed",
         "false_positive", "uncertain",
     }
     if new_status not in valid_statuses:
@@ -544,6 +544,59 @@ def acknowledge_alert(request: Request, alert_id: str):
     return api_not_found("告警不存在或操作失败")
 
 
+@router.post("/{alert_id}/confirm-anomaly")
+def confirm_real_anomaly(request: Request, alert_id: str):
+    """痛点 10: explicitly mark an alert as a real anomaly (FN feedback).
+
+    Mirrors mark_false_positive but with positive intent — the snapshot
+    flows into the validation set via FeedbackManager so the next training
+    run sees this case as a confirmed positive sample.
+    """
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+    success = db.update_alert_workflow(
+        alert_id, "confirmed_anomaly", notes="确认真异常 / FN 反馈",
+    )
+    if not success:
+        return api_not_found("告警不存在或操作失败")
+
+    audit = getattr(request.app.state, "audit_logger", None)
+    client_ip = request.client.host if request.client else ""
+    if audit:
+        audit.log(
+            user="operator",
+            action="confirm_anomaly",
+            target_type="alert",
+            target_id=alert_id,
+            ip_address=client_ip,
+        )
+
+    _submit_workflow_feedback(request, alert_id, "confirmed_anomaly")
+    return api_success({"alert_id": alert_id, "message": "已确认真异常"})
+
+
+@router.get("/feedback-stats")
+def feedback_stats(request: Request, camera_id: str | None = None):
+    """痛点 10: aggregate FP / Confirmed counts for the alerts dashboard card."""
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+    summary_fn = getattr(db, "get_feedback_summary", None)
+    if summary_fn is None:
+        return api_success({"fp_count": 0, "confirmed_count": 0, "fp_rate": 0.0})
+    raw = summary_fn(camera_id=camera_id) if camera_id else summary_fn()
+    fp_count = int(raw.get("false_positive", 0) if isinstance(raw, dict) else 0)
+    confirmed_count = int(raw.get("confirmed", 0) if isinstance(raw, dict) else 0)
+    total = fp_count + confirmed_count
+    fp_rate = round(fp_count / total, 4) if total else 0.0
+    return api_success({
+        "fp_count": fp_count,
+        "confirmed_count": confirmed_count,
+        "fp_rate": fp_rate,
+    })
+
+
 @router.post("/{alert_id}/false-positive")
 def mark_false_positive(request: Request, alert_id: str):
     """Mark an alert as a false positive and submit to feedback queue.
@@ -612,13 +665,16 @@ def _submit_workflow_feedback(
     """Submit feedback to the queue when an alert workflow transition happens.
 
     Maps workflow statuses to feedback types:
-    - acknowledged → confirmed
-    - false_positive → false_positive
-    - uncertain → uncertain
+    - confirmed_anomaly → confirmed (痛点 10: explicit "this WAS a real anomaly")
+    - acknowledged     → confirmed (legacy alias kept for backwards compat —
+                                    UX v2 prefers confirmed_anomaly)
+    - false_positive   → false_positive
+    - uncertain        → uncertain
     Other statuses (investigating, resolved, closed) don't generate feedback.
     """
     _STATUS_TO_FEEDBACK = {
         "acknowledged": "confirmed",
+        "confirmed_anomaly": "confirmed",
         "false_positive": "false_positive",
         "uncertain": "uncertain",
     }
