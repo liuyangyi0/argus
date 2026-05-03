@@ -166,6 +166,23 @@ async def create_training_job(request: Request):
                 f"超参数校验失败: {'; '.join(param_errors)}",
             )
 
+    # 痛点 2: dataset_selection 多版本合并训练。Validate the JSON shape here
+    # so a malformed payload is rejected before the job lands in the queue.
+    dataset_selection_raw = body.get("dataset_selection")
+    dataset_selection_serialized: str | None = None
+    if dataset_selection_raw is not None:
+        try:
+            from argus.anomaly.dataset_selection import DatasetSelection
+
+            sel = DatasetSelection.from_payload(dataset_selection_raw)
+        except (ValueError, TypeError) as e:
+            return api_validation_error(f"dataset_selection 无效: {e}")
+        if camera_id and sel.camera_id != camera_id:
+            return api_validation_error(
+                f"dataset_selection 摄像头 ({sel.camera_id}) 与 camera_id ({camera_id}) 不一致"
+            )
+        dataset_selection_serialized = sel.to_json()
+
     job_id = str(uuid.uuid4())[:12]
 
     base_model_version = None
@@ -186,6 +203,7 @@ async def create_training_job(request: Request):
         status=TrainingJobStatus.PENDING_CONFIRMATION.value,
         base_model_version=base_model_version,
         dataset_version=body.get("dataset_version"),
+        dataset_selection=dataset_selection_serialized,
         hyperparameters=json.dumps(hyperparams) if hyperparams else None,
     )
 

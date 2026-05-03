@@ -309,19 +309,51 @@ class TrainingJobExecutor:
         if param_errors:
             raise ValueError(f"Invalid hyperparameters: {'; '.join(param_errors)}")
 
-        # Run training (trainer already has validation wired in)
+        # 痛点 2: optional multi-version dataset selection. When provided,
+        # we merge several baseline versions into a tmp dir before training.
+        selection = None
+        if job.dataset_selection:
+            from argus.anomaly.dataset_selection import DatasetSelection
+
+            try:
+                selection = DatasetSelection.from_json(job.dataset_selection)
+            except ValueError as e:
+                raise ValueError(f"dataset_selection 无效: {e}")
+            if selection.camera_id != camera_id:
+                raise ValueError(
+                    f"dataset_selection 摄像头 ({selection.camera_id}) "
+                    f"与 job.camera_id ({camera_id}) 不一致"
+                )
+
+        train_kwargs = dict(
+            camera_id=camera_id,
+            #zone_id=job.zone_id or "default",
+            zone_id="default", # 基线采集图片默认存储路径是 baselines/{camera_id}/default，所以这里默认使用 default zone
+            model_type=job.model_type or params.get("model_type", "patchcore"),
+            image_size=params.get("image_size", 256),
+            export_format=params.get("export_format", "openvino"),
+            quantization=params.get("quantization", "fp16"),
+            backbone_checkpoint=backbone_checkpoint,
+            skip_baseline_validation=params.get("skip_baseline_validation", False),
+        )
+
         with self._training_mode_guard(reason=f"head_train:{job.job_id}"):
-            result = self._trainer.train(
-                camera_id=camera_id,
-                #zone_id=job.zone_id or "default",
-                zone_id="default", # 基线采集图片默认存储路径是 baselines/{camera_id}/default，所以这里默认使用 default zone
-                model_type=job.model_type or params.get("model_type", "patchcore"),
-                image_size=params.get("image_size", 256),
-                export_format=params.get("export_format", "openvino"),
-                quantization=params.get("quantization", "fp16"),
-                backbone_checkpoint=backbone_checkpoint,
-                skip_baseline_validation=params.get("skip_baseline_validation", False),
-            )
+            if selection is not None:
+                from argus.anomaly.trainer import _DatasetMerger, _build_merger_items
+
+                bm = self._trainer._baseline_manager
+                resolved_dirs = bm.resolve_dataset_dirs(selection)
+                image_count = bm.count_images_multi(resolved_dirs)
+                merger_items = _build_merger_items(selection, resolved_dirs)
+                with _DatasetMerger(merger_items) as merged_root:
+                    result = self._trainer.train(
+                        **train_kwargs,
+                        baseline_dir_override=merged_root,
+                        image_count_override=image_count,
+                        baseline_versions_label=selection.version_summary(),
+                    )
+            else:
+                result = self._trainer.train(**train_kwargs)
 
         if result.status.value != TrainingStatus.COMPLETE.value:
             raise RuntimeError(result.error or f"Training failed with status {result.status}")

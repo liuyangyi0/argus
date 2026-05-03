@@ -944,6 +944,19 @@ class RetrainingConfig(BaseModel):
     auto_deploy_min_grade: str = Field(
         default="B", description="Minimum quality grade for auto-deploy (A/B/C/F)",
     )
+    # 痛点 2: which captures auto-retraining feeds into the trainer.
+    # current_only -- always train on the active version (legacy behaviour).
+    # all_active   -- merge every Active-state version for that camera/zone.
+    # since_last_train -- merge versions newer than the last successful run.
+    dataset_strategy: str = Field(
+        default="current_only",
+        pattern="^(current_only|all_active|since_last_train)$",
+        description="Auto-retrain dataset selection strategy",
+    )
+    dataset_lookback_days: int | None = Field(
+        default=None, ge=1, le=365,
+        description="When dataset_strategy='since_last_train', cap version age in days",
+    )
 
     # Two-level training architecture
     backbone_retrain_interval_days: int = Field(
