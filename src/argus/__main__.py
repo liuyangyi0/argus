@@ -388,6 +388,8 @@ def main():
             trainer=model_trainer,
             model_registry=model_reg,
             baseline_manager=baseline_manager,
+            baseline_lifecycle=getattr(app.state, "baseline_lifecycle", None),
+            database=db,
         )
         create_backbone_retraining_task(
             scheduler=scheduler,

@@ -277,6 +277,156 @@ class TestCreateRetrainingTask:
         assert kwargs["action"] == "auto_retrain_activation_blocked"
         assert kwargs["target_id"] == "cam_01-patchcore-20260406-001"
 
+    def test_all_active_strategy_merges_eligible_versions(self):
+        """P2 follow-up: dataset_strategy='all_active' must call trainer with
+        baseline_dir_override pointing at a merged tmp dir built from every
+        VERIFIED + ACTIVE version."""
+        from argus.core.scheduler import create_retraining_task
+
+        scheduler = MagicMock()
+        config = self._make_config(min_new_baselines=5)
+        config.retraining = RetrainingConfig(
+            enabled=True, min_new_baselines=5, dataset_strategy="all_active",
+        )
+        trainer = MagicMock()
+        trainer.train.return_value = MagicMock(quality_grade="A", status=MagicMock(value="COMPLETE"))
+
+        baseline_mgr = MagicMock()
+        baseline_mgr.count_images.return_value = 50
+        # Multi-dir resolution returns two paths
+        from pathlib import Path
+        baseline_mgr.resolve_dataset_dirs.return_value = [Path("/tmp/v1"), Path("/tmp/v2")]
+        baseline_mgr.count_images_multi.return_value = 80
+
+        registry = MagicMock()
+        registry.list_models.return_value = []
+
+        # Lifecycle returns 2 eligible versions (VERIFIED + ACTIVE)
+        lifecycle = MagicMock()
+        v1 = MagicMock(); v1.version = "v001"
+        v2 = MagicMock(); v2.version = "v003"
+        lifecycle.get_eligible_versions.return_value = [v1, v2]
+
+        with patch("argus.anomaly.trainer._DatasetMerger") as merger_cls, \
+             patch("argus.anomaly.trainer._build_merger_items") as build_items:
+            merger = MagicMock()
+            merger.__enter__ = MagicMock(return_value=Path("/tmp/merged"))
+            merger.__exit__ = MagicMock(return_value=False)
+            merger_cls.return_value = merger
+            build_items.return_value = [("a", Path("/tmp/v1")), ("b", Path("/tmp/v2"))]
+
+            create_retraining_task(
+                scheduler=scheduler,
+                config=config,
+                camera_configs=[self._make_camera()],
+                trainer=trainer,
+                model_registry=registry,
+                baseline_manager=baseline_mgr,
+                baseline_lifecycle=lifecycle,
+            )
+            callback = scheduler.add_interval_task.call_args[0][1]
+            callback()
+
+        # Lifecycle was queried with since=None (no since_last_train cap)
+        lifecycle.get_eligible_versions.assert_called_once()
+        kwargs = lifecycle.get_eligible_versions.call_args.kwargs
+        assert kwargs["since"] is None
+
+        trainer.train.assert_called_once()
+        train_kwargs = trainer.train.call_args.kwargs
+        assert train_kwargs["baseline_dir_override"] == Path("/tmp/merged")
+        assert train_kwargs["image_count_override"] == 80
+        assert "v001" in train_kwargs["baseline_versions_label"]
+        assert "v003" in train_kwargs["baseline_versions_label"]
+
+    def test_since_last_train_strategy_uses_last_completion(self):
+        """since_last_train must filter eligible versions by the timestamp of
+        the most recent successful TrainingRecord."""
+        from argus.core.scheduler import create_retraining_task
+        from datetime import datetime, timezone
+
+        scheduler = MagicMock()
+        config = self._make_config(min_new_baselines=5)
+        config.retraining = RetrainingConfig(
+            enabled=True, min_new_baselines=5, dataset_strategy="since_last_train",
+        )
+        trainer = MagicMock()
+        trainer.train.return_value = MagicMock(quality_grade="A", status=MagicMock(value="COMPLETE"))
+
+        baseline_mgr = MagicMock()
+        baseline_mgr.count_images.return_value = 50
+
+        registry = MagicMock()
+        registry.list_models.return_value = []
+
+        lifecycle = MagicMock()
+        lifecycle.get_eligible_versions.return_value = []  # nothing newer → fallback
+
+        # Database returns one COMPLETE training record
+        last_train = datetime(2026, 4, 1, 12, 0, 0, tzinfo=timezone.utc)
+        db = MagicMock()
+        record = MagicMock()
+        record.status = "COMPLETE"
+        record.trained_at = last_train
+        db.get_training_history.return_value = [record]
+
+        create_retraining_task(
+            scheduler=scheduler,
+            config=config,
+            camera_configs=[self._make_camera()],
+            trainer=trainer,
+            model_registry=registry,
+            baseline_manager=baseline_mgr,
+            baseline_lifecycle=lifecycle,
+            database=db,
+        )
+        callback = scheduler.add_interval_task.call_args[0][1]
+        callback()
+
+        lifecycle.get_eligible_versions.assert_called_once()
+        kwargs = lifecycle.get_eligible_versions.call_args.kwargs
+        # since must be the last training timestamp
+        assert kwargs["since"] == last_train
+
+        # No eligible versions → trainer falls back to single-version legacy path
+        # (no baseline_dir_override kwarg in train call)
+        train_kwargs = trainer.train.call_args.kwargs
+        assert "baseline_dir_override" not in train_kwargs
+
+    def test_dataset_strategy_unwired_when_lifecycle_missing(self):
+        """all_active without baseline_lifecycle must log warning + fall back."""
+        from argus.core.scheduler import create_retraining_task
+
+        scheduler = MagicMock()
+        config = self._make_config(min_new_baselines=5)
+        config.retraining = RetrainingConfig(
+            enabled=True, min_new_baselines=5, dataset_strategy="all_active",
+        )
+        trainer = MagicMock()
+        trainer.train.return_value = MagicMock(quality_grade="A", status=MagicMock(value="COMPLETE"))
+
+        baseline_mgr = MagicMock()
+        baseline_mgr.count_images.return_value = 50
+
+        registry = MagicMock()
+        registry.list_models.return_value = []
+
+        create_retraining_task(
+            scheduler=scheduler,
+            config=config,
+            camera_configs=[self._make_camera()],
+            trainer=trainer,
+            model_registry=registry,
+            baseline_manager=baseline_mgr,
+            # no baseline_lifecycle → fallback to current_only
+        )
+        callback = scheduler.add_interval_task.call_args[0][1]
+        callback()
+
+        # Train still runs but on legacy single-version path
+        train_kwargs = trainer.train.call_args.kwargs
+        assert "baseline_dir_override" not in train_kwargs
+
     def test_camera_failure_isolation(self):
         """One camera failing should not block others."""
         from argus.core.scheduler import create_retraining_task
