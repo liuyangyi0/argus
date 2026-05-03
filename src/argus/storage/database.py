@@ -85,6 +85,9 @@ _AUTO_MIGRATIONS: list[tuple[str, str, str]] = [
     # Phase 2: raw per-sample scores/labels for threshold slider
     ("training_records", "val_scores_json", "TEXT"),
     ("training_records", "val_labels_json", "TEXT"),
+    # 痛点 2 (multi-version dataset selection)
+    ("training_records", "baseline_versions", "TEXT"),
+    ("training_jobs", "dataset_selection", "TEXT"),
     ("models", "backbone_version_id", "VARCHAR(128)"),
     # Model release pipeline
     ("models", "stage", "VARCHAR(20) DEFAULT 'candidate'"),
