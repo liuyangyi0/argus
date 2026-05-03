@@ -161,6 +161,17 @@ class AlertDispatcher:
                 pass
         return payload
 
+    def set_websocket_broadcaster(self, broadcaster: Callable[[str, dict], None] | None) -> None:
+        """Wire (or rewire) the WebSocket broadcaster after construction.
+
+        The dispatcher is built before the dashboard FastAPI app — and thus
+        before ``ws_manager`` exists — so production code constructs the
+        dispatcher with ``on_alert=None`` and calls this setter once the app
+        is up. Without this hookup alerts are never pushed to the dashboard
+        in real time (P1 audit finding 2026-05).
+        """
+        self._on_alert_ws = broadcaster
+
     def dispatch(self, alert: Alert) -> None:
         """Send an alert to all configured channels."""
         evidence_unavailable = False

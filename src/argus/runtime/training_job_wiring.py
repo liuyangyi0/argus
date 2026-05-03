@@ -43,17 +43,24 @@ def register_training_job_processing(
     from argus.anomaly.job_executor import TrainingJobExecutor
     from argus.storage.model_registry import ModelRegistry
 
+    # P1 fix (2026-05): training completion no longer hot-reloads the new
+    # model into the running pipeline. Newly trained models are registered
+    # as CANDIDATE and must walk the candidate → shadow → canary → production
+    # release pipeline before activation. The dashboard's "activate model"
+    # button calls model_runtime.activate_model_version which then runs
+    # sync_model_record_runtime — that is the single supported path for
+    # putting a new model on the inference hot path.
     def _on_model_trained(camera_id: str, model_path: Path) -> None:
-        if camera_manager is None:
-            return
-        pipeline = camera_manager.get_pipeline(camera_id)
-        if pipeline is not None:
-            pipeline.reload_anomaly_model(model_path)
-            logger.info(
-                "training.model_hot_reloaded",
-                camera_id=camera_id,
-                model_path=str(model_path),
-            )
+        logger.info(
+            "training.candidate_registered",
+            camera_id=camera_id,
+            model_path=str(model_path),
+            msg=(
+                "Training complete; candidate model registered. Promote via "
+                "the release pipeline (shadow → canary → production) to make "
+                "it the active inference model."
+            ),
+        )
 
     # Silence unused-import warnings — caller owns these lifecycles now.
     _ = baseline_manager
