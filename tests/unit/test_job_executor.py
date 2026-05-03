@@ -92,6 +92,114 @@ def _make_trainer(model_dir: Path, exports_dir: Path) -> MagicMock:
     return trainer
 
 
+def test_dataset_selection_drives_multi_version_training(
+    db, registry, model_artifacts, tmp_path,
+):
+    """痛点 2: when job.dataset_selection is set, executor must merge the
+    selected versions and pass baseline_dir_override / image_count_override
+    / baseline_versions_label to trainer.train."""
+    from argus.anomaly.dataset_selection import (
+        DatasetSelection,
+        DatasetSelectionItem,
+    )
+
+    model_dir, _ = model_artifacts
+    baselines_root = tmp_path / "baselines"
+    # Two real baseline versions
+    for ver in ("v001", "v003"):
+        d = baselines_root / "cam_01" / "default" / ver
+        d.mkdir(parents=True)
+        for i in range(3):
+            (d / f"baseline_{i:05d}.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    selection = DatasetSelection(
+        items=[
+            DatasetSelectionItem("cam_01", "default", "v001"),
+            DatasetSelectionItem("cam_01", "default", "v003"),
+        ],
+        total_frames=6,
+    )
+
+    job = TrainingJobRecord(
+        job_id="job-multi-ds",
+        job_type=TrainingJobType.ANOMALY_HEAD.value,
+        camera_id="cam_01",
+        zone_id="default",
+        model_type="patchcore",
+        trigger_type="manual",
+        status=TrainingJobStatus.QUEUED.value,
+        hyperparameters=json.dumps({"skip_baseline_validation": True}),
+        dataset_selection=selection.to_json(),
+    )
+    db.save_training_job(job)
+
+    trainer = _make_trainer(model_dir, tmp_path / "exports")
+    # BaselineManager wired to our fake baselines_root
+    from argus.anomaly.baseline import BaselineManager
+    trainer._baseline_manager = BaselineManager(baselines_dir=str(baselines_root))
+
+    executor = TrainingJobExecutor(
+        database=db,
+        trainer=trainer,
+        baselines_dir=baselines_root,
+        model_packages_dir=tmp_path / "packages",
+    )
+    executor.execute(job.job_id)
+
+    # trainer.train must have been called once with override args populated
+    call = trainer.train.call_args
+    kwargs = call.kwargs
+    assert kwargs["baseline_dir_override"] is not None
+    assert kwargs["baseline_dir_override"].is_dir() is False, (
+        "merger tmp dir should be cleaned up after the with-block"
+    )
+    assert kwargs["image_count_override"] == 6
+    assert kwargs["baseline_versions_label"] == "v001+v003 / 6 frames"
+
+
+def test_dataset_selection_camera_mismatch_fails_job(
+    db, registry, model_artifacts, tmp_path,
+):
+    """A dataset_selection that targets a different camera must abort the
+    job with a clear error rather than training the wrong baseline."""
+    from argus.anomaly.dataset_selection import (
+        DatasetSelection,
+        DatasetSelectionItem,
+    )
+
+    model_dir, _ = model_artifacts
+
+    bad_selection = DatasetSelection(
+        items=[DatasetSelectionItem("cam_99", "default", "v001")],
+    )
+    job = TrainingJobRecord(
+        job_id="job-cam-mismatch",
+        job_type=TrainingJobType.ANOMALY_HEAD.value,
+        camera_id="cam_01",
+        zone_id="default",
+        model_type="patchcore",
+        trigger_type="manual",
+        status=TrainingJobStatus.QUEUED.value,
+        hyperparameters=json.dumps({"skip_baseline_validation": True}),
+        dataset_selection=bad_selection.to_json(),
+    )
+    db.save_training_job(job)
+
+    trainer = _make_trainer(model_dir, tmp_path / "exports")
+    executor = TrainingJobExecutor(
+        database=db,
+        trainer=trainer,
+        baselines_dir=tmp_path / "baselines",
+        model_packages_dir=tmp_path / "packages",
+    )
+    executor.execute(job.job_id)
+
+    updated = db.get_training_job(job.job_id)
+    assert updated.status == TrainingJobStatus.FAILED.value
+    assert "不一致" in (updated.error or "")
+    trainer.train.assert_not_called()
+
+
 def test_packaging_failure_retires_candidate_and_marks_job_failed(
     db, registry, model_artifacts, queued_job, tmp_path,
 ):

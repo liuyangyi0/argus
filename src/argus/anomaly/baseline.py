@@ -135,6 +135,40 @@ class BaselineManager:
             return 0
         return len(list(base_dir.glob("*.png"))) + len(list(base_dir.glob("*.jpg")))
 
+    def resolve_dataset_dirs(self, selection) -> list[Path]:
+        """Resolve a DatasetSelection to absolute baseline directories (痛点 2).
+
+        Each selection item must point at an existing version directory under
+        ``baselines_dir/<camera_id>/<zone_id>/<version>``; missing or empty
+        directories raise ``FileNotFoundError`` so the caller fails loudly
+        rather than silently producing an empty training set.
+        """
+        if selection is None:
+            raise ValueError("DatasetSelection is required")
+        resolved: list[Path] = []
+        for item in selection.items:
+            path = self.baselines_dir / item.camera_id / item.zone_id / item.version
+            if not path.is_dir():
+                raise FileNotFoundError(
+                    f"Baseline version not found: {item.camera_id}/{item.zone_id}/{item.version}"
+                )
+            if not (any(path.glob("*.png")) or any(path.glob("*.jpg"))):
+                raise FileNotFoundError(
+                    f"Baseline version has no images: {item.camera_id}/{item.zone_id}/{item.version}"
+                )
+            resolved.append(path)
+        return resolved
+
+    @staticmethod
+    def count_images_multi(dirs: list[Path]) -> int:
+        """Sum image counts across multiple baseline directories."""
+        total = 0
+        for path in dirs:
+            if not path.is_dir():
+                continue
+            total += len(list(path.glob("*.png"))) + len(list(path.glob("*.jpg")))
+        return total
+
     # ── Per-image CRUD (for manual baseline maintenance) ──
 
     # Accept only baseline_NNNNN.png / .jpg / .jpeg filenames. The 5-digit

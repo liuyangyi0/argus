@@ -314,6 +314,11 @@ class TrainingRecord(Base):
     val_scores_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     val_labels_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Multi-dataset training (痛点 2): JSON array of baseline versions when
+    # the run merged multiple captures, else NULL (single version goes in
+    # baseline_version above for backwards compatibility).
+    baseline_versions: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Output validation (TRN-006)
     model_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     export_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -338,6 +343,7 @@ class TrainingRecord(Base):
             "model_type": self.model_type,
             "export_format": self.export_format,
             "baseline_version": self.baseline_version,
+            "baseline_versions": self.baseline_versions,
             "baseline_count": self.baseline_count,
             "train_count": self.train_count,
             "val_count": self.val_count,
@@ -613,6 +619,10 @@ class TrainingJobRecord(Base):
     # Model lineage
     base_model_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     dataset_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 痛点 2: multi-version dataset selection serialized as JSON
+    # (DatasetSelection.to_json output). When NULL the trainer falls back
+    # to the single dataset_version above (backwards compatible).
+    dataset_selection: Mapped[str | None] = mapped_column(Text, nullable=True)
     hyperparameters: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
 
     # Results
@@ -644,6 +654,7 @@ class TrainingJobRecord(Base):
             "status": self.status,
             "base_model_version": self.base_model_version,
             "dataset_version": self.dataset_version,
+            "dataset_selection": self.dataset_selection,
             "hyperparameters": self.hyperparameters,
             "metrics": self.metrics,
             "artifacts_path": self.artifacts_path,

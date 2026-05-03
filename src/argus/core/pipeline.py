@@ -92,6 +92,11 @@ class PipelineMode(str, Enum):
     ACTIVE = "active"  # Normal detection + alerts
     MAINTENANCE = "maintenance"  # MOG2 frozen, detection + alerts continue
     LEARNING = "learning"  # Full pipeline runs but alerts suppressed
+    COLLECTION = "collection"  # Capture mode: skip YOLO + Anomaly, raw frame still flows
+    TRAINING = "training"  # Training in progress: skip YOLO + Anomaly to free GPU
+
+
+_DETECTION_SKIPPED_MODES = (PipelineMode.COLLECTION, PipelineMode.TRAINING)
 
 
 def _severity_rank(severity) -> int:
@@ -482,6 +487,12 @@ class DetectionPipeline:
         self._learning_start_time: float | None = None
         self._learning_duration: float = 0.0
         self._auto_learning_complete = False
+
+        # COLLECTION/TRAINING watchdog: long-running tasks may crash without
+        # resetting the mode; auto-recover after max_duration to avoid
+        # permanent stuck state.
+        self._mode_session_start_time: float | None = None
+        self._mode_session_max_duration: float = 4 * 3600.0  # 4 hours
 
         # 5.1/5.2: Per-frame inference tracking for CameraInferenceRunner
         self._last_inference_record: InferenceRecord | None = None
@@ -1044,6 +1055,24 @@ class DetectionPipeline:
                 msg="Learning mode expired, switching to ACTIVE",
             )
 
+        # COLLECTION/TRAINING watchdog: recover if a long-running task crashed
+        # before resetting the mode (otherwise pipeline would skip detection forever).
+        if (
+            self._mode_session_start_time is not None
+            and self.mode in _DETECTION_SKIPPED_MODES
+            and (time.monotonic() - self._mode_session_start_time) >= self._mode_session_max_duration
+        ):
+            with self._mode_lock:
+                stuck_mode = self._mode
+                self._mode = PipelineMode.ACTIVE
+                self._mode_session_start_time = None
+            logger.warning(
+                "pipeline.mode_session_timeout_recovered",
+                camera_id=frame_data.camera_id,
+                stuck_mode=stuck_mode.value,
+                max_duration_seconds=self._mode_session_max_duration,
+            )
+
         current_mode = self.mode
         # Save raw frame reference before zone masking — apply() returns a new
         # array (cv2.bitwise_and), so the original frame is not mutated.
@@ -1115,6 +1144,21 @@ class DetectionPipeline:
         # Save latest frame reference — get_latest_frame() copies on read
         with self._latest_frame_lock:
             self._latest_frame = frame
+
+        # COLLECTION/TRAINING modes skip detection stages entirely (痛点 1/3).
+        # raw_frame and latest_frame are still updated above so the capture
+        # thread / video wall keep working; YOLO + Anomalib + MOG2 consumption
+        # are bypassed to free CPU/GPU and avoid contaminating alert history.
+        if current_mode in _DETECTION_SKIPPED_MODES:
+            diag.stages.append(StageResult(
+                stage_name="mode_skip",
+                duration_ms=0.0,
+                skipped=True,
+                skip_reason=current_mode.value,
+            ))
+            diag.total_duration_ms = (time.monotonic() - start) * 1000
+            self._diagnostics.append(diag)
+            return None
 
         # Single full-resolution BGR->GRAY conversion shared by brightness
         # detection (below) and MOG2 stabilization. Valid only for this frame.
@@ -2389,17 +2433,22 @@ class DetectionPipeline:
         with self._mode_lock:
             return self._mode
 
-    def set_mode(self, mode: PipelineMode) -> None:
-        """Set pipeline operating mode (DET-006)."""
+    def set_mode(self, mode: PipelineMode) -> PipelineMode:
+        """Set pipeline operating mode (DET-006). Returns previous mode."""
         with self._mode_lock:
             old = self._mode
             self._mode = mode
+            if mode in _DETECTION_SKIPPED_MODES:
+                self._mode_session_start_time = time.monotonic()
+            else:
+                self._mode_session_start_time = None
         logger.info(
             "pipeline.mode_changed",
             camera_id=self.camera_config.camera_id,
             old=old.value,
             new=mode.value,
         )
+        return old
 
     def get_learning_progress(self) -> dict:
         """Return learning mode progress for dashboard display (DET-010)."""
@@ -2422,12 +2471,50 @@ class DetectionPipeline:
             self._zone_mask_cache.clear()
         logger.info("pipeline.zones_updated", camera_id=self.camera_config.camera_id, zones=len(zones))
 
-    def update_thresholds(self, anomaly_threshold: float | None = None) -> None:
-        """Hot-update detection thresholds without restart."""
+    def update_thresholds(
+        self,
+        anomaly_threshold: float | None = None,
+        *,
+        severity_changed: bool = False,
+        temporal_changed: bool = False,
+        suppression_changed: bool = False,
+    ) -> dict[str, bool]:
+        """Hot-update detection thresholds without restart (痛点 9).
+
+        AlertGrader holds a reference to the shared AlertConfig object, so
+        modifications to ``alerts.severity_thresholds`` / ``alerts.temporal``
+        / ``alerts.suppression`` are observed automatically. The boolean
+        flags here only refresh pipeline-level derived caches (e.g.
+        heartbeat seconds) that snapshot config values once.
+
+        Returns a per-section ``{section: True}`` map that the route layer
+        can surface to the UI as ``hot_reloaded`` indicators.
+        """
+        applied: dict[str, bool] = {}
         with self._config_lock:
             if anomaly_threshold is not None:
                 self._anomaly_detector.threshold = anomaly_threshold
-        logger.info("pipeline.thresholds_updated", camera_id=self.camera_config.camera_id)
+                applied["anomaly_threshold"] = True
+            if temporal_changed:
+                # Refresh derived heartbeat caches from the (already-mutated)
+                # alert_config.temporal reference.
+                try:
+                    new_max_gap = self._alert_grader._config.temporal.max_gap_seconds
+                    self._heartbeat_seconds = new_max_gap
+                    self._low_light_heartbeat_seconds = new_max_gap / 2
+                    applied["temporal"] = True
+                except AttributeError:
+                    applied["temporal"] = False
+            if severity_changed:
+                applied["severity"] = True  # AlertGrader reads via self._config ref
+            if suppression_changed:
+                applied["suppression"] = True  # ditto
+        logger.info(
+            "pipeline.thresholds_updated",
+            camera_id=self.camera_config.camera_id,
+            applied=list(applied.keys()),
+        )
+        return applied
 
     def get_diagnostics_buffer(self) -> DiagnosticsBuffer:
         """Get the per-frame diagnostics ring buffer (DET-008)."""

@@ -56,11 +56,22 @@ const detectionParams = ref({
 })
 const detectionLoading = ref(false)
 
+// 痛点 9: per-section apply toast
+import { useConfigApplyToast } from '../../composables/useConfigApplyToast'
+const { notifyAll: notifyConfigApply } = useConfigApplyToast()
+
 async function handleSaveDetection() {
   detectionLoading.value = true
   try {
     const res = await updateDetectionParams(detectionParams.value)
-    message.success(`检测参数已更新 (${res?.pipelines_updated ?? 0} 条流水线)`)
+    notifyConfigApply(res || {})
+    if (!res?.anomaly_threshold?.changed
+        && !res?.severity?.changed
+        && !res?.temporal?.changed
+        && !res?.suppression?.changed) {
+      // No knob actually changed — keep the old generic toast
+      message.success(`检测参数已更新 (${res?.pipelines_updated ?? 0} 条流水线)`)
+    }
   } catch { message.error('更新失败') }
   finally { detectionLoading.value = false }
 }

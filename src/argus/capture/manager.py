@@ -502,6 +502,26 @@ class CameraManager:
             return None
         return pipeline.mode.value
 
+    def list_camera_ids(self) -> list[str]:
+        """List all camera IDs that currently have a pipeline registered."""
+        return list(self._pipelines.keys())
+
+    def get_all_pipeline_modes(self) -> dict[str, str]:
+        """Return a snapshot of every camera's current pipeline mode."""
+        return {cid: p.mode.value for cid, p in self._pipelines.items()}
+
+    def set_all_pipeline_modes(self, mode: PipelineMode) -> dict[str, str]:
+        """Switch every registered pipeline into the given mode.
+
+        Returns a {camera_id: previous_mode} mapping useful for restoration
+        by GlobalPipelineModeGuard.
+        """
+        previous: dict[str, str] = {}
+        for cid, pipeline in self._pipelines.items():
+            previous[cid] = pipeline.mode.value
+            pipeline.set_mode(mode)
+        return previous
+
     def get_learning_progress(self, camera_id: str) -> dict | None:
         """Get learning mode progress for a camera (DET-010)."""
         pipeline = self._pipelines.get(camera_id)

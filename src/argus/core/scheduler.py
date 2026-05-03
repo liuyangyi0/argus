@@ -377,11 +377,25 @@ def create_retraining_task(
                     )
                     continue
 
+                # 痛点 2: dataset_strategy controls which baseline versions feed
+                # the auto-retrain. current_only keeps the legacy single-version
+                # behaviour; multi-version strategies are reserved for a follow-up
+                # implementation that walks baseline_lifecycle / training_records.
+                strategy = getattr(retrain_cfg, "dataset_strategy", "current_only")
+                if strategy != "current_only":
+                    logger.warning(
+                        "retraining.dataset_strategy_unimplemented",
+                        camera_id=camera_id,
+                        requested=strategy,
+                        fallback="current_only",
+                    )
+
                 logger.info(
                     "retraining.triggered",
                     camera_id=camera_id,
                     new_images=new_images,
                     total_images=current_count,
+                    dataset_strategy=strategy,
                 )
 
                 result = trainer.train(

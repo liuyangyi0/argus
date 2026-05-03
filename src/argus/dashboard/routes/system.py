@@ -15,6 +15,32 @@ from argus.dashboard.api_response import api_success
 router = APIRouter()
 
 
+@router.get("/mode_summary")
+def mode_summary(request: Request):
+    """痛点 4: aggregate pipeline_mode across cameras for the navbar badge.
+
+    Returns ``{cameras: {id: mode}, global_state}`` where global_state is
+    one of "normal" | "capturing" | "training" | "maintenance":
+    - training when ANY camera is in TRAINING (most disruptive — GPU busy)
+    - capturing when any camera is in COLLECTION (samples being recorded)
+    - maintenance when any camera is in MAINTENANCE
+    - normal otherwise (all ACTIVE / LEARNING)
+    """
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    if camera_manager is None:
+        return api_success({"cameras": {}, "global_state": "normal"})
+    modes = camera_manager.get_all_pipeline_modes()
+    if "training" in modes.values():
+        global_state = "training"
+    elif "collection" in modes.values():
+        global_state = "capturing"
+    elif "maintenance" in modes.values():
+        global_state = "maintenance"
+    else:
+        global_state = "normal"
+    return api_success({"cameras": modes, "global_state": global_state})
+
+
 @router.get("/health")
 def health(request: Request):
     """JSON health endpoint for monitoring tools."""
