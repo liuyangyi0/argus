@@ -15,6 +15,7 @@ import {
 } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import { useAlertStore } from '../../stores/useAlertStore'
+import { useAuthStore } from '../../stores/useAuthStore'
 import { scoreColor } from '../../utils/colors'
 import { formatTimestamp } from '../../utils/time'
 import { extractErrorMessage } from '../../utils/error'
@@ -31,6 +32,10 @@ const emit = defineEmits<{
 const router = useRouter()
 const store = useAlertStore()
 const { selectedAlert } = storeToRefs(store)
+// Viewer can read alerts but must not mutate workflow state. Backend RBAC
+// 403s these endpoints anyway; we just hide the buttons to remove dead clicks.
+const auth = useAuthStore()
+const canMutateAlert = computed(() => auth.hasRole(['admin', 'operator']))
 
 const imageMode = ref<'composite' | 'snapshot' | 'heatmap' | 'compare'>('composite')
 const annotationMode = ref(false)
@@ -466,7 +471,7 @@ function goToModelVersion() {
           </div>
           <div class="meta-panel-bd actions-panel-bd">
             <Button
-              v-if="selectedAlert.workflow_status === 'new'"
+              v-if="canMutateAlert && selectedAlert.workflow_status === 'new'"
               type="primary"
               block
               @click="handleAcknowledge"
@@ -475,19 +480,20 @@ function goToModelVersion() {
               确认真实
             </Button>
             <Button
-              v-if="selectedAlert.workflow_status === 'new' || selectedAlert.workflow_status === 'acknowledged'"
+              v-if="canMutateAlert && (selectedAlert.workflow_status === 'new' || selectedAlert.workflow_status === 'acknowledged')"
               block
               @click="handleFalsePositive"
             >
               <template #icon><StopOutlined /></template>
               标记误报
             </Button>
-            <div v-if="selectedAlert.workflow_status !== 'new' && selectedAlert.workflow_status !== 'acknowledged'" class="status-display">
+            <div v-if="!canMutateAlert || (selectedAlert.workflow_status !== 'new' && selectedAlert.workflow_status !== 'acknowledged')" class="status-display">
               <Tag :color="workflowColor[selectedAlert.workflow_status]" style="font-size: 13px; padding: 4px 16px">
                 {{ workflowLabel[selectedAlert.workflow_status] }}
               </Tag>
             </div>
             <Button
+              v-if="canMutateAlert"
               danger
               block
               @click="handleDelete"

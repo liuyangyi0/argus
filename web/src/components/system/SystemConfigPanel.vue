@@ -16,6 +16,11 @@ import {
   listBackups, restoreBackup, deleteBackup,
 } from '../../api'
 import { getCameras } from '../../api/cameras'
+import { useAuthStore } from '../../stores/useAuthStore'
+
+// All write operations on this panel are admin-only. Backend RBAC remains
+// authoritative; client-side gating just avoids the 403 toast on click.
+const auth = useAuthStore()
 
 // ── Config reload / save ──
 const configLoading = ref(false)
@@ -164,7 +169,7 @@ onMounted(() => { Promise.all([loadAudioConfig(), loadCameras(), loadBackups()])
   <div>
     <!-- Config reload / save -->
     <Card title="系统配置" style="margin-bottom: 16px">
-      <Space>
+      <Space v-if="auth.hasRole(['admin'])">
         <Button type="primary" :loading="configLoading" @click="handleReloadConfig">
           <template #icon><ReloadOutlined /></template>重新加载配置
         </Button>
@@ -195,7 +200,7 @@ onMounted(() => { Promise.all([loadAudioConfig(), loadCameras(), loadBackups()])
           <div><Typography.Text type="secondary">高 (high)</Typography.Text>
             <InputNumber v-model:value="detectionParams.sev_high" :min="0" :max="1" :step="0.05" style="width: 100%" /></div>
         </div>
-        <Button type="primary" :loading="detectionLoading" @click="handleSaveDetection">更新检测参数</Button>
+        <Button v-if="auth.hasRole(['admin'])" type="primary" :loading="detectionLoading" @click="handleSaveDetection">更新检测参数</Button>
       </div>
     </Card>
 
@@ -216,7 +221,7 @@ onMounted(() => { Promise.all([loadAudioConfig(), loadCameras(), loadBackups()])
             <InputNumber v-model:value="webhookConfig.webhook_timeout" :min="1" :max="60" style="width: 100%" />
           </div>
         </template>
-        <Space>
+        <Space v-if="auth.hasRole(['admin'])">
           <Button type="primary" :loading="webhookLoading" @click="handleSaveWebhook">
             <template #icon><SaveOutlined /></template>保存
           </Button>
@@ -255,7 +260,7 @@ onMounted(() => { Promise.all([loadAudioConfig(), loadCameras(), loadBackups()])
     <!-- Backup management -->
     <Card title="数据备份" style="margin-bottom: 16px">
       <div style="margin-bottom: 12px">
-        <Button type="primary" :loading="backupCreateLoading" @click="handleCreateBackup">立即备份</Button>
+        <Button v-if="auth.hasRole(['admin'])" type="primary" :loading="backupCreateLoading" @click="handleCreateBackup">立即备份</Button>
         <Button style="margin-left: 8px" @click="loadBackups">
           <template #icon><ReloadOutlined /></template>刷新
         </Button>
@@ -271,7 +276,7 @@ onMounted(() => { Promise.all([loadAudioConfig(), loadCameras(), loadBackups()])
             </Space>
           </template>
           <template v-if="column.key === 'actions'">
-            <Space size="small">
+            <Space v-if="auth.hasRole(['admin'])" size="small">
               <Popconfirm title="确定从此备份恢复？当前数据库将被覆盖。" @confirm="handleRestore(record.name)">
                 <Button size="small" type="primary" ghost><template #icon><UndoOutlined /></template>恢复</Button>
               </Popconfirm>
@@ -300,7 +305,7 @@ onMounted(() => { Promise.all([loadAudioConfig(), loadCameras(), loadBackups()])
           <Input v-if="key === 'high'" v-model:value="audioConfig[key].voice_template" placeholder="语音模板, 如: {camera} 高级别告警" style="width: 250px" />
         </Space>
       </div>
-      <Button type="primary" @click="saveAudioConfig">保存音频配置</Button>
+      <Button v-if="auth.hasRole(['admin'])" type="primary" @click="saveAudioConfig">保存音频配置</Button>
     </Card>
   </div>
 </template>

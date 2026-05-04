@@ -170,3 +170,62 @@ def prometheus_metrics():
         content=METRICS.generate(),
         media_type="text/plain; version=0.0.4; charset=utf-8",
     )
+
+
+@router.get("/anomaly-degradation")
+def anomaly_degradation(request: Request):
+    """Aggregate anomaly head degradation status across all pipelines.
+
+    Reports whether the per-camera anomaly detector has fallen into the
+    simplex-only fallback mode (see ``DetectionPipeline._enter_anomaly_degraded``).
+    The frontend uses this to drive the global degradation banner — operators
+    must know that alert severity has been auto-downgraded.
+
+    Returns ``{anomaly: {degraded, reason, since, cameras: [...]}}``. The
+    aggregate ``degraded`` is True iff *any* camera is degraded; the per-camera
+    list lets the system overview page surface details.
+    """
+    camera_manager = getattr(request.app.state, "camera_manager", None)
+    if camera_manager is None or not getattr(camera_manager, "_pipelines", None):
+        return api_success({
+            "anomaly": {
+                "degraded": False,
+                "reason": "pipeline_not_ready",
+                "since": None,
+                "cameras": [],
+            },
+        })
+
+    cameras_status = []
+    aggregate_degraded = False
+    aggregate_reason: str | None = None
+    aggregate_since: float | None = None
+    for cam_id, pipeline in camera_manager._pipelines.items():
+        try:
+            is_degraded = pipeline.is_anomaly_degraded()
+            reason = pipeline.get_anomaly_degradation_reason()
+            since = pipeline.get_anomaly_degradation_started_at()
+        except AttributeError:
+            # Older pipeline (no degradation accessors) — treat as nominal.
+            is_degraded = False
+            reason = None
+            since = None
+        cameras_status.append({
+            "camera_id": cam_id,
+            "degraded": bool(is_degraded),
+            "reason": reason,
+            "since": since,
+        })
+        if is_degraded and not aggregate_degraded:
+            aggregate_degraded = True
+            aggregate_reason = reason
+            aggregate_since = since
+
+    return api_success({
+        "anomaly": {
+            "degraded": aggregate_degraded,
+            "reason": aggregate_reason,
+            "since": aggregate_since,
+            "cameras": cameras_status,
+        },
+    })

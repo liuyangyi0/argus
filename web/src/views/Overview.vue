@@ -6,6 +6,8 @@ import { Alert as AAlert, Button as AButton } from 'ant-design-vue'
 import { useWallStore } from '../stores/useWallStore'
 import { getDailyTrend } from '../api/reports'
 import { getTrainingJobs } from '../api/training'
+import { getAnomalyDegradation, type AnomalyDegradationStatus } from '../api/system'
+import { useWebSocket } from '../composables/useWebSocket'
 import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 defineOptions({ name: 'OverviewPage' })
@@ -29,6 +31,52 @@ async function fetchPendingCount() {
 function goToTrainingTab() {
   router.push({ path: '/models/training', query: { tab: 'pending' } })
 }
+
+// Anomaly head degradation banner — shown red when ANY camera's anomaly
+// detector has fallen back to simplex-only mode. Initial state comes from a
+// one-shot fetch on mount; live updates arrive via the system_degradation
+// WebSocket topic. Failure to load is silently treated as "not degraded" so
+// the banner never appears spuriously.
+const anomalyDegradation = ref<AnomalyDegradationStatus['anomaly'] | null>(null)
+async function fetchAnomalyDegradation() {
+  try {
+    const res = await getAnomalyDegradation()
+    anomalyDegradation.value = res?.anomaly ?? null
+  } catch {
+    anomalyDegradation.value = null
+  }
+}
+
+useWebSocket({
+  topics: ['system_degradation'],
+  onMessage: (_topic, data) => {
+    // Backend payload shape: {type, component, camera_id, reason, started_at, ...}
+    if (!data || typeof data !== 'object') return
+    if (data.type === 'entered' && data.component === 'anomaly') {
+      anomalyDegradation.value = {
+        degraded: true,
+        reason: data.reason ?? null,
+        since: data.started_at ?? null,
+        cameras: [{
+          camera_id: data.camera_id ?? '',
+          degraded: true,
+          reason: data.reason ?? null,
+          since: data.started_at ?? null,
+        }],
+      }
+    } else if (data.type === 'recovered' && data.component === 'anomaly') {
+      // Re-query to pick up other cameras still degraded; recovery for one
+      // camera does not necessarily mean the whole system is nominal again.
+      fetchAnomalyDegradation()
+    }
+  },
+})
+
+const anomalyDegradedReason = computed(() => anomalyDegradation.value?.reason ?? '未知')
+const anomalyDegradedCameras = computed(() => {
+  const cams = anomalyDegradation.value?.cameras ?? []
+  return cams.filter((c) => c.degraded).map((c) => c.camera_id).join('、')
+})
 
 // True until the very first wall-status fetch completes — used to swap the
 // "未配置视频源" placeholder grid for a skeleton during the initial load
@@ -103,6 +151,7 @@ onMounted(async () => {
   startClock()
   // Fire-and-forget — banner appears as soon as the count resolves.
   fetchPendingCount()
+  fetchAnomalyDegradation()
 })
 
 // keep-alive path: view is deactivated (cached) → stop; reactivated → restart.
@@ -291,6 +340,21 @@ function sparklineFill(values: number[]): string {
           </button>
         </div>
       </div>
+
+      <a-alert
+        v-if="anomalyDegradation?.degraded"
+        type="error"
+        show-icon
+        style="margin: 0 18px 4px"
+      >
+        <template #message>
+          系统当前处于降级状态：异常检测模型不可用
+          <span v-if="anomalyDegradedCameras"> ({{ anomalyDegradedCameras }})</span>
+        </template>
+        <template #description>
+          原因：{{ anomalyDegradedReason }}。告警 severity 已被自动调低，请尽快排查。
+        </template>
+      </a-alert>
 
       <a-alert
         v-if="pendingCount > 0"

@@ -28,6 +28,30 @@ export const getDegradationSummary = () => api.get('/degradation/summary').then(
 export const getDegradationHistory = (days?: number) =>
   api.get('/degradation/history', { params: { days } }).then(u)
 
+// ── Anomaly head degradation (per-pipeline simplex fallback) ──
+// Distinct from the global degradation bar (`/degradation/*`): this surfaces
+// the specific case where the anomaly model crashed or failed to load and the
+// pipeline silently fell back to the simplex safety channel. Operators must
+// be told because alert severity is auto-downgraded in this mode.
+export interface AnomalyDegradationCameraStatus {
+  camera_id: string
+  degraded: boolean
+  reason: string | null
+  since: number | null
+}
+
+export interface AnomalyDegradationStatus {
+  anomaly: {
+    degraded: boolean
+    reason: string | null
+    since: number | null
+    cameras: AnomalyDegradationCameraStatus[]
+  }
+}
+
+export const getAnomalyDegradation = () =>
+  api.get<ApiResponse<AnomalyDegradationStatus>>('/system/anomaly-degradation').then(unwrap)
+
 // ── Audio Alerts ──
 export const getAudioAlerts = () => api.get('/config/audio-alerts').then(u)
 export const updateAudioAlerts = (data: any) => api.put('/config/audio-alerts', data).then(u)

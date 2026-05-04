@@ -1,6 +1,6 @@
 import { ref, onUnmounted, type Ref } from 'vue'
 
-type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation' | 'heatmap' | 'audio_alert' | 'models' | 'model_release'
+type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation' | 'heatmap' | 'audio_alert' | 'models' | 'model_release' | 'system_degradation'
 
 // ── Audio Alert System ──
 const audioMuted = ref(false)

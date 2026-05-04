@@ -7,6 +7,7 @@ import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons-vu
 import { addCamera, deleteCamera, getCameraConfig, getCameras, getRegions, getUsbDevices, startCamera, stopCamera, updateCamera } from '../api'
 import { testCameraConnection, testCameraConnectionDraft } from '../api/cameras'
 import { useWebSocket } from '../composables/useWebSocket'
+import { useAuthStore } from '../stores/useAuthStore'
 import { extractErrorMessage } from '../utils/error'
 import HealthBadge from '../components/common/HealthBadge.vue'
 import ModeBadge from '../components/common/ModeBadge.vue'
@@ -22,6 +23,10 @@ const initialLoading = ref(true)
 defineOptions({ name: 'CamerasPage' })
 
 const router = useRouter()
+// Client-side gating mirror of the backend RBAC. Hides write-mode entries
+// (add / edit / delete / start / stop) from viewer accounts so they don't
+// see buttons that 403 on click. Backend remains the source of truth.
+const auth = useAuthStore()
 const cameras = ref<any[]>([])
 const loading = ref(true)
 
@@ -309,7 +314,7 @@ const columns = [
   <main class="glass" style=" padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px">
       <Typography.Title :level="3" style="margin: 0">摄像头</Typography.Title>
-      <Button type="primary" @click="openAddModal">
+      <Button v-if="auth.hasRole(['admin', 'operator'])" type="primary" @click="openAddModal">
         <PlusOutlined /> 新增摄像头
       </Button>
     </div>
@@ -448,19 +453,19 @@ const columns = [
         </template>
         <template v-else-if="column.key === 'action'">
           <Space @click.stop>
-            <Button v-if="!record.connected" type="primary" size="small" @click="handleStart(record.camera_id)">
+            <Button v-if="!record.connected && auth.hasRole(['admin', 'operator'])" type="primary" size="small" @click="handleStart(record.camera_id)">
               启动
             </Button>
-            <Button v-else danger size="small" @click="handleStop(record.camera_id)">
+            <Button v-else-if="record.connected && auth.hasRole(['admin', 'operator'])" danger size="small" @click="handleStop(record.camera_id)">
               停止
             </Button>
-            <Button size="small" @click="openEditModal(record.camera_id)">
+            <Button v-if="auth.hasRole(['admin', 'operator'])" size="small" @click="openEditModal(record.camera_id)">
               <template #icon><EditOutlined /></template>
             </Button>
             <Button size="small" @click="router.push(`/cameras/${record.camera_id}`)">
               详情
             </Button>
-            <Button size="small" danger @click="handleDelete(record.camera_id)">
+            <Button v-if="auth.hasRole(['admin'])" size="small" danger @click="handleDelete(record.camera_id)">
               <template #icon><DeleteOutlined /></template>
             </Button>
           </Space>

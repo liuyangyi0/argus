@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, reactive } from 'vue'
 import {
   Card, Table, Button, Tag, Space, Modal, Form, Select, Input,
   Descriptions, Drawer, Steps, Tooltip, Dropdown, Menu, message,
@@ -20,6 +20,32 @@ import { STAGE_MAP, VALID_TRANSITIONS, STAGE_LABELS } from '../../composables/us
 import { useWebSocket } from '../../composables/useWebSocket'
 import { extractErrorMessage } from '../../utils/error'
 import type { ModelInfo, ModelVersionEvent, CameraSummary } from '../../types/api'
+
+// ── Release pipeline stage stepper config ──
+// 后端 stage 字段为小写 enum 字符串（candidate/shadow/canary/production/retired）。
+// STAGES 定义 4 段主线流程,retired 是终态分支,在行级单独渲染为"已退役"覆盖层。
+const STAGES: { key: string; label: string }[] = [
+  { key: 'candidate', label: '候选' },
+  { key: 'shadow', label: '影子' },
+  { key: 'canary', label: '灰度' },
+  { key: 'production', label: '生产' },
+]
+const STAGE_INDEX: Record<string, number> = STAGES.reduce(
+  (acc, s, i) => ((acc[s.key] = i), acc),
+  {} as Record<string, number>,
+)
+function stepClass(stageKey: string, currentStage: string): 'done' | 'active' | 'pending' {
+  const cur = STAGE_INDEX[currentStage]
+  const idx = STAGE_INDEX[stageKey]
+  if (cur === undefined || idx === undefined) return 'pending'
+  if (idx < cur) return 'done'
+  if (idx === cur) return 'active'
+  return 'pending'
+}
+function shortVid(vid: string): string {
+  if (!vid) return '?'
+  return vid.length > 12 ? vid.slice(0, 12) : vid
+}
 
 const props = defineProps<{
   models: ModelInfo[]
@@ -50,10 +76,13 @@ const recalibrateLoading = ref<string | null>(null)
 
 // ── Release pipeline live progress (model_release WS topic) ──
 // 后端在 release_pipeline.transition() commit 成功后会广播一条
-// stage_transition 事件,这里把它转成非阻塞 toast,并触发表格刷新,
+// stage_transition 事件,这里转成 toast + 行内 stepper 流光动画,
 // 让操作员看到金丝雀/生产推进的真实进度,不必手动 refresh。
 // 用 useWebSocket 自带的 onUnmounted 清理,这里不需要再手动 unsubscribe。
-const transitioningVersionId = ref<string | null>(null)
+// transitioningEvents 同时支持多行同时收到事件(多版本并行推进)。
+type TransitionInfo = { from: string; to: string; ts: number }
+const transitioningEvents = reactive<Record<string, TransitionInfo>>({})
+const FLOW_DURATION_MS = 1200
 useWebSocket({
   topics: ['model_release'],
   onMessage: (_topic, data) => {
@@ -66,19 +95,85 @@ useWebSocket({
     }
     if (payload?.type !== 'stage_transition') return
     const vid = payload.model_version_id ?? ''
-    const from = STAGE_LABELS[payload.from_stage ?? ''] || payload.from_stage || '?'
-    const to = STAGE_LABELS[payload.to_stage ?? ''] || payload.to_stage || '?'
-    message.info(`模型 ${vid} 已 ${from} → ${to}`)
-    // 简短高亮该行的 stage 列,1.5s 后清除并刷新表格数据
-    transitioningVersionId.value = vid
+    const from = (payload.from_stage ?? '').toLowerCase()
+    const to = (payload.to_stage ?? '').toLowerCase()
+    const stageLabel = (s: string) => STAGE_MAP[s]?.text || s || '?'
+    message.info(`模型 ${shortVid(vid)} 进入 ${stageLabel(to)} 阶段`)
+    // 记录此行的过渡事件,触发 stepper 流光 1.2s,然后清除并刷新表格
+    transitioningEvents[vid] = { from, to, ts: Date.now() }
     setTimeout(() => {
-      if (transitioningVersionId.value === vid) {
-        transitioningVersionId.value = null
+      const cur = transitioningEvents[vid]
+      // 只有当事件还是同一次过渡时才清除(避免短时间内多次过渡互相覆盖)
+      if (cur && cur.ts === transitioningEvents[vid]?.ts) {
+        delete transitioningEvents[vid]
       }
       emit('changed')
-    }, 1500)
+    }, FLOW_DURATION_MS)
   },
 })
+
+// 计算行的过渡事件:用于 stepper 渲染流光段。
+function transitionFor(vid: string): TransitionInfo | null {
+  return transitioningEvents[vid] || null
+}
+
+// 渲染 stepper 段间连接器的 class:
+// - flowing: 当前正在过渡且这段 segment (i 到 i+1) 是 from→to 的范围
+// - done: 两端都已通过(idx <= currentStage - 1)
+// - pending: 否则
+function connectorClass(i: number, record: Record<string, any>): string {
+  const cur = STAGE_INDEX[record.stage as string]
+  const t = transitionFor(record.model_version_id as string)
+  if (t) {
+    const fIdx = STAGE_INDEX[t.from]
+    const tIdx = STAGE_INDEX[t.to]
+    if (fIdx !== undefined && tIdx !== undefined) {
+      const lo = Math.min(fIdx, tIdx)
+      const hi = Math.max(fIdx, tIdx)
+      if (i >= lo && i < hi) {
+        return tIdx > fIdx ? 'connector flowing forward' : 'connector flowing backward'
+      }
+    }
+  }
+  if (cur !== undefined && i < cur) return 'connector done'
+  return 'connector pending'
+}
+
+// 行级 class:retired 灰化整行
+// 入参类型放宽到 Record<string, any>:ant-design-vue 的 row-class-name 回调
+// 在内部按通用对象传 record,严格 TS 模式下不能直接绑定 ModelInfo 签名。
+function rowClassName(record: Record<string, any>): string {
+  return record.stage === 'retired' ? 'row-retired' : ''
+}
+
+// ── T3: Expandable row — stage history ──
+// 展开时按需拉取该 model_version_id 的 stage_history(已有 API 端点),
+// 不引入新依赖、不修改 api/models.ts。失败/空态在展开内提示。
+const expandedRowKeys = ref<string[]>([])
+const stageHistoryByVersion = reactive<Record<string, ModelVersionEvent[]>>({})
+const stageHistoryLoadingByVersion = reactive<Record<string, boolean>>({})
+const stageHistoryErrorByVersion = reactive<Record<string, string>>({})
+
+async function ensureStageHistory(vid: string) {
+  if (stageHistoryByVersion[vid] || stageHistoryLoadingByVersion[vid]) return
+  stageHistoryLoadingByVersion[vid] = true
+  delete stageHistoryErrorByVersion[vid]
+  try {
+    const res = await getStageHistory(vid)
+    stageHistoryByVersion[vid] = res.events || []
+  } catch (e) {
+    stageHistoryErrorByVersion[vid] = extractErrorMessage(e, '获取阶段历史失败')
+  } finally {
+    stageHistoryLoadingByVersion[vid] = false
+  }
+}
+
+function onExpandedRowsChange(keys: (string | number)[]) {
+  expandedRowKeys.value = keys.map(k => String(k))
+  for (const vid of expandedRowKeys.value) {
+    ensureStageHistory(vid)
+  }
+}
 
 // ── Pipeline stats ──
 const stageCounts = computed(() => {
@@ -323,11 +418,12 @@ function handleMenuClick(record: any, { key }: { key: string | number }) {
 }
 
 // ── Table columns ──
+// '阶段' 列加宽到 240px 以容纳紧凑 4 段 stepper(候选/影子/灰度/生产)。
 const columns = [
   { title: '版本 ID', dataIndex: 'model_version_id', key: 'version_id', ellipsis: true },
   { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 90 },
   { title: '类型', dataIndex: 'model_type', key: 'model_type', width: 100 },
-  { title: '阶段', key: 'stage', width: 90 },
+  { title: '阶段', key: 'stage', width: 240 },
   { title: '状态', key: 'is_active', width: 80 },
   { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 150 },
   { title: '操作', key: 'action', width: 220 },
@@ -362,20 +458,78 @@ const columns = [
       :pagination="{ pageSize: 15, showSizeChanger: false }"
       row-key="model_version_id"
       size="small"
+      :row-class-name="rowClassName"
+      :expanded-row-keys="expandedRowKeys"
+      @expanded-rows-change="onExpandedRowsChange"
     >
+      <template #expandedRowRender="{ record }">
+        <div class="stage-history-panel">
+          <div v-if="stageHistoryLoadingByVersion[record.model_version_id]" class="stage-history-empty">
+            <LoadingOutlined spin /> 加载阶段历史...
+          </div>
+          <div v-else-if="stageHistoryErrorByVersion[record.model_version_id]" class="stage-history-empty error">
+            {{ stageHistoryErrorByVersion[record.model_version_id] }}
+          </div>
+          <div v-else-if="stageHistoryByVersion[record.model_version_id]?.length">
+            <div
+              v-for="(event, idx) in stageHistoryByVersion[record.model_version_id]"
+              :key="idx"
+              class="stage-history-item"
+            >
+              <Space>
+                <Tag :color="(STAGE_MAP[event.from_stage ?? ''] || { color: 'default' }).color">
+                  {{ (STAGE_MAP[event.from_stage ?? ''] || { text: event.from_stage || '?' }).text }}
+                </Tag>
+                <span class="arrow">&rarr;</span>
+                <Tag :color="(STAGE_MAP[event.to_stage] || { color: 'default' }).color">
+                  {{ (STAGE_MAP[event.to_stage] || { text: event.to_stage }).text }}
+                </Tag>
+                <span class="meta">{{ event.triggered_by }}</span>
+                <span v-if="event.reason" class="meta">原因: {{ event.reason }}</span>
+              </Space>
+              <span class="ts">
+                {{ event.timestamp ? event.timestamp.replace('T', ' ').substring(0, 19) : '' }}
+              </span>
+            </div>
+          </div>
+          <div v-else class="stage-history-empty">暂无阶段变更记录</div>
+        </div>
+      </template>
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'version_id'">
           <span style="font-family: monospace; font-size: 12px">{{ record.model_version_id }}</span>
         </template>
         <template v-if="column.key === 'stage'">
-          <Tag :color="(STAGE_MAP[record.stage] || { color: 'default' }).color">
-            {{ (STAGE_MAP[record.stage] || { text: record.stage }).text }}
-          </Tag>
-          <LoadingOutlined
-            v-if="transitioningVersionId === record.model_version_id"
-            spin
-            style="margin-left: 6px; color: #1677ff"
-          />
+          <div
+            class="stage-stepper"
+            :class="{ 'is-retired': record.stage === 'retired' }"
+            :data-vid="record.model_version_id"
+          >
+            <template v-if="record.stage === 'retired'">
+              <Tag color="default" class="retired-tag">已退役</Tag>
+            </template>
+            <template v-else>
+              <template v-for="(s, i) in STAGES" :key="s.key">
+                <div class="stage-step" :class="stepClass(s.key, record.stage)">
+                  <div class="stage-dot">
+                    <span
+                      v-if="
+                        transitionFor(record.model_version_id) &&
+                        transitionFor(record.model_version_id)?.to === s.key
+                      "
+                      class="stage-dot-pulse"
+                    ></span>
+                  </div>
+                  <div class="stage-label">{{ s.label }}</div>
+                </div>
+                <div
+                  v-if="i < STAGES.length - 1"
+                  :key="`c-${s.key}`"
+                  :class="connectorClass(i, record)"
+                ></div>
+              </template>
+            </template>
+          </div>
         </template>
         <template v-if="column.key === 'is_active'">
           <Tag v-if="record.is_active" color="green">已激活</Tag>
@@ -592,3 +746,199 @@ const columns = [
     </div>
   </Drawer>
 </template>
+
+<style scoped>
+/* ── Stage stepper (4 段紧凑流程图) ──
+   每行的"阶段"列内联显示 候选→影子→灰度→生产 的可视化进度。
+   宽度约 220px,单行高度 36px,与表格 size="small" 协调。 */
+.stage-stepper {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  width: 100%;
+  min-width: 200px;
+  max-width: 240px;
+  height: 36px;
+}
+.stage-stepper.is-retired {
+  justify-content: flex-start;
+}
+.retired-tag {
+  margin: 0;
+}
+.stage-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 36px;
+}
+.stage-dot {
+  position: relative;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid #c4c8d4;
+  background: transparent;
+  box-sizing: border-box;
+  transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
+}
+.stage-step.done .stage-dot {
+  background: #1677ff;
+  border-color: #1677ff;
+}
+.stage-step.active .stage-dot {
+  background: #1677ff;
+  border-color: #1677ff;
+  box-shadow: 0 0 0 3px rgba(22, 119, 255, 0.18);
+}
+.stage-step.pending .stage-dot {
+  background: transparent;
+  border-color: #c4c8d4;
+}
+.stage-label {
+  font-size: 11px;
+  line-height: 1.1;
+  margin-top: 4px;
+  white-space: nowrap;
+  color: #8c8c8c;
+}
+.stage-step.done .stage-label,
+.stage-step.active .stage-label {
+  color: #1f1f1f;
+  font-weight: 500;
+}
+.stage-step.active .stage-label {
+  color: #1677ff;
+}
+
+/* connector: stepper 段间的连线;高 2px,绝对定位在 dot 中心高度 */
+.connector {
+  flex: 1 1 auto;
+  height: 2px;
+  background: #d9d9d9;
+  align-self: flex-start;
+  margin-top: 7px; /* 12px dot / 2 + 1px(border) ≈ dot 中心 */
+  position: relative;
+  overflow: hidden;
+  min-width: 8px;
+}
+.connector.done {
+  background: #1677ff;
+}
+.connector.pending {
+  background: #d9d9d9;
+}
+
+/* T2: 流光动画 — 收到 stage_transition WS 事件时,from→to 段间出现 1.2s 流光 */
+.connector.flowing {
+  background: linear-gradient(90deg, #1677ff 0%, #1677ff 100%);
+}
+.connector.flowing::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -50%;
+  width: 50%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.85) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  animation: stage-flow 1.2s ease-in-out forwards;
+}
+.connector.flowing.backward::after {
+  /* 回退过渡:流光从右往左 */
+  animation-name: stage-flow-back;
+}
+@keyframes stage-flow {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+@keyframes stage-flow-back {
+  from {
+    transform: translateX(300%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* 目标 dot 的 pulse — 强调 to_stage,持续 1.2s 后由父级清除 transitioningEvents 移除 */
+.stage-dot-pulse {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: rgba(22, 119, 255, 0.45);
+  animation: stage-dot-ping 1.2s ease-out forwards;
+  pointer-events: none;
+}
+@keyframes stage-dot-ping {
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0.7;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.6);
+    opacity: 0;
+  }
+}
+
+/* Retired 行整行变灰 */
+:deep(.row-retired) {
+  opacity: 0.55;
+}
+:deep(.row-retired) td {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+/* T3: 展开行内的阶段历史面板 */
+.stage-history-panel {
+  padding: 8px 12px;
+  background: rgba(10, 10, 15, 0.03);
+  border-radius: 4px;
+}
+.stage-history-empty {
+  text-align: center;
+  padding: 16px;
+  color: #8890a0;
+  font-size: 12px;
+}
+.stage-history-empty.error {
+  color: #e5484d;
+}
+.stage-history-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 4px;
+  border-bottom: 1px dashed rgba(0, 0, 0, 0.06);
+  font-size: 12px;
+}
+.stage-history-item:last-child {
+  border-bottom: none;
+}
+.stage-history-item .arrow {
+  color: #8890a0;
+}
+.stage-history-item .meta {
+  color: #6b7280;
+  font-size: 11px;
+}
+.stage-history-item .ts {
+  color: #8890a0;
+  font-size: 11px;
+  font-family: monospace;
+}
+</style>
