@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 
 from argus.dashboard.api_response import (
     api_conflict,
@@ -25,7 +26,9 @@ from argus.dashboard.api_response import (
 )
 from argus.anomaly.job_executor import validate_hyperparameters
 from argus.storage.models import (
+    AlertRecord,
     AuditLog,
+    FeedbackRecord,
     TrainingJobRecord,
     TrainingJobStatus,
     TrainingJobType,
@@ -112,6 +115,83 @@ async def get_training_job(request: Request, job_id: str):
             except (json.JSONDecodeError, TypeError):
                 logger.debug("training_job.json_parse_failed", field=field, exc_info=True)
     return api_success(data)
+
+
+@router.get("/{job_id}/source-alerts")
+async def get_training_job_source_alerts(request: Request, job_id: str):
+    """List the alerts whose feedback fed into this training job.
+
+    Reverse lookup path:
+        training_job.model_version_id  →  feedback.trained_into  →  feedback.alert_id  →  AlertRecord
+
+    The schema does not store ``source_alert_ids`` on TrainingJobRecord directly;
+    instead, FeedbackManager.mark_batch_processed stamps each consumed feedback
+    entry's ``trained_into`` field with the resulting model_version_id when a job
+    completes (see argus.anomaly.job_executor → database.update_training_job and
+    argus.storage.database.mark_feedback_processed). This endpoint joins those
+    two records to reconstruct the alert lineage.
+
+    Returns ``[]`` (not 404) when:
+      - the job has no ``model_version_id`` yet (still pending / running / failed),
+      - or no feedback rows reference the job's model_version_id (e.g. a manual
+        backbone retrain that wasn't triggered by alert feedback).
+
+    Capped at 50 alerts to keep the response small for the UI panel.
+    """
+    db = _get_db(request)
+    if db is None:
+        return api_unavailable("数据库不可用")
+
+    job = db.get_training_job(job_id)
+    if job is None:
+        return api_not_found(f"任务不存在: {job_id}")
+
+    # Without a completed model_version_id there is no link to follow yet.
+    if not job.model_version_id:
+        return api_success({"job_id": job_id, "alerts": [], "total": 0})
+
+    with db.get_session() as session:
+        feedback_rows = list(
+            session.scalars(
+                select(FeedbackRecord)
+                .where(FeedbackRecord.trained_into == job.model_version_id)
+                .where(FeedbackRecord.alert_id.is_not(None))
+            ).all()
+        )
+        alert_ids = [fb.alert_id for fb in feedback_rows if fb.alert_id]
+
+        if not alert_ids:
+            return api_success({"job_id": job_id, "alerts": [], "total": 0})
+
+        # Cap at 50 to keep the panel response light. Order newest-first so the
+        # operator sees the most recent triggers, which are the ones they're
+        # likely to have just labelled.
+        alerts = list(
+            session.scalars(
+                select(AlertRecord)
+                .where(AlertRecord.alert_id.in_(alert_ids))
+                .order_by(AlertRecord.timestamp.desc())
+                .limit(50)
+            ).all()
+        )
+
+    summaries = [
+        {
+            "alert_id": a.alert_id,
+            "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+            "camera_id": a.camera_id,
+            "severity": a.severity,
+            "anomaly_score": a.anomaly_score,
+            "workflow_status": a.workflow_status,
+        }
+        for a in alerts
+    ]
+    return api_success({
+        "job_id": job_id,
+        "model_version_id": job.model_version_id,
+        "alerts": summaries,
+        "total": len(summaries),
+    })
 
 
 @router.post("/")

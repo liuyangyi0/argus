@@ -1,14 +1,34 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, onDeactivated, onActivated, watch } from 'vue'
 import { storeToRefs } from 'pinia'
+import { useRouter } from 'vue-router'
+import { Alert as AAlert, Button as AButton } from 'ant-design-vue'
 import { useWallStore } from '../stores/useWallStore'
 import { getDailyTrend } from '../api/reports'
+import { getTrainingJobs } from '../api/training'
 import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 defineOptions({ name: 'OverviewPage' })
 
+const router = useRouter()
 const wallStore = useWallStore()
 const { cameras, health, loading } = storeToRefs(wallStore)
+
+// Pending training-job banner — surfaces audit C-11 pending_confirmation jobs
+// so operators have a single discoverable entry point from the dashboard.
+const pendingCount = ref(0)
+async function fetchPendingCount() {
+  try {
+    const res = await getTrainingJobs({ status: 'pending_confirmation', limit: 1 })
+    // Backend returns pending_count regardless of status filter (total pending).
+    pendingCount.value = res?.pending_count ?? 0
+  } catch {
+    pendingCount.value = 0
+  }
+}
+function goToTrainingTab() {
+  router.push({ path: '/models/training', query: { tab: 'pending' } })
+}
 
 // True until the very first wall-status fetch completes — used to swap the
 // "未配置视频源" placeholder grid for a skeleton during the initial load
@@ -81,6 +101,8 @@ onMounted(async () => {
     initialLoading.value = false
   }
   startClock()
+  // Fire-and-forget — banner appears as soon as the count resolves.
+  fetchPendingCount()
 })
 
 // keep-alive path: view is deactivated (cached) → stop; reactivated → restart.
@@ -269,6 +291,22 @@ function sparklineFill(values: number[]): string {
           </button>
         </div>
       </div>
+
+      <a-alert
+        v-if="pendingCount > 0"
+        type="warning"
+        show-icon
+        style="margin: 0 18px 4px"
+      >
+        <template #message>
+          {{ pendingCount }} 个训练任务待确认
+        </template>
+        <template #description>
+          <a-button type="link" size="small" style="padding-left: 0" @click="goToTrainingTab">
+            前往「模型管理 → 训练与评估」处理
+          </a-button>
+        </template>
+      </a-alert>
 
       <div class="viewport" style="flex:1; overflow:hidden; padding:2px 4px 12px; display:flex; min-height:0;">
 

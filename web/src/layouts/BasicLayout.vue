@@ -1,43 +1,103 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import DegradationBar from '../components/DegradationBar.vue'
 import ErrorBoundary from '../components/ErrorBoundary.vue'
 import { useWebSocket } from '../composables/useWebSocket'
 import { useSystemMode } from '../composables/useSystemMode'
+import { useAuthStore } from '../stores/useAuthStore'
 
 const router = useRouter()
 const route = useRoute()
+const auth = useAuthStore()
 
 // Active state matching for sidebar links
 const isActive = (pathPrefix: string) => route.path.startsWith(pathPrefix)
 const isExact = (path: string) => route.path === path || route.path.startsWith(path + '/')
 
-// Sub-menu definitions (mirrors router children for Models / System)
-const modelsChildren: Array<{ path: string; label: string }> = [
-  { path: '/models/baseline', label: '基线管理' },
+// Sub-menu definitions (mirrors router children for Models / System).
+// `roles` mirrors the route-level `requiresRole` meta — entries with no
+// `roles` key are visible to every authenticated role (and anonymous, since
+// these are also the public/all-role pages). Backend RBAC remains the source
+// of truth; this list only hides nav entries to reduce wandering.
+type NavChild = { path: string; label: string; roles?: string[] }
+
+const modelsChildren: NavChild[] = [
+  { path: '/models/baseline', label: '基线管理', roles: ['admin', 'operator'] },
   { path: '/models/collections', label: '采集集合' },
-  { path: '/models/training', label: '训练与评估' },
-  { path: '/models/registry', label: '模型与发布' },
+  { path: '/models/training', label: '训练与评估', roles: ['admin', 'operator'] },
+  { path: '/models/registry', label: '模型与发布', roles: ['admin', 'operator'] },
   { path: '/models/comparison', label: 'A/B 对比' },
   { path: '/models/labeling', label: '标注队列' },
   { path: '/models/threshold', label: '阈值预览' },
 ]
 
-const systemChildren: Array<{ path: string; label: string }> = [
+const systemChildren: NavChild[] = [
   { path: '/system/overview', label: '系统概览' },
   { path: '/system/model-status', label: '模型状态' },
-  { path: '/system/config', label: '配置管理' },
-  { path: '/system/audit', label: '审计日志' },
+  { path: '/system/config', label: '配置管理', roles: ['admin'] },
+  { path: '/system/audit', label: '审计日志', roles: ['admin'] },
   { path: '/system/degradation', label: '降级事件' },
   { path: '/system/modules', label: '功能模块' },
   { path: '/system/classifier', label: '分类器' },
   { path: '/system/segmenter', label: '分割器' },
   { path: '/system/imaging', label: '多模态成像' },
   { path: '/system/cross-camera', label: '跨相机' },
-  { path: '/system/users', label: '用户管理' },
+  { path: '/system/users', label: '用户管理', roles: ['admin'] },
   { path: '/system/regions', label: '区域管理' },
 ]
+
+// Visibility helpers: when the user isn't loaded yet we keep entries hidden
+// so the menu never flashes options the user can't reach. Entries with no
+// `roles` are always visible (matches public router meta).
+function canSeeChild(child: NavChild): boolean {
+  if (!child.roles) return true
+  return auth.hasRole(child.roles)
+}
+const visibleModelsChildren = computed(() => modelsChildren.filter(canSeeChild))
+const visibleSystemChildren = computed(() => systemChildren.filter(canSeeChild))
+
+// Models top-level entry mirrors the most-permissive child (admin/operator).
+const canSeeModelsGroup = computed(() => visibleModelsChildren.value.length > 0)
+const canSeeSystemGroup = computed(() => visibleSystemChildren.value.length > 0)
+
+// User dropdown derived state
+const avatarLetter = computed(() => {
+  const u = auth.currentUser
+  if (!u) return '?'
+  const src = u.display_name || u.username || ''
+  return (src.trim().charAt(0) || '?').toUpperCase()
+})
+
+const ROLE_META: Record<string, { color: string; label: string }> = {
+  admin: { color: 'red', label: '管理员' },
+  operator: { color: 'blue', label: '操作员' },
+  viewer: { color: 'default', label: '查看者' },
+}
+
+const roleColor = computed(() => {
+  const role = auth.currentUser?.role
+  return (role && ROLE_META[role]?.color) || 'default'
+})
+const roleLabel = computed(() => {
+  const role = auth.currentUser?.role
+  return (role && ROLE_META[role]?.label) || (role ?? '')
+})
+
+async function onMenuClick({ key }: { key: string }) {
+  if (key !== 'logout') return
+  // Best-effort POST to backend; even on failure (network down, cookie
+  // already expired) we force-redirect to /login so the UI never sits in a
+  // half-authenticated state where currentUser is cleared client-side but
+  // the URL still shows a protected page.
+  try {
+    await fetch('/logout', { method: 'POST', credentials: 'include' })
+  } catch {
+    /* swallow — full-page redirect below is the source of truth */
+  }
+  auth.clear()
+  window.location.href = '/login'
+}
 
 const modelsOpen = ref(isActive('/models'))
 const systemOpen = ref(isActive('/system'))
@@ -82,6 +142,13 @@ function handleKeyDown(e: KeyboardEvent) {
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
+  // Hydrate the dropdown when landing on a public page (e.g. /overview).
+  // The router guard skips /api/me for public routes, so currentUser may be
+  // null even though a session cookie is set. fetchCurrentUser() is cached
+  // (60s TTL) and de-dupes in-flight calls, so this is cheap and idempotent.
+  if (!auth.currentUser) {
+    void auth.fetchCurrentUser()
+  }
 })
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeyDown)
@@ -113,8 +180,8 @@ onUnmounted(() => {
           </router-link>
           <div class="nav-label">系统</div>
 
-          <!-- Models sub-menu -->
-          <div class="sub-group" :class="{ 'is-open': modelsOpen }">
+          <!-- Models sub-menu (admin/operator only — viewer hides the entry) -->
+          <div v-if="canSeeModelsGroup" class="sub-group" :class="{ 'is-open': modelsOpen }">
             <button
               type="button"
               class="sub-toggle"
@@ -128,7 +195,7 @@ onUnmounted(() => {
             </button>
             <div v-show="modelsOpen" class="sub-list">
               <router-link
-                v-for="item in modelsChildren"
+                v-for="item in visibleModelsChildren"
                 :key="item.path"
                 :to="item.path"
                 :class="{ active: isExact(item.path) }"
@@ -139,8 +206,8 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <!-- System sub-menu -->
-          <div class="sub-group" :class="{ 'is-open': systemOpen }">
+          <!-- System sub-menu (always visible — admin-only items inside are gated individually) -->
+          <div v-if="canSeeSystemGroup" class="sub-group" :class="{ 'is-open': systemOpen }">
             <button
               type="button"
               class="sub-toggle"
@@ -154,7 +221,7 @@ onUnmounted(() => {
             </button>
             <div v-show="systemOpen" class="sub-list">
               <router-link
-                v-for="item in systemChildren"
+                v-for="item in visibleSystemChildren"
                 :key="item.path"
                 :to="item.path"
                 :class="{ active: isExact(item.path) }"
@@ -174,6 +241,26 @@ onUnmounted(() => {
 
     <!-- CONTENT WRAPPER -->
     <div style="display: flex; flex-direction: column; flex: 1; min-width: 0;">
+      <!-- TOPBAR with user dropdown -->
+      <header v-if="auth.currentUser" class="topbar">
+        <a-dropdown placement="bottomRight" :trigger="['click']">
+          <span class="user-trigger" tabindex="0">
+            <a-avatar size="small">{{ avatarLetter }}</a-avatar>
+            <span class="user-name">{{ auth.currentUser.display_name || auth.currentUser.username }}</span>
+            <a-tag :color="roleColor" class="role-tag">{{ roleLabel }}</a-tag>
+          </span>
+          <template #overlay>
+            <a-menu @click="onMenuClick">
+              <a-menu-item key="profile" disabled>
+                <span>{{ auth.currentUser.username }} · {{ roleLabel }}</span>
+              </a-menu-item>
+              <a-menu-divider />
+              <a-menu-item key="logout">登出</a-menu-item>
+            </a-menu>
+          </template>
+        </a-dropdown>
+      </header>
+
       <!-- WebSocket disconnect banner (inline in column) -->
       <div
         v-if="!wsConnected && (wsReconnecting || wsFallbackMode)"
@@ -352,5 +439,48 @@ onUnmounted(() => {
   font-weight: 600;
   text-align: center;
   letter-spacing: 0.3px;
+}
+
+/* ============ TOPBAR with user dropdown ============ */
+.topbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  height: 44px;
+  padding: 0 18px;
+  border-bottom: 0.5px solid var(--line);
+  background: rgba(255, 255, 255, 0.6);
+  backdrop-filter: blur(8px);
+  flex-shrink: 0;
+}
+.user-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background 0.15s;
+  user-select: none;
+}
+.user-trigger:hover { background: rgba(10, 10, 15, 0.05); }
+.user-trigger:focus-visible {
+  outline: 2px solid rgba(10, 10, 15, 0.25);
+  outline-offset: 2px;
+}
+.user-trigger .user-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-trigger .role-tag {
+  margin-inline-end: 0;
+  font-size: 11px;
+  line-height: 18px;
+  padding: 0 6px;
 }
 </style>

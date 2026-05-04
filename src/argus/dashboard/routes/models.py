@@ -79,6 +79,13 @@ def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
         if anomaly_cfg:
             kwargs["min_shadow_days"] = getattr(anomaly_cfg, "min_shadow_days", 3)
             kwargs["min_canary_days"] = getattr(anomaly_cfg, "min_canary_days", 7)
+    # Wire the dashboard WS manager as broadcaster so stage transitions
+    # surface in the frontend release-pipeline view in real time. We only
+    # pass the bound broadcast method (publisher signature: topic, payload),
+    # so ReleasePipeline never sees the rest of the manager.
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if ws_manager is not None and hasattr(ws_manager, "broadcast"):
+        kwargs["event_publisher"] = ws_manager.broadcast
     pipeline = ReleasePipeline(session_factory=session_factory, **kwargs)
     request.app.state._release_pipeline = pipeline
     return pipeline
