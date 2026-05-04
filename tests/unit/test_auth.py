@@ -3,7 +3,10 @@
 import time
 
 import pytest
+from fastapi.testclient import TestClient
 
+from argus.config.schema import ArgusConfig, AuthConfig
+from argus.dashboard.app import create_app
 from argus.dashboard.auth import (
     PERMISSION_MAP,
     create_session_token,
@@ -14,6 +17,7 @@ from argus.dashboard.auth import (
     verify_password,
     verify_session_token,
 )
+from argus.storage.database import Database
 
 
 # ── Password hashing ──
@@ -221,3 +225,66 @@ class TestCurrentUsername:
     def test_returns_unknown_when_state_user_is_not_dict(self):
         req = _FakeRequest("some_string_garbage")  # robustness against bad middleware
         assert current_username(req) == "unknown"
+
+
+# ── /api/me endpoint ──
+
+
+@pytest.fixture
+def _me_db(tmp_path):
+    database = Database(database_url=f"sqlite:///{tmp_path / 'me.db'}")
+    database.initialize()
+    yield database
+    database.close()
+
+
+def _build_auth_enabled_client(database: Database) -> tuple[TestClient, str]:
+    """Build a TestClient with auth enabled and return (client, session_secret)."""
+    config = ArgusConfig(auth=AuthConfig(enabled=True, api_token="me-test-token"))
+    app = create_app(database=database, config=config)
+    client = TestClient(app)
+    return client, app.state.session_secret
+
+
+class TestMeEndpoint:
+    """GET /api/me — current-session identity probe used by the SPA."""
+
+    def test_unauthenticated_returns_401(self, _me_db):
+        """No session cookie → middleware returns the canonical 401 envelope."""
+        client, _ = _build_auth_enabled_client(_me_db)
+        # Force the API branch (not the HTML redirect branch) of the middleware.
+        resp = client.get("/api/me", headers={"accept": "application/json"})
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "Authentication required"}
+
+    def test_authenticated_returns_username_and_role(self, _me_db):
+        """Valid session cookie → 200 with flat {username, role} body."""
+        _me_db.create_user(
+            "alice", hash_password("pw-alice"), "operator", "Alice Operator",
+        )
+        client, secret = _build_auth_enabled_client(_me_db)
+        token = create_session_token("alice", "operator", secret)
+        client.cookies.set("argus_session", token)
+
+        resp = client.get("/api/me")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["username"] == "alice"
+        assert body["role"] == "operator"
+        assert body["display_name"] == "Alice Operator"
+        # Must not leak sensitive fields.
+        assert "password_hash" not in body
+        assert "session_token" not in body
+        assert "api_token" not in body
+
+    def test_authenticated_without_display_name_omits_field(self, _me_db):
+        """Users with no display_name get a body without the optional key."""
+        _me_db.create_user("bob", hash_password("pw-bob"), "viewer", None)
+        client, secret = _build_auth_enabled_client(_me_db)
+        token = create_session_token("bob", "viewer", secret)
+        client.cookies.set("argus_session", token)
+
+        resp = client.get("/api/me")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {"username": "bob", "role": "viewer"}

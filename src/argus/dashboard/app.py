@@ -25,6 +25,7 @@ from argus.dashboard.routes.audit import router as audit_router
 from argus.dashboard.routes.backup import router as backup_router
 from argus.dashboard.routes.cameras import router as cameras_router
 from argus.dashboard.routes.config import router as config_router
+from argus.dashboard.routes.me import router as me_router
 from argus.dashboard.routes.sensors import router as sensors_router
 from argus.dashboard.routes.system import router as system_router
 from argus.dashboard.routes.tasks import router as tasks_router
@@ -218,6 +219,7 @@ def create_app(
     app.include_router(audit_router, prefix="/api/audit", tags=["audit"])
     app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
     app.include_router(users_router, prefix="/api/users", tags=["users"])
+    app.include_router(me_router, prefix="/api/me", tags=["me"])
     app.include_router(regions_router, prefix="/api/regions", tags=["regions"])
     app.include_router(reports_router, prefix="/api/reports", tags=["reports"])
     app.include_router(sensors_router, prefix="/api/sensors", tags=["sensors"])

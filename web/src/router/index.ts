@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteLocationNormalized } from 'vue-router'
 import BasicLayout from '../layouts/BasicLayout.vue'
+import { useAuthStore } from '../stores/useAuthStore'
 
 // Map legacy `?tab=` query values to new child routes
 const MODELS_TAB_TO_PATH: Record<string, string> = {
@@ -239,10 +240,37 @@ const router = createRouter({
   ],
 })
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   document.title = `${to.meta.title || 'Argus'} - Argus`
-  // future hook: when /api/me available, check meta.requiresRole here
-  if (to.meta.requiresRole) { /* no-op until /api/me lands; axios 401/403 enforces today */ }
+
+  // Public routes: no identity check needed. Avoid hitting /api/me for
+  // anonymous browsing of public pages.
+  if (!to.meta.requiresAuth && !to.meta.requiresRole) return true
+
+  const auth = useAuthStore()
+  // Cache (60s) and in-flight de-dup are handled inside the store, so
+  // rapid back-to-back navigations don't fan out to N concurrent requests.
+  let user = auth.currentUser
+  if (!user) {
+    user = await auth.fetchCurrentUser()
+  }
+
+  // Not authenticated: client.ts's 401 interceptor already kicked off a
+  // full-page redirect to /login. Just cancel the in-app navigation here.
+  if (!user) return false
+
+  // Role check (only for routes that opt in via meta.requiresRole).
+  if (to.meta.requiresRole && Array.isArray(to.meta.requiresRole)) {
+    if (!auth.hasRole(to.meta.requiresRole as string[])) {
+      // Dynamic import to avoid module-init order issues with client.ts
+      // (which also imports `message` from ant-design-vue).
+      const { message } = await import('ant-design-vue')
+      message.error('权限不足:你的角色无法访问此页面')
+      return false
+    }
+  }
+
+  return true
 })
 
 export default router
