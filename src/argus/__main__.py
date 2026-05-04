@@ -417,6 +417,25 @@ def main():
         db.close()
         sys.exit(1)
 
+    # Wire ws_manager.broadcast into each pipeline's degradation publisher
+    # so anomaly head fallback events surface to the dashboard banner.
+    # Pipelines are created during start_all(); ws_manager is created during
+    # create_app() above — both must exist before this is safe to call. Each
+    # pipeline's setter is a no-op when the publisher is None, and broadcast
+    # failures are swallowed by the pipeline (best-effort).
+    if app is not None:
+        ws_mgr_for_pipeline = getattr(app.state, "ws_manager", None)
+        if ws_mgr_for_pipeline is not None:
+            for cam_id, pipeline in manager._pipelines.items():
+                try:
+                    pipeline.set_degradation_publisher(ws_mgr_for_pipeline.broadcast)
+                except Exception as exc:
+                    logger.warning(
+                        "main.degradation_publisher_wire_failed",
+                        camera_id=cam_id,
+                        error=str(exc),
+                    )
+
     logger.info("argus.running", cameras=len(started), msg="Press Ctrl+C to stop")
 
     _go2rtc_check_counter = 0

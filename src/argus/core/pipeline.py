@@ -211,11 +211,13 @@ class DetectionPipeline:
         inference_executor: ThreadPoolExecutor | None = None,
         encode_executor: ThreadPoolExecutor | None = None,
         sensor_fusion: object | None = None,
+        degradation_publisher: Callable[[str, dict], None] | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
         self._on_drift = on_drift
         self._event_bus = event_bus
+        self._degradation_publisher = degradation_publisher
         self._inference_executor = inference_executor or _get_default_inference_executor()
         # Ring-buffer JPEG encoding runs on a dedicated pool so it never
         # starves inference futures (encode = 5-15ms each; inference = ~30ms).
@@ -449,6 +451,7 @@ class DetectionPipeline:
         # simplex safety channel run solo, instead of crashing the camera.
         self._anomaly_degraded: bool = False
         self._anomaly_degradation_reason: str | None = None
+        self._anomaly_degradation_started_at: float | None = None
         self._anomaly_failure_count: int = 0
         self._anomaly_degraded_lock = threading.Lock()
 
@@ -1010,6 +1013,8 @@ class DetectionPipeline:
                 return
             self._anomaly_degraded = True
             self._anomaly_degradation_reason = reason
+            self._anomaly_degradation_started_at = time.time()
+            started_at = self._anomaly_degradation_started_at
         logger.error(
             "pipeline.anomaly_degraded_entered",
             camera_id=self.camera_config.camera_id,
@@ -1034,6 +1039,28 @@ class DetectionPipeline:
                     "pipeline.anomaly_degraded_publish_failed",
                     camera_id=self.camera_config.camera_id,
                     exc_info=True,
+                )
+        # Push directly to the dashboard WebSocket subscribers when a
+        # publisher is wired. Best-effort: any failure here must NOT impact
+        # the inference loop.
+        if self._degradation_publisher is not None:
+            try:
+                self._degradation_publisher(
+                    "system_degradation",
+                    {
+                        "type": "entered",
+                        "component": "anomaly",
+                        "camera_id": self.camera_config.camera_id,
+                        "reason": reason,
+                        "started_at": started_at,
+                        "simplex_active": self._simplex is not None,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "pipeline.degradation_broadcast_failed",
+                    camera_id=self.camera_config.camera_id,
+                    error=str(exc),
                 )
 
     def _record_anomaly_inference_ok(self) -> None:
@@ -1070,6 +1097,23 @@ class DetectionPipeline:
         """Reason for current anomaly degradation, or None if nominal."""
         with self._anomaly_degraded_lock:
             return self._anomaly_degradation_reason
+
+    def get_anomaly_degradation_started_at(self) -> float | None:
+        """Unix timestamp when the anomaly head entered degraded mode."""
+        with self._anomaly_degraded_lock:
+            return self._anomaly_degradation_started_at
+
+    def set_degradation_publisher(
+        self, publisher: Callable[[str, dict], None] | None,
+    ) -> None:
+        """Inject (or replace) the WebSocket broadcast callable.
+
+        Used by ``__main__.py`` to wire ``ws_manager.broadcast`` into
+        pipelines that were created before the dashboard initialised. The
+        publisher is only invoked on state transitions, so calling this
+        after the initial state has been set still surfaces future events.
+        """
+        self._degradation_publisher = publisher
 
     def initialize(self) -> bool:
         """Initialize all pipeline components. Returns True on success."""

@@ -36,7 +36,7 @@ logger = structlog.get_logger()
 
 VALID_TOPICS = frozenset({
     "health", "cameras", "alerts", "tasks", "wall", "degradation", "heatmap",
-    "audio_alert", "models", "model_release",
+    "audio_alert", "models", "model_release", "system_degradation",
 })
 
 
