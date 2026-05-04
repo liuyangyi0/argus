@@ -12,6 +12,11 @@ from typing import Callable
 import structlog
 from sqlalchemy.orm import Session
 
+from argus.core.error_channel import (
+    SEVERITY_CRITICAL,
+    SEVERITY_ERROR,
+    get_error_channel,
+)
 from argus.storage.models import (
     AuditLog,
     ModelRecord,
@@ -186,6 +191,23 @@ class ReleasePipeline:
                         error_type=type(rollback_exc).__name__,
                         error=str(rollback_exc),
                     )
+                    get_error_channel().emit(
+                        severity=SEVERITY_CRITICAL,
+                        source="release_pipeline",
+                        code="rollback_failed",
+                        message=(
+                            f"Stage transition 回滚失败 "
+                            f"({current_stage} → {target_stage})"
+                        ),
+                        context={
+                            "model_version_id": model_version_id,
+                            "from_stage": current_stage,
+                            "to_stage": target_stage,
+                            "triggered_by": triggered_by,
+                            "error_type": type(rollback_exc).__name__,
+                            "error": str(rollback_exc),
+                        },
+                    )
                 logger.error(
                     "release_pipeline.transition_failed",
                     model_version_id=model_version_id,
@@ -194,6 +216,23 @@ class ReleasePipeline:
                     triggered_by=triggered_by,
                     error_type=type(exc).__name__,
                     error=str(exc),
+                )
+                get_error_channel().emit(
+                    severity=SEVERITY_ERROR,
+                    source="release_pipeline",
+                    code="transition_failed",
+                    message=(
+                        f"Stage transition 失败 "
+                        f"({current_stage} → {target_stage})"
+                    ),
+                    context={
+                        "model_version_id": model_version_id,
+                        "from_stage": current_stage,
+                        "to_stage": target_stage,
+                        "triggered_by": triggered_by,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
                 )
                 raise
 

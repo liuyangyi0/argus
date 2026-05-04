@@ -21,6 +21,11 @@ import structlog
 from argus.alerts.grader import Alert, AlertSeverity
 from argus.config.schema import AlertConfig, AnomalyConfig, CameraConfig, ClassifierConfig, CrossCameraConfig, SegmenterConfig
 from argus.core.correlation import CameraOverlapPair, CrossCameraCorrelator
+from argus.core.error_channel import (
+    SEVERITY_ERROR,
+    SEVERITY_WARNING,
+    get_error_channel,
+)
 from argus.core.pipeline import DetectionPipeline, PipelineMode, PipelineStats
 from argus.core.runner import CameraInferenceRunner, RunnerSnapshot
 
@@ -896,6 +901,13 @@ class CameraManager:
 
         if not runner.initialize():
             logger.error("manager.init_failed", camera_id=camera_id)
+            get_error_channel().emit(
+                severity=SEVERITY_WARNING,
+                source="capture_manager",
+                code="init_failed",
+                message=f"摄像头 {camera_id} 初始化失败",
+                context={"camera_id": camera_id},
+            )
             return False
 
         thread = threading.Thread(
@@ -1019,6 +1031,17 @@ class CameraManager:
                     self._stop_event.wait(1.0)
         except Exception as e:
             logger.error("camera_loop.fatal", camera_id=camera_id, error=str(e))
+            get_error_channel().emit(
+                severity=SEVERITY_ERROR,
+                source="capture_manager",
+                code="camera_loop_fatal",
+                message=f"摄像头 {camera_id} 处理循环致命错误: {e}",
+                context={
+                    "camera_id": camera_id,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
         finally:
             logger.info("camera_loop.stopped", camera_id=camera_id)
             with self._lock:

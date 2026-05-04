@@ -245,6 +245,33 @@ class Database:
                             table=table, column=column, error=str(e),
                             exc_info=True,
                         )
+                        # 启动期通常 ws_manager 还没就绪 —— ErrorChannel 会把
+                        # 该事件缓冲下来,等 dashboard 启动后注入 publisher 时
+                        # 再 flush。即使最后 RuntimeError 拉起进程崩溃,这条
+                        # 事件已经落入 structlog,这里只是给运维多一条 WS 通道。
+                        try:
+                            from argus.core.error_channel import (
+                                SEVERITY_CRITICAL,
+                                get_error_channel,
+                            )
+                            get_error_channel().emit(
+                                severity=SEVERITY_CRITICAL,
+                                source="database",
+                                code="migration_failed",
+                                message=f"自动迁移失败:{table}.{column}",
+                                context={
+                                    "table": table,
+                                    "column": column,
+                                    "error_type": type(e).__name__,
+                                    "error": str(e),
+                                },
+                            )
+                        except Exception:  # pragma: no cover — defensive
+                            # 不能让 emit 自己再炸,启动期一切以日志为准
+                            logger.debug(
+                                "database.error_channel_emit_failed",
+                                exc_info=True,
+                            )
                         raise RuntimeError(
                             f"Auto-migration failed on {table}.{column}: {e}. "
                             f"Database schema may be inconsistent. "

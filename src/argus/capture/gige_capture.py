@@ -27,6 +27,10 @@ import structlog
 from typing import TYPE_CHECKING
 
 from argus.capture.camera import CameraState, FrameData
+from argus.core.error_channel import (
+    SEVERITY_ERROR,
+    get_error_channel,
+)
 
 if TYPE_CHECKING:
     from argus.capture.frame_buffer import LatestFrameBuffer
@@ -408,6 +412,20 @@ class GigECapture:
                         camera_id=self.camera_id,
                         attempts=attempt,
                     )
+                    get_error_channel().emit(
+                        severity=SEVERITY_ERROR,
+                        source="gige_capture",
+                        code="reconnect_exhausted",
+                        message=(
+                            f"GigE 摄像头 {self.camera_id} 重连次数耗尽 "
+                            f"(attempts={attempt})"
+                        ),
+                        context={
+                            "camera_id": self.camera_id,
+                            "attempts": attempt,
+                            "max_attempts": self.max_reconnect_attempts,
+                        },
+                    )
                     break
 
                 attempt += 1
@@ -452,6 +470,20 @@ class GigECapture:
                     "gige.reconnect_exhausted",
                     camera_id=self.camera_id,
                     attempts=attempt,
+                )
+                get_error_channel().emit(
+                    severity=SEVERITY_ERROR,
+                    source="gige_capture",
+                    code="reconnect_exhausted",
+                    message=(
+                        f"GigE 摄像头 {self.camera_id} 重连次数耗尽 "
+                        f"(attempts={attempt})"
+                    ),
+                    context={
+                        "camera_id": self.camera_id,
+                        "attempts": attempt,
+                        "max_attempts": self.max_reconnect_attempts,
+                    },
                 )
                 return False
 

@@ -49,6 +49,10 @@ def _get_default_inference_executor() -> ThreadPoolExecutor:
 from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
 from types import MappingProxyType
 
+from argus.core.error_channel import (
+    SEVERITY_WARNING,
+    get_error_channel,
+)
 from argus.core.event_bus import (
     EventBus,
     FrameAnalyzed,
@@ -1062,6 +1066,22 @@ class DetectionPipeline:
                     camera_id=self.camera_config.camera_id,
                     error=str(exc),
                 )
+        # Mirror to the unified error channel so the system_errors banner
+        # shows the same event alongside other backend failures. emit() is
+        # internally swallowed; this can never crash the inference loop.
+        get_error_channel().emit(
+            severity=SEVERITY_WARNING,
+            source="pipeline",
+            code="anomaly_degraded",
+            message=f"摄像头 {self.camera_config.camera_id} 进入异常降级",
+            context={
+                "camera_id": self.camera_config.camera_id,
+                "reason": reason,
+                "simplex_active": self._simplex is not None,
+                "started_at": started_at,
+                "manual_recovery_required": manual_recovery_hint,
+            },
+        )
 
     def _record_anomaly_inference_ok(self) -> None:
         """Reset the consecutive failure counter after a successful inference."""

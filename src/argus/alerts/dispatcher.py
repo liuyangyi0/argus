@@ -24,6 +24,11 @@ import structlog
 from argus.alerts.grader import Alert
 from argus.config.schema import AlertConfig, AudioAlertConfig
 from argus.core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+from argus.core.error_channel import (
+    SEVERITY_CRITICAL,
+    SEVERITY_ERROR,
+    get_error_channel,
+)
 from argus.storage.database import Database
 
 logger = structlog.get_logger()
@@ -224,6 +229,22 @@ class AlertDispatcher:
                     error=str(exc),
                     msg="Alert dropped: queue overflow + fallback failed",
                 )
+                get_error_channel().emit(
+                    severity=SEVERITY_CRITICAL,
+                    source="dispatcher",
+                    code="db_overflow_fallback_failed",
+                    message=(
+                        f"告警丢失:DB 队列溢出且同步回退也失败 "
+                        f"(alert_id={alert.alert_id})"
+                    ),
+                    context={
+                        "alert_id": alert.alert_id,
+                        "camera_id": alert.camera_id,
+                        "severity": alert.severity.value,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
                 # 同步 fallback 又挂了,告警实际上已经丢了。把溢出事件落到
                 # _record_dispatch_failure(目前是日志兜底;若以后接入了 metrics
                 # 模块,会自动打 counter)。
@@ -307,6 +328,19 @@ class AlertDispatcher:
             self._dispatch_database_strict(alert, snapshot_path, heatmap_path)
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))
+            get_error_channel().emit(
+                severity=SEVERITY_ERROR,
+                source="dispatcher",
+                code="db_failed",
+                message=f"后台 worker 写库失败 (alert_id={alert.alert_id})",
+                context={
+                    "alert_id": alert.alert_id,
+                    "camera_id": alert.camera_id,
+                    "severity": alert.severity.value,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
 
     def _dispatch_database_strict(
         self, alert: Alert, snapshot_path: str | None, heatmap_path: str | None
