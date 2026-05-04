@@ -436,6 +436,19 @@ def main():
                         error=str(exc),
                     )
 
+            # Wire the unified error channel publisher: any logger.error site
+            # that also calls ErrorChannel.emit() will surface to the
+            # `system_errors` WS topic. Events emitted before this line were
+            # buffered in memory and are flushed atomically here.
+            try:
+                from argus.core.error_channel import get_error_channel
+                get_error_channel().set_publisher(ws_mgr_for_pipeline.broadcast)
+            except Exception as exc:
+                logger.warning(
+                    "main.error_channel_wire_failed",
+                    error=str(exc),
+                )
+
     logger.info("argus.running", cameras=len(started), msg="Press Ctrl+C to stop")
 
     _go2rtc_check_counter = 0

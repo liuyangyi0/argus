@@ -24,6 +24,10 @@ import structlog
 
 from argus.anomaly import _trainer_export as _te
 from argus.anomaly.baseline import BaselineManager
+from argus.core.error_channel import (
+    SEVERITY_ERROR,
+    get_error_channel,
+)
 from argus.storage.models import BaselineState
 
 if TYPE_CHECKING:
@@ -482,6 +486,18 @@ class ModelTrainer:
                 return self._fail(start, error="anomalib 未安装", **common_fail_kwargs)
             except Exception as e:
                 logger.error("training.failed", error=str(e))
+                get_error_channel().emit(
+                    severity=SEVERITY_ERROR,
+                    source="trainer",
+                    code="training_failed",
+                    message=f"模型训练失败 ({camera_id}/{zone_id}): {e}",
+                    context={
+                        "camera_id": camera_id,
+                        "zone_id": zone_id,
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    },
+                )
                 return self._fail(start, error=str(e), **common_fail_kwargs)
 
             # Export

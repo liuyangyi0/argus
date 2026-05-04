@@ -35,6 +35,10 @@ if TYPE_CHECKING:
     from argus.storage.database import Database
     from argus.storage.model_registry import ModelRegistry
 
+from argus.core.error_channel import (
+    SEVERITY_ERROR,
+    get_error_channel,
+)
 from argus.core.pipeline import PipelineMode
 from argus.core.pipeline_mode_guard import GlobalPipelineModeGuard
 
@@ -228,6 +232,20 @@ class TrainingJobExecutor:
                 duration_seconds=duration,
             )
             logger.error("job_executor.failed", job_id=job_id, error=str(e))
+            get_error_channel().emit(
+                severity=SEVERITY_ERROR,
+                source="job_executor",
+                code="job_failed",
+                message=f"训练任务失败 (job_id={job_id}): {e}",
+                context={
+                    "job_id": job_id,
+                    "job_type": getattr(job, "job_type", None),
+                    "camera_id": getattr(job, "camera_id", None),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "duration_seconds": duration,
+                },
+            )
 
     def _execute_backbone(self, job) -> None:
         """Execute SSL backbone fine-tuning job."""

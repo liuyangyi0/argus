@@ -1,11 +1,15 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, h, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
+import { Button, notification } from 'ant-design-vue'
+import { BellOutlined } from '@ant-design/icons-vue'
 import DegradationBar from '../components/DegradationBar.vue'
 import ErrorBoundary from '../components/ErrorBoundary.vue'
+import ErrorCenterDrawer from '../components/system/ErrorCenterDrawer.vue'
 import { useWebSocket } from '../composables/useWebSocket'
 import { useSystemMode } from '../composables/useSystemMode'
 import { useAuthStore } from '../stores/useAuthStore'
+import { useErrorStore } from '../stores/useErrorStore'
 
 const router = useRouter()
 const route = useRoute()
@@ -118,9 +122,36 @@ function toggleSystem() {
   systemOpen.value = !systemOpen.value
 }
 
-// WebSocket connection state for global banner
+// Global error center: aggregates `system_errors` topic into a Pinia store and
+// pops a notification for error/critical events. The same useWebSocket call
+// also drives the disconnect banner via the `health` topic so we keep a single
+// long-lived subscriber on the layout.
+const errorStore = useErrorStore()
 const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFallbackMode, retryCount: wsRetryCount, nextRetryIn: wsNextRetryIn } = useWebSocket({
-  topics: ['health'],
+  topics: ['health', 'system_errors'],
+  onMessage: (topic, payload) => {
+    if (topic !== 'system_errors') return
+    errorStore.pushError(payload)
+    const severity = payload?.severity
+    if (severity === 'critical' || severity === 'error') {
+      notification.open({
+        message: `[${payload.source ?? 'unknown'}] ${payload.code ?? 'unknown'}`,
+        description: payload.message ?? '',
+        type: severity === 'critical' ? 'error' : 'warning',
+        duration: severity === 'critical' ? 0 : 6,  // critical 不自动关闭
+        btn: () =>
+          h(
+            Button,
+            {
+              size: 'small',
+              type: 'link',
+              onClick: () => errorStore.openDrawer(),
+            },
+            { default: () => '查看错误中心' },
+          ),
+      })
+    }
+  },
 })
 
 // 痛点 4: global pipeline mode banner (capturing / training / maintenance)
@@ -241,8 +272,13 @@ onUnmounted(() => {
 
     <!-- CONTENT WRAPPER -->
     <div style="display: flex; flex-direction: column; flex: 1; min-width: 0;">
-      <!-- TOPBAR with user dropdown -->
+      <!-- TOPBAR with error center bell + user dropdown -->
       <header v-if="auth.currentUser" class="topbar">
+        <a-badge :count="errorStore.unreadCount" :overflow-count="99" :offset="[-4, 4]">
+          <a-button type="text" shape="circle" title="错误中心" @click="errorStore.openDrawer()">
+            <BellOutlined />
+          </a-button>
+        </a-badge>
         <a-dropdown placement="bottomRight" :trigger="['click']">
           <span class="user-trigger" tabindex="0">
             <a-avatar size="small">{{ avatarLetter }}</a-avatar>
@@ -309,6 +345,9 @@ onUnmounted(() => {
         </div>
       </ErrorBoundary>
     </div>
+
+    <!-- Global error center drawer (mounted once at app shell level) -->
+    <ErrorCenterDrawer />
 
     <!-- Keyboard shortcuts window -->
     <div v-if="shortcutHelpVisible" class="shortcut-help glass">
@@ -446,6 +485,7 @@ onUnmounted(() => {
   display: flex;
   justify-content: flex-end;
   align-items: center;
+  gap: 8px;
   height: 44px;
   padding: 0 18px;
   border-bottom: 0.5px solid var(--line);
