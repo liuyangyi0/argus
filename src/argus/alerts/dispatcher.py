@@ -207,8 +207,31 @@ class AlertDispatcher:
                 alert_id=alert.alert_id,
                 msg="Alert DB persistence lost — queue overflow, attempting sync fallback",
             )
-            # Fallback: synchronous write so the alert is never silently lost
-            self._dispatch_database(alert, snapshot_path, heatmap_path)
+            # Fallback: synchronous write so the alert is never silently lost.
+            # 这里必须用 *_strict 版本 —— 普通 _dispatch_database 在写库失败时
+            # 会吞异常(因为后台 worker 线程不能因为单条告警挂掉),但 fallback
+            # 路径如果再静默吃掉就真的丢告警了。所以这里要求把异常上抛,让
+            # 调用方(或上层 except)能感知到 alert 真的没落到任何持久层。
+            try:
+                self._dispatch_database_strict(alert, snapshot_path, heatmap_path)
+            except Exception as exc:
+                logger.error(
+                    "dispatch.fallback_db_failed",
+                    alert_id=alert.alert_id,
+                    camera_id=alert.camera_id,
+                    severity=alert.severity.value,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    msg="Alert dropped: queue overflow + fallback failed",
+                )
+                # 同步 fallback 又挂了,告警实际上已经丢了。把溢出事件落到
+                # _record_dispatch_failure(目前是日志兜底;若以后接入了 metrics
+                # 模块,会自动打 counter)。
+                self._record_dispatch_failure(alert, "db_queue_overflow_and_fallback_failed")
+                raise RuntimeError(
+                    f"Alert dropped: queue overflow + fallback failed "
+                    f"(alert_id={alert.alert_id}, original={exc!s})"
+                ) from exc
 
         # Channel 2: Webhook (non-blocking, queued to background thread, with circuit breaker DET-009)
         if self._config.webhook.enabled:
@@ -273,59 +296,75 @@ class AlertDispatcher:
     def _dispatch_database(
         self, alert: Alert, snapshot_path: str | None, heatmap_path: str | None
     ) -> None:
-        """Persist alert to database."""
+        """Persist alert to database (worker-safe; swallows exceptions).
+
+        后台 _db_worker 线程会循环调用本方法。这里必须把异常吃掉,否则
+        worker 线程会因为单条告警写库失败而退出,后续告警全部丢失。
+        如果调用方需要在写失败时感知到失败(例如同步 fallback 路径),
+        应改用 ``_dispatch_database_strict``。
+        """
         try:
-            # Only forward segmentation fields when the segmenter actually
-            # produced objects — keeps the DB column NULL for alerts where
-            # the segmenter is off or returned an empty result.
-            seg_count = getattr(alert, "segmentation_count", 0)
-            seg_total_area = getattr(alert, "segmentation_total_area_px", 0)
-            seg_objects = getattr(alert, "segmentation_objects", None)
-            has_segmentation = bool(seg_count)
-            import json as _json
-
-            traj_json = None
-            if alert.trajectory_points:
-                traj_json = _json.dumps(
-                    [{"t": round(t, 4), "x": round(x, 1), "y": round(y, 1)}
-                     for t, x, y in alert.trajectory_points]
-                )
-
-            self._db.save_alert(
-                alert_id=alert.alert_id,
-                timestamp=datetime.fromtimestamp(alert.timestamp, tz=timezone.utc),
-                camera_id=alert.camera_id,
-                zone_id=alert.zone_id,
-                severity=alert.severity.value,
-                anomaly_score=alert.anomaly_score,
-                snapshot_path=snapshot_path,
-                heatmap_path=heatmap_path,
-                event_group_id=getattr(alert, "event_group_id", None),
-                event_group_count=getattr(alert, "event_group_count", 1),
-                speed_ms=alert.speed_ms,
-                speed_px_per_sec=alert.speed_px_per_sec,
-                trajectory_model=alert.trajectory_model,
-                origin_x_mm=alert.origin_x_mm,
-                origin_y_mm=alert.origin_y_mm,
-                origin_z_mm=alert.origin_z_mm,
-                landing_x_mm=alert.landing_x_mm,
-                landing_y_mm=alert.landing_y_mm,
-                landing_z_mm=alert.landing_z_mm,
-                trajectories_json=getattr(alert, "trajectories_json", None),
-                classification_label=alert.classification_label,
-                classification_confidence=alert.classification_confidence,
-                corroborated=getattr(alert, "corroborated", None),
-                correlation_partner=getattr(alert, "correlation_partner", None),
-                segmentation_count=seg_count if has_segmentation else None,
-                segmentation_total_area_px=seg_total_area if has_segmentation else None,
-                segmentation_objects=seg_objects if has_segmentation else None,
-                category=getattr(alert, "category", None),
-                severity_adjusted_by_classifier=getattr(alert, "severity_adjusted_by_classifier", None),
-                trajectory_points=traj_json,
-                model_version_id=getattr(alert, "model_version_id", None),
-            )
+            self._dispatch_database_strict(alert, snapshot_path, heatmap_path)
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))
+
+    def _dispatch_database_strict(
+        self, alert: Alert, snapshot_path: str | None, heatmap_path: str | None
+    ) -> None:
+        """Persist alert to database; raises on failure.
+
+        给 dispatch() 的同步 fallback 路径用 —— 那条路径已经因为 queue
+        溢出走到了"最后一根稻草",再吞错就真丢告警了。
+        """
+        # Only forward segmentation fields when the segmenter actually
+        # produced objects — keeps the DB column NULL for alerts where
+        # the segmenter is off or returned an empty result.
+        seg_count = getattr(alert, "segmentation_count", 0)
+        seg_total_area = getattr(alert, "segmentation_total_area_px", 0)
+        seg_objects = getattr(alert, "segmentation_objects", None)
+        has_segmentation = bool(seg_count)
+        import json as _json
+
+        traj_json = None
+        if alert.trajectory_points:
+            traj_json = _json.dumps(
+                [{"t": round(t, 4), "x": round(x, 1), "y": round(y, 1)}
+                 for t, x, y in alert.trajectory_points]
+            )
+
+        self._db.save_alert(
+            alert_id=alert.alert_id,
+            timestamp=datetime.fromtimestamp(alert.timestamp, tz=timezone.utc),
+            camera_id=alert.camera_id,
+            zone_id=alert.zone_id,
+            severity=alert.severity.value,
+            anomaly_score=alert.anomaly_score,
+            snapshot_path=snapshot_path,
+            heatmap_path=heatmap_path,
+            event_group_id=getattr(alert, "event_group_id", None),
+            event_group_count=getattr(alert, "event_group_count", 1),
+            speed_ms=alert.speed_ms,
+            speed_px_per_sec=alert.speed_px_per_sec,
+            trajectory_model=alert.trajectory_model,
+            origin_x_mm=alert.origin_x_mm,
+            origin_y_mm=alert.origin_y_mm,
+            origin_z_mm=alert.origin_z_mm,
+            landing_x_mm=alert.landing_x_mm,
+            landing_y_mm=alert.landing_y_mm,
+            landing_z_mm=alert.landing_z_mm,
+            trajectories_json=getattr(alert, "trajectories_json", None),
+            classification_label=alert.classification_label,
+            classification_confidence=alert.classification_confidence,
+            corroborated=getattr(alert, "corroborated", None),
+            correlation_partner=getattr(alert, "correlation_partner", None),
+            segmentation_count=seg_count if has_segmentation else None,
+            segmentation_total_area_px=seg_total_area if has_segmentation else None,
+            segmentation_objects=seg_objects if has_segmentation else None,
+            category=getattr(alert, "category", None),
+            severity_adjusted_by_classifier=getattr(alert, "severity_adjusted_by_classifier", None),
+            trajectory_points=traj_json,
+            model_version_id=getattr(alert, "model_version_id", None),
+        )
 
     def _dispatch_with_retry(
         self,

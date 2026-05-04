@@ -49,7 +49,7 @@ npm run build
 ## 当前实现速记
 
 - FastAPI 应用在 `src/argus/dashboard/app.py` 中装配 API、WebSocket、中间件和前端静态资源。
-- 前端当前只有 6 个主视图，很多管理能力集中在模型页和系统页的标签中。
+- 前端当前是 7 个主路由（Overview / Cameras / Alerts / Reports / Models / System / Replay），很多管理能力集中在模型页和系统页的标签中。
 - go2rtc 是当前流媒体链路的重要组成部分，USB 摄像头路径尤其依赖它的重定向逻辑。
 - 默认配置中分类器、分割器、跨摄像头和自动重训练通常关闭。
 

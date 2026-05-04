@@ -15,7 +15,7 @@ OpenVocabClassifier（代号 D1）是 Argus 异常告警链路上的 **可选语
 - 还会把 `(label, confidence)` 注入 `EarlyWarning`，作为单帧快路径的二次佐证（`require_detection_or_classifier=true` 时必备其一）。
 
 **为什么默认关闭**：
-1. `ClassifierConfig.enabled` 在 `src/argus/config/schema.py:310` 的 schema 默认值是 `False`（仓库当前 `configs/default.yaml:208` 把它打开了，但 schema 默认仍然是 `False`，意味着新建的最小化 yaml 不会自动启用）。
+1. `ClassifierConfig.enabled` 在 `src/argus/config/schema.py:310` 的 schema 默认值是 `False`，并且 `configs/default.yaml:212` 也保持为 `false`（与 README/requirements 对齐，启用需用户主动改 yaml 或在 System → 功能模块 中打开）。
 2. 它依赖 `ultralytics>=8.3.0` 的 YOLOWorld 类，并且要在第一次 `load()` 时联网或本地命中 `yolov8s-worldv2.pt` 权重，对离线/受限环境是个隐患。
 3. 在每个被裁剪出的异常 bbox 上多做一次 YOLO-World 推理，CPU 单核场景会显著拖慢主链路（见 §6），生产侧不见得能 always-on。
 
@@ -60,7 +60,7 @@ OpenVocabClassifier（代号 D1）是 Argus 异常告警链路上的 **可选语
 
 | 字段 | 默认值（schema） | 默认值（default.yaml） | 合法范围 | 调整建议 |
 |---|---|---|---|---|
-| `classifier.enabled` | `False` | `true` | bool | 关闭即整个分类层不接入 pipeline；可在 UI 热切换（见 §5）。 |
+| `classifier.enabled` | `False` | `false` | bool | 关闭即整个分类层不接入 pipeline；启用后可在 UI 热切换（见 §5）。 |
 | `classifier.model_name` | `yolov8s-worldv2.pt` | 同左 | 任意 ultralytics YOLOWorld 兼容权重路径或文件名 | 想要更高精度可换 `yolov8l-worldv2.pt`（更大、更慢）。 |
 | `classifier.vocabulary` | `FOE_VOCAB` 全集（`classifier.py:20-37`，约 50 项） | yaml 里只放了 17 项核心词 | 非空字符串列表 | 词表越大，YOLO-World 推理越慢；建议保留实际场景里出现的标签即可。 |
 | `classifier.min_anomaly_score_to_classify` | `0.5` | `0.5` | `[0.0, 1.0]` | 调高以减少分类调用次数。低于该分数的候选直接跳过分类，pipeline.py:1581 处判断。 |
@@ -96,7 +96,7 @@ OpenVocabClassifier（代号 D1）是 Argus 异常告警链路上的 **可选语
    返回 `False` 时，要么联网让 `OpenVocabClassifier.load()` 自动下载，要么手动从 ultralytics release 下载放在仓库根目录。
 
 3. **编辑配置**
-   打开 `configs/default.yaml`，确保 `classifier.enabled: true`（仓库现状已经是 `true`），并按需调整 `vocabulary` / `high_risk_labels` / `low_risk_labels` / `suppress_labels`。如果使用自定义词表 JSON：
+   打开 `configs/default.yaml`，将 `classifier.enabled` 改为 `true`（仓库现状是 `false`，默认关闭，启用时需在配置文件中改为 `true`），并按需调整 `vocabulary` / `high_risk_labels` / `low_risk_labels` / `suppress_labels`。如果使用自定义词表 JSON：
    ```yaml
    classifier:
      enabled: true
@@ -175,7 +175,7 @@ python -c "import time, numpy as np; from argus.anomaly.classifier import OpenVo
 python -c "from argus.config.loader import load_config; c = load_config('configs/default.yaml'); print('enabled=', c.classifier.enabled, 'min_score=', c.classifier.min_anomaly_score_to_classify, 'vocab=', len(c.classifier.vocabulary))"
 ```
 
-期望：`enabled= True min_score= 0.5 vocab= 17`（与当前 default.yaml 一致）。
+期望：`enabled= False min_score= 0.5 vocab= 17`（默认 yaml 关闭分类器；启用后这里会变成 `True`）。
 
 ### 7.3 在线状态自检
 

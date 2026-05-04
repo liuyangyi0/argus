@@ -1,6 +1,6 @@
 # Argus 系统架构文档
 
-> 最后更新：2026-04-12
+> 最后更新：2026-05-04
 
 本文档描述当前仓库已经落地的系统结构、运行时关系和主要边界，内容以实际代码路径为准，而不是历史规划中的理想版本。
 
@@ -372,3 +372,26 @@ go2rtc 是当前视频访问链条中的关键节点：
 - 对默认关闭的模块只描述为“可选”或“支持接入”。
 - 对反馈、回放、训练、标注等能力，要明确区分“后端能力”“标签页入口”和“独立主页面”。
 - 不再使用未经核实的模块数量、测试数量或宣传式功能统计。
+
+## 14. 2026-04 后增量
+
+本节记录 `2026-04-12` 之后合入主干、影响整体架构边界的关键改动。后续如再做大改，仍应在这里追加摘要并同步更新对应正文小节，避免读者只读前 13 节就拿到过期心智。
+
+### 14.1 安全 / RBAC（commit `91dfc2f`）
+
+- 调度器新增 stage gate：之前 `auto_retrain` 路径会以 `allow_bypass=True` 跳过 release pipeline，现在已与人工激活共用同一套 stage gate（见 `src/argus/storage/model_registry.py` 的 `activate` 校验段）。
+- 7 个原本宽松的端点补齐 RBAC 校验（覆盖系统配置、模型管理、训练任务等敏感动作），未授权调用会被中间件拒绝。
+- 17 处 audit 写入不再硬编码 `triggered_by`，改为从认证身份解析，方便审计回放。
+
+参考阅读：`docs/enable_checklists/auto_retraining.md` §1 / §6.3 已同步更新对应描述。
+
+### 14.2 模型发布管线（commit `a68db43`）
+
+- Release pipeline 接入 WebSocket：阶段流转事件实时推送到前端，Models 页可观察 shadow → canary → production 的进度。
+- `activate` 端点不再有 bypass 路径，所有激活动作都必须先通过 stage gate。
+- 训练阶段不再热载候选模型：训练完成的产物先注册为 `CANDIDATE`，等通过 release pipeline 才会被任何 pipeline 采用，避免“训练即上线”的污染风险。
+
+### 14.3 训练管线（commit `da9453e`）
+
+- `dataset_strategy` 多版本策略落地：单次重训练任务可以指定数据集版本组合（例如“当前 v3 baseline + 上次 FP 增量”），实现见 `src/argus/core/scheduler.py` 中 `_resolve_dataset_selection_for_retrain`。
+- 默认配置中分类器仍保持关闭（与 README/requirements 一致），新增训练任务不会因配置缺省而把 D1 误开。

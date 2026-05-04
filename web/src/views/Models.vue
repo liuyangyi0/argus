@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { Typography } from 'ant-design-vue'
+import { Breadcrumb, Typography } from 'ant-design-vue'
 
 const route = useRoute()
 
@@ -22,6 +22,10 @@ const sectionTitle = computed(() => {
 
 <template>
   <main class="glass" style="padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
+    <Breadcrumb style="margin-bottom: 12px">
+      <Breadcrumb.Item>模型管理</Breadcrumb.Item>
+      <Breadcrumb.Item v-if="sectionTitle">{{ sectionTitle }}</Breadcrumb.Item>
+    </Breadcrumb>
     <Typography.Title :level="3" style="margin-bottom: 8px; color: var(--ink)">
       模型管理<span v-if="sectionTitle" style="color: var(--ink-4); font-weight: 500"> / {{ sectionTitle }}</span>
     </Typography.Title>
