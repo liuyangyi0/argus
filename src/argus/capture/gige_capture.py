@@ -338,6 +338,7 @@ class GigECapture:
         if ret != 0:
             self._state.connected = False
             self._state.error = f"GetImageBuffer failed: 0x{ret:08x}"
+            self.request_reconnect()
             return None
 
         try:
@@ -475,10 +476,6 @@ class GigECapture:
         return False
 
     # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
     # Async capture thread (same interface as CameraCapture)
     # ------------------------------------------------------------------
 
@@ -514,44 +511,6 @@ class GigECapture:
         if self._frame_buffer is None:
             return self.read()
         return self._frame_buffer.get(timeout=5.0)
-
-    def request_reconnect(self) -> None:
-        """Request a non-blocking reconnection attempt."""
-        with self._reconnect_lock:
-            if self._reconnecting:
-                return
-            self._reconnecting = True
-
-        thread = threading.Thread(
-            target=self._reconnect_background,
-            name=f"reconnect-{self.camera_id}",
-            daemon=True,
-        )
-        thread.start()
-
-    def _reconnect_background(self) -> None:
-        """Background reconnection with exponential backoff."""
-        try:
-            self.release()
-            delay = self.reconnect_delay
-            attempt = 0
-            while not self._stop_event.is_set():
-                if self.max_reconnect_attempts >= 0 and attempt >= self.max_reconnect_attempts:
-                    logger.error("gige.reconnect_exhausted", camera_id=self.camera_id, attempts=attempt)
-                    break
-                attempt += 1
-                self._state.reconnect_count += 1
-                logger.info("gige.reconnecting", camera_id=self.camera_id, attempt=attempt, delay=delay)
-                self._stop_event.wait(delay)
-                if self._stop_event.is_set():
-                    break
-                if self.connect():
-                    logger.info("gige.reconnected", camera_id=self.camera_id, attempts=attempt)
-                    break
-                delay = min(delay * 2, 60.0)
-        finally:
-            with self._reconnect_lock:
-                self._reconnecting = False
 
     # ------------------------------------------------------------------
     # Lifecycle

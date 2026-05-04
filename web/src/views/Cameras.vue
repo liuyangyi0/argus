@@ -11,7 +11,13 @@ import { extractErrorMessage } from '../utils/error'
 import HealthBadge from '../components/common/HealthBadge.vue'
 import ModeBadge from '../components/common/ModeBadge.vue'
 import ConnectionTestResult from '../components/common/ConnectionTestResult.vue'
+import ContentSkeleton from '../components/ContentSkeleton.vue'
 import type { ConnectionTestResult as ConnTestResult } from '../types/api'
+
+// initialLoading distinguishes the very-first fetch (where the table is empty
+// and we want a skeleton instead of the bare ant Table loading spinner over an
+// empty body) from subsequent refreshes triggered by WebSocket fallback.
+const initialLoading = ref(true)
 
 defineOptions({ name: 'CamerasPage' })
 
@@ -81,6 +87,7 @@ async function fetchData() {
   } catch {
   } finally {
     loading.value = false
+    initialLoading.value = false
   }
 }
 
@@ -412,7 +419,9 @@ const columns = [
       </Form>
     </Modal>
 
+    <ContentSkeleton v-if="initialLoading" type="table" :rows="6" />
     <Table
+      v-else
       :columns="columns"
       :data-source="cameras"
       :loading="loading"

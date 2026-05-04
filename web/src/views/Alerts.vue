@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -8,6 +8,7 @@ import { useWebSocket } from '../composables/useWebSocket'
 import AlertsToolbar from '../components/alerts/AlertsToolbar.vue'
 import AlertsTable from '../components/alerts/AlertsTable.vue'
 import AlertDetailPanel from '../components/alerts/AlertDetailPanel.vue'
+import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 defineOptions({ name: 'AlertsPage' })
 
@@ -15,7 +16,13 @@ const route = useRoute()
 const router = useRouter()
 
 const store = useAlertStore()
-const { alerts, selectedAlert } = storeToRefs(store)
+const { alerts, selectedAlert, loading: storeLoading } = storeToRefs(store)
+
+// Show skeleton only on the very first load — later refreshes (WebSocket
+// fallback poll, ack/del) keep the existing rows visible and let the
+// AlertsTable's built-in loading prop handle row-level feedback.
+const hasLoadedOnce = ref(false)
+const showSkeleton = computed(() => !hasLoadedOnce.value && storeLoading.value)
 
 const fetchData = () => store.fetchData()
 
@@ -62,6 +69,7 @@ function handleKeydown(e: KeyboardEvent) {
 
 onMounted(async () => {
   await fetchData()
+  hasLoadedOnce.value = true
   // Support URL query: ?id=xxx to auto-open alert detail
   if (route.query.id) {
     const target = alerts.value.find(a => a.alert_id === route.query.id)
@@ -77,24 +85,29 @@ onUnmounted(() => {
 
 <template>
   <main class="alerts-layout glass">
-    <!-- Left: list panel -->
-    <div
-      :style="{
-        width: selectedAlert ? '520px' : '100%',
-        flexShrink: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        transition: 'width 0.25s ease',
-        borderRight: selectedAlert ? '1px solid var(--argus-sidebar-border)' : 'none',
-        overflow: 'hidden',
-      }"
-    >
-      <AlertsToolbar />
-      <AlertsTable @select="showDetail" />
-    </div>
+    <!-- Initial-load skeleton sits inside the layout so the page reserves the
+         right amount of space immediately. -->
+    <ContentSkeleton v-if="showSkeleton" type="table" :rows="8" />
+    <template v-else>
+      <!-- Left: list panel -->
+      <div
+        :style="{
+          width: selectedAlert ? '520px' : '100%',
+          flexShrink: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          transition: 'width 0.25s ease',
+          borderRight: selectedAlert ? '1px solid var(--argus-sidebar-border)' : 'none',
+          overflow: 'hidden',
+        }"
+      >
+        <AlertsToolbar />
+        <AlertsTable @select="showDetail" />
+      </div>
 
-    <!-- Right: detail panel -->
-    <AlertDetailPanel @close="closeDetail" />
+      <!-- Right: detail panel -->
+      <AlertDetailPanel @close="closeDetail" />
+    </template>
   </main>
 </template>
 

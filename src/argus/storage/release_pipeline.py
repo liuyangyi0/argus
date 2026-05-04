@@ -115,43 +115,76 @@ class ReleasePipeline:
                     ModelStage.CANARY.value, self._min_canary_days, "Canary",
                 )
 
-            record.stage = target_stage
+            # 把 transition 的所有 DB 写入(retire 旧 production / 新增 event /
+            # audit / commit)整体包在 try 中。SQLAlchemy 的 with-session 上下文
+            # 管理器只负责关闭 session,并不会在 commit 抛错时自动回滚 ——
+            # 否则可能出现"已经把旧 production retire 了,但新模型 commit 失败"
+            # 的孤儿状态。这里在任何异常路径上都先 rollback 再上抛。
+            try:
+                record.stage = target_stage
 
-            if target_stage == ModelStage.CANARY.value:
-                record.canary_camera_id = canary_camera_id
-            elif target_stage == ModelStage.PRODUCTION.value:
-                self._retire_current_production(
-                    session, record.camera_id, model_version_id, triggered_by,
+                if target_stage == ModelStage.CANARY.value:
+                    record.canary_camera_id = canary_camera_id
+                elif target_stage == ModelStage.PRODUCTION.value:
+                    self._retire_current_production(
+                        session, record.camera_id, model_version_id, triggered_by,
+                    )
+                    record.is_active = True
+                    record.canary_camera_id = None
+                elif target_stage == ModelStage.RETIRED.value:
+                    record.is_active = False
+                    record.canary_camera_id = None
+
+                event = ModelVersionEvent(
+                    timestamp=now,
+                    camera_id=record.camera_id,
+                    from_version=model_version_id,
+                    to_version=model_version_id,
+                    from_stage=current_stage,
+                    to_stage=target_stage,
+                    triggered_by=triggered_by,
+                    reason=reason,
                 )
-                record.is_active = True
-                record.canary_camera_id = None
-            elif target_stage == ModelStage.RETIRED.value:
-                record.is_active = False
-                record.canary_camera_id = None
+                session.add(event)
 
-            event = ModelVersionEvent(
-                timestamp=now,
-                camera_id=record.camera_id,
-                from_version=model_version_id,
-                to_version=model_version_id,
-                from_stage=current_stage,
-                to_stage=target_stage,
-                triggered_by=triggered_by,
-                reason=reason,
-            )
-            session.add(event)
+                audit = AuditLog(
+                    timestamp=now,
+                    user=triggered_by,
+                    action="model_stage_transition",
+                    target_type="model",
+                    target_id=model_version_id,
+                    detail=f"{current_stage} → {target_stage}" + (f": {reason}" if reason else ""),
+                )
+                session.add(audit)
 
-            audit = AuditLog(
-                timestamp=now,
-                user=triggered_by,
-                action="model_stage_transition",
-                target_type="model",
-                target_id=model_version_id,
-                detail=f"{current_stage} → {target_stage}" + (f": {reason}" if reason else ""),
-            )
-            session.add(audit)
+                session.commit()
+            except Exception as exc:
+                # 任何写入路径上的失败都必须把会话回滚,避免把"半成品"
+                # transition(例如已 retire 旧 production 但新模型未落库)
+                # 留在内存 / 数据库里,然后 re-raise 让上层调用方知情。
+                try:
+                    session.rollback()
+                except Exception as rollback_exc:  # pragma: no cover - defensive
+                    logger.error(
+                        "release_pipeline.transition_rollback_failed",
+                        model_version_id=model_version_id,
+                        from_stage=current_stage,
+                        to_stage=target_stage,
+                        triggered_by=triggered_by,
+                        error_type=type(rollback_exc).__name__,
+                        error=str(rollback_exc),
+                    )
+                logger.error(
+                    "release_pipeline.transition_failed",
+                    model_version_id=model_version_id,
+                    from_stage=current_stage,
+                    to_stage=target_stage,
+                    triggered_by=triggered_by,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
 
-            session.commit()
             session.refresh(record)
 
             logger.info(

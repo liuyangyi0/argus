@@ -1,4 +1,5 @@
 import axios, { type AxiosResponse } from 'axios'
+import { message } from 'ant-design-vue'
 import type { ApiResponse } from '../types/api'
 import { ApiError } from '../types/api'
 import { logger } from '../utils/logger'
@@ -7,6 +8,10 @@ export const api = axios.create({
   baseURL: '/api',
   timeout: 30000,
 })
+
+// Debounce: avoid duplicate toasts/redirects when many in-flight requests fail at once.
+let isRedirecting = false
+let forbiddenToastAt = 0
 
 // The interceptor used to `message.error(...)` here — which collided with the
 // 36+ call sites that also toast in their own catch blocks, producing double
@@ -29,6 +34,25 @@ api.interceptors.response.use(
       msg = err.message
     }
     logger.debug('[API]', status, msg)
+    if (status === 401) {
+      // Backend serves SSR /login — no SPA route exists, must full-page redirect.
+      if (!isRedirecting) {
+        isRedirecting = true
+        message.warning('登录已过期,请重新登录')
+        const next = encodeURIComponent(window.location.pathname + window.location.search)
+        window.location.href = `/login?next=${next}`
+      }
+      return Promise.reject(new ApiError(status, msg, body))
+    }
+    if (status === 403) {
+      // Coalesce 403 toasts within 1s window so a burst doesn't spam.
+      const now = Date.now()
+      if (now - forbiddenToastAt > 1000) {
+        forbiddenToastAt = now
+        message.error('权限不足')
+      }
+      return Promise.reject(new ApiError(status, msg, body))
+    }
     return Promise.reject(new ApiError(status, msg, body))
   }
 )

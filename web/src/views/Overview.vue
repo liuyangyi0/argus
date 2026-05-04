@@ -3,11 +3,17 @@ import { ref, computed, onMounted, onBeforeUnmount, onDeactivated, onActivated, 
 import { storeToRefs } from 'pinia'
 import { useWallStore } from '../stores/useWallStore'
 import { getDailyTrend } from '../api/reports'
+import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 defineOptions({ name: 'OverviewPage' })
 
 const wallStore = useWallStore()
 const { cameras, health, loading } = storeToRefs(wallStore)
+
+// True until the very first wall-status fetch completes — used to swap the
+// "未配置视频源" placeholder grid for a skeleton during the initial load
+// (otherwise users see the bare dashed-empty grid even when data is on the way).
+const initialLoading = ref(true)
 
 // System status presentation
 const systemStatus = computed(() => health.value?.status ?? 'unknown')
@@ -68,8 +74,12 @@ function stopClock() {
   }
 }
 
-onMounted(() => {
-  wallStore.fetchInitialStatus()
+onMounted(async () => {
+  try {
+    await wallStore.fetchInitialStatus()
+  } finally {
+    initialLoading.value = false
+  }
   startClock()
 })
 
@@ -262,8 +272,15 @@ function sparklineFill(values: number[]): string {
 
       <div class="viewport" style="flex:1; overflow:hidden; padding:2px 4px 12px; display:flex; min-height:0;">
 
+        <!-- Skeleton during the very first fetch; replaced by the live grid as
+             soon as cameras + health resolve. -->
+        <div v-if="initialLoading" class="videos grid-2">
+          <ContentSkeleton type="card" :rows="6" />
+          <ContentSkeleton type="card" :rows="6" />
+        </div>
+
         <!-- VIDEOS -->
-        <div class="videos" :class="gridClass">
+        <div v-else class="videos" :class="gridClass">
           <template v-for="cam in cameras" :key="cam.camera_id">
             <div class="feed" :class="{ 'live': health?.cameras?.find((c: any) => c.camera_id === cam.camera_id)?.connected }">
               <div class="feed-bg"></div>

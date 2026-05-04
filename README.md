@@ -93,8 +93,13 @@ src/argus/
   contracts/      数据契约与边界校验
   core/           检测编排、阈值、时序、健康、降级、指标
   dashboard/      FastAPI 应用、认证、中间件、API 路由
+  imaging/        采集后处理、偏振与多模态融合
   person/         人员检测与过滤
+  physics/        相机标定、跨摄像头几何、轨迹与速度估计
   prefilter/      MOG2 与 Simplex 预筛相关能力
+  preprocessing/  帧对齐与稳定化预处理
+  runtime/        日志初始化、训练任务热加载等运行时装配
+  sensors/        多传感器融合接入
   storage/        SQLite、ORM、备份、模型注册、推理记录
   streaming/      go2rtc 集成与流媒体代理
   validation/     合成验证与评估工具
@@ -127,6 +132,8 @@ tests/
 - Models：基线、训练、模型、A/B 对比、标注、阈值预览。
 - System：系统概览、配置管理、用户、审计、降级历史、音频配置、备份与清理。
 - ReplayView / StoryboardReplay：从告警跳转进入的单机位 / 多机位录像回放，参数化子路由，不在侧栏。
+
+> 注意：本节描述当前实现（v1）。完整 UX v2（值班台 Video Wall）设计见 `docs/argus_ux_v2_enhancements_5.md`，实现仍在分阶段进行。
 
 ## 远程测试机
 

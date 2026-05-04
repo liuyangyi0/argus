@@ -212,7 +212,15 @@ class Database:
                     )
 
     def _auto_migrate(self) -> None:
-        """Add missing columns to existing SQLite tables (lightweight migration)."""
+        """Add missing columns to existing SQLite tables (lightweight migration).
+
+        失败语义:
+        - "已存在"类错误(列/索引/表已存在)是正常情况(数据库已经迁移过),
+          降到 warning 并跳过本条迁移,继续后续迁移。
+        - 其它错误(SQL 语法错、约束冲突、磁盘 I/O 错等)必须 raise
+          RuntimeError,带足够的上下文(表/列/原始错误)给运维定位,
+          避免 schema 不一致的 DB 静默进入运行时。
+        """
         migrations = list(_AUTO_MIGRATIONS)
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
@@ -222,14 +230,50 @@ class Database:
                     logger.info("database.migration", table=table, column=column)
                 except Exception as e:
                     err_msg = str(e).lower()
-                    if "duplicate" in err_msg or "already exists" in err_msg:
-                        logger.debug("database.migration_column_exists", table=table, column=column)
-                    else:
+                    if self._is_already_exists_error(err_msg):
+                        # Idempotent re-run: 已经迁过了。warning 比 debug 显眼,
+                        # 方便启动期肉眼看到"为什么这条没跑",但不影响进程。
                         logger.warning(
+                            "database.migration_skipped_already_exists",
+                            table=table,
+                            column=column,
+                            reason="column/index/table already exists",
+                        )
+                    else:
+                        logger.error(
                             "database.migration_failed",
                             table=table, column=column, error=str(e),
                             exc_info=True,
                         )
+                        raise RuntimeError(
+                            f"Auto-migration failed on {table}.{column}: {e}. "
+                            f"Database schema may be inconsistent. "
+                            f"Suggested fix: inspect the SQL above, run the ALTER "
+                            f"statement manually, or restore from a known-good "
+                            f"backup before restarting."
+                        ) from e
+
+    @staticmethod
+    def _is_already_exists_error(err_msg: str) -> bool:
+        """保守判定一条 ALTER 失败是否属于"幂等成功"。
+
+        只放过 SQLite / PostgreSQL / MySQL 在"列/索引/表已存在"时的常见消息片段。
+        其它错误(语法、I/O、约束)一律视为真错误并上抛。
+        """
+        # 必须同时包含目标关键词(column/index/table) + 已存在指示词。
+        # SQLite: "duplicate column name: foo"
+        # SQLite: "table foo already exists" / "index foo already exists"
+        # PostgreSQL: 'column "foo" of relation "bar" already exists'
+        # MySQL/MariaDB: "Duplicate column name 'foo'"
+        already_indicators = ("already exists", "duplicate column")
+        if not any(ind in err_msg for ind in already_indicators):
+            return False
+        # 避免误吞"duplicate key value"这类 UNIQUE 约束冲突
+        if "duplicate column" in err_msg:
+            return True
+        # "already exists" 必须和 column / index / table 一起出现
+        scope_indicators = ("column", "index", "table")
+        return any(scope in err_msg for scope in scope_indicators)
 
     def get_session(self) -> Session:
         """Get a new database session."""
