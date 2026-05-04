@@ -164,6 +164,16 @@ function handleDelete() {
     },
   })
 }
+
+// C-AlertTrainingLink: jump to model registry page with the version_id as a
+// query hint. ModelsRegistryView ignores unknown query params today, so this
+// is "navigate to the page" rather than "highlight that row" — but the value
+// of the link is the lineage trace, not the highlight.
+function goToModelVersion() {
+  const versionId = selectedAlert.value?.model_version_id
+  if (!versionId) return
+  router.push({ path: '/models/registry', query: { version_id: versionId } })
+}
 </script>
 
 <template>
@@ -424,6 +434,28 @@ function handleDelete() {
               <span class="meta-k">备注</span>
               <span class="meta-v meta-v--notes">{{ selectedAlert.notes }}</span>
             </div>
+            <div v-if="selectedAlert.model_version_id" class="meta-row">
+              <span class="meta-k">
+                <Tooltip title="触发本告警的模型版本。点击跳转到模型管理页面查看完整谱系。">
+                  <span>触发模型</span>
+                </Tooltip>
+              </span>
+              <span class="meta-v meta-v--model-link">
+                <Button
+                  type="link"
+                  size="small"
+                  style="padding: 0; height: auto; font-family: monospace; font-size: 12px"
+                  @click="goToModelVersion"
+                >
+                  {{ selectedAlert.model_version_id }}
+                </Button>
+              </span>
+            </div>
+            <div v-if="selectedAlert.workflow_status === 'false_positive'" class="meta-row meta-row--feedback-hint">
+              <Tag color="orange" style="margin: 0; white-space: normal; line-height: 1.5">
+                此告警已计入 FP 反馈，后续训练任务可在「模型管理 → 训练与评估」查看
+              </Tag>
+            </div>
           </div>
         </div>
 
@@ -664,6 +696,20 @@ function handleDelete() {
 .status-display {
   text-align: center;
   padding: 12px 0;
+}
+
+/* C-AlertTrainingLink: model link + FP feedback hint row */
+.meta-v--model-link {
+  display: inline-flex;
+  align-items: center;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.meta-row--feedback-hint {
+  justify-content: center;
+  padding-top: 10px;
 }
 
 </style>

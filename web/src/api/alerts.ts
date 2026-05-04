@@ -28,3 +28,18 @@ export const saveAnnotations = (alertId: string, annotations: any[]) =>
   api.post(`/alerts/${alertId}/annotations`, { annotations }).then(u)
 export const getAlertGroup = (eventGroupId: string) =>
   api.get(`/alerts/group/${eventGroupId}`).then(u)
+
+// C-AlertTrainingLink: resolve a model_version_id to its registry record so the
+// alert detail panel can show camera / stage / created_at next to the link.
+// Returns null when the version isn't in the registry (e.g. retired record
+// pruned, model id stamped on the alert before registry was populated).
+export const getModelVersionInfo = async (modelVersionId: string) => {
+  if (!modelVersionId) return null
+  try {
+    const res: any = await api.get('/models/json').then(u)
+    const models = res?.models || []
+    return models.find((m: any) => m.model_version_id === modelVersionId) || null
+  } catch {
+    return null
+  }
+}

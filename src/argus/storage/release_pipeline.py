@@ -7,6 +7,7 @@ Each transition is recorded as a ModelVersionEvent and AuditLog entry.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 import structlog
 from sqlalchemy.orm import Session
@@ -55,10 +56,21 @@ class StageTransitionError(Exception):
 class ReleasePipeline:
     """Manages model release lifecycle with four-stage promotion."""
 
-    def __init__(self, session_factory, *, min_shadow_days: int = 3, min_canary_days: int = 7):
+    def __init__(
+        self,
+        session_factory,
+        *,
+        min_shadow_days: int = 3,
+        min_canary_days: int = 7,
+        event_publisher: Callable[[str, dict], None] | None = None,
+    ):
         self._session_factory = session_factory
         self._min_shadow_days = min_shadow_days
         self._min_canary_days = min_canary_days
+        # Optional broadcaster (typically ws_manager.broadcast) so the
+        # frontend can show stage-transition progress in real time. Kept
+        # optional so unit tests / non-dashboard callers stay unaffected.
+        self._event_publisher = event_publisher
 
     def transition(
         self,
@@ -194,6 +206,37 @@ class ReleasePipeline:
                 to_stage=target_stage,
                 triggered_by=triggered_by,
             )
+
+            # Best-effort broadcast for the frontend release-pipeline UI.
+            # Runs only after the DB write has fully committed so the
+            # frontend never sees a stage transition that ends up rolled
+            # back. A broadcast failure must never bubble up — it would
+            # turn a successful transition into a 500 for the operator.
+            if self._event_publisher is not None:
+                try:
+                    self._event_publisher(
+                        "model_release",
+                        {
+                            "type": "stage_transition",
+                            "model_version_id": model_version_id,
+                            "camera_id": record.camera_id,
+                            "from_stage": current_stage,
+                            "to_stage": target_stage,
+                            "triggered_by": triggered_by,
+                            "timestamp": now.isoformat(),
+                            "reason": reason,
+                        },
+                    )
+                except Exception as publish_exc:
+                    logger.warning(
+                        "release_pipeline.broadcast_failed",
+                        model_version_id=model_version_id,
+                        from_stage=current_stage,
+                        to_stage=target_stage,
+                        error_type=type(publish_exc).__name__,
+                        error=str(publish_exc),
+                    )
+
             return record
 
     def get_shadow_stats(

@@ -17,6 +17,7 @@ import {
   reexportModel, recalibrateModel,
 } from '../../api'
 import { STAGE_MAP, VALID_TRANSITIONS, STAGE_LABELS } from '../../composables/useModelState'
+import { useWebSocket } from '../../composables/useWebSocket'
 import { extractErrorMessage } from '../../utils/error'
 import type { ModelInfo, ModelVersionEvent, CameraSummary } from '../../types/api'
 
@@ -46,6 +47,38 @@ const reexportModalVisible = ref(false)
 const reexportForm = ref({ version_id: '', export_format: 'openvino', quantization: 'fp16' })
 const reexportLoading = ref(false)
 const recalibrateLoading = ref<string | null>(null)
+
+// ── Release pipeline live progress (model_release WS topic) ──
+// 后端在 release_pipeline.transition() commit 成功后会广播一条
+// stage_transition 事件,这里把它转成非阻塞 toast,并触发表格刷新,
+// 让操作员看到金丝雀/生产推进的真实进度,不必手动 refresh。
+// 用 useWebSocket 自带的 onUnmounted 清理,这里不需要再手动 unsubscribe。
+const transitioningVersionId = ref<string | null>(null)
+useWebSocket({
+  topics: ['model_release'],
+  onMessage: (_topic, data) => {
+    const payload = data as {
+      type?: string
+      model_version_id?: string
+      from_stage?: string
+      to_stage?: string
+      triggered_by?: string
+    }
+    if (payload?.type !== 'stage_transition') return
+    const vid = payload.model_version_id ?? ''
+    const from = STAGE_LABELS[payload.from_stage ?? ''] || payload.from_stage || '?'
+    const to = STAGE_LABELS[payload.to_stage ?? ''] || payload.to_stage || '?'
+    message.info(`模型 ${vid} 已 ${from} → ${to}`)
+    // 简短高亮该行的 stage 列,1.5s 后清除并刷新表格数据
+    transitioningVersionId.value = vid
+    setTimeout(() => {
+      if (transitioningVersionId.value === vid) {
+        transitioningVersionId.value = null
+      }
+      emit('changed')
+    }, 1500)
+  },
+})
 
 // ── Pipeline stats ──
 const stageCounts = computed(() => {
@@ -338,6 +371,11 @@ const columns = [
           <Tag :color="(STAGE_MAP[record.stage] || { color: 'default' }).color">
             {{ (STAGE_MAP[record.stage] || { text: record.stage }).text }}
           </Tag>
+          <LoadingOutlined
+            v-if="transitioningVersionId === record.model_version_id"
+            spin
+            style="margin-left: 6px; color: #1677ff"
+          />
         </template>
         <template v-if="column.key === 'is_active'">
           <Tag v-if="record.is_active" color="green">已激活</Tag>
