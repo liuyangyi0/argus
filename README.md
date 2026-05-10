@@ -41,8 +41,8 @@ Vue Dashboard
 
 ## 与旧文档相比的校正
 
-- 本仓库当前前端主视图为 6 个：总览、摄像头、摄像头详情、告警、模型、系统。
-- 用户、审计、备份、报表等能力目前主要以后端 API 和系统页子标签形式暴露；训练作业入口位于模型页标签中，而不是独立前端路由。
+- 本仓库当前前端主路由为 7 个：总览、摄像头、摄像头详情、告警、报表、模型、系统。另有两个从告警跳转的参数化子路由（`/replay/:alertId` 和 `/replay/:alertId/storyboard`），由 ReplayView 和 StoryboardReplay 视图渲染，不在侧栏出现。
+- 用户、审计、备份等能力目前主要以后端 API 和系统页子标签形式暴露；训练作业入口位于模型页标签中，而不是独立前端路由。
 - YOLO-World 分类、SAM2 分割、跨摄像头关联、自动重训练等能力在配置层和后端代码中已预留，但默认配置下通常关闭，不应视为默认启用能力。
 - 项目版本信息以代码为准：Python 包版本当前为 0.1.0，运行时指标与 FastAPI 应用内部版本使用 0.2.0。
 
@@ -93,14 +93,19 @@ src/argus/
   contracts/      数据契约与边界校验
   core/           检测编排、阈值、时序、健康、降级、指标
   dashboard/      FastAPI 应用、认证、中间件、API 路由
+  imaging/        采集后处理、偏振与多模态融合
   person/         人员检测与过滤
+  physics/        相机标定、跨摄像头几何、轨迹与速度估计
   prefilter/      MOG2 与 Simplex 预筛相关能力
+  preprocessing/  帧对齐与稳定化预处理
+  runtime/        日志初始化、训练任务热加载等运行时装配
+  sensors/        多传感器融合接入
   storage/        SQLite、ORM、备份、模型注册、推理记录
   streaming/      go2rtc 集成与流媒体代理
   validation/     合成验证与评估工具
 
 web/
-  src/views/      6 个主视图
+  src/views/      7 个主路由视图 + 2 个参数化子路由视图（ReplayView / StoryboardReplay）
   src/components/ 模型管理、图表与页面组件
   src/composables/ WebSocket、模型状态、流播放逻辑
 
@@ -123,8 +128,21 @@ tests/
 - Cameras：摄像头列表与控制。
 - CameraDetail：单摄像头详情、画面和诊断。
 - Alerts：告警列表、筛选、工作流处理。
+- Reports：报表与统计分析。
 - Models：基线、训练、模型、A/B 对比、标注、阈值预览。
 - System：系统概览、配置管理、用户、审计、降级历史、音频配置、备份与清理。
+- ReplayView / StoryboardReplay：从告警跳转进入的单机位 / 多机位录像回放，参数化子路由，不在侧栏。
+
+> 注意：本节描述当前实现（v1）。完整 UX v2（值班台 Video Wall）设计见 `docs/argus_ux_v2_enhancements_5.md`，实现仍在分阶段进行。
+
+## 远程测试机
+
+```bash
+ssh whp222
+```
+
+- 私钥：`~/.ssh/id_ed25519_argus`
+- 目标：`whp@192.168.66.222`
 
 ## 相关文档
 

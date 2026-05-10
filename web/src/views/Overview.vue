@@ -1,13 +1,87 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, onDeactivated, onActivated, watch } from 'vue'
 import { storeToRefs } from 'pinia'
+import { useRouter } from 'vue-router'
+import { Alert as AAlert, Button as AButton } from 'ant-design-vue'
 import { useWallStore } from '../stores/useWallStore'
 import { getDailyTrend } from '../api/reports'
+import { getTrainingJobs } from '../api/training'
+import { getAnomalyDegradation, type AnomalyDegradationStatus } from '../api/system'
+import { useWebSocket } from '../composables/useWebSocket'
+import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 defineOptions({ name: 'OverviewPage' })
 
+const router = useRouter()
 const wallStore = useWallStore()
 const { cameras, health, loading } = storeToRefs(wallStore)
+
+// Pending training-job banner — surfaces audit C-11 pending_confirmation jobs
+// so operators have a single discoverable entry point from the dashboard.
+const pendingCount = ref(0)
+async function fetchPendingCount() {
+  try {
+    const res = await getTrainingJobs({ status: 'pending_confirmation', limit: 1 })
+    // Backend returns pending_count regardless of status filter (total pending).
+    pendingCount.value = res?.pending_count ?? 0
+  } catch {
+    pendingCount.value = 0
+  }
+}
+function goToTrainingTab() {
+  router.push({ path: '/models/training', query: { tab: 'pending' } })
+}
+
+// Anomaly head degradation banner — shown red when ANY camera's anomaly
+// detector has fallen back to simplex-only mode. Initial state comes from a
+// one-shot fetch on mount; live updates arrive via the system_degradation
+// WebSocket topic. Failure to load is silently treated as "not degraded" so
+// the banner never appears spuriously.
+const anomalyDegradation = ref<AnomalyDegradationStatus['anomaly'] | null>(null)
+async function fetchAnomalyDegradation() {
+  try {
+    const res = await getAnomalyDegradation()
+    anomalyDegradation.value = res?.anomaly ?? null
+  } catch {
+    anomalyDegradation.value = null
+  }
+}
+
+useWebSocket({
+  topics: ['system_degradation'],
+  onMessage: (_topic, data) => {
+    // Backend payload shape: {type, component, camera_id, reason, started_at, ...}
+    if (!data || typeof data !== 'object') return
+    if (data.type === 'entered' && data.component === 'anomaly') {
+      anomalyDegradation.value = {
+        degraded: true,
+        reason: data.reason ?? null,
+        since: data.started_at ?? null,
+        cameras: [{
+          camera_id: data.camera_id ?? '',
+          degraded: true,
+          reason: data.reason ?? null,
+          since: data.started_at ?? null,
+        }],
+      }
+    } else if (data.type === 'recovered' && data.component === 'anomaly') {
+      // Re-query to pick up other cameras still degraded; recovery for one
+      // camera does not necessarily mean the whole system is nominal again.
+      fetchAnomalyDegradation()
+    }
+  },
+})
+
+const anomalyDegradedReason = computed(() => anomalyDegradation.value?.reason ?? '未知')
+const anomalyDegradedCameras = computed(() => {
+  const cams = anomalyDegradation.value?.cameras ?? []
+  return cams.filter((c) => c.degraded).map((c) => c.camera_id).join('、')
+})
+
+// True until the very first wall-status fetch completes — used to swap the
+// "未配置视频源" placeholder grid for a skeleton during the initial load
+// (otherwise users see the bare dashed-empty grid even when data is on the way).
+const initialLoading = ref(true)
 
 // System status presentation
 const systemStatus = computed(() => health.value?.status ?? 'unknown')
@@ -68,9 +142,16 @@ function stopClock() {
   }
 }
 
-onMounted(() => {
-  wallStore.fetchInitialStatus()
+onMounted(async () => {
+  try {
+    await wallStore.fetchInitialStatus()
+  } finally {
+    initialLoading.value = false
+  }
   startClock()
+  // Fire-and-forget — banner appears as soon as the count resolves.
+  fetchPendingCount()
+  fetchAnomalyDegradation()
 })
 
 // keep-alive path: view is deactivated (cached) → stop; reactivated → restart.
@@ -260,10 +341,48 @@ function sparklineFill(values: number[]): string {
         </div>
       </div>
 
+      <a-alert
+        v-if="anomalyDegradation?.degraded"
+        type="error"
+        show-icon
+        style="margin: 0 18px 4px"
+      >
+        <template #message>
+          系统当前处于降级状态：异常检测模型不可用
+          <span v-if="anomalyDegradedCameras"> ({{ anomalyDegradedCameras }})</span>
+        </template>
+        <template #description>
+          原因：{{ anomalyDegradedReason }}。告警 severity 已被自动调低，请尽快排查。
+        </template>
+      </a-alert>
+
+      <a-alert
+        v-if="pendingCount > 0"
+        type="warning"
+        show-icon
+        style="margin: 0 18px 4px"
+      >
+        <template #message>
+          {{ pendingCount }} 个训练任务待确认
+        </template>
+        <template #description>
+          <a-button type="link" size="small" style="padding-left: 0" @click="goToTrainingTab">
+            前往「模型管理 → 训练与评估」处理
+          </a-button>
+        </template>
+      </a-alert>
+
       <div class="viewport" style="flex:1; overflow:hidden; padding:2px 4px 12px; display:flex; min-height:0;">
 
+        <!-- Skeleton during the very first fetch; replaced by the live grid as
+             soon as cameras + health resolve. -->
+        <div v-if="initialLoading" class="videos grid-2">
+          <ContentSkeleton type="card" :rows="6" />
+          <ContentSkeleton type="card" :rows="6" />
+        </div>
+
         <!-- VIDEOS -->
-        <div class="videos" :class="gridClass">
+        <div v-else class="videos" :class="gridClass">
           <template v-for="cam in cameras" :key="cam.camera_id">
             <div class="feed" :class="{ 'live': health?.cameras?.find((c: any) => c.camera_id === cam.camera_id)?.connected }">
               <div class="feed-bg"></div>

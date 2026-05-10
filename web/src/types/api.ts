@@ -39,6 +39,21 @@ export class ApiError extends Error {
 
 // ── Domain Types ──
 
+export type PipelineMode =
+  | 'active'
+  | 'maintenance'
+  | 'learning'
+  | 'collection'
+  | 'training'
+
+export interface CameraHealth {
+  status?: string
+  last_heartbeat?: string | null
+  recent_errors?: string[] | null
+  fps?: number | null
+  [k: string]: any
+}
+
 export interface CameraSummary {
   camera_id: string
   name: string
@@ -46,7 +61,68 @@ export interface CameraSummary {
   region_name?: string | null
   connected: boolean
   running: boolean
+  pipeline_mode?: PipelineMode | null
+  health?: CameraHealth | null
   stats: CameraStats | null
+}
+
+export interface ConnectionTestResult {
+  ok: boolean
+  latency_ms?: number
+  resolution?: [number, number]
+  error?: string
+}
+
+export interface SystemModeSummary {
+  cameras: Record<string, PipelineMode>
+  global_state: 'normal' | 'capturing' | 'training' | 'maintenance'
+}
+
+export interface BaselineCollection {
+  camera_id: string
+  zone_id: string
+  version: string
+  image_count: number
+  status: 'ok' | 'partial' | 'failed' | string
+  captured_at?: string | null
+  session_label?: string
+  acceptance_rate?: number | null
+  error?: string | null
+  state?: string | null
+  is_current?: boolean
+}
+
+export interface DatasetSelectionItem {
+  camera_id: string
+  zone_id: string
+  version: string
+  session_label?: string
+}
+
+export interface DatasetSelection {
+  items: DatasetSelectionItem[]
+  total_frames?: number
+}
+
+export interface ConfigApplyResult {
+  changed: boolean
+  hot_reloaded: boolean
+  applied: number
+  total: number
+}
+
+export interface DetectionParamsResponse {
+  pipelines_updated: number
+  anomaly_threshold: ConfigApplyResult
+  severity: ConfigApplyResult
+  temporal: ConfigApplyResult
+  suppression: ConfigApplyResult
+}
+
+export interface FeedbackStats {
+  fp_count: number
+  confirmed_count: number
+  fp_rate: number
 }
 
 export interface CameraStats {

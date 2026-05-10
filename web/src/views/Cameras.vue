@@ -5,12 +5,28 @@ import { Badge, Button, Form, Input, InputNumber, Modal, Select, Space, Table, T
 import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons-vue'
 
 import { addCamera, deleteCamera, getCameraConfig, getCameras, getRegions, getUsbDevices, startCamera, stopCamera, updateCamera } from '../api'
+import { testCameraConnection, testCameraConnectionDraft } from '../api/cameras'
 import { useWebSocket } from '../composables/useWebSocket'
+import { useAuthStore } from '../stores/useAuthStore'
 import { extractErrorMessage } from '../utils/error'
+import HealthBadge from '../components/common/HealthBadge.vue'
+import ModeBadge from '../components/common/ModeBadge.vue'
+import ConnectionTestResult from '../components/common/ConnectionTestResult.vue'
+import ContentSkeleton from '../components/ContentSkeleton.vue'
+import type { ConnectionTestResult as ConnTestResult } from '../types/api'
+
+// initialLoading distinguishes the very-first fetch (where the table is empty
+// and we want a skeleton instead of the bare ant Table loading spinner over an
+// empty body) from subsequent refreshes triggered by WebSocket fallback.
+const initialLoading = ref(true)
 
 defineOptions({ name: 'CamerasPage' })
 
 const router = useRouter()
+// Client-side gating mirror of the backend RBAC. Hides write-mode entries
+// (add / edit / delete / start / stop) from viewer accounts so they don't
+// see buttons that 403 on click. Backend remains the source of truth.
+const auth = useAuthStore()
 const cameras = ref<any[]>([])
 const loading = ref(true)
 
@@ -76,6 +92,7 @@ async function fetchData() {
   } catch {
   } finally {
     loading.value = false
+    initialLoading.value = false
   }
 }
 
@@ -184,6 +201,41 @@ async function openEditModal(cameraId: string) {
   }
 }
 
+// 痛点 8: post-save connectivity probe state shown above the modal form
+const probeState = ref<'idle' | 'testing' | 'done'>('idle')
+const probeResult = ref<ConnTestResult | null>(null)
+
+async function runProbe(cameraId: string) {
+  probeState.value = 'testing'
+  probeResult.value = null
+  try {
+    probeResult.value = await testCameraConnection(cameraId)
+  } catch {
+    probeResult.value = { ok: false, error: 'probe_request_failed' }
+  } finally {
+    probeState.value = 'done'
+  }
+}
+
+async function runDraftProbe() {
+  if (!cameraForm.value.source) {
+    message.warning('请先填写视频源')
+    return
+  }
+  probeState.value = 'testing'
+  probeResult.value = null
+  try {
+    probeResult.value = await testCameraConnectionDraft({
+      source: cameraForm.value.source,
+      protocol: cameraForm.value.protocol,
+    })
+  } catch {
+    probeResult.value = { ok: false, error: 'probe_request_failed' }
+  } finally {
+    probeState.value = 'done'
+  }
+}
+
 async function handleSubmit() {
   try {
     const form = new FormData()
@@ -197,6 +249,7 @@ async function handleSubmit() {
       }
     })
 
+    const cameraId = cameraForm.value.camera_id
     if (editingId.value) {
       const res = await updateCamera(editingId.value, form)
       message.success(res.message || '配置已更新')
@@ -205,10 +258,25 @@ async function handleSubmit() {
       message.success('摄像头已添加')
     }
 
-    modalVisible.value = false
-    cameraForm.value = defaultForm()
-    editingId.value = null
     fetchData()
+
+    // 痛点 8: live-probe the camera before closing the modal so the user
+    // immediately sees whether the source is reachable.
+    if (cameraId) {
+      await runProbe(cameraId)
+      if (probeResult.value?.ok) {
+        modalVisible.value = false
+        cameraForm.value = defaultForm()
+        editingId.value = null
+        probeState.value = 'idle'
+        probeResult.value = null
+      }
+      // Connection failed → keep modal open so the user sees the reason
+    } else {
+      modalVisible.value = false
+      cameraForm.value = defaultForm()
+      editingId.value = null
+    }
   } catch (e) {
     message.error(extractErrorMessage(e, editingId.value ? '更新失败' : '添加失败'))
   }
@@ -216,6 +284,8 @@ async function handleSubmit() {
 
 const columns = [
   { title: '状态', key: 'status', width: 80 },
+  { title: '健康度', key: 'health', width: 100 },
+  { title: '运行模式', key: 'pipeline_mode', width: 110 },
   { title: '摄像头 ID', dataIndex: 'camera_id', key: 'camera_id' },
   { title: '名称', dataIndex: 'name', key: 'name' },
   { title: '区域', dataIndex: 'region_name', key: 'region_name', width: 140 },
@@ -244,7 +314,7 @@ const columns = [
   <main class="glass" style=" padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px">
       <Typography.Title :level="3" style="margin: 0">摄像头</Typography.Title>
-      <Button type="primary" @click="openAddModal">
+      <Button v-if="auth.hasRole(['admin', 'operator'])" type="primary" @click="openAddModal">
         <PlusOutlined /> 新增摄像头
       </Button>
     </div>
@@ -258,6 +328,12 @@ const columns = [
       @ok="handleSubmit"
     >
       <Form layout="vertical" style="margin-top: 16px">
+        <ConnectionTestResult
+          v-if="probeState !== 'idle'"
+          :state="probeState"
+          :result="probeResult"
+          style="margin-bottom: 12px"
+        />
         <Form.Item label="摄像头 ID" required>
           <Input v-model:value="cameraForm.camera_id" placeholder="cam_02" :disabled="!!editingId" />
         </Form.Item>
@@ -289,6 +365,14 @@ const columns = [
             </Select.Option>
           </Select>
           <Input v-else v-model:value="cameraForm.source" :placeholder="sourcePlaceholder()" />
+          <Button
+            size="small"
+            style="margin-top: 6px"
+            :loading="probeState === 'testing'"
+            @click="runDraftProbe"
+          >
+            测试连接
+          </Button>
         </Form.Item>
 
         <Space>
@@ -340,7 +424,9 @@ const columns = [
       </Form>
     </Modal>
 
+    <ContentSkeleton v-if="initialLoading" type="table" :rows="6" />
     <Table
+      v-else
       :columns="columns"
       :data-source="cameras"
       :loading="loading"
@@ -355,24 +441,31 @@ const columns = [
           <Badge :status="record.connected ? 'success' : 'default'" />
           {{ record.connected ? '在线' : '离线' }}
         </template>
+        <template v-else-if="column.key === 'health'">
+          <HealthBadge :health="record.health" :connected="record.connected" />
+        </template>
+        <template v-else-if="column.key === 'pipeline_mode'">
+          <ModeBadge :mode="record.pipeline_mode" />
+          <span v-if="!record.pipeline_mode || record.pipeline_mode === 'active'" style="color: var(--ink-3); font-size: 12px">—</span>
+        </template>
         <template v-else-if="column.key === 'region_name'">
           {{ record.region_name || '-' }}
         </template>
         <template v-else-if="column.key === 'action'">
           <Space @click.stop>
-            <Button v-if="!record.connected" type="primary" size="small" @click="handleStart(record.camera_id)">
+            <Button v-if="!record.connected && auth.hasRole(['admin', 'operator'])" type="primary" size="small" @click="handleStart(record.camera_id)">
               启动
             </Button>
-            <Button v-else danger size="small" @click="handleStop(record.camera_id)">
+            <Button v-else-if="record.connected && auth.hasRole(['admin', 'operator'])" danger size="small" @click="handleStop(record.camera_id)">
               停止
             </Button>
-            <Button size="small" @click="openEditModal(record.camera_id)">
+            <Button v-if="auth.hasRole(['admin', 'operator'])" size="small" @click="openEditModal(record.camera_id)">
               <template #icon><EditOutlined /></template>
             </Button>
             <Button size="small" @click="router.push(`/cameras/${record.camera_id}`)">
               详情
             </Button>
-            <Button size="small" danger @click="handleDelete(record.camera_id)">
+            <Button v-if="auth.hasRole(['admin'])" size="small" danger @click="handleDelete(record.camera_id)">
               <template #icon><DeleteOutlined /></template>
             </Button>
           </Space>

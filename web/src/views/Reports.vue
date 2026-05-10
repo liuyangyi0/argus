@@ -7,12 +7,16 @@ import { BarChart, LineChart, PieChart } from 'echarts/charts'
 import { CanvasRenderer } from 'echarts/renderers'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
+import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 use([CanvasRenderer, BarChart, LineChart, PieChart, GridComponent, TooltipComponent, LegendComponent])
 import { getReportStats, getDailyTrend, getSeverityDist, getCameraDist, getFPTrend, downloadComplianceReport } from '../api/reports'
 import { SEVERITY_COLORS } from '../utils/colors'
 
 const loading = ref(true)
+// Show skeleton only on first load; subsequent days-change refreshes keep
+// previous data visible while the inline <Spin> overlays it.
+const initialLoading = ref(true)
 const days = ref(30)
 const stats = ref<any>(null)
 const trendData = ref<any>(null)
@@ -41,7 +45,10 @@ async function fetchAll() {
     cameraData.value = cam
     fpData.value = fp
   } catch { /* interceptor handles */ }
-  finally { loading.value = false }
+  finally {
+    loading.value = false
+    initialLoading.value = false
+  }
 }
 
 async function handleDownloadCompliance() {
@@ -174,7 +181,8 @@ const fpOption = computed(() => {
       </div>
     </Card>
 
-    <Spin :spinning="loading">
+    <ContentSkeleton v-if="initialLoading" type="card" :rows="6" />
+    <Spin v-else :spinning="loading">
       <!-- Summary stats -->
       <Row :gutter="16"  style="margin-bottom: 12px;" v-if="stats">
         <Col :span="6"><Card size="small"><Statistic title="告警总数" :value="stats.total_alerts" /></Card></Col>

@@ -5,15 +5,19 @@ async WebSocket clients via a ``janus`` sync/async queue — replacing the
 fragile ``call_soon_threadsafe`` approach.
 
 Topics:
-- health:      System health and camera status changes
-- cameras:     Camera statistics updates
-- alerts:      New alert notifications
-- tasks:       Background task progress updates
-- wall:        Video wall aggregated score/status (UX v2 §2)
-- degradation: Degradation events new/resolved (UX v2 §5)
-- heatmap:     Per-camera anomaly heatmap data for frontend Canvas overlay
-- audio_alert: Audio alert playback events
-- models:      Model lifecycle events (activation success/failure, reload notices)
+- health:        System health and camera status changes
+- cameras:       Camera statistics updates
+- alerts:        New alert notifications
+- tasks:         Background task progress updates
+- wall:          Video wall aggregated score/status (UX v2 §2)
+- degradation:   Degradation events new/resolved (UX v2 §5)
+- heatmap:       Per-camera anomaly heatmap data for frontend Canvas overlay
+- audio_alert:   Audio alert playback events
+- models:        Model lifecycle events (activation success/failure, reload notices)
+- model_release: Release-pipeline stage transitions (candidate→shadow→canary→production)
+- system_errors: Runtime error events from the unified error channel (dispatcher,
+                 pipeline, release_pipeline, gige_capture, ...) — used by the
+                 dashboard to aggregate and display backend failures.
 """
 
 from __future__ import annotations
@@ -35,7 +39,8 @@ logger = structlog.get_logger()
 
 VALID_TOPICS = frozenset({
     "health", "cameras", "alerts", "tasks", "wall", "degradation", "heatmap",
-    "audio_alert", "models",
+    "audio_alert", "models", "model_release", "system_degradation",
+    "system_errors",
 })
 
 

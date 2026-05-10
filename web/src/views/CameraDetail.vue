@@ -7,9 +7,12 @@ import { getCameraDetail } from '../api'
 import ZoneEditor from '../components/ZoneEditor.vue'
 import CalibrationWizard from '../components/calibration/CalibrationWizard.vue'
 import { useGo2RTC } from '../composables/useGo2RTC'
+import { useAuthStore } from '../stores/useAuthStore'
 
 const route = useRoute()
 const router = useRouter()
+// Hide zone-save (write op) from viewers; backend RBAC remains authoritative.
+const auth = useAuthStore()
 const cameraId = route.params.id as string
 const camera = ref<any>(null)
 const loading = ref(true)
@@ -218,7 +221,7 @@ const leftTab = ref<'live' | 'info' | 'zones'>('live')
           <!-- ZONES TAB -->
           <div v-else-if="leftTab === 'zones'" class="zones-wrapper">
             <ZoneEditor v-model="zoneEditorData" :image-src="snapshotUrl" :width="640" :height="480" />
-            <div style="margin-top: 16px; text-align:right; flex-shrink: 0;">
+            <div v-if="auth.hasRole(['admin', 'operator'])" style="margin-top: 16px; text-align:right; flex-shrink: 0;">
                <Button type="primary" @click="saveZones">保存区域配置</Button>
             </div>
           </div>

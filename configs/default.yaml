@@ -205,7 +205,11 @@ capture_quality:
   person_confidence: 0.3
   entropy_min: 3.0
 classifier:
-  enabled: true
+  # P2 fix (2026-05): default OFF to match README/requirements. Loading
+  # YOLO-World pulls a multi-hundred-MB model and changes the alert
+  # severity arithmetic; users must opt in explicitly via System →
+  # 功能模块.
+  enabled: false
   model_name: yolov8s-worldv2.pt
   vocabulary:
   - wrench

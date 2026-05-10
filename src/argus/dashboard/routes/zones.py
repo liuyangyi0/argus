@@ -8,6 +8,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from argus.dashboard.api_response import api_success, api_not_found, api_unavailable
+from argus.dashboard.auth import current_username
 from argus.dashboard.forms import htmx_toast_headers
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,7 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="update_zone",
             target_type="zone",
             target_id=f"{zone_req.camera_id}/{zone_req.zone_id}",
@@ -146,7 +147,7 @@ async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkI
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="update_zone",
             target_type="zone",
             target_id=camera_id,
@@ -179,7 +180,7 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="update_zone",
             target_type="zone",
             target_id=f"{camera_id}/{zone_id}",

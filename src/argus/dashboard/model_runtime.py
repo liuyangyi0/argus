@@ -49,13 +49,24 @@ def activate_model_version(
     version_id: str,
     *,
     triggered_by: str = "dashboard",
+    allow_bypass: bool = False,
 ) -> tuple[ModelRecord, bool]:
-    """Activate a model version in the registry and sync runtime if the camera is running."""
+    """Activate a model version in the registry and sync runtime.
+
+    P1 fix (2026-05): default no longer bypasses the candidate→shadow→canary→
+    production stage gate. Callers wanting an emergency forced activation
+    must opt in explicitly with ``allow_bypass=True`` (admin-only path).
+    Routes that just need to flip an already-promoted version (rollback /
+    reactivate-retired) work unchanged because registry.activate accepts
+    those stages without bypass.
+    """
     registry = get_registry(request)
     if registry is None:
         raise ValueError("Database not available")
 
-    registry.activate(version_id, triggered_by=triggered_by, allow_bypass=True)
+    registry.activate(
+        version_id, triggered_by=triggered_by, allow_bypass=allow_bypass,
+    )
     record = registry.get_by_version_id(version_id)
     if record is None:
         raise ValueError(f"Model version not found: {version_id}")

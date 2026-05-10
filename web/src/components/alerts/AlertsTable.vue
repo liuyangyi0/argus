@@ -90,6 +90,19 @@ async function handleFalsePositive(id: string) {
   }
 }
 
+// 痛点 10: explicit "this WAS a real anomaly" — pushes the snapshot into the
+// validation set as a confirmed positive sample for the next training run.
+import { confirmRealAnomaly } from '../../api/alerts'
+async function handleConfirmAnomaly(id: string) {
+  try {
+    await confirmRealAnomaly(id)
+    message.success('已确认真异常，已加入正样本训练集')
+    await store.fetchData()
+  } catch (e) {
+    message.error(extractErrorMessage(e, '确认失败'))
+  }
+}
+
 function handleBulkDelete() {
   if (!selectedRowKeys.value.length) return
   Modal.confirm({
@@ -375,8 +388,16 @@ const columns = computed(() => {
               @click="handleAcknowledge(record.alert_id)"
             >确认</Button>
             <Button
+              v-if="record.workflow_status !== 'confirmed_anomaly' && record.workflow_status !== 'false_positive'"
+              type="primary"
+              size="small"
+              style="background-color: #52c41a; border-color: #52c41a"
+              @click="handleConfirmAnomaly(record.alert_id)"
+            >确认真异常</Button>
+            <Button
               v-if="record.workflow_status === 'new' || record.workflow_status === 'acknowledged'"
               size="small"
+              danger
               @click="handleFalsePositive(record.alert_id)"
             >误报</Button>
           </Space>

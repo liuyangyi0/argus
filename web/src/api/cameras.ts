@@ -1,4 +1,9 @@
-import type { ApiResponse, CamerasPayload } from '../types/api'
+import type {
+  ApiResponse,
+  CamerasPayload,
+  ConnectionTestResult,
+  SystemModeSummary,
+} from '../types/api'
 import { api, unwrap, u } from './client'
 
 // ── Cameras ──
@@ -13,6 +18,20 @@ export const addCamera = (data: FormData) => api.post('/cameras', data).then(u)
 export const updateCamera = (id: string, data: FormData) => api.put(`/cameras/${id}`, data).then(u)
 export const getCameraConfig = (id: string) => api.get(`/cameras/${id}/config`).then(u)
 export const deleteCamera = (id: string) => api.delete(`/cameras/${id}`).then(u)
+
+// ── Camera connectivity test (痛点 8) ──
+export const testCameraConnection = (id: string) =>
+  api.post<ApiResponse<ConnectionTestResult>>(`/cameras/${id}/test-connection`).then(unwrap)
+export const testCameraConnectionDraft = (
+  payload: { source: string | number; protocol?: string },
+) =>
+  api
+    .post<ApiResponse<ConnectionTestResult>>('/cameras/test-connection-draft', payload)
+    .then(unwrap)
+
+// ── System mode summary (痛点 4) ──
+export const getSystemModeSummary = () =>
+  api.get<ApiResponse<SystemModeSummary>>('/system/mode_summary').then(unwrap)
 
 // ── Video Wall ──
 export const getWallStatus = () =>

@@ -32,6 +32,8 @@ from argus.capture.samplers import (
     get_active_sampler_unavailable_reason,
 )
 from argus.config.schema import CaptureQualityConfig, BaselineCaptureConfig
+from argus.core.pipeline import PipelineMode
+from argus.core.pipeline_mode_guard import PipelineModeGuard
 
 logger = structlog.get_logger()
 
@@ -197,6 +199,17 @@ def run_baseline_capture_job(
         )
 
     # ── Main capture loop ────────────────────────────────────────────────
+    # PipelineModeGuard switches the camera into COLLECTION for the loop
+    # duration (痛点 1) and guarantees restoration on exit. We use explicit
+    # enter/exit instead of `with` to avoid re-indenting the long loop body.
+    failed_dir_timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    mode_guard = PipelineModeGuard(
+        camera_manager,
+        job_config.camera_id,
+        PipelineMode.COLLECTION,
+        reason=f"baseline_capture:{job_config.session_label}",
+    )
+    mode_guard.__enter__()
     try:
         while collected < job_config.target_frames and time.monotonic() < deadline:
             # Pause checkpoint — blocks with zero CPU while paused
@@ -326,47 +339,78 @@ def run_baseline_capture_job(
         raise
 
     finally:
+        # Restore pipeline mode FIRST so the camera resumes detection while
+        # we do disk I/O for the metadata files.
+        mode_guard.__exit__(
+            type(loop_error) if loop_error is not None else None,
+            loop_error,
+            loop_error.__traceback__ if loop_error is not None else None,
+        )
+
         # ── Finalization ─────────────────────────────────────────────────
-        # Always write outputs even on abort/error so partial data is usable.
-        if loop_error is not None and collected < min_required_frames:
-            shutil.rmtree(version_dir, ignore_errors=True)
-            logger.warning(
-                "baseline.capture_partial_removed",
-                camera_id=job_config.camera_id,
-                version=version_dir.name,
-                collected=collected,
-                error=str(loop_error),
-            )
+        # Always write outputs (痛点 7: keep failed runs visible to the user
+        # instead of rmtree-ing them silently).
+        if loop_error is not None:
+            status = "partial" if collected >= min_required_frames else "failed"
+            error_message: str | None = str(loop_error)
+        elif collected < min_required_frames:
+            status = "failed"
+            error_message = "insufficient_frames"
         else:
-            _write_manifest(version_dir)
-            _write_stats(version_dir, stats, collected, start_time)
-            _write_job_config(version_dir, job_config)
-            _write_capture_meta(version_dir, job_config, stats)
-            if collected >= min_required_frames:
-                bm.set_current_version(
-                    job_config.camera_id, "default", version_dir.name
-                )
-            if lifecycle is not None and collected >= min_required_frames:
+            status = "ok"
+            error_message = None
+
+        _write_manifest(version_dir)
+        _write_stats(version_dir, stats, collected, start_time)
+        _write_job_config(version_dir, job_config)
+        _write_capture_meta(
+            version_dir, job_config, stats,
+            error=error_message, status=status,
+        )
+
+        if status == "ok":
+            bm.set_current_version(
+                job_config.camera_id, "default", version_dir.name
+            )
+            if lifecycle is not None:
                 lifecycle.register_version(
                     job_config.camera_id,
                     "default",
                     version_dir.name,
                     image_count=collected,
                 )
-            logger.info(
-                "baseline.capture_finalized",
-                camera_id=job_config.camera_id,
-                version=version_dir.name,
-                collected=collected,
-                target_frames=job_config.target_frames,
-                total_grabbed=stats.total_grabbed,
-                null_frames=stats.null_frames,
-                total_rejected=stats.total_rejected,
-                output_dir=str(version_dir),
+        elif status == "failed":
+            # Rename failed runs so list_baselines can surface them with
+            # a distinct status without polluting the active version pool.
+            failed_dir = version_dir.with_name(
+                f"failed_{failed_dir_timestamp}_{version_dir.name}"
             )
+            try:
+                version_dir.rename(failed_dir)
+                version_dir = failed_dir
+            except OSError as rename_err:
+                logger.warning(
+                    "baseline.capture_rename_failed",
+                    camera_id=job_config.camera_id,
+                    src=str(version_dir),
+                    error=str(rename_err),
+                )
+
+        logger.info(
+            "baseline.capture_finalized",
+            camera_id=job_config.camera_id,
+            version=version_dir.name,
+            status=status,
+            error=error_message,
+            collected=collected,
+            target_frames=job_config.target_frames,
+            total_grabbed=stats.total_grabbed,
+            null_frames=stats.null_frames,
+            total_rejected=stats.total_rejected,
+            output_dir=str(version_dir),
+        )
 
     if collected < min_required_frames:
-        shutil.rmtree(version_dir, ignore_errors=True)
         logger.error(
             "baseline.capture_failed",
             camera_id=job_config.camera_id,
@@ -375,10 +419,12 @@ def run_baseline_capture_job(
             total_grabbed=stats.total_grabbed,
             null_frames=stats.null_frames,
             total_rejected=stats.total_rejected,
+            preserved_dir=str(version_dir),
         )
         raise RuntimeError(
             f"采集失败: 仅采集到 {collected} 帧，至少需要 {min_required_frames} 帧。"
             "请检查摄像头实时画面、连接状态或采集间隔设置。"
+            f" (失败现场已保留至 {version_dir.name})"
         )
 
     # ── Layer 3: Post-capture review ─────────────────────────────────────
@@ -591,15 +637,26 @@ def _write_capture_meta(
     version_dir: Path,
     job_config: BaselineCaptureJobConfig,
     stats: CaptureStats,
+    *,
+    error: str | None = None,
+    status: str = "ok",
 ) -> Path:
-    """Write capture metadata compatible with dashboard reporting."""
-    meta = {
+    """Write capture metadata compatible with dashboard reporting.
+
+    The optional ``error`` field carries the failure reason when capture
+    aborted abnormally (truncated to 500 chars to keep the meta file small).
+    The ``status`` field is one of "ok" | "failed" | "partial".
+    """
+    meta: dict = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "camera_id": job_config.camera_id,
         "session_label": job_config.session_label,
         "quality_filter_enabled": job_config.quality_config.enabled,
         "stats": stats.to_dict(),
+        "status": status,
     }
+    if error is not None:
+        meta["error"] = error[:500]
     path = version_dir / "capture_meta.json"
     path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     return path

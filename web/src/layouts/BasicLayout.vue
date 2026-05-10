@@ -1,19 +1,162 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, h, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
+import { Button, notification } from 'ant-design-vue'
+import { BellOutlined } from '@ant-design/icons-vue'
 import DegradationBar from '../components/DegradationBar.vue'
 import ErrorBoundary from '../components/ErrorBoundary.vue'
+import ErrorCenterDrawer from '../components/system/ErrorCenterDrawer.vue'
 import { useWebSocket } from '../composables/useWebSocket'
+import { useSystemMode } from '../composables/useSystemMode'
+import { useAuthStore } from '../stores/useAuthStore'
+import { useErrorStore } from '../stores/useErrorStore'
 
 const router = useRouter()
 const route = useRoute()
+const auth = useAuthStore()
 
 const isActive = (pathPrefix: string) => route.path.startsWith(pathPrefix)
+const isExact = (path: string) => route.path === path || route.path.startsWith(path + '/')
 
-const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFallbackMode, retryCount: wsRetryCount, nextRetryIn: wsNextRetryIn } = useWebSocket({
-  topics: ['health'],
+// Sub-menu definitions (mirrors router children for Models / System).
+// `roles` mirrors the route-level `requiresRole` meta — entries with no
+// `roles` key are visible to every authenticated role (and anonymous, since
+// these are also the public/all-role pages). Backend RBAC remains the source
+// of truth; this list only hides nav entries to reduce wandering.
+type NavChild = { path: string; label: string; roles?: string[] }
+
+const modelsChildren: NavChild[] = [
+  { path: '/models/baseline', label: '基线管理', roles: ['admin', 'operator'] },
+  { path: '/models/collections', label: '采集集合' },
+  { path: '/models/training', label: '训练与评估', roles: ['admin', 'operator'] },
+  { path: '/models/registry', label: '模型与发布', roles: ['admin', 'operator'] },
+  { path: '/models/comparison', label: 'A/B 对比' },
+  { path: '/models/labeling', label: '标注队列' },
+  { path: '/models/threshold', label: '阈值预览' },
+]
+
+const systemChildren: NavChild[] = [
+  { path: '/system/overview', label: '系统概览' },
+  { path: '/system/model-status', label: '模型状态' },
+  { path: '/system/config', label: '配置管理', roles: ['admin'] },
+  { path: '/system/audit', label: '审计日志', roles: ['admin'] },
+  { path: '/system/degradation', label: '降级事件' },
+  { path: '/system/modules', label: '功能模块' },
+  { path: '/system/classifier', label: '分类器' },
+  { path: '/system/segmenter', label: '分割器' },
+  { path: '/system/imaging', label: '多模态成像' },
+  { path: '/system/cross-camera', label: '跨相机' },
+  { path: '/system/users', label: '用户管理', roles: ['admin'] },
+  { path: '/system/regions', label: '区域管理' },
+]
+
+// Visibility helpers: when the user isn't loaded yet we keep entries hidden
+// so the menu never flashes options the user can't reach. Entries with no
+// `roles` are always visible (matches public router meta).
+function canSeeChild(child: NavChild): boolean {
+  if (!child.roles) return true
+  return auth.hasRole(child.roles)
+}
+const visibleModelsChildren = computed(() => modelsChildren.filter(canSeeChild))
+const visibleSystemChildren = computed(() => systemChildren.filter(canSeeChild))
+
+// Models top-level entry mirrors the most-permissive child (admin/operator).
+const canSeeModelsGroup = computed(() => visibleModelsChildren.value.length > 0)
+const canSeeSystemGroup = computed(() => visibleSystemChildren.value.length > 0)
+
+// User dropdown derived state
+const avatarLetter = computed(() => {
+  const u = auth.currentUser
+  if (!u) return '?'
+  const src = u.display_name || u.username || ''
+  return (src.trim().charAt(0) || '?').toUpperCase()
 })
 
+const ROLE_META: Record<string, { color: string; label: string }> = {
+  admin: { color: 'red', label: '管理员' },
+  operator: { color: 'blue', label: '操作员' },
+  viewer: { color: 'default', label: '查看者' },
+}
+
+const roleColor = computed(() => {
+  const role = auth.currentUser?.role
+  return (role && ROLE_META[role]?.color) || 'default'
+})
+const roleLabel = computed(() => {
+  const role = auth.currentUser?.role
+  return (role && ROLE_META[role]?.label) || (role ?? '')
+})
+
+async function onMenuClick({ key }: { key: string }) {
+  if (key !== 'logout') return
+  // Best-effort POST to backend; even on failure (network down, cookie
+  // already expired) we force-redirect to /login so the UI never sits in a
+  // half-authenticated state where currentUser is cleared client-side but
+  // the URL still shows a protected page.
+  try {
+    await fetch('/logout', { method: 'POST', credentials: 'include' })
+  } catch {
+    /* swallow — full-page redirect below is the source of truth */
+  }
+  auth.clear()
+  window.location.href = '/login'
+}
+
+const modelsOpen = ref(isActive('/models'))
+const systemOpen = ref(isActive('/system'))
+
+// Auto-open the parent group whose route is active
+watch(
+  () => route.path,
+  (p) => {
+    if (p.startsWith('/models')) modelsOpen.value = true
+    if (p.startsWith('/system')) systemOpen.value = true
+  },
+)
+
+function toggleModels() {
+  modelsOpen.value = !modelsOpen.value
+}
+function toggleSystem() {
+  systemOpen.value = !systemOpen.value
+}
+
+// Global error center: aggregates `system_errors` topic into a Pinia store and
+// pops a notification for error/critical events. The same useWebSocket call
+// also drives the disconnect banner via the `health` topic so we keep a single
+// long-lived subscriber on the layout.
+const errorStore = useErrorStore()
+const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFallbackMode, retryCount: wsRetryCount, nextRetryIn: wsNextRetryIn } = useWebSocket({
+  topics: ['health', 'system_errors'],
+  onMessage: (topic, payload) => {
+    if (topic !== 'system_errors') return
+    errorStore.pushError(payload)
+    const severity = payload?.severity
+    if (severity === 'critical' || severity === 'error') {
+      notification.open({
+        message: `[${payload.source ?? 'unknown'}] ${payload.code ?? 'unknown'}`,
+        description: payload.message ?? '',
+        type: severity === 'critical' ? 'error' : 'warning',
+        duration: severity === 'critical' ? 0 : 6,  // critical 不自动关闭
+        btn: () =>
+          h(
+            Button,
+            {
+              size: 'small',
+              type: 'link',
+              onClick: () => errorStore.openDrawer(),
+            },
+            { default: () => '查看错误中心' },
+          ),
+      })
+    }
+  },
+})
+
+// 痛点 4: global pipeline mode banner (capturing / training / maintenance)
+const { showBanner: showModeBanner, bannerLabel: modeBannerLabel, bannerColor: modeBannerColor } = useSystemMode()
+
+// Global keyboard shortcuts
 const shortcutHelpVisible = ref(false)
 const navKeys: Record<string, string> = {
   '1': '/overview',
@@ -46,6 +189,13 @@ function handleKeyDown(e: KeyboardEvent) {
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
+  // Hydrate the dropdown when landing on a public page (e.g. /overview).
+  // The router guard skips /api/me for public routes, so currentUser may be
+  // null even though a session cookie is set. fetchCurrentUser() is cached
+  // (60s TTL) and de-dupes in-flight calls, so this is cheap and idempotent.
+  if (!auth.currentUser) {
+    void auth.fetchCurrentUser()
+  }
 })
 
 onUnmounted(() => {
@@ -92,15 +242,58 @@ onUnmounted(() => {
 
           <div class="nav-label">系统</div>
 
-          <router-link to="/models" :class="{ active: isActive('/models') }">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg>
-            模型管理
-          </router-link>
 
-          <router-link to="/system" :class="{ active: isActive('/system') }">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
-            设置
-          </router-link>
+          <!-- Models sub-menu (admin/operator only — viewer hides the entry) -->
+          <div v-if="canSeeModelsGroup" class="sub-group" :class="{ 'is-open': modelsOpen }">
+            <button
+              type="button"
+              class="sub-toggle"
+              :class="{ active: isActive('/models') }"
+              :aria-expanded="modelsOpen"
+              @click="toggleModels"
+            >
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg>
+              <span class="sub-label">模型管理</span>
+              <svg class="caret" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+            </button>
+            <div v-show="modelsOpen" class="sub-list">
+              <router-link
+                v-for="item in visibleModelsChildren"
+                :key="item.path"
+                :to="item.path"
+                :class="{ active: isExact(item.path) }"
+                class="sub-item"
+              >
+                <span class="sub-dot" />{{ item.label }}
+              </router-link>
+            </div>
+          </div>
+
+          <!-- System sub-menu (always visible — admin-only items inside are gated individually) -->
+          <div v-if="canSeeSystemGroup" class="sub-group" :class="{ 'is-open': systemOpen }">
+            <button
+              type="button"
+              class="sub-toggle"
+              :class="{ active: isActive('/system') }"
+              :aria-expanded="systemOpen"
+              @click="toggleSystem"
+            >
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+              <span class="sub-label">设置</span>
+              <svg class="caret" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+            </button>
+            <div v-show="systemOpen" class="sub-list">
+              <router-link
+                v-for="item in visibleSystemChildren"
+                :key="item.path"
+                :to="item.path"
+                :class="{ active: isExact(item.path) }"
+                class="sub-item"
+              >
+                <span class="sub-dot" />{{ item.label }}
+              </router-link>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -111,6 +304,33 @@ onUnmounted(() => {
     </aside>
 
     <div style="display: flex; flex-direction: column; flex: 1; min-width: 0;">
+
+      <!-- TOPBAR with error center bell + user dropdown -->
+      <header v-if="auth.currentUser" class="topbar">
+        <a-badge :count="errorStore.unreadCount" :overflow-count="99" :offset="[-4, 4]">
+          <a-button type="text" shape="circle" title="错误中心" @click="errorStore.openDrawer()">
+            <BellOutlined />
+          </a-button>
+        </a-badge>
+        <a-dropdown placement="bottomRight" :trigger="['click']">
+          <span class="user-trigger" tabindex="0">
+            <a-avatar size="small">{{ avatarLetter }}</a-avatar>
+            <span class="user-name">{{ auth.currentUser.display_name || auth.currentUser.username }}</span>
+            <a-tag :color="roleColor" class="role-tag">{{ roleLabel }}</a-tag>
+          </span>
+          <template #overlay>
+            <a-menu @click="onMenuClick">
+              <a-menu-item key="profile" disabled>
+                <span>{{ auth.currentUser.username }} · {{ roleLabel }}</span>
+              </a-menu-item>
+              <a-menu-divider />
+              <a-menu-item key="logout">登出</a-menu-item>
+            </a-menu>
+          </template>
+        </a-dropdown>
+      </header>
+
+      <!-- WebSocket disconnect banner (inline in column) -->
       <div
         v-if="!wsConnected && (wsReconnecting || wsFallbackMode)"
         role="alert"
@@ -149,6 +369,14 @@ onUnmounted(() => {
       </div>
 
       <ErrorBoundary>
+        <!-- 痛点 4: pipeline mode banner (visible only when not in normal state) -->
+        <div
+          v-if="showModeBanner"
+          class="mode-banner"
+          :style="{ backgroundColor: modeBannerColor }"
+        >
+          {{ modeBannerLabel }}
+        </div>
         <DegradationBar />
         <div style="display: flex; flex-direction: row; flex: 1; min-height: 0; gap: 12px;">
           <router-view v-slot="{ Component }">
@@ -160,6 +388,11 @@ onUnmounted(() => {
       </ErrorBoundary>
     </div>
 
+
+    <!-- Global error center drawer (mounted once at app shell level) -->
+    <ErrorCenterDrawer />
+
+    <!-- Keyboard shortcuts window -->
     <div v-if="shortcutHelpVisible" class="shortcut-help glass">
       <h4>键盘快捷键</h4>
       <ul>
@@ -185,6 +418,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  overflow-y: auto;
 }
 
 .brand {
@@ -284,20 +518,57 @@ onUnmounted(() => {
   box-shadow: 0 1px 2px rgba(10, 10, 15, 0.05), 0 4px 10px -2px rgba(10, 10, 15, 0.06), inset 0 0 0 0.5px rgba(10, 10, 15, 0.05);
 }
 
-.nav a.active svg {
-  color: var(--ink);
-}
 
-.side-foot {
-  padding: 12px 12px 4px;
-  border-top: 0.5px solid var(--line);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--ink-5);
-  font-weight: 500;
+/* ====== Sub-menu group ====== */
+.sub-group { display: flex; flex-direction: column; }
+.sub-toggle {
+  display: flex; align-items: center; gap: 11px; padding: 8px 12px;
+  border: none; background: transparent;
+  border-radius: var(--r-sm);
+  color: var(--ink-3); font-size: 13px; font-weight: 500;
+  cursor: pointer; text-align: left; width: 100%;
+  transition: background .15s, color .15s;
+  font-family: inherit;
 }
+.sub-toggle svg { width: 16px; height: 16px; flex-shrink: 0; stroke-width: 1.8; color: var(--ink-4); transition: color .15s, transform .2s; }
+.sub-toggle .sub-label { flex: 1; }
+.sub-toggle .caret { width: 12px; height: 12px; opacity: .6; transition: transform .2s; }
+.sub-group.is-open .sub-toggle .caret { transform: rotate(90deg); }
+.sub-toggle:hover { background: rgba(10,10,15,.04); color: var(--ink); }
+.sub-toggle:hover svg { color: var(--ink-2); }
+.sub-toggle.active {
+  color: var(--ink); font-weight: 600;
+}
+.sub-toggle.active svg { color: var(--ink); }
+
+.sub-list {
+  display: flex; flex-direction: column; gap: 1px;
+  margin: 2px 0 4px 12px;
+  padding-left: 10px;
+  border-left: 1px solid var(--line);
+}
+.sub-item {
+  display: flex !important; align-items: center; gap: 8px;
+  padding: 6px 10px !important; border-radius: var(--r-sm);
+  color: var(--ink-4) !important; font-size: 12.5px !important; font-weight: 500 !important;
+  text-decoration: none; transition: background .15s, color .15s;
+}
+.sub-item .sub-dot {
+  width: 4px; height: 4px; border-radius: 50%;
+  background: var(--ink-5); flex-shrink: 0;
+  transition: background .15s, transform .15s;
+}
+.sub-item:hover { background: rgba(10,10,15,.04); color: var(--ink-2) !important; }
+.sub-item:hover .sub-dot { background: var(--ink-3); }
+.sub-item.active {
+  color: var(--ink) !important; font-weight: 600 !important;
+  background: #fff !important;
+  box-shadow: 0 1px 2px rgba(10,10,15,.05), inset 0 0 0 0.5px rgba(10,10,15,.05) !important;
+}
+.sub-item.active .sub-dot { background: var(--ink); transform: scale(1.4); }
+
+.side-foot { padding: 12px 12px 4px; border-top: 0.5px solid var(--line); display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--ink-5); font-weight: 500; }
+
 
 .shortcut-help {
   position: absolute;
@@ -309,34 +580,62 @@ onUnmounted(() => {
   z-index: 1000;
 }
 
-.shortcut-help h4 {
-  margin: 0 0 16px;
-  font-size: 14px;
+.shortcut-help h4 { margin: 0 0 16px; font-size: 14px; }
+.shortcut-help ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.shortcut-help li { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--ink-3); }
+.shortcut-help kbd { background: #fff; border: 1px solid var(--line-2); padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px; }
+
+/* 痛点 4: pipeline mode banner */
+.mode-banner {
+  color: #fff;
+  padding: 6px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  letter-spacing: 0.3px;
 }
 
-.shortcut-help ul {
-  list-style: none;
-  padding: 0;
-  margin: 0;
+/* ============ TOPBAR with user dropdown ============ */
+.topbar {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.shortcut-help li {
-  display: flex;
+  justify-content: flex-end;
   align-items: center;
-  gap: 12px;
-  font-size: 12px;
-  color: var(--ink-3);
+  gap: 8px;
+  height: 44px;
+  padding: 0 18px;
+  border-bottom: 0.5px solid var(--line);
+  background: rgba(255, 255, 255, 0.6);
+  backdrop-filter: blur(8px);
+  flex-shrink: 0;
 }
-
-.shortcut-help kbd {
-  background: #fff;
-  border: 1px solid var(--line-2);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: monospace;
+.user-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background 0.15s;
+  user-select: none;
+}
+.user-trigger:hover { background: rgba(10, 10, 15, 0.05); }
+.user-trigger:focus-visible {
+  outline: 2px solid rgba(10, 10, 15, 0.25);
+  outline-offset: 2px;
+}
+.user-trigger .user-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-trigger .role-tag {
+  margin-inline-end: 0;
   font-size: 11px;
+  line-height: 18px;
+  padding: 0 6px;
 }
 </style>

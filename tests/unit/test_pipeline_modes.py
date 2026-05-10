@@ -148,6 +148,127 @@ def test_pipeline_mode_enum_values():
     assert PipelineMode.ACTIVE.value == "active"
     assert PipelineMode.MAINTENANCE.value == "maintenance"
     assert PipelineMode.LEARNING.value == "learning"
+    assert PipelineMode.COLLECTION.value == "collection"
+    assert PipelineMode.TRAINING.value == "training"
+
+
+def test_set_mode_returns_previous_mode():
+    """set_mode now returns the previous mode so PipelineModeGuard can restore it."""
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(camera_config=cam_config, alert_config=alert_config)
+    assert pipeline.set_mode(PipelineMode.COLLECTION) == PipelineMode.ACTIVE
+    assert pipeline.set_mode(PipelineMode.ACTIVE) == PipelineMode.COLLECTION
+
+
+def test_set_mode_records_session_for_skipped_modes():
+    """Entering COLLECTION/TRAINING records start time for the watchdog;
+    leaving them clears it so ACTIVE never auto-recovers itself."""
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(camera_config=cam_config, alert_config=alert_config)
+
+    pipeline.set_mode(PipelineMode.COLLECTION)
+    assert pipeline._mode_session_start_time is not None
+
+    pipeline.set_mode(PipelineMode.ACTIVE)
+    assert pipeline._mode_session_start_time is None
+
+    pipeline.set_mode(PipelineMode.TRAINING)
+    assert pipeline._mode_session_start_time is not None
+
+    pipeline.set_mode(PipelineMode.MAINTENANCE)
+    assert pipeline._mode_session_start_time is None
+
+
+def _make_frame_data(frame_number: int = 0):
+    from argus.capture.camera import FrameData
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+    return FrameData(
+        frame=frame,
+        camera_id="test_cam",
+        timestamp=time.time(),
+        frame_number=frame_number,
+        resolution=(64, 48),
+    )
+
+
+def test_collection_mode_skips_detection_stages():
+    """COLLECTION mode must NOT touch YOLO / Anomalib / MOG2.process()."""
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(camera_config=cam_config, alert_config=alert_config)
+
+    pipeline._prefilter = MagicMock()
+    pipeline._object_detector = MagicMock()
+    pipeline._anomaly_detector = MagicMock()
+
+    pipeline.set_mode(PipelineMode.COLLECTION)
+    result = pipeline.process_frame(_make_frame_data())
+
+    assert result is None
+    pipeline._prefilter.process.assert_not_called()
+    pipeline._object_detector.detect.assert_not_called() if hasattr(
+        pipeline._object_detector, "detect"
+    ) else None
+    pipeline._anomaly_detector.predict.assert_not_called() if hasattr(
+        pipeline._anomaly_detector, "predict"
+    ) else None
+    # Raw frame must remain available for capture threads
+    assert pipeline._latest_raw_frame is not None
+    assert pipeline._latest_frame is not None
+
+
+def test_training_mode_skips_detection_stages():
+    """TRAINING mode (痛点 3) shares the skip path with COLLECTION."""
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(camera_config=cam_config, alert_config=alert_config)
+
+    pipeline._prefilter = MagicMock()
+    pipeline.set_mode(PipelineMode.TRAINING)
+
+    assert pipeline.process_frame(_make_frame_data()) is None
+    pipeline._prefilter.process.assert_not_called()
+
+
+def test_maintenance_mode_still_runs_prefilter():
+    """MAINTENANCE freezes MOG2 learning but does NOT skip detection (boundary)."""
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(camera_config=cam_config, alert_config=alert_config)
+    prefilter = MagicMock()
+    prefilter.process.return_value = MagicMock(has_change=False)
+    pipeline._prefilter = prefilter
+    pipeline.set_mode(PipelineMode.MAINTENANCE)
+
+    pipeline.process_frame(_make_frame_data())
+    prefilter.process.assert_called()
+
+
+def test_mode_session_watchdog_recovers_after_timeout():
+    """If COLLECTION lingers past max_duration the next frame must auto-restore ACTIVE."""
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(camera_config=cam_config, alert_config=alert_config)
+    pipeline._mode_session_max_duration = 0.01  # force trigger
+
+    pipeline.set_mode(PipelineMode.COLLECTION)
+    assert pipeline.mode == PipelineMode.COLLECTION
+    time.sleep(0.05)
+
+    pipeline.process_frame(_make_frame_data())
+
+    assert pipeline.mode == PipelineMode.ACTIVE
+    assert pipeline._mode_session_start_time is None
+
+
+def test_mode_session_watchdog_inactive_for_active_mode():
+    """ACTIVE must never trigger the watchdog (start_time is always None)."""
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(camera_config=cam_config, alert_config=alert_config)
+    pipeline._mode_session_max_duration = 0.001
+
+    pipeline.set_mode(PipelineMode.COLLECTION)
+    pipeline.set_mode(PipelineMode.ACTIVE)
+    time.sleep(0.05)
+    assert pipeline._mode_session_start_time is None
+    # Mode stays ACTIVE; no spontaneous transitions
+    assert pipeline.mode == PipelineMode.ACTIVE
 
 
 def test_detector_status_delegation():

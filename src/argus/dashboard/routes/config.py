@@ -21,6 +21,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
+from argus.dashboard.auth import current_username
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 from argus.dashboard.model_runtime import find_registered_model_by_path
 
@@ -40,64 +41,6 @@ class ThresholdUpdateRequest(BaseModel):
 class ModelReloadRequest(BaseModel):
     camera_id: str
     model_path: str
-
-
-_NOTIFICATION_TEMPLATE_METHODS = {"email", "sms", "webhook"}
-
-
-def _coerce_bool(value: object, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on", "启用", "是"}
-    return bool(value)
-
-
-def _notification_template_to_dict(template) -> dict:
-    return {
-        "id": template.id,
-        "name": template.name,
-        "method": template.method,
-        "subject": template.subject or "",
-        "content": template.content,
-        "enabled": bool(template.enabled),
-        "created_at": template.created_at.isoformat() if template.created_at else None,
-        "updated_at": template.updated_at.isoformat() if template.updated_at else None,
-    }
-
-
-def _normalize_notification_template_payload(body: dict) -> tuple[dict | None, str | None]:
-    if not isinstance(body, dict):
-        return None, "请求体必须是 JSON 对象"
-
-    name = str(body.get("name", "")).strip()
-    method = str(body.get("method", "")).strip()
-    subject = str(body.get("subject", "")).strip()
-    content = str(body.get("content", "")).strip()
-    enabled = _coerce_bool(body.get("enabled"), True)
-
-    if not name:
-        return None, "模板名称不能为空"
-    if len(name) > 100:
-        return None, "模板名称不能超过 100 个字符"
-    if method not in _NOTIFICATION_TEMPLATE_METHODS:
-        return None, "通知方式无效"
-    if len(subject) > 200:
-        return None, "模板标题不能超过 200 个字符"
-    if not content:
-        return None, "模板内容不能为空"
-    if len(content) > 4000:
-        return None, "模板内容不能超过 4000 个字符"
-
-    return {
-        "name": name,
-        "method": method,
-        "subject": subject or None,
-        "content": content,
-        "enabled": enabled,
-    }, None
 
 
 @router.post("/detection-params")
@@ -136,14 +79,28 @@ async def update_detection_params(request: Request):
     if form.get("supp_zone"):
         supp.same_zone_window_seconds = float(form["supp_zone"])
 
+    # Determine which sections changed so we can tell the pipelines to
+    # refresh their derived caches AND tell the UI which knobs took effect.
+    severity_changed = any(form.get(k) for k in ("sev_info", "sev_low", "sev_medium", "sev_high"))
+    temporal_changed = any(form.get(k) for k in ("temp_gap", "temp_overlap"))
+    suppression_changed = bool(form.get("supp_zone"))
+    anomaly_threshold = float(form["anomaly_threshold"]) if form.get("anomaly_threshold") else None
+
     # Apply to pipelines
     updated = 0
+    section_hot: dict[str, bool] = {}
     for cam_cfg in config.cameras:
         pipeline = camera_manager._pipelines.get(cam_cfg.camera_id)
         if not pipeline:
             continue
-        if form.get("anomaly_threshold"):
-            pipeline.update_thresholds(anomaly_threshold=float(form["anomaly_threshold"]))
+        applied = pipeline.update_thresholds(
+            anomaly_threshold=anomaly_threshold,
+            severity_changed=severity_changed,
+            temporal_changed=temporal_changed,
+            suppression_changed=suppression_changed,
+        ) or {}
+        for k, v in applied.items():
+            section_hot[k] = section_hot.get(k, True) and bool(v)
         updated += 1
 
     logger.info("config.detection_params_updated", pipelines=updated)
@@ -151,21 +108,39 @@ async def update_detection_params(request: Request):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="update_config",
             target_type="detection_params",
             detail=f"更新检测参数，影响 {updated} 条流水线",
             ip_address=client_ip,
         )
+
+    # 痛点 9: per-section hot-reload status drives the SystemConfigPanel toast.
+    def _summary(touched: bool, key: str) -> dict:
+        if not touched:
+            return {"changed": False, "hot_reloaded": False, "applied": 0, "total": updated}
+        return {
+            "changed": True,
+            "hot_reloaded": section_hot.get(key, False),
+            "applied": updated if section_hot.get(key, False) else 0,
+            "total": updated,
+        }
+
     return api_success(
-        {"pipelines_updated": updated},
+        {
+            "pipelines_updated": updated,
+            "anomaly_threshold": _summary(anomaly_threshold is not None, "anomaly_threshold"),
+            "severity": _summary(severity_changed, "severity"),
+            "temporal": _summary(temporal_changed, "temporal"),
+            "suppression": _summary(suppression_changed, "suppression"),
+        },
         headers=htmx_toast_headers("检测参数已更新"),
     )
 
 
 @router.post("/notifications")
 async def update_notifications(request: Request):
-    """Update email/webhook config."""
+    """Update webhook config (email surface was removed in 2026-05)."""
     config = request.app.state.config
     if not config:
         return api_unavailable("不可用")
@@ -218,88 +193,6 @@ async def test_webhook(request: Request):
         )
     except Exception as e:
         return api_internal_error(str(e))
-
-
-@router.get("/notification-templates")
-async def list_notification_templates(
-    request: Request,
-    method: str | None = Query(None),
-):
-    """Return notification templates stored in the database."""
-    db = request.app.state.db
-    if not db:
-        return api_unavailable("数据库不可用")
-
-    method_filter = (method or "").strip() or None
-    if method_filter and method_filter not in _NOTIFICATION_TEMPLATE_METHODS:
-        return api_validation_error("通知方式无效")
-
-    templates = db.get_notification_templates(method=method_filter)
-    return api_success({"templates": [_notification_template_to_dict(item) for item in templates]})
-
-
-@router.post("/notification-templates")
-async def create_notification_template(request: Request):
-    """Create a notification template."""
-    from argus.dashboard.auth import require_role
-
-    if not require_role(request, "admin", "engineer"):
-        return api_forbidden("需要管理员或工程师权限")
-
-    db = request.app.state.db
-    if not db:
-        return api_unavailable("数据库不可用")
-
-    body = await request.json()
-    payload, error = _normalize_notification_template_payload(body)
-    if error:
-        return api_validation_error(error)
-
-    assert payload is not None
-    template = db.create_notification_template(**payload)
-    return api_success({"template": _notification_template_to_dict(template)})
-
-
-@router.put("/notification-templates/{template_id}")
-async def update_notification_template(request: Request, template_id: int):
-    """Update a notification template."""
-    from argus.dashboard.auth import require_role
-
-    if not require_role(request, "admin", "engineer"):
-        return api_forbidden("需要管理员或工程师权限")
-
-    db = request.app.state.db
-    if not db:
-        return api_unavailable("数据库不可用")
-    if db.get_notification_template(template_id) is None:
-        return api_not_found("模板不存在")
-
-    body = await request.json()
-    payload, error = _normalize_notification_template_payload(body)
-    if error:
-        return api_validation_error(error)
-
-    assert payload is not None
-    db.update_notification_template(template_id, **payload)
-    template = db.get_notification_template(template_id)
-    assert template is not None
-    return api_success({"template": _notification_template_to_dict(template)})
-
-
-@router.delete("/notification-templates/{template_id}")
-async def delete_notification_template(request: Request, template_id: int):
-    """Delete a notification template."""
-    from argus.dashboard.auth import require_role
-
-    if not require_role(request, "admin", "engineer"):
-        return api_forbidden("需要管理员或工程师权限")
-
-    db = request.app.state.db
-    if not db:
-        return api_unavailable("数据库不可用")
-    if not db.delete_notification_template(template_id):
-        return api_not_found("模板不存在")
-    return api_success({"id": template_id})
 
 
 @router.get("/storage/info")
@@ -433,7 +326,7 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
     client_ip = request.client.host if request.client else ""
     if audit:
         audit.log(
-            user="operator",
+            user=current_username(request),
             action="clear_lock",
             target_type="camera",
             target_id=camera_id,

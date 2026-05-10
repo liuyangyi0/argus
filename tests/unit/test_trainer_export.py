@@ -9,7 +9,9 @@ training image_size; these tests verify the export call carries that arg.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from argus.anomaly.trainer import ModelTrainer
 
@@ -69,3 +71,43 @@ class TestExportStaticInputShape:
         kwargs = mock_engine.export.call_args.kwargs
         assert "input_size" not in kwargs
         assert "onnx_kwargs" not in kwargs
+
+
+class TestAssertOpenvinoStatic:
+    """Guard: reject an exported IR whose input still has a dynamic dim.
+
+    Symptom when it slips through: CPU inference raises
+    'Broadcast Check failed, Value -1 not in range' at first predict().
+    """
+
+    def _make_model_mock(self, *, static: bool):
+        """Build a mock ov.Model with one input whose shape is static/dynamic."""
+        input_tensor = MagicMock()
+        input_tensor.any_name = "input"
+        input_tensor.partial_shape.is_static = static
+        model = MagicMock()
+        model.inputs = [input_tensor]
+        return model
+
+    def test_raises_on_dynamic_input(self, tmp_path):
+        xml = tmp_path / "model.xml"
+        xml.write_text("<net/>")
+        fake_model = self._make_model_mock(static=False)
+        with patch("openvino.Core") as core_cls:
+            core_cls.return_value.read_model.return_value = fake_model
+            with pytest.raises(RuntimeError, match="non-static input shape"):
+                ModelTrainer._assert_openvino_static(tmp_path)
+
+    def test_passes_on_static_input(self, tmp_path):
+        xml = tmp_path / "model.xml"
+        xml.write_text("<net/>")
+        fake_model = self._make_model_mock(static=True)
+        with patch("openvino.Core") as core_cls:
+            core_cls.return_value.read_model.return_value = fake_model
+            ModelTrainer._assert_openvino_static(tmp_path)  # no raise
+
+    def test_noop_when_no_xml_present(self, tmp_path):
+        """No IR on disk yet → nothing to check; other code reports missing."""
+        with patch("openvino.Core") as core_cls:
+            ModelTrainer._assert_openvino_static(tmp_path)
+            core_cls.assert_not_called()

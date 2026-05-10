@@ -1,6 +1,8 @@
 <script setup lang="ts">
+import { ref, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
+import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 defineOptions({ name: 'ReplayPage' })
 
@@ -8,6 +10,19 @@ const route = useRoute()
 const router = useRouter()
 
 const alertId = route.params.alertId as string
+
+// ReplayPlayer owns its own "加载回放数据..." text via useReplayController, but
+// it only renders that text once the component mounts and the controller starts.
+// Show a transient skeleton in the body for the first few hundred ms so the
+// page never appears blank during route entry. The timer is cleared on unmount
+// to avoid setting state after teardown.
+const showSkeleton = ref(true)
+const skeletonTimer = window.setTimeout(() => {
+  showSkeleton.value = false
+}, 400)
+onBeforeUnmount(() => {
+  window.clearTimeout(skeletonTimer)
+})
 </script>
 
 <template>
@@ -24,7 +39,8 @@ const alertId = route.params.alertId as string
     </div>
 
     <div class="replay-body">
-      <ReplayPlayer :alert-id="alertId" />
+      <ContentSkeleton v-if="showSkeleton" type="card" :rows="8" />
+      <ReplayPlayer v-else :alert-id="alertId" />
     </div>
   </main>
 </template>

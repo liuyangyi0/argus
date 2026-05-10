@@ -1,7 +1,7 @@
 [project]
 name = "argus"
 version = "0.1.0"
-description = "Nuclear power plant foreign object visual detection system"
+description = "General-purpose edge visual anomaly and foreign object detection system for fixed cameras"
 requires-python = ">=3.11"
 dependencies = [
     "opencv-python>=4.10.0",

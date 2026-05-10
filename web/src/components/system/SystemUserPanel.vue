@@ -4,7 +4,13 @@ import { Button, Card, Form, Input, Modal, Popconfirm, Select, Switch, Table, Ta
 
 import type { CreateUserPayload, UpdateUserPayload, UserItem } from '../../api'
 import { createUser, deleteUser, getUsers, updateUser } from '../../api'
+import { useAuthStore } from '../../stores/useAuthStore'
 import { extractErrorMessage } from '../../utils/error'
+
+// User-management writes are admin-only. Even though the parent route is
+// already admin-gated, hide the buttons here too — the panel could be reused
+// in a non-admin context, and double gating prevents 403 toasts on click.
+const auth = useAuthStore()
 
 type ModalMode = 'create' | 'edit'
 
@@ -255,7 +261,7 @@ onMounted(() => {
 
     <Card title="用户列表">
       <template #extra>
-        <Button type="primary" @click="openCreateModal">新增用户</Button>
+        <Button v-if="auth.hasRole(['admin'])" type="primary" @click="openCreateModal">新增用户</Button>
       </template>
 
       <Table
@@ -282,8 +288,8 @@ onMounted(() => {
             {{ record.last_login || '-' }}
           </template>
           <template v-else-if="column.key === 'action'">
-            <Button size="small" style="margin-right: 8px" @click="handleEdit(record)">编辑</Button>
-            <Popconfirm title="确定删除该用户吗？" @confirm="handleDeleteRecord(record)">
+            <Button v-if="auth.hasRole(['admin'])" size="small" style="margin-right: 8px" @click="handleEdit(record)">编辑</Button>
+            <Popconfirm v-if="auth.hasRole(['admin'])" title="确定删除该用户吗？" @confirm="handleDeleteRecord(record)">
               <Button size="small" danger :loading="busyRow === record.username">删除</Button>
             </Popconfirm>
           </template>
