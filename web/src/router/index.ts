@@ -67,6 +67,12 @@ const router = createRouter({
           component: () => import('../views/StoryboardReplay.vue'),
           meta: { title: '多机位回放' },
         },
+        {
+          path: 'warehouse3D',
+          name: 'warehouse3D',
+          component: () => import('../views/Warehouse3D.vue'),
+          meta: { title: '3D' },
+        },
       ]
     }
   ],
