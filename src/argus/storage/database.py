@@ -23,7 +23,6 @@ from argus.storage.models import (
     InferenceRecord,
     LabelingQueueRecord,
     LabelingQueueStatus,
-    NotificationTemplate,
     Region,
     TrainingJobRecord,
     TrainingRecord,
@@ -46,61 +45,97 @@ _USER_UPDATABLE_FIELDS = {
 _REGION_UPDATABLE_FIELDS = {
     "name",
     "owner",
-    "email",
     "phone",
-    "notification_methods",
-    "notification_template_ids",
 }
 
-_NOTIFICATION_TEMPLATE_UPDATABLE_FIELDS = {
-    "name",
-    "method",
-    "subject",
-    "content",
-    "enabled",
-}
-
-_STARTER_NOTIFICATION_TEMPLATES = [
-    {
-        "name": "邮箱告警模板",
-        "method": "email",
-        "subject": "[{severity}] {camera_name} 告警",
-        "content": (
-            "告警编号: {alert_id}\n"
-            "摄像头: {camera_name}\n"
-            "区域: {region_name}\n"
-            "严重度: {severity}\n"
-            "告警类型: {category}\n"
-            "异常分数: {anomaly_score}\n"
-            "发生时间: {timestamp}\n"
-            "请尽快登录 Argus 查看现场画面。"
-        ),
-    },
-    {
-        "name": "短信告警模板",
-        "method": "sms",
-        "subject": "",
-        "content": "{camera_name} 在 {timestamp} 触发 {severity} 告警，区域 {region_name}，请及时处理。",
-    },
-    {
-        "name": "Webhook 告警模板",
-        "method": "webhook",
-        "subject": "",
-        "content": (
-            '{\n'
-            '  "alert_id": "{alert_id}",\n'
-            '  "camera_id": "{camera_id}",\n'
-            '  "camera_name": "{camera_name}",\n'
-            '  "region_name": "{region_name}",\n'
-            '  "severity": "{severity}",\n'
-            '  "category": "{category}",\n'
-            '  "anomaly_score": "{anomaly_score}",\n'
-            '  "timestamp": "{timestamp}"\n'
-            '}'
-        ),
-    },
+# Module-level so tests can import it and verify every (table, column) pair has
+# a matching ORM declaration in models.py — see tests/lint/test_orm_auto_migrate.py.
+# When you add a new column to an ORM model, append it here AND keep this in sync
+# with the SQL type. Tuple shape: (table_name, column_name, column_sql_type).
+_AUTO_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("alerts", "workflow_status", "VARCHAR(20) DEFAULT 'new'"),
+    ("alerts", "assigned_to", "VARCHAR(100)"),
+    ("alerts", "resolved_at", "DATETIME"),
+    # NOTE: an entry for ("training_records", "group_id", "VARCHAR(100)") was
+    # removed after tests/lint/test_orm_auto_migrate.py flagged it as orphaned —
+    # no ORM column or query references training_records.group_id. Existing
+    # SQLite databases that received the migration retain the column harmlessly.
+    # If a future feature needs to track baseline group on training records,
+    # add the field to TrainingRecord *and* re-add the migration entry here.
+    # Phase 1: real-labeled P/R/F1/AUROC/PR-AUC metrics
+    ("training_records", "val_precision", "REAL"),
+    ("training_records", "val_recall", "REAL"),
+    ("training_records", "val_f1", "REAL"),
+    ("training_records", "val_auroc", "REAL"),
+    ("training_records", "val_pr_auc", "REAL"),
+    ("training_records", "val_confusion_matrix", "TEXT"),
+    ("training_records", "val_real_sample_count", "INTEGER"),
+    # Phase 2: raw per-sample scores/labels for threshold slider
+    ("training_records", "val_scores_json", "TEXT"),
+    ("training_records", "val_labels_json", "TEXT"),
+    # 痛点 2 (multi-version dataset selection)
+    ("training_records", "baseline_versions", "TEXT"),
+    ("training_jobs", "dataset_selection", "TEXT"),
+    ("models", "backbone_version_id", "VARCHAR(128)"),
+    # Model release pipeline
+    ("models", "stage", "VARCHAR(20) DEFAULT 'candidate'"),
+    ("models", "component_type", "VARCHAR(20) DEFAULT 'full'"),
+    ("models", "model_path", "VARCHAR(500)"),
+    ("models", "canary_camera_id", "VARCHAR(50)"),
+    # Alert recording MP4 migration (d47d70f)
+    ("alert_recordings", "video_codec", "VARCHAR(10) DEFAULT 'h264'"),
+    ("alert_recordings", "width", "INTEGER"),
+    ("alert_recordings", "height", "INTEGER"),
+    # Alert aggregation
+    ("alerts", "event_group_id", "VARCHAR(64)"),
+    ("alerts", "event_group_count", "INTEGER DEFAULT 1"),
+    # Physics enrichment (speed, trajectory, localization)
+    ("alerts", "speed_ms", "REAL"),
+    ("alerts", "speed_px_per_sec", "REAL"),
+    ("alerts", "trajectory_model", "VARCHAR(20)"),
+    ("alerts", "origin_x_mm", "REAL"),
+    ("alerts", "origin_y_mm", "REAL"),
+    ("alerts", "origin_z_mm", "REAL"),
+    ("alerts", "landing_x_mm", "REAL"),
+    ("alerts", "landing_y_mm", "REAL"),
+    ("alerts", "landing_z_mm", "REAL"),
+    # Multi-track trajectory fits (JSON with per-track mm + px fields)
+    ("alerts", "trajectories_json", "TEXT"),
+    # Classification enrichment
+    ("alerts", "classification_label", "VARCHAR(100)"),
+    ("alerts", "classification_confidence", "REAL"),
+    # Cross-camera corroboration
+    ("alerts", "corroborated", "BOOLEAN"),
+    ("alerts", "correlation_partner", "VARCHAR(50)"),
+    # Segmentation enrichment (D2 — SAM2 instance segmentation).
+    # segmentation_objects stores JSON text: bbox/area/centroid/conf
+    # per object, masks are NOT persisted.
+    ("alerts", "segmentation_count", "INTEGER"),
+    ("alerts", "segmentation_total_area_px", "INTEGER"),
+    ("alerts", "segmentation_objects", "TEXT"),
+    ("alerts", "category", "VARCHAR(30)"),
+    ("alerts", "severity_adjusted_by_classifier", "BOOLEAN"),
+    ("alerts", "trajectory_points", "TEXT"),
+    # Model lineage — lets us answer "which model fired this alert?"
+    # after a model switch.
+    ("alerts", "model_version_id", "VARCHAR(128)"),
+    # Inference record enrichment (deployment stage + zone)
+    ("inference_records", "deployment_stage", "VARCHAR(20)"),
+    ("inference_records", "zone_id", "VARCHAR(50) DEFAULT 'default' NOT NULL"),
+    # Baseline version enrichment (secondary verifier + group)
+    ("baseline_versions", "verified_by_secondary", "VARCHAR(100)"),
+    ("baseline_versions", "group_id", "VARCHAR(100)"),
+    # NOTE: ("regions", "notification_template_ids", ...) was removed in 2026-05
+    # along with the entire email-notification surface. Existing SQLite databases
+    # retain the column harmlessly — SQLite cannot DROP COLUMN, so the legacy
+    # data stays in the file but is no longer mapped or read by the ORM.
 ]
 
+# Tables that were dropped in code and should be removed from any pre-existing
+# SQLite database on next startup. Idempotent — DROP TABLE IF EXISTS.
+_DROP_TABLES: list[str] = [
+    "notification_templates",
+]
 
 class Database:
     """SQLite database manager for alert persistence.
@@ -152,81 +187,41 @@ class Database:
             except Exception as e:
                 logger.error("database.integrity_check_error", error=str(e))
 
-        # Auto-migrate: add missing columns to existing tables
+        # Auto-migrate: add missing columns + drop deprecated tables
         self._auto_migrate()
-        self._seed_notification_templates()
+        self._drop_deprecated_tables()
 
         logger.info("database.initialized", url=self._database_url)
 
+    def _drop_deprecated_tables(self) -> None:
+        """Idempotently DROP TABLE for surfaces that were retired (e.g. the
+        email notification template system in 2026-05). Required so an old
+        SQLite file does not keep orphan tables around forever."""
+        if not _DROP_TABLES:
+            return
+        with self._engine.connect() as conn:
+            for table in _DROP_TABLES:
+                try:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+                    conn.commit()
+                    logger.info("database.dropped_deprecated_table", table=table)
+                except Exception as e:
+                    logger.warning(
+                        "database.drop_deprecated_table_failed",
+                        table=table, error=str(e),
+                    )
+
     def _auto_migrate(self) -> None:
-        """Add missing columns to existing SQLite tables (lightweight migration)."""
-        migrations = [
-            ("alerts", "workflow_status", "VARCHAR(20) DEFAULT 'new'"),
-            ("alerts", "assigned_to", "VARCHAR(100)"),
-            ("alerts", "resolved_at", "DATETIME"),
-            ("training_records", "group_id", "VARCHAR(100)"),
-            # Phase 1: real-labeled P/R/F1/AUROC/PR-AUC metrics
-            ("training_records", "val_precision", "REAL"),
-            ("training_records", "val_recall", "REAL"),
-            ("training_records", "val_f1", "REAL"),
-            ("training_records", "val_auroc", "REAL"),
-            ("training_records", "val_pr_auc", "REAL"),
-            ("training_records", "val_confusion_matrix", "TEXT"),
-            ("training_records", "val_real_sample_count", "INTEGER"),
-            # Phase 2: raw per-sample scores/labels for threshold slider
-            ("training_records", "val_scores_json", "TEXT"),
-            ("training_records", "val_labels_json", "TEXT"),
-            ("models", "backbone_version_id", "VARCHAR(128)"),
-            # Model release pipeline
-            ("models", "stage", "VARCHAR(20) DEFAULT 'candidate'"),
-            ("models", "component_type", "VARCHAR(20) DEFAULT 'full'"),
-            ("models", "model_path", "VARCHAR(500)"),
-            ("models", "canary_camera_id", "VARCHAR(50)"),
-            # Alert recording MP4 migration (d47d70f)
-            ("alert_recordings", "video_codec", "VARCHAR(10) DEFAULT 'h264'"),
-            ("alert_recordings", "width", "INTEGER"),
-            ("alert_recordings", "height", "INTEGER"),
-            # Alert aggregation
-            ("alerts", "event_group_id", "VARCHAR(64)"),
-            ("alerts", "event_group_count", "INTEGER DEFAULT 1"),
-            # Physics enrichment (speed, trajectory, localization)
-            ("alerts", "speed_ms", "REAL"),
-            ("alerts", "speed_px_per_sec", "REAL"),
-            ("alerts", "trajectory_model", "VARCHAR(20)"),
-            ("alerts", "origin_x_mm", "REAL"),
-            ("alerts", "origin_y_mm", "REAL"),
-            ("alerts", "origin_z_mm", "REAL"),
-            ("alerts", "landing_x_mm", "REAL"),
-            ("alerts", "landing_y_mm", "REAL"),
-            ("alerts", "landing_z_mm", "REAL"),
-            # Multi-track trajectory fits (JSON with per-track mm + px fields)
-            ("alerts", "trajectories_json", "TEXT"),
-            # Classification enrichment
-            ("alerts", "classification_label", "VARCHAR(100)"),
-            ("alerts", "classification_confidence", "REAL"),
-            # Cross-camera corroboration
-            ("alerts", "corroborated", "BOOLEAN"),
-            ("alerts", "correlation_partner", "VARCHAR(50)"),
-            # Segmentation enrichment (D2 — SAM2 instance segmentation).
-            # segmentation_objects stores JSON text: bbox/area/centroid/conf
-            # per object, masks are NOT persisted.
-            ("alerts", "segmentation_count", "INTEGER"),
-            ("alerts", "segmentation_total_area_px", "INTEGER"),
-            ("alerts", "segmentation_objects", "TEXT"),
-            ("alerts", "category", "VARCHAR(30)"),
-            ("alerts", "severity_adjusted_by_classifier", "BOOLEAN"),
-            ("alerts", "trajectory_points", "TEXT"),
-            # Model lineage — lets us answer "which model fired this alert?"
-            # after a model switch.
-            ("alerts", "model_version_id", "VARCHAR(128)"),
-            # Inference record enrichment (deployment stage + zone)
-            ("inference_records", "deployment_stage", "VARCHAR(20)"),
-            ("inference_records", "zone_id", "VARCHAR(50) DEFAULT 'default' NOT NULL"),
-            # Baseline version enrichment (secondary verifier + group)
-            ("baseline_versions", "verified_by_secondary", "VARCHAR(100)"),
-            ("baseline_versions", "group_id", "VARCHAR(100)"),
-            ("regions", "notification_template_ids", "VARCHAR(500) DEFAULT '' NOT NULL"),
-        ]
+        """Add missing columns to existing SQLite tables (lightweight migration).
+
+        失败语义:
+        - "已存在"类错误(列/索引/表已存在)是正常情况(数据库已经迁移过),
+          降到 warning 并跳过本条迁移,继续后续迁移。
+        - 其它错误(SQL 语法错、约束冲突、磁盘 I/O 错等)必须 raise
+          RuntimeError,带足够的上下文(表/列/原始错误)给运维定位,
+          避免 schema 不一致的 DB 静默进入运行时。
+        """
+        migrations = list(_AUTO_MIGRATIONS)
         with self._engine.connect() as conn:
             for table, column, col_type in migrations:
                 try:
@@ -235,30 +230,77 @@ class Database:
                     logger.info("database.migration", table=table, column=column)
                 except Exception as e:
                     err_msg = str(e).lower()
-                    if "duplicate" in err_msg or "already exists" in err_msg:
-                        logger.debug("database.migration_column_exists", table=table, column=column)
-                    else:
+                    if self._is_already_exists_error(err_msg):
+                        # Idempotent re-run: 已经迁过了。warning 比 debug 显眼,
+                        # 方便启动期肉眼看到"为什么这条没跑",但不影响进程。
                         logger.warning(
+                            "database.migration_skipped_already_exists",
+                            table=table,
+                            column=column,
+                            reason="column/index/table already exists",
+                        )
+                    else:
+                        logger.error(
                             "database.migration_failed",
                             table=table, column=column, error=str(e),
                             exc_info=True,
                         )
+                        # 启动期通常 ws_manager 还没就绪 —— ErrorChannel 会把
+                        # 该事件缓冲下来,等 dashboard 启动后注入 publisher 时
+                        # 再 flush。即使最后 RuntimeError 拉起进程崩溃,这条
+                        # 事件已经落入 structlog,这里只是给运维多一条 WS 通道。
+                        try:
+                            from argus.core.error_channel import (
+                                SEVERITY_CRITICAL,
+                                get_error_channel,
+                            )
+                            get_error_channel().emit(
+                                severity=SEVERITY_CRITICAL,
+                                source="database",
+                                code="migration_failed",
+                                message=f"自动迁移失败:{table}.{column}",
+                                context={
+                                    "table": table,
+                                    "column": column,
+                                    "error_type": type(e).__name__,
+                                    "error": str(e),
+                                },
+                            )
+                        except Exception:  # pragma: no cover — defensive
+                            # 不能让 emit 自己再炸,启动期一切以日志为准
+                            logger.debug(
+                                "database.error_channel_emit_failed",
+                                exc_info=True,
+                            )
+                        raise RuntimeError(
+                            f"Auto-migration failed on {table}.{column}: {e}. "
+                            f"Database schema may be inconsistent. "
+                            f"Suggested fix: inspect the SQL above, run the ALTER "
+                            f"statement manually, or restore from a known-good "
+                            f"backup before restarting."
+                        ) from e
 
-    def _seed_notification_templates(self) -> None:
-        """Create starter notification templates in the database once."""
-        with self.get_session() as session:
-            count = session.scalar(
-                select(sa_func.count()).select_from(NotificationTemplate)
-            ) or 0
-            if count > 0:
-                return
-            for item in _STARTER_NOTIFICATION_TEMPLATES:
-                session.add(NotificationTemplate(**item))
-            session.commit()
-            logger.info(
-                "database.notification_templates_seeded",
-                count=len(_STARTER_NOTIFICATION_TEMPLATES),
-            )
+    @staticmethod
+    def _is_already_exists_error(err_msg: str) -> bool:
+        """保守判定一条 ALTER 失败是否属于"幂等成功"。
+
+        只放过 SQLite / PostgreSQL / MySQL 在"列/索引/表已存在"时的常见消息片段。
+        其它错误(语法、I/O、约束)一律视为真错误并上抛。
+        """
+        # 必须同时包含目标关键词(column/index/table) + 已存在指示词。
+        # SQLite: "duplicate column name: foo"
+        # SQLite: "table foo already exists" / "index foo already exists"
+        # PostgreSQL: 'column "foo" of relation "bar" already exists'
+        # MySQL/MariaDB: "Duplicate column name 'foo'"
+        already_indicators = ("already exists", "duplicate column")
+        if not any(ind in err_msg for ind in already_indicators):
+            return False
+        # 避免误吞"duplicate key value"这类 UNIQUE 约束冲突
+        if "duplicate column" in err_msg:
+            return True
+        # "already exists" 必须和 column / index / table 一起出现
+        scope_indicators = ("column", "index", "table")
+        return any(scope in err_msg for scope in scope_indicators)
 
     def get_session(self) -> Session:
         """Get a new database session."""
@@ -1057,21 +1099,11 @@ class Database:
         self,
         name: str,
         owner: str,
-        email: str | None = None,
         phone: str | None = None,
-        notification_methods: str = "",
-        notification_template_ids: str = "",
     ) -> Region:
         """Create a managed region/contact entry."""
         with self.get_session() as session:
-            region = Region(
-                name=name,
-                owner=owner,
-                email=email,
-                phone=phone,
-                notification_methods=notification_methods,
-                notification_template_ids=notification_template_ids,
-            )
+            region = Region(name=name, owner=owner, phone=phone)
             session.add(region)
             session.commit()
             session.refresh(region)
@@ -1094,7 +1126,6 @@ class Database:
         name: str | None = None,
         owner: str | None = None,
         phone: str | None = None,
-        email: str | None = None,
     ) -> list[Region]:
         """Return regions filtered by fuzzy query fields."""
         with self.get_session() as session:
@@ -1105,8 +1136,6 @@ class Database:
                 stmt = stmt.where(Region.owner.like(f"%{owner}%"))
             if phone:
                 stmt = stmt.where(Region.phone.like(f"%{phone}%"))
-            if email:
-                stmt = stmt.where(Region.email.like(f"%{email}%"))
             return list(session.scalars(stmt).all())
 
     def update_region(self, region_id: int, **kwargs) -> bool:
@@ -1130,106 +1159,6 @@ class Database:
             session.delete(region)
             session.commit()
             logger.info("database.region_deleted", region_id=region_id, name=region.name)
-            return True
-
-    # ── Notification templates ──
-
-    def create_notification_template(
-        self,
-        *,
-        name: str,
-        method: str,
-        subject: str | None = None,
-        content: str,
-        enabled: bool = True,
-    ) -> NotificationTemplate:
-        """Create a reusable alert notification template."""
-        with self.get_session() as session:
-            template = NotificationTemplate(
-                name=name,
-                method=method,
-                subject=subject,
-                content=content,
-                enabled=enabled,
-            )
-            session.add(template)
-            session.commit()
-            session.refresh(template)
-            logger.info(
-                "database.notification_template_created",
-                template_id=template.id,
-                method=method,
-                name=name,
-            )
-            return template
-
-    def get_notification_template(self, template_id: int) -> NotificationTemplate | None:
-        """Get a notification template by id."""
-        with self.get_session() as session:
-            return session.scalar(
-                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
-            )
-
-    def get_notification_templates(self, method: str | None = None) -> list[NotificationTemplate]:
-        """Return notification templates, optionally filtered by method."""
-        with self.get_session() as session:
-            stmt = select(NotificationTemplate).order_by(
-                NotificationTemplate.method.asc(),
-                NotificationTemplate.updated_at.desc(),
-                NotificationTemplate.id.desc(),
-            )
-            if method:
-                stmt = stmt.where(NotificationTemplate.method == method)
-            return list(session.scalars(stmt).all())
-
-    def get_notification_templates_by_ids(self, template_ids: list[int]) -> list[NotificationTemplate]:
-        """Return notification templates ordered by the given ids."""
-        if not template_ids:
-            return []
-
-        with self.get_session() as session:
-            rows = list(
-                session.scalars(
-                    select(NotificationTemplate).where(NotificationTemplate.id.in_(template_ids))
-                ).all()
-            )
-
-        template_map = {item.id: item for item in rows}
-        return [template_map[template_id] for template_id in template_ids if template_id in template_map]
-
-    def update_notification_template(self, template_id: int, **kwargs) -> bool:
-        """Update editable fields on a notification template."""
-        with self.get_session() as session:
-            template = session.scalar(
-                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
-            )
-            if template is None:
-                return False
-
-            for key, value in kwargs.items():
-                if key in _NOTIFICATION_TEMPLATE_UPDATABLE_FIELDS and hasattr(template, key):
-                    setattr(template, key, value)
-            session.commit()
-            return True
-
-    def delete_notification_template(self, template_id: int) -> bool:
-        """Delete a notification template by id."""
-        with self.get_session() as session:
-            template = session.scalar(
-                select(NotificationTemplate).where(NotificationTemplate.id == template_id)
-            )
-            if template is None:
-                return False
-            method = template.method
-            name = template.name
-            session.delete(template)
-            session.commit()
-            logger.info(
-                "database.notification_template_deleted",
-                template_id=template_id,
-                method=method,
-                name=name,
-            )
             return True
 
     def save_alert_recording(self, record: AlertRecordingRecord) -> AlertRecordingRecord:

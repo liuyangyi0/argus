@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 
 from argus.dashboard.api_response import (
     api_conflict,
@@ -25,7 +26,9 @@ from argus.dashboard.api_response import (
 )
 from argus.anomaly.job_executor import validate_hyperparameters
 from argus.storage.models import (
+    AlertRecord,
     AuditLog,
+    FeedbackRecord,
     TrainingJobRecord,
     TrainingJobStatus,
     TrainingJobType,
@@ -114,6 +117,83 @@ async def get_training_job(request: Request, job_id: str):
     return api_success(data)
 
 
+@router.get("/{job_id}/source-alerts")
+async def get_training_job_source_alerts(request: Request, job_id: str):
+    """List the alerts whose feedback fed into this training job.
+
+    Reverse lookup path:
+        training_job.model_version_id  →  feedback.trained_into  →  feedback.alert_id  →  AlertRecord
+
+    The schema does not store ``source_alert_ids`` on TrainingJobRecord directly;
+    instead, FeedbackManager.mark_batch_processed stamps each consumed feedback
+    entry's ``trained_into`` field with the resulting model_version_id when a job
+    completes (see argus.anomaly.job_executor → database.update_training_job and
+    argus.storage.database.mark_feedback_processed). This endpoint joins those
+    two records to reconstruct the alert lineage.
+
+    Returns ``[]`` (not 404) when:
+      - the job has no ``model_version_id`` yet (still pending / running / failed),
+      - or no feedback rows reference the job's model_version_id (e.g. a manual
+        backbone retrain that wasn't triggered by alert feedback).
+
+    Capped at 50 alerts to keep the response small for the UI panel.
+    """
+    db = _get_db(request)
+    if db is None:
+        return api_unavailable("数据库不可用")
+
+    job = db.get_training_job(job_id)
+    if job is None:
+        return api_not_found(f"任务不存在: {job_id}")
+
+    # Without a completed model_version_id there is no link to follow yet.
+    if not job.model_version_id:
+        return api_success({"job_id": job_id, "alerts": [], "total": 0})
+
+    with db.get_session() as session:
+        feedback_rows = list(
+            session.scalars(
+                select(FeedbackRecord)
+                .where(FeedbackRecord.trained_into == job.model_version_id)
+                .where(FeedbackRecord.alert_id.is_not(None))
+            ).all()
+        )
+        alert_ids = [fb.alert_id for fb in feedback_rows if fb.alert_id]
+
+        if not alert_ids:
+            return api_success({"job_id": job_id, "alerts": [], "total": 0})
+
+        # Cap at 50 to keep the panel response light. Order newest-first so the
+        # operator sees the most recent triggers, which are the ones they're
+        # likely to have just labelled.
+        alerts = list(
+            session.scalars(
+                select(AlertRecord)
+                .where(AlertRecord.alert_id.in_(alert_ids))
+                .order_by(AlertRecord.timestamp.desc())
+                .limit(50)
+            ).all()
+        )
+
+    summaries = [
+        {
+            "alert_id": a.alert_id,
+            "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+            "camera_id": a.camera_id,
+            "severity": a.severity,
+            "anomaly_score": a.anomaly_score,
+            "workflow_status": a.workflow_status,
+        }
+        for a in alerts
+    ]
+    return api_success({
+        "job_id": job_id,
+        "model_version_id": job.model_version_id,
+        "alerts": summaries,
+        "total": len(summaries),
+    })
+
+
 @router.post("/")
 async def create_training_job(request: Request):
     """Create a new training job (status=pending_confirmation).
@@ -166,6 +246,23 @@ async def create_training_job(request: Request):
                 f"超参数校验失败: {'; '.join(param_errors)}",
             )
 
+    # 痛点 2: dataset_selection 多版本合并训练。Validate the JSON shape here
+    # so a malformed payload is rejected before the job lands in the queue.
+    dataset_selection_raw = body.get("dataset_selection")
+    dataset_selection_serialized: str | None = None
+    if dataset_selection_raw is not None:
+        try:
+            from argus.anomaly.dataset_selection import DatasetSelection
+
+            sel = DatasetSelection.from_payload(dataset_selection_raw)
+        except (ValueError, TypeError) as e:
+            return api_validation_error(f"dataset_selection 无效: {e}")
+        if camera_id and sel.camera_id != camera_id:
+            return api_validation_error(
+                f"dataset_selection 摄像头 ({sel.camera_id}) 与 camera_id ({camera_id}) 不一致"
+            )
+        dataset_selection_serialized = sel.to_json()
+
     job_id = str(uuid.uuid4())[:12]
 
     base_model_version = None
@@ -186,6 +283,7 @@ async def create_training_job(request: Request):
         status=TrainingJobStatus.PENDING_CONFIRMATION.value,
         base_model_version=base_model_version,
         dataset_version=body.get("dataset_version"),
+        dataset_selection=dataset_selection_serialized,
         hyperparameters=json.dumps(hyperparams) if hyperparams else None,
     )
 

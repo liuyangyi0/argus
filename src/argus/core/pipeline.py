@@ -49,6 +49,10 @@ def _get_default_inference_executor() -> ThreadPoolExecutor:
 from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
 from types import MappingProxyType
 
+from argus.core.error_channel import (
+    SEVERITY_WARNING,
+    get_error_channel,
+)
 from argus.core.event_bus import (
     EventBus,
     FrameAnalyzed,
@@ -92,6 +96,11 @@ class PipelineMode(str, Enum):
     ACTIVE = "active"  # Normal detection + alerts
     MAINTENANCE = "maintenance"  # MOG2 frozen, detection + alerts continue
     LEARNING = "learning"  # Full pipeline runs but alerts suppressed
+    COLLECTION = "collection"  # Capture mode: skip YOLO + Anomaly, raw frame still flows
+    TRAINING = "training"  # Training in progress: skip YOLO + Anomaly to free GPU
+
+
+_DETECTION_SKIPPED_MODES = (PipelineMode.COLLECTION, PipelineMode.TRAINING)
 
 
 def _severity_rank(severity) -> int:
@@ -178,6 +187,12 @@ class DetectionPipeline:
 
     _TIMEOUT_DEGRADE_THRESHOLD = 5
 
+    # Anomaly degradation: enter simplex-only fallback after this many
+    # consecutive hard exceptions from `_predict_anomaly`. Single failures are
+    # tolerated by the detector's own try/except — only a sustained outage of
+    # the anomaly head trips this gate.
+    _ANOMALY_DEGRADE_THRESHOLD = 5
+
     def __init__(
         self,
         camera_config: CameraConfig,
@@ -200,11 +215,13 @@ class DetectionPipeline:
         inference_executor: ThreadPoolExecutor | None = None,
         encode_executor: ThreadPoolExecutor | None = None,
         sensor_fusion: object | None = None,
+        degradation_publisher: Callable[[str, dict], None] | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
         self._on_drift = on_drift
         self._event_bus = event_bus
+        self._degradation_publisher = degradation_publisher
         self._inference_executor = inference_executor or _get_default_inference_executor()
         # Ring-buffer JPEG encoding runs on a dedicated pool so it never
         # starves inference futures (encode = 5-15ms each; inference = ~30ms).
@@ -432,6 +449,16 @@ class DetectionPipeline:
         # Consecutive inference timeout counter for degradation detection
         self._consecutive_timeouts = 0
 
+        # Anomaly head degradation state (requirements §3.2 №9): when the
+        # main anomaly model is unavailable (load failure or sustained
+        # runtime errors) the pipeline drops the anomaly stage and lets the
+        # simplex safety channel run solo, instead of crashing the camera.
+        self._anomaly_degraded: bool = False
+        self._anomaly_degradation_reason: str | None = None
+        self._anomaly_degradation_started_at: float | None = None
+        self._anomaly_failure_count: int = 0
+        self._anomaly_degraded_lock = threading.Lock()
+
         # Thread safety for hot-updates
         self._config_lock = threading.Lock()
 
@@ -482,6 +509,12 @@ class DetectionPipeline:
         self._learning_start_time: float | None = None
         self._learning_duration: float = 0.0
         self._auto_learning_complete = False
+
+        # COLLECTION/TRAINING watchdog: long-running tasks may crash without
+        # resetting the mode; auto-recover after max_duration to avoid
+        # permanent stuck state.
+        self._mode_session_start_time: float | None = None
+        self._mode_session_max_duration: float = 4 * 3600.0  # 4 hours
 
         # 5.1/5.2: Per-frame inference tracking for CameraInferenceRunner
         self._last_inference_record: InferenceRecord | None = None
@@ -901,6 +934,11 @@ class DetectionPipeline:
         When the ensemble is active, converts EnsembleResult back to AnomalyResult
         for downstream compatibility. Falls back to single detector on any error.
 
+        Requirements §3.2 №9: when the anomaly head is in degraded mode
+        (sustained outage or load failure) we skip inference entirely and
+        return a synthetic safe result so the simplex safety channel can
+        still produce alerts without burning CPU on a broken model.
+
         Args:
             frame: 3-channel BGR visible-light frame.
             fused_tensor: Optional multi-channel tensor from ModalityFusion
@@ -908,25 +946,194 @@ class DetectionPipeline:
                 detector truncates to 3 channels (Plan A); Plan B will pass
                 the full tensor to a model trained on multi-channel input.
         """
-        if self._ensemble_detector is not None:
-            try:
-                from argus.anomaly.ensemble import DetectorEnsemble
+        # Short-circuit when degraded — no inference, simplex carries the load.
+        # detection_failed=False prevents the runner's reload churn from
+        # firing repeatedly on a model we already gave up on.
+        if self._anomaly_degraded:
+            threshold = getattr(self._anomaly_detector, "threshold", 0.7)
+            return AnomalyResult(
+                anomaly_score=0.0,
+                anomaly_map=None,
+                is_anomalous=False,
+                threshold=float(threshold),
+                detection_failed=False,
+            )
 
-                ensemble: DetectorEnsemble = self._ensemble_detector  # type: ignore[assignment]
-                ensemble_result = ensemble.predict(frame)
-                return AnomalyResult(
-                    anomaly_score=ensemble_result.anomaly_score,
-                    anomaly_map=ensemble_result.anomaly_map,
-                    is_anomalous=ensemble_result.is_anomalous,
-                    threshold=ensemble_result.threshold,
+        try:
+            if self._ensemble_detector is not None:
+                try:
+                    from argus.anomaly.ensemble import DetectorEnsemble
+
+                    ensemble: DetectorEnsemble = self._ensemble_detector  # type: ignore[assignment]
+                    ensemble_result = ensemble.predict(frame)
+                    self._record_anomaly_inference_ok()
+                    return AnomalyResult(
+                        anomaly_score=ensemble_result.anomaly_score,
+                        anomaly_map=ensemble_result.anomaly_map,
+                        is_anomalous=ensemble_result.is_anomalous,
+                        threshold=ensemble_result.threshold,
+                    )
+                except Exception:
+                    logger.warning(
+                        "pipeline.ensemble_predict_fallback",
+                        camera_id=self.camera_config.camera_id,
+                        msg="Ensemble predict failed — falling back to single detector",
+                    )
+            result = self._anomaly_detector.predict(frame, fused_tensor=fused_tensor)
+            self._record_anomaly_inference_ok()
+            return result
+        except Exception as exc:
+            # Single-frame failures: tolerated by detector's own try/except;
+            # if execution lands here it means the call raised hard. Count
+            # it; trip degraded mode after _ANOMALY_DEGRADE_THRESHOLD in a
+            # row. Until then keep returning a safe failed result so the
+            # rest of the pipeline can proceed.
+            self._record_anomaly_inference_failure(
+                f"{type(exc).__name__}: {exc}"
+            )
+            threshold = getattr(self._anomaly_detector, "threshold", 0.7)
+            return AnomalyResult(
+                anomaly_score=0.0,
+                anomaly_map=None,
+                is_anomalous=False,
+                threshold=float(threshold),
+                detection_failed=True,
+            )
+
+    # ── Anomaly head degradation helpers (requirements §3.2 №9) ──
+
+    def _enter_anomaly_degraded(
+        self, reason: str, *, manual_recovery_hint: bool = False,
+    ) -> None:
+        """Mark the anomaly head as degraded. Idempotent and thread-safe.
+
+        Once entered, the pipeline stops calling the anomaly detector and
+        relies on the simplex safety channel for alerts. Recovery requires
+        a process restart (no automatic backbone reload here — runner
+        handles its own restart attempts via DegradationStateMachine).
+        """
+        with self._anomaly_degraded_lock:
+            if self._anomaly_degraded:
+                return
+            self._anomaly_degraded = True
+            self._anomaly_degradation_reason = reason
+            self._anomaly_degradation_started_at = time.time()
+            started_at = self._anomaly_degradation_started_at
+        logger.error(
+            "pipeline.anomaly_degraded_entered",
+            camera_id=self.camera_config.camera_id,
+            reason=reason,
+            simplex_active=self._simplex is not None,
+            manual_recovery_required=manual_recovery_hint,
+        )
+        # Surface to the global degradation bar when an EventBus / dashboard
+        # is wired. Failure to publish must never crash the pipeline.
+        if self._event_bus is not None:
+            try:
+                self._event_bus.publish(
+                    "pipeline.anomaly_degraded",
+                    {
+                        "camera_id": self.camera_config.camera_id,
+                        "reason": reason,
+                        "simplex_active": self._simplex is not None,
+                    },
                 )
             except Exception:
-                logger.warning(
-                    "pipeline.ensemble_predict_fallback",
+                logger.debug(
+                    "pipeline.anomaly_degraded_publish_failed",
                     camera_id=self.camera_config.camera_id,
-                    msg="Ensemble predict failed — falling back to single detector",
+                    exc_info=True,
                 )
-        return self._anomaly_detector.predict(frame, fused_tensor=fused_tensor)
+        # Push directly to the dashboard WebSocket subscribers when a
+        # publisher is wired. Best-effort: any failure here must NOT impact
+        # the inference loop.
+        if self._degradation_publisher is not None:
+            try:
+                self._degradation_publisher(
+                    "system_degradation",
+                    {
+                        "type": "entered",
+                        "component": "anomaly",
+                        "camera_id": self.camera_config.camera_id,
+                        "reason": reason,
+                        "started_at": started_at,
+                        "simplex_active": self._simplex is not None,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "pipeline.degradation_broadcast_failed",
+                    camera_id=self.camera_config.camera_id,
+                    error=str(exc),
+                )
+        # Mirror to the unified error channel so the system_errors banner
+        # shows the same event alongside other backend failures. emit() is
+        # internally swallowed; this can never crash the inference loop.
+        get_error_channel().emit(
+            severity=SEVERITY_WARNING,
+            source="pipeline",
+            code="anomaly_degraded",
+            message=f"摄像头 {self.camera_config.camera_id} 进入异常降级",
+            context={
+                "camera_id": self.camera_config.camera_id,
+                "reason": reason,
+                "simplex_active": self._simplex is not None,
+                "started_at": started_at,
+                "manual_recovery_required": manual_recovery_hint,
+            },
+        )
+
+    def _record_anomaly_inference_ok(self) -> None:
+        """Reset the consecutive failure counter after a successful inference."""
+        if self._anomaly_failure_count != 0:
+            with self._anomaly_degraded_lock:
+                self._anomaly_failure_count = 0
+
+    def _record_anomaly_inference_failure(self, reason: str) -> None:
+        """Count a hard failure; trip degraded mode at the threshold."""
+        with self._anomaly_degraded_lock:
+            self._anomaly_failure_count += 1
+            count = self._anomaly_failure_count
+            already_degraded = self._anomaly_degraded
+        logger.warning(
+            "pipeline.anomaly_inference_error",
+            camera_id=self.camera_config.camera_id,
+            reason=reason,
+            consecutive=count,
+            threshold=self._ANOMALY_DEGRADE_THRESHOLD,
+        )
+        if not already_degraded and count >= self._ANOMALY_DEGRADE_THRESHOLD:
+            self._enter_anomaly_degraded(
+                f"sustained_inference_errors: {count} consecutive — last={reason}",
+                manual_recovery_hint=True,
+            )
+
+    def is_anomaly_degraded(self) -> bool:
+        """Whether the anomaly head is in simplex-only fallback mode."""
+        with self._anomaly_degraded_lock:
+            return self._anomaly_degraded
+
+    def get_anomaly_degradation_reason(self) -> str | None:
+        """Reason for current anomaly degradation, or None if nominal."""
+        with self._anomaly_degraded_lock:
+            return self._anomaly_degradation_reason
+
+    def get_anomaly_degradation_started_at(self) -> float | None:
+        """Unix timestamp when the anomaly head entered degraded mode."""
+        with self._anomaly_degraded_lock:
+            return self._anomaly_degradation_started_at
+
+    def set_degradation_publisher(
+        self, publisher: Callable[[str, dict], None] | None,
+    ) -> None:
+        """Inject (or replace) the WebSocket broadcast callable.
+
+        Used by ``__main__.py`` to wire ``ws_manager.broadcast`` into
+        pipelines that were created before the dashboard initialised. The
+        publisher is only invoked on state transitions, so calling this
+        after the initial state has been set still surfaces future events.
+        """
+        self._degradation_publisher = publisher
 
     def initialize(self) -> bool:
         """Initialize all pipeline components. Returns True on success."""
@@ -940,12 +1147,32 @@ class DetectionPipeline:
         if self._camera.protocol in ("rtsp", "gige"):
             self._camera.start_capture_thread()
 
-        self._anomaly_detector.load()
+        # Requirements §3.2 №9: anomaly head load failure must not crash the
+        # camera. Enter simplex-only degraded mode and continue, so the
+        # safety channel can still raise alerts. The runner converts this
+        # state into BACKBONE_FAILED via get_detector_status() if needed.
+        try:
+            self._anomaly_detector.load()
+        except Exception as exc:
+            self._enter_anomaly_degraded(
+                f"load_failed: {type(exc).__name__}: {exc}",
+                manual_recovery_hint=True,
+            )
 
-        # Calibrate raw scores if PostProcessor MinMax is broken
-        if self._anomaly_detector.get_status().minmax_broken:
-            baseline_dir = self._find_baseline_dir(self.camera_config.camera_id)
-            self._anomaly_detector.calibrate_raw_scores(baseline_dir)
+        # Calibrate raw scores if PostProcessor MinMax is broken — skipped
+        # in degraded mode because the detector is offline.
+        if not self._anomaly_degraded:
+            try:
+                if self._anomaly_detector.get_status().minmax_broken:
+                    baseline_dir = self._find_baseline_dir(self.camera_config.camera_id)
+                    self._anomaly_detector.calibrate_raw_scores(baseline_dir)
+            except Exception as exc:
+                # Calibration failure is not fatal but signals a sick detector.
+                logger.warning(
+                    "pipeline.calibrate_failed",
+                    camera_id=self.camera_config.camera_id,
+                    error=str(exc),
+                )
 
         # DET-010: Auto-enter learning mode on first start
         fps = max(1, self.camera_config.fps_target)
@@ -962,10 +1189,14 @@ class DetectionPipeline:
         )
 
         ensemble_active = self._ensemble_detector is not None
+        # `is_loaded` may be unavailable on the detector when load() crashed
+        # before assigning the attribute — guard with getattr.
+        anomaly_model_loaded = bool(getattr(self._anomaly_detector, "is_loaded", False))
         logger.info(
             "pipeline.initialized",
             camera_id=self.camera_config.camera_id,
-            anomaly_model_loaded=self._anomaly_detector.is_loaded,
+            anomaly_model_loaded=anomaly_model_loaded,
+            anomaly_degraded=self._anomaly_degraded,
             ensemble_active=ensemble_active,
             ensemble_models=(
                 self._ensemble_detector.model_count
@@ -1044,6 +1275,24 @@ class DetectionPipeline:
                 msg="Learning mode expired, switching to ACTIVE",
             )
 
+        # COLLECTION/TRAINING watchdog: recover if a long-running task crashed
+        # before resetting the mode (otherwise pipeline would skip detection forever).
+        if (
+            self._mode_session_start_time is not None
+            and self.mode in _DETECTION_SKIPPED_MODES
+            and (time.monotonic() - self._mode_session_start_time) >= self._mode_session_max_duration
+        ):
+            with self._mode_lock:
+                stuck_mode = self._mode
+                self._mode = PipelineMode.ACTIVE
+                self._mode_session_start_time = None
+            logger.warning(
+                "pipeline.mode_session_timeout_recovered",
+                camera_id=frame_data.camera_id,
+                stuck_mode=stuck_mode.value,
+                max_duration_seconds=self._mode_session_max_duration,
+            )
+
         current_mode = self.mode
         # Save raw frame reference before zone masking — apply() returns a new
         # array (cv2.bitwise_and), so the original frame is not mutated.
@@ -1115,6 +1364,21 @@ class DetectionPipeline:
         # Save latest frame reference — get_latest_frame() copies on read
         with self._latest_frame_lock:
             self._latest_frame = frame
+
+        # COLLECTION/TRAINING modes skip detection stages entirely (痛点 1/3).
+        # raw_frame and latest_frame are still updated above so the capture
+        # thread / video wall keep working; YOLO + Anomalib + MOG2 consumption
+        # are bypassed to free CPU/GPU and avoid contaminating alert history.
+        if current_mode in _DETECTION_SKIPPED_MODES:
+            diag.stages.append(StageResult(
+                stage_name="mode_skip",
+                duration_ms=0.0,
+                skipped=True,
+                skip_reason=current_mode.value,
+            ))
+            diag.total_duration_ms = (time.monotonic() - start) * 1000
+            self._diagnostics.append(diag)
+            return None
 
         # Single full-resolution BGR->GRAY conversion shared by brightness
         # detection (below) and MOG2 stabilization. Valid only for this frame.
@@ -1952,6 +2216,26 @@ class DetectionPipeline:
                 alert, simplex_result, detection_result,
             )
 
+            # Requirements §3.2 №9: when the anomaly head is degraded the
+            # alert was raised by the simplex safety channel alone. Downgrade
+            # HIGH severity to MEDIUM so operators know it is a fallback
+            # signal, not a confirmed dual-channel detection.
+            if self._anomaly_degraded:
+                from argus.alerts.grader import AlertSeverity, HANDLING_POLICIES
+
+                if alert.severity == AlertSeverity.HIGH:
+                    alert.severity = AlertSeverity.MEDIUM
+                    alert.handling_policy = HANDLING_POLICIES.get(
+                        AlertSeverity.MEDIUM, alert.handling_policy,
+                    )
+                    logger.info(
+                        "pipeline.alert_severity_degraded",
+                        camera_id=frame_data.camera_id,
+                        original="high",
+                        adjusted="medium",
+                        reason="anomaly_head_degraded",
+                    )
+
             alert.model_version_id = self._model_version_id
             self.stats.alerts_emitted += 1
             if self._on_alert:
@@ -2389,17 +2673,22 @@ class DetectionPipeline:
         with self._mode_lock:
             return self._mode
 
-    def set_mode(self, mode: PipelineMode) -> None:
-        """Set pipeline operating mode (DET-006)."""
+    def set_mode(self, mode: PipelineMode) -> PipelineMode:
+        """Set pipeline operating mode (DET-006). Returns previous mode."""
         with self._mode_lock:
             old = self._mode
             self._mode = mode
+            if mode in _DETECTION_SKIPPED_MODES:
+                self._mode_session_start_time = time.monotonic()
+            else:
+                self._mode_session_start_time = None
         logger.info(
             "pipeline.mode_changed",
             camera_id=self.camera_config.camera_id,
             old=old.value,
             new=mode.value,
         )
+        return old
 
     def get_learning_progress(self) -> dict:
         """Return learning mode progress for dashboard display (DET-010)."""
@@ -2422,12 +2711,50 @@ class DetectionPipeline:
             self._zone_mask_cache.clear()
         logger.info("pipeline.zones_updated", camera_id=self.camera_config.camera_id, zones=len(zones))
 
-    def update_thresholds(self, anomaly_threshold: float | None = None) -> None:
-        """Hot-update detection thresholds without restart."""
+    def update_thresholds(
+        self,
+        anomaly_threshold: float | None = None,
+        *,
+        severity_changed: bool = False,
+        temporal_changed: bool = False,
+        suppression_changed: bool = False,
+    ) -> dict[str, bool]:
+        """Hot-update detection thresholds without restart (痛点 9).
+
+        AlertGrader holds a reference to the shared AlertConfig object, so
+        modifications to ``alerts.severity_thresholds`` / ``alerts.temporal``
+        / ``alerts.suppression`` are observed automatically. The boolean
+        flags here only refresh pipeline-level derived caches (e.g.
+        heartbeat seconds) that snapshot config values once.
+
+        Returns a per-section ``{section: True}`` map that the route layer
+        can surface to the UI as ``hot_reloaded`` indicators.
+        """
+        applied: dict[str, bool] = {}
         with self._config_lock:
             if anomaly_threshold is not None:
                 self._anomaly_detector.threshold = anomaly_threshold
-        logger.info("pipeline.thresholds_updated", camera_id=self.camera_config.camera_id)
+                applied["anomaly_threshold"] = True
+            if temporal_changed:
+                # Refresh derived heartbeat caches from the (already-mutated)
+                # alert_config.temporal reference.
+                try:
+                    new_max_gap = self._alert_grader._config.temporal.max_gap_seconds
+                    self._heartbeat_seconds = new_max_gap
+                    self._low_light_heartbeat_seconds = new_max_gap / 2
+                    applied["temporal"] = True
+                except AttributeError:
+                    applied["temporal"] = False
+            if severity_changed:
+                applied["severity"] = True  # AlertGrader reads via self._config ref
+            if suppression_changed:
+                applied["suppression"] = True  # ditto
+        logger.info(
+            "pipeline.thresholds_updated",
+            camera_id=self.camera_config.camera_id,
+            applied=list(applied.keys()),
+        )
+        return applied
 
     def get_diagnostics_buffer(self) -> DiagnosticsBuffer:
         """Get the per-frame diagnostics ring buffer (DET-008)."""

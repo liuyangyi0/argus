@@ -21,6 +21,11 @@ import structlog
 from argus.alerts.grader import Alert, AlertSeverity
 from argus.config.schema import AlertConfig, AnomalyConfig, CameraConfig, ClassifierConfig, CrossCameraConfig, SegmenterConfig
 from argus.core.correlation import CameraOverlapPair, CrossCameraCorrelator
+from argus.core.error_channel import (
+    SEVERITY_ERROR,
+    SEVERITY_WARNING,
+    get_error_channel,
+)
 from argus.core.pipeline import DetectionPipeline, PipelineMode, PipelineStats
 from argus.core.runner import CameraInferenceRunner, RunnerSnapshot
 
@@ -502,6 +507,26 @@ class CameraManager:
             return None
         return pipeline.mode.value
 
+    def list_camera_ids(self) -> list[str]:
+        """List all camera IDs that currently have a pipeline registered."""
+        return list(self._pipelines.keys())
+
+    def get_all_pipeline_modes(self) -> dict[str, str]:
+        """Return a snapshot of every camera's current pipeline mode."""
+        return {cid: p.mode.value for cid, p in self._pipelines.items()}
+
+    def set_all_pipeline_modes(self, mode: PipelineMode) -> dict[str, str]:
+        """Switch every registered pipeline into the given mode.
+
+        Returns a {camera_id: previous_mode} mapping useful for restoration
+        by GlobalPipelineModeGuard.
+        """
+        previous: dict[str, str] = {}
+        for cid, pipeline in self._pipelines.items():
+            previous[cid] = pipeline.mode.value
+            pipeline.set_mode(mode)
+        return previous
+
     def get_learning_progress(self, camera_id: str) -> dict | None:
         """Get learning mode progress for a camera (DET-010)."""
         pipeline = self._pipelines.get(camera_id)
@@ -876,6 +901,13 @@ class CameraManager:
 
         if not runner.initialize():
             logger.error("manager.init_failed", camera_id=camera_id)
+            get_error_channel().emit(
+                severity=SEVERITY_WARNING,
+                source="capture_manager",
+                code="init_failed",
+                message=f"摄像头 {camera_id} 初始化失败",
+                context={"camera_id": camera_id},
+            )
             return False
 
         thread = threading.Thread(
@@ -999,6 +1031,17 @@ class CameraManager:
                     self._stop_event.wait(1.0)
         except Exception as e:
             logger.error("camera_loop.fatal", camera_id=camera_id, error=str(e))
+            get_error_channel().emit(
+                severity=SEVERITY_ERROR,
+                source="capture_manager",
+                code="camera_loop_fatal",
+                message=f"摄像头 {camera_id} 处理循环致命错误: {e}",
+                context={
+                    "camera_id": camera_id,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
         finally:
             logger.info("camera_loop.stopped", camera_id=camera_id)
             with self._lock:

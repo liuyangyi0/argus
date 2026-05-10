@@ -1,4 +1,4 @@
-import type { ApiResponse, AlertsPayload } from '../types/api'
+import type { ApiResponse, AlertsPayload, FeedbackStats } from '../types/api'
 import { api, unwrap, u } from './client'
 
 export const getAlerts = (params?: Record<string, any>) =>
@@ -6,6 +6,15 @@ export const getAlerts = (params?: Record<string, any>) =>
 export const getAlert = (id: string) => api.get(`/alerts/${id}/detail`).then(u)
 export const acknowledgeAlert = (id: string) => api.post(`/alerts/${id}/acknowledge`).then(u)
 export const markFalsePositive = (id: string) => api.post(`/alerts/${id}/false-positive`).then(u)
+// 痛点 10: explicit "this WAS a real anomaly" — feeds confirmed feedback to validation set
+export const confirmRealAnomaly = (id: string) =>
+  api.post(`/alerts/${id}/confirm-anomaly`).then(u)
+export const getFeedbackStats = (camera_id?: string) =>
+  api
+    .get<ApiResponse<FeedbackStats>>('/alerts/feedback-stats', {
+      params: camera_id ? { camera_id } : undefined,
+    })
+    .then(unwrap)
 export const updateAlertWorkflow = (id: string, data: Record<string, any>) =>
   api.post(`/alerts/${id}/workflow`, data).then(u)
 export const bulkAcknowledge = (ids: string[]) =>
@@ -19,3 +28,18 @@ export const saveAnnotations = (alertId: string, annotations: any[]) =>
   api.post(`/alerts/${alertId}/annotations`, { annotations }).then(u)
 export const getAlertGroup = (eventGroupId: string) =>
   api.get(`/alerts/group/${eventGroupId}`).then(u)
+
+// C-AlertTrainingLink: resolve a model_version_id to its registry record so the
+// alert detail panel can show camera / stage / created_at next to the link.
+// Returns null when the version isn't in the registry (e.g. retired record
+// pruned, model id stamped on the alert before registry was populated).
+export const getModelVersionInfo = async (modelVersionId: string) => {
+  if (!modelVersionId) return null
+  try {
+    const res: any = await api.get('/models/json').then(u)
+    const models = res?.models || []
+    return models.find((m: any) => m.model_version_id === modelVersionId) || null
+  } catch {
+    return null
+  }
+}
