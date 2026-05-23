@@ -18,12 +18,14 @@ from sqlalchemy import select
 
 from argus.dashboard.api_response import (
     api_conflict,
+    api_forbidden,
     api_success,
     api_internal_error,
     api_not_found,
     api_unavailable,
     api_validation_error,
 )
+from argus.dashboard.auth import require_permission
 from argus.anomaly.job_executor import validate_hyperparameters
 from argus.storage.models import (
     AlertRecord,
@@ -38,6 +40,12 @@ from argus.storage.models import (
 logger = structlog.get_logger()
 
 router = APIRouter()
+
+
+def _deny_without_training_permission(request: Request) -> JSONResponse | None:
+    if require_permission(request, "manage_training"):
+        return None
+    return api_forbidden("权限不足")
 
 
 def _get_db(request: Request):
@@ -208,6 +216,10 @@ async def create_training_job(request: Request):
         hyperparameters?: dict,
     }
     """
+    denied = _deny_without_training_permission(request)
+    if denied:
+        return denied
+
     db = _get_db(request)
     if db is None:
         return api_unavailable("数据库不可用")
@@ -301,6 +313,10 @@ async def create_training_job(request: Request):
 @router.post("/{job_id}/confirm")
 async def confirm_training_job(request: Request, job_id: str):
     """Human confirms a pending training job (writes audit log)."""
+    denied = _deny_without_training_permission(request)
+    if denied:
+        return denied
+
     db = _get_db(request)
     if db is None:
         return api_unavailable("数据库不可用")
@@ -340,6 +356,10 @@ async def confirm_training_job(request: Request, job_id: str):
 @router.post("/{job_id}/reject")
 async def reject_training_job(request: Request, job_id: str):
     """Human rejects a pending training job."""
+    denied = _deny_without_training_permission(request)
+    if denied:
+        return denied
+
     db = _get_db(request)
     if db is None:
         return api_unavailable("数据库不可用")

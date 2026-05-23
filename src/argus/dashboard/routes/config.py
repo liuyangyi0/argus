@@ -21,13 +21,19 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import current_username
+from argus.dashboard.auth import current_username, require_permission
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 from argus.dashboard.model_runtime import find_registered_model_by_path
 
 logger = structlog.get_logger()
 
 router = APIRouter()
+
+
+def _deny_without_permission(request: Request, permission: str):
+    if require_permission(request, permission):
+        return None
+    return api_forbidden("权限不足")
 
 
 class ThresholdUpdateRequest(BaseModel):
@@ -46,6 +52,10 @@ class ModelReloadRequest(BaseModel):
 @router.post("/detection-params")
 async def update_detection_params(request: Request):
     """Update detection parameters from form."""
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     config = request.app.state.config
     camera_manager = request.app.state.camera_manager
     if not config or not camera_manager:
@@ -141,6 +151,10 @@ async def update_detection_params(request: Request):
 @router.post("/notifications")
 async def update_notifications(request: Request):
     """Update webhook config (email surface was removed in 2026-05)."""
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     config = request.app.state.config
     if not config:
         return api_unavailable("不可用")
@@ -166,6 +180,10 @@ async def update_notifications(request: Request):
 @router.post("/test-webhook")
 async def test_webhook(request: Request):
     """Send a test webhook."""
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     config = request.app.state.config
     if not config:
         return api_unavailable("不可用")
@@ -258,6 +276,10 @@ def cleanup_data(request: Request):
 @router.post("/thresholds")
 async def update_thresholds(request: Request, req: ThresholdUpdateRequest):
     """Hot-update detection thresholds without restart."""
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("不可用")
@@ -274,6 +296,10 @@ async def update_thresholds(request: Request, req: ThresholdUpdateRequest):
 @router.post("/reload-model")
 async def reload_model(request: Request, req: ModelReloadRequest):
     """Trigger model hot-reload for a specific camera."""
+    denied = _deny_without_permission(request, "manage_models")
+    if denied:
+        return denied
+
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("不可用")
@@ -313,6 +339,10 @@ async def reload_model(request: Request, req: ModelReloadRequest):
 @router.post("/clear-lock/{camera_id}")
 async def clear_anomaly_lock(request: Request, camera_id: str):
     """Clear the anomaly region lock for a camera."""
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("不可用")
@@ -338,6 +368,10 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
 @router.post("/camera/{camera_id}/restart")
 async def restart_camera(request: Request, camera_id: str):
     """Stop and restart a camera pipeline."""
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("不可用")
@@ -353,6 +387,10 @@ async def restart_camera(request: Request, camera_id: str):
 @router.post("/reload")
 def reload_config(request: Request):
     """Reload configuration from YAML."""
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     config_path = getattr(request.app.state, "config_path", None)
     camera_manager = request.app.state.camera_manager
     if not config_path or not camera_manager:
@@ -385,6 +423,10 @@ def reload_config(request: Request):
 @router.post("/save")
 def save_config(request: Request):
     """Save current config to YAML file."""
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     config = request.app.state.config
     config_path = getattr(request.app.state, "config_path", None)
     if not config or not config_path:
@@ -427,6 +469,10 @@ async def update_audio_alerts(request: Request):
     Request body: {low: {enabled, sound, voice_template},
                    medium: {...}, high: {...}}
     """
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+
     config = request.app.state.config
     if not config:
         return api_unavailable("配置不可用")
@@ -710,10 +756,9 @@ async def update_cross_camera_config(
     """
     from argus.config.schema import CameraOverlapConfig
     from argus.core.correlation import CameraOverlapPair
-    from argus.dashboard.auth import require_role
-
-    if not require_role(request, "admin", "engineer"):
-        return api_forbidden("需要管理员或工程师权限")
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
 
     config = request.app.state.config
     if not config:
@@ -842,9 +887,9 @@ async def update_segmenter_params_route(
     Validation: max_points in [1, 32], min_anomaly_score in [0, 1],
     min_mask_area_px ≥ 0, timeout_seconds in (0, 120].
     """
-    from argus.dashboard.auth import require_role
-    if not require_role(request, "admin", "engineer"):
-        return api_forbidden("需要管理员或工程师权限")
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
 
     config = request.app.state.config
     if not config:
@@ -928,9 +973,9 @@ async def update_classifier_vocabulary(
     of the vocabulary — otherwise operators risk labelling things that the
     detector will never emit.
     """
-    from argus.dashboard.auth import require_role
-    if not require_role(request, "admin", "engineer"):
-        return api_forbidden("需要管理员或工程师权限")
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
 
     config = request.app.state.config
     if not config:
@@ -1024,10 +1069,9 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
     'continuous_recording.enabled', 'classifier.enabled'.
     Requires admin or engineer role.
     """
-    from argus.dashboard.auth import require_role
-    if not require_role(request, "admin", "engineer"):
-        from argus.dashboard.api_response import api_forbidden
-        return api_forbidden("需要管理员或工程师权限")
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
 
     config = request.app.state.config
     parts = req.key.split(".")

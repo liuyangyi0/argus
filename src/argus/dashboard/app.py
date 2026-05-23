@@ -46,6 +46,39 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
+def _mount_vue_spa(app: FastAPI, vue_dist: Path) -> None:
+    """Mount the built Vue SPA when a usable build is present.
+
+    ``web/dist`` is an ignored build artifact and may exist in a partially
+    generated state during local testing. Avoid letting a stale directory break
+    backend startup.
+    """
+    index_file = vue_dist / "index.html"
+    if not index_file.is_file():
+        if vue_dist.exists():
+            logger.warning("app.vue_dist_incomplete", path=str(vue_dist))
+        return
+
+    assets_dir = vue_dist / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="vue-assets")
+    else:
+        logger.warning("app.vue_assets_missing", path=str(assets_dir))
+
+    # SPA fallback: all non-API routes serve index.html
+    @app.get("/{full_path:path}")
+    async def serve_spa(request: Request, full_path: str):
+        # Don't intercept API or WebSocket routes
+        if full_path.startswith("api/") or full_path.startswith("ws"):
+            return
+        # Serve actual files if they exist (favicon, etc.)
+        file_path = vue_dist / full_path
+        if file_path.is_file():
+            return FileResponse(str(file_path))
+        # SPA fallback — Vue Router handles client-side routing
+        return FileResponse(str(index_file))
+
+
 def create_app(
     database: Database | None = None,
     camera_manager: CameraManager | None = None,
@@ -280,20 +313,6 @@ def create_app(
     # Serve built Vue app from web/dist/ (production)
     vue_dist = Path(__file__).parent.parent.parent.parent / "web" / "dist"
     if vue_dist.is_dir():
-        # Serve static assets (js, css, images)
-        app.mount("/assets", StaticFiles(directory=str(vue_dist / "assets")), name="vue-assets")
-
-        # SPA fallback: all non-API routes serve index.html
-        @app.get("/{full_path:path}")
-        async def serve_spa(request: Request, full_path: str):
-            # Don't intercept API or WebSocket routes
-            if full_path.startswith("api/") or full_path.startswith("ws"):
-                return
-            # Serve actual files if they exist (favicon, etc.)
-            file_path = vue_dist / full_path
-            if file_path.is_file():
-                return FileResponse(str(file_path))
-            # SPA fallback — Vue Router handles client-side routing
-            return FileResponse(str(vue_dist / "index.html"))
+        _mount_vue_spa(app, vue_dist)
 
     return app

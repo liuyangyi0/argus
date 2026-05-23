@@ -12,7 +12,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import hash_password, require_role
+from argus.dashboard.auth import VALID_ROLES, hash_password, require_role
 
 router = APIRouter()
 
@@ -97,7 +97,7 @@ async def create_user_json(request: Request):
 
     if not username or not password:
         return api_validation_error("用户名和密码不能为空")
-    if role not in ("admin", "operator", "viewer"):
+    if role not in VALID_ROLES:
         return api_validation_error("角色无效")
     if len(password) < 6:
         return api_validation_error("密码至少 6 位")
@@ -136,7 +136,7 @@ async def update_user_json(request: Request, username: str):
     active = bool(body.get("active", user.active))
     current_user = getattr(request.state, "user", {}) or {}
 
-    if role not in ("admin", "operator", "viewer"):
+    if role not in VALID_ROLES:
         return api_validation_error("角色无效")
     if password and len(password) < 6:
         return api_validation_error("密码至少 6 位")

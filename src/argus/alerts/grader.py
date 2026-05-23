@@ -716,7 +716,7 @@ class AlertGrader:
         with self._tracker_lock:
             stale_keys = [
                 key for key, tracker in self._trackers.items()
-                if tracker.last_seen > 0 and (now - tracker.last_seen) > max_age_seconds
+                if tracker.last_seen != 0 and (now - tracker.last_seen) > max_age_seconds
             ]
             for key in stale_keys:
                 del self._trackers[key]
