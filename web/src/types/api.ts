@@ -274,9 +274,11 @@ export interface HealthCamera {
   avg_latency_ms: number
 }
 
+export type UserRole = 'admin' | 'engineer' | 'operator' | 'viewer'
+
 export interface UserInfo {
   username: string
-  role: 'admin' | 'operator' | 'viewer'
+  role: UserRole
   display_name: string
   active: boolean
   last_login: string | null

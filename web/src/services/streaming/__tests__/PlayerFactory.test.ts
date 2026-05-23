@@ -12,12 +12,16 @@ describe('PlayerFactory', () => {
   })
 
   it('connects to WebRTC when go2rtc supports it', async () => {
-    // Mock axios response
+    // Backend streaming endpoints use the standard {code,msg,data} envelope.
     vi.mocked(axios.get).mockResolvedValue({
       data: {
-        camera_id: 'cam1',
-        go2rtc: true,
-        webrtc_ws: 'ws://localhost/webrtc'
+        code: 0,
+        msg: 'ok',
+        data: {
+          camera_id: 'cam1',
+          go2rtc: true,
+          webrtc_ws: 'ws://localhost/webrtc'
+        }
       }
     })
 
@@ -32,6 +36,26 @@ describe('PlayerFactory', () => {
     expect(axios.get).toHaveBeenCalledWith('/api/streaming/cam1')
     expect(player).toBe(null) // Since our mocked JSDOM doesn't have a real WebRTC server running, it falls back/fails to connect in 15s or fails instantly depending on mock, but the flow is tested
     vi.useRealTimers()
+  })
+
+  it('unwraps the dashboard API envelope for stream info', async () => {
+    vi.mocked(axios.get).mockResolvedValue({
+      data: {
+        code: 0,
+        msg: 'ok',
+        data: {
+          camera_id: 'cam1',
+          go2rtc: true,
+          webrtc_ws: 'ws://localhost/webrtc',
+          mse_ws: 'ws://localhost/mse'
+        }
+      }
+    })
+
+    const info = await PlayerFactory.fetchStreamInfo('cam1')
+
+    expect(info?.go2rtc).toBe(true)
+    expect(info?.webrtc_ws).toBe('ws://localhost/webrtc')
   })
   
   it('returns null if stream info not found', async () => {

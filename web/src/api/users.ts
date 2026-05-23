@@ -1,8 +1,9 @@
 import { api, u } from './client'
+import type { UserRole } from '../types/api'
 
 export interface UserItem {
   username: string
-  role: 'admin' | 'operator' | 'viewer'
+  role: UserRole
   display_name: string
   active: boolean
   last_login?: string | null

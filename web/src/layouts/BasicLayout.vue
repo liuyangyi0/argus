@@ -2,12 +2,23 @@
 import { ref, computed, h, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { Button, notification } from 'ant-design-vue'
-import { BellOutlined } from '@ant-design/icons-vue'
+import {
+  AlertOutlined,
+  BarChartOutlined,
+  BellOutlined,
+  DashboardOutlined,
+  DatabaseOutlined,
+  InboxOutlined,
+  RightOutlined,
+  SettingOutlined,
+  VideoCameraOutlined,
+} from '@ant-design/icons-vue'
 import DegradationBar from '../components/DegradationBar.vue'
 import ErrorBoundary from '../components/ErrorBoundary.vue'
 import ErrorCenterDrawer from '../components/system/ErrorCenterDrawer.vue'
 import { useWebSocket } from '../composables/useWebSocket'
 import { useSystemMode } from '../composables/useSystemMode'
+import { ROLE_META } from '../constants/roles'
 import { useAuthStore } from '../stores/useAuthStore'
 import { useErrorStore } from '../stores/useErrorStore'
 
@@ -26,10 +37,10 @@ const isExact = (path: string) => route.path === path || route.path.startsWith(p
 type NavChild = { path: string; label: string; roles?: string[] }
 
 const modelsChildren: NavChild[] = [
-  { path: '/models/baseline', label: '基线管理', roles: ['admin', 'operator'] },
+  { path: '/models/baseline', label: '基线管理', roles: ['admin', 'engineer'] },
   { path: '/models/collections', label: '采集集合' },
-  { path: '/models/training', label: '训练与评估', roles: ['admin', 'operator'] },
-  { path: '/models/registry', label: '模型与发布', roles: ['admin', 'operator'] },
+  { path: '/models/training', label: '训练与评估', roles: ['admin', 'engineer'] },
+  { path: '/models/registry', label: '模型与发布', roles: ['admin', 'engineer'] },
   { path: '/models/comparison', label: 'A/B 对比' },
   { path: '/models/labeling', label: '标注队列' },
   { path: '/models/threshold', label: '阈值预览' },
@@ -38,7 +49,7 @@ const modelsChildren: NavChild[] = [
 const systemChildren: NavChild[] = [
   { path: '/system/overview', label: '系统概览' },
   { path: '/system/model-status', label: '模型状态' },
-  { path: '/system/config', label: '配置管理', roles: ['admin'] },
+  { path: '/system/config', label: '配置管理', roles: ['admin', 'engineer'] },
   { path: '/system/audit', label: '审计日志', roles: ['admin'] },
   { path: '/system/degradation', label: '降级事件' },
   { path: '/system/modules', label: '功能模块' },
@@ -60,7 +71,7 @@ function canSeeChild(child: NavChild): boolean {
 const visibleModelsChildren = computed(() => modelsChildren.filter(canSeeChild))
 const visibleSystemChildren = computed(() => systemChildren.filter(canSeeChild))
 
-// Models top-level entry mirrors the most-permissive child (admin/operator).
+// Models top-level entry mirrors the visible child set for the current role.
 const canSeeModelsGroup = computed(() => visibleModelsChildren.value.length > 0)
 const canSeeSystemGroup = computed(() => visibleSystemChildren.value.length > 0)
 
@@ -71,12 +82,6 @@ const avatarLetter = computed(() => {
   const src = u.display_name || u.username || ''
   return (src.trim().charAt(0) || '?').toUpperCase()
 })
-
-const ROLE_META: Record<string, { color: string; label: string }> = {
-  admin: { color: 'red', label: '管理员' },
-  operator: { color: 'blue', label: '操作员' },
-  viewer: { color: 'default', label: '查看者' },
-}
 
 const roleColor = computed(() => {
   const role = auth.currentUser?.role
@@ -216,34 +221,28 @@ onUnmounted(() => {
           <div class="nav-label">工作台</div>
 
           <router-link to="/overview" :class="{ active: isActive('/overview') }">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-            总览
+            <DashboardOutlined />总览
           </router-link>
 
           <router-link to="/cameras" :class="{ active: isActive('/cameras') }">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg>
-            摄像头
+            <VideoCameraOutlined />摄像头
           </router-link>
 
           <router-link to="/alerts" :class="{ active: isActive('/alerts') }">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
-            告警中心
+            <AlertOutlined />告警中心
           </router-link>
 
           <router-link to="/reports" :class="{ active: isActive('/reports') }">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 16l4-8 4 4 4-6"/></svg>
-            报表
+            <BarChartOutlined />报表
           </router-link>
 
           <router-link to="/warehouse3D" :class="{ active: isActive('/warehouse3D') }">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5v-9Z"/><path d="M12 21v-9"/><path d="M21 7.5 12 12 3 7.5"/></svg>
-            3D仓库
+            <InboxOutlined />3D仓库
           </router-link>
 
           <div class="nav-label">系统</div>
 
-
-          <!-- Models sub-menu (admin/operator only — viewer hides the entry) -->
+          <!-- Models sub-menu (role-gated by router RBAC meta) -->
           <div v-if="canSeeModelsGroup" class="sub-group" :class="{ 'is-open': modelsOpen }">
             <button
               type="button"
@@ -252,9 +251,9 @@ onUnmounted(() => {
               :aria-expanded="modelsOpen"
               @click="toggleModels"
             >
-              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg>
+              <DatabaseOutlined />
               <span class="sub-label">模型管理</span>
-              <svg class="caret" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+              <RightOutlined class="caret" />
             </button>
             <div v-show="modelsOpen" class="sub-list">
               <router-link
@@ -278,9 +277,9 @@ onUnmounted(() => {
               :aria-expanded="systemOpen"
               @click="toggleSystem"
             >
-              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+              <SettingOutlined />
               <span class="sub-label">设置</span>
-              <svg class="caret" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+              <RightOutlined class="caret" />
             </button>
             <div v-show="systemOpen" class="sub-list">
               <router-link
@@ -303,8 +302,8 @@ onUnmounted(() => {
       </div>
     </aside>
 
-    <div style="display: flex; flex-direction: column; flex: 1; min-width: 0;">
-
+    <!-- CONTENT WRAPPER -->
+    <div class="content-shell">
       <!-- TOPBAR with error center bell + user dropdown -->
       <header v-if="auth.currentUser" class="topbar">
         <a-badge :count="errorStore.unreadCount" :overflow-count="99" :offset="[-4, 4]">
@@ -378,7 +377,8 @@ onUnmounted(() => {
           {{ modeBannerLabel }}
         </div>
         <DegradationBar />
-        <div style="display: flex; flex-direction: row; flex: 1; min-height: 0; gap: 12px;">
+        <!-- Flex row container for route views -->
+        <div class="route-shell">
           <router-view v-slot="{ Component }">
             <keep-alive :include="['OverviewPage', 'CamerasPage', 'AlertsPage']">
               <component :is="Component" />
@@ -411,6 +411,20 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* ============ LEFT SIDEBAR ============ */
+.content-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+.route-shell {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+  gap: 12px;
+}
 .sidebar {
   width: 230px;
   flex-shrink: 0;
