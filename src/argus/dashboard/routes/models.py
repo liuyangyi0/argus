@@ -18,12 +18,14 @@ from fastapi.responses import JSONResponse
 
 from argus.dashboard.api_response import (
     api_conflict,
+    api_forbidden,
     api_internal_error,
     api_not_found,
     api_success,
     api_unavailable,
     api_validation_error,
 )
+from argus.dashboard.auth import require_permission
 from argus.dashboard.model_runtime import (
     activate_model_version,
     get_registry,
@@ -45,6 +47,13 @@ MAX_BATCH_SIZE = 100
 
 # Dedicated thread pool for CPU-intensive model inference (not asyncio default pool)
 _AB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ab-compare")
+
+
+def _deny_without_permission(request: Request, permission: str) -> JSONResponse | None:
+    """Return a 403 response when the current user lacks a permission."""
+    if require_permission(request, permission):
+        return None
+    return api_forbidden("权限不足")
 
 
 def _get_registry(request: Request) -> ModelRegistry | None:
@@ -136,6 +145,10 @@ async def list_models(request: Request, camera_id: str | None = None):
 @router.post("/{version_id}/activate")
 async def activate_model(request: Request, version_id: str):
     """Activate a specific model version."""
+    denied = _deny_without_permission(request, "manage_models")
+    if denied:
+        return denied
+
     if _get_registry(request) is None:
         return api_unavailable("数据库不可用")
 
@@ -175,6 +188,10 @@ async def rollback_model(request: Request, version_id: str):
     The version_id is used to identify the camera; the actual rollback
     activates the previous model for that camera.
     """
+    denied = _deny_without_permission(request, "rollback_model")
+    if denied:
+        return denied
+
     registry = _get_registry(request)
     if registry is None:
         return api_unavailable("数据库不可用")
@@ -303,6 +320,10 @@ async def promote_model(request: Request, version_id: str):
 
     Body: { target_stage, triggered_by, reason?, canary_camera_id? }
     """
+    denied = _deny_without_permission(request, "manage_models")
+    if denied:
+        return denied
+
     pipeline = _get_release_pipeline(request)
     if pipeline is None:
         return api_unavailable("数据库不可用")
@@ -342,6 +363,10 @@ async def promote_model(request: Request, version_id: str):
 @router.post("/{version_id}/retire")
 async def retire_model(request: Request, version_id: str):
     """Retire a model (any stage → retired)."""
+    denied = _deny_without_permission(request, "manage_models")
+    if denied:
+        return denied
+
     pipeline = _get_release_pipeline(request)
     if pipeline is None:
         return api_unavailable("数据库不可用")
@@ -372,6 +397,10 @@ async def retire_model(request: Request, version_id: str):
 @router.delete("/{version_id}")
 def delete_model(request: Request, version_id: str):
     """Delete a model version (only non-active, non-production models)."""
+    denied = _deny_without_permission(request, "manage_models")
+    if denied:
+        return denied
+
     registry = _get_registry(request)
     if registry is None:
         return api_unavailable("数据库不可用")
@@ -449,6 +478,10 @@ async def reexport_model(request: Request, version_id: str):
 
     Body: { export_format?: str, quantization?: str }
     """
+    denied = _deny_without_permission(request, "manage_models")
+    if denied:
+        return denied
+
     registry = _get_registry(request)
     if registry is None:
         return api_unavailable("数据库不可用")
@@ -501,6 +534,10 @@ async def recalibrate_model(request: Request, version_id: str):
 
     Runs conformal calibration + sigmoid recalibration, persists to calibration.json.
     """
+    denied = _deny_without_permission(request, "manage_models")
+    if denied:
+        return denied
+
     registry = _get_registry(request)
     if registry is None:
         return api_unavailable("数据库不可用")
@@ -889,6 +926,10 @@ async def backbone_upgrade(request: Request):
 
     Body: { backbone_path: str, version: str, triggered_by: str }
     """
+    denied = _deny_without_permission(request, "manage_models")
+    if denied:
+        return denied
+
     from pathlib import Path
 
     from argus.anomaly.backbone_manager import BackboneManager

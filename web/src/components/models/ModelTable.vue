@@ -543,7 +543,7 @@ const columns = [
             <!-- Activate -->
             <Tooltip title="激活此版本">
               <Button
-                v-if="!record.is_active"
+                v-if="!record.is_active && (record.stage === 'production' || record.stage === 'retired')"
                 size="small"
                 type="primary"
                 :loading="activatingModel === record.model_version_id"

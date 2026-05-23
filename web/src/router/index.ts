@@ -51,13 +51,13 @@ const router = createRouter({
           path: 'overview',
           name: 'overview',
           component: () => import('../views/Overview.vue'),
-          meta: { title: '总览' },
+          meta: { title: '总览', requiresAuth: true },
         },
         {
           path: 'cameras',
           name: 'cameras',
           component: () => import('../views/Cameras.vue'),
-          meta: { title: '摄像头' },
+          meta: { title: '摄像头', requiresAuth: true },
         },
         {
           path: 'cameras/:id',
@@ -69,13 +69,13 @@ const router = createRouter({
           path: 'alerts',
           name: 'alerts',
           component: () => import('../views/Alerts.vue'),
-          meta: { title: '告警' },
+          meta: { title: '告警', requiresAuth: true },
         },
         {
           path: 'reports',
           name: 'reports',
           component: () => import('../views/Reports.vue'),
-          meta: { title: '报表' },
+          meta: { title: '报表', requiresAuth: true },
         },
         {
           path: 'models',
@@ -94,19 +94,19 @@ const router = createRouter({
               path: 'baseline',
               name: 'models-baseline',
               component: () => import('../views/models/BaselineView.vue'),
-              meta: { title: '基线管理', requiresAuth: true, requiresRole: ['admin', 'operator'] },
+              meta: { title: '基线管理', requiresAuth: true, requiresRole: ['admin', 'engineer'] },
             },
             {
               path: 'training',
               name: 'models-training',
               component: () => import('../views/models/TrainingView.vue'),
-              meta: { title: '训练与评估', requiresAuth: true, requiresRole: ['admin', 'operator'] },
+              meta: { title: '训练与评估', requiresAuth: true, requiresRole: ['admin', 'engineer'] },
             },
             {
               path: 'registry',
               name: 'models-registry',
               component: () => import('../views/models/ModelsRegistryView.vue'),
-              meta: { title: '模型与发布', requiresAuth: true, requiresRole: ['admin', 'operator'] },
+              meta: { title: '模型与发布', requiresAuth: true, requiresRole: ['admin', 'engineer'] },
             },
             {
               path: 'comparison',
@@ -165,7 +165,7 @@ const router = createRouter({
               path: 'config',
               name: 'system-config',
               component: () => import('../views/system/ConfigView.vue'),
-              meta: { title: '配置管理', requiresAuth: true, requiresRole: ['admin'] },
+              meta: { title: '配置管理', requiresAuth: true, requiresRole: ['admin', 'engineer'] },
             },
             {
               path: 'audit',

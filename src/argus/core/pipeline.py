@@ -907,14 +907,20 @@ class DetectionPipeline:
         """Auto-categorize alert based on detection characteristics."""
         _ENV_LABELS = {"insect", "bird", "shadow", "reflection", "crane", "overhead-bridge", "scaffold"}
 
-        if alert.speed_px_per_sec and alert.speed_px_per_sec > 50:
-            if alert.trajectory_model in ("free_fall", "projectile", "projectile_drag"):
+        speed_px_per_sec = getattr(alert, "speed_px_per_sec", None)
+        if isinstance(speed_px_per_sec, int | float) and speed_px_per_sec > 50:
+            trajectory_model = getattr(alert, "trajectory_model", None)
+            if trajectory_model in ("free_fall", "projectile", "projectile_drag"):
                 return "projectile"
 
         if detection_result and getattr(detection_result, "has_persons", False):
             return "person_intrusion"
 
-        if alert.classification_label and alert.classification_label.lower() in _ENV_LABELS:
+        classification_label = getattr(alert, "classification_label", None)
+        if (
+            isinstance(classification_label, str)
+            and classification_label.lower() in _ENV_LABELS
+        ):
             return "environmental"
 
         if simplex_result and getattr(simplex_result, "has_detection", False):

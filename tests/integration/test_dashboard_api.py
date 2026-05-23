@@ -23,6 +23,7 @@ from argus.dashboard.tasks import TaskManager
 from argus.storage.database import Database
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.models import ModelVersionEvent
+from argus.storage.release_pipeline import ReleasePipeline
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +393,11 @@ class TestDashboardFeatureChain:
             config_path=str(config_path),
             task_manager=task_manager,
         )
+        app.state._release_pipeline = ReleasePipeline(
+            session_factory=integration_db.get_session,
+            min_shadow_days=0,
+            min_canary_days=0,
+        )
         client = TestClient(app)
 
         add_resp = client.post(
@@ -482,8 +488,26 @@ class TestDashboardFeatureChain:
         registry = ModelRegistry(session_factory=integration_db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
 
-        publish_resp = client.post(f"/api/models/{version_id}/activate")
+        shadow_resp = client.post(
+            f"/api/models/{version_id}/promote",
+            json={"target_stage": "shadow", "triggered_by": "tester"},
+        )
+        assert shadow_resp.status_code == 200
+        canary_resp = client.post(
+            f"/api/models/{version_id}/promote",
+            json={
+                "target_stage": "canary",
+                "triggered_by": "tester",
+                "canary_camera_id": "cam_01",
+            },
+        )
+        assert canary_resp.status_code == 200
+        publish_resp = client.post(
+            f"/api/models/{version_id}/promote",
+            json={"target_stage": "production", "triggered_by": "tester"},
+        )
         assert publish_resp.status_code == 200
+        assert publish_resp.json()["data"]["model"]["stage"] == "production"
         assert publish_resp.json()["data"]["runtime_synced"] is True
         camera_manager.reload_model.assert_called_with(
             "cam_01",

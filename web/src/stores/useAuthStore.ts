@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '../api'
+import type { UserRole } from '../types/api'
 import { logger } from '../utils/logger'
 
 /**
@@ -10,11 +11,12 @@ import { logger } from '../utils/logger'
  */
 export const ROLES = {
   ADMIN: 'admin',
+  ENGINEER: 'engineer',
   OPERATOR: 'operator',
   VIEWER: 'viewer',
 } as const
 
-export type Role = (typeof ROLES)[keyof typeof ROLES]
+export type Role = UserRole
 
 export interface CurrentUser {
   username: string

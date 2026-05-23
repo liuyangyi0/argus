@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import cv2
 import numpy as np
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette import requests as starlette_requests
 
@@ -16,9 +17,10 @@ from argus.runtime.training_job_wiring import (
 )
 from argus.capture.manager import CameraManager
 from argus.config.loader import load_config, save_config
-from argus.config.schema import AlertConfig, ArgusConfig, CameraConfig
+from argus.config.schema import AlertConfig, ArgusConfig, AuthConfig, CameraConfig
 from argus.core.health import HealthMonitor
-from argus.dashboard.app import create_app
+from argus.dashboard.auth import create_session_token
+from argus.dashboard.app import _mount_vue_spa, create_app
 from argus.dashboard.routes.baseline import _train_model_task
 from argus.dashboard.routes.alerts import _generate_composite, _is_safe_path
 from argus.storage.model_registry import ModelRegistry
@@ -55,6 +57,19 @@ def client(db, health, alerts_dir):
 
 
 class TestDashboardPages:
+    def test_vue_spa_mount_tolerates_missing_assets_dir(self, tmp_path):
+        """A partial web/dist should not break backend startup."""
+        vue_dist = tmp_path / "dist"
+        vue_dist.mkdir()
+        (vue_dist / "index.html").write_text('<div id="app"></div>')
+
+        app = FastAPI()
+        _mount_vue_spa(app, vue_dist)
+        response = TestClient(app).get("/system")
+
+        assert response.status_code == 200
+        assert '<div id="app">' in response.text
+
     def test_index_page_loads(self, client):
         """Root page should return Vue SPA HTML."""
         response = client.get("/")
@@ -666,6 +681,21 @@ class TestCameraControlRoutes:
 
 
 class TestModelPublishRoutes:
+    @staticmethod
+    def _set_role_cookie(client: TestClient, app, role: str) -> None:
+        token = create_session_token(f"{role}_user", role, app.state.session_secret)
+        client.cookies.set("argus_session", token)
+
+    @staticmethod
+    def _register_model(registry: ModelRegistry, root: Path, camera_id: str = "cam_01") -> str:
+        model_dir = root / "model"
+        model_dir.mkdir(parents=True)
+        (model_dir / "model.xml").write_text("model")
+        baseline_dir = root / "baseline"
+        baseline_dir.mkdir(parents=True)
+        (baseline_dir / "img.png").write_bytes(b"img")
+        return registry.register(model_dir, baseline_dir, camera_id, "patchcore")
+
     def test_activate_promoted_model_syncs_runtime(self, db, health, alerts_dir, tmp_path):
         """Activating a model that has walked the release pipeline (now at
         PRODUCTION stage) should hot-reload the running camera.
@@ -746,6 +776,77 @@ class TestModelPublishRoutes:
         msg = (body.get("msg") or body.get("message") or "").lower()
         assert "candidate" in msg or "stage" in msg or "shadow" in msg
         camera_manager.reload_model.assert_not_called()
+
+    @pytest.mark.parametrize("role", ["viewer", "operator"])
+    def test_model_mutation_rejects_roles_without_manage_models(
+        self, role, db, health, alerts_dir, tmp_path,
+    ):
+        """Model release writes are guarded by backend RBAC, not only the UI."""
+        config = ArgusConfig(auth=AuthConfig(enabled=True, api_token="test-token"))
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir), config=config)
+        client = TestClient(app)
+        self._set_role_cookie(client, app, role)
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = self._register_model(registry, tmp_path / role)
+
+        response = client.post(
+            f"/api/models/{version_id}/promote",
+            json={"target_stage": "shadow", "triggered_by": role},
+            headers={"accept": "application/json"},
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.parametrize("role", ["engineer", "admin"])
+    def test_model_mutation_allows_manage_models_roles(
+        self, role, db, health, alerts_dir, tmp_path,
+    ):
+        config = ArgusConfig(auth=AuthConfig(enabled=True, api_token="test-token"))
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir), config=config)
+        client = TestClient(app)
+        self._set_role_cookie(client, app, role)
+
+        registry = ModelRegistry(session_factory=db.get_session)
+        version_id = self._register_model(registry, tmp_path / role)
+
+        response = client.post(
+            f"/api/models/{version_id}/promote",
+            json={"target_stage": "shadow", "triggered_by": role},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["model"]["stage"] == "shadow"
+
+
+class TestUserManagementRoutes:
+    def test_create_and_update_engineer_role(self, db, health, alerts_dir):
+        """User management accepts the canonical four-role RBAC set."""
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+        client = TestClient(app)
+
+        create_resp = client.post(
+            "/api/users/json",
+            json={
+                "username": "eng1",
+                "password": "secret1",
+                "role": "engineer",
+                "display_name": "Engineer One",
+            },
+        )
+        assert create_resp.status_code == 200
+        assert create_resp.json()["data"]["user"]["role"] == "engineer"
+
+        update_resp = client.put(
+            "/api/users/eng1/json",
+            json={
+                "role": "engineer",
+                "display_name": "Engineer Updated",
+                "active": True,
+            },
+        )
+        assert update_resp.status_code == 200
+        assert update_resp.json()["data"]["user"]["role"] == "engineer"
 
     def test_config_reload_model_uses_manager_reload(self, db, health, alerts_dir, tmp_path, monkeypatch):
         """Config reload-model route should use the shared runtime reload path."""

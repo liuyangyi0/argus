@@ -261,7 +261,16 @@ export class PlayerFactory {
   static async fetchStreamInfo(cameraId: string): Promise<StreamInfo | null> {
     try {
       const resp = await axios.get(`/api/streaming/${cameraId}`)
-      return resp.data as StreamInfo
+      const payload = resp.data
+      if (
+        payload &&
+        typeof payload === 'object' &&
+        'code' in payload &&
+        'data' in payload
+      ) {
+        return payload.data as StreamInfo
+      }
+      return payload as StreamInfo
     } catch (e) {
       logger.debug(`[go2rtc] fetchStreamInfo failed for ${cameraId}:`, e)
       return null

@@ -4,6 +4,7 @@ import { Button, Card, Form, Input, Modal, Popconfirm, Select, Switch, Table, Ta
 
 import type { CreateUserPayload, UpdateUserPayload, UserItem } from '../../api'
 import { createUser, deleteUser, getUsers, updateUser } from '../../api'
+import { USER_ROLE_OPTIONS } from '../../constants/roles'
 import { useAuthStore } from '../../stores/useAuthStore'
 import { extractErrorMessage } from '../../utils/error'
 
@@ -38,11 +39,7 @@ const modalMode = ref<ModalMode>('create')
 const editingUsername = ref<string | null>(null)
 const userForm = ref<UserFormState>(createEmptyForm())
 
-const roleOptions = [
-  { label: '管理员', value: 'admin', color: 'red' },
-  { label: '操作员', value: 'operator', color: 'blue' },
-  { label: '观察者', value: 'viewer', color: 'default' },
-] satisfies Array<{ label: string; value: UserItem['role']; color: string }>
+const roleOptions = USER_ROLE_OPTIONS
 
 const roleLabelMap = Object.fromEntries(
   roleOptions.map((item) => [item.value, item.label]),

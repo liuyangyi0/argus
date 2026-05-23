@@ -656,14 +656,11 @@ class TestDinomaly2FewShot:
         assert "不足" in result.error
 
 
-class TestDinomaly2FallbackOnImportError:
-    """Verify fallback to PatchCore when Dinomaly is not importable."""
+class TestDinomaly2Unavailable:
+    """Verify Dinomaly requests fail explicitly when Dinomaly is not importable."""
 
-    def test_fallback_to_patchcore(self, trainer, tmp_path):
-        """If Dinomaly import fails, should fall back to PatchCore with warning."""
-        mock_patchcore_cls = MagicMock()
-        mock_patchcore_instance = MagicMock()
-        mock_patchcore_cls.return_value = mock_patchcore_instance
+    def test_import_error_is_reported(self, trainer, tmp_path):
+        """If Dinomaly import fails, do not silently train a different model type."""
         mock_engine_cls = MagicMock()
         mock_folder_cls = MagicMock()
 
@@ -683,19 +680,11 @@ class TestDinomaly2FallbackOnImportError:
 
         with patch("anomalib.data.Folder", mock_folder_cls, create=True), \
              patch("anomalib.engine.Engine", mock_engine_cls, create=True), \
-             patch("anomalib.models.Patchcore", mock_patchcore_cls, create=True), \
-             patch.object(builtins, "__import__", side_effect=patched_import):
-            engine, model = trainer._train_anomalib(
+             patch.object(builtins, "__import__", side_effect=patched_import), \
+             pytest.raises(ImportError, match="Dinomaly"):
+            trainer._train_anomalib(
                 data_dir=tmp_path / "train",
                 output_dir=output_dir,
                 model_type="dinomaly2",
                 image_size=256,
             )
-
-        # Should have fallen back to PatchCore
-        assert model is mock_patchcore_instance
-        mock_patchcore_cls.assert_called_once_with(
-            backbone="wide_resnet50_2",
-            layers=["layer2", "layer3"],
-            coreset_sampling_ratio=0.1,
-        )
