@@ -61,6 +61,14 @@ class TestModelRegistry:
         with pytest.raises(ValueError, match="Cannot activate model at stage"):
             registry.activate(vid)
 
+    def test_activate_rejects_retired_model_without_bypass(self, registry, model_dir, baseline_dir):
+        """Retired is terminal for normal activation."""
+        vid = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        registry.promote(vid, "retired", triggered_by="engineer")
+
+        with pytest.raises(ValueError, match="retired model"):
+            registry.activate(vid)
+
     def test_alert_carries_model_version(self):
         """Alert dataclass should have model_version_id field."""
         from argus.alerts.grader import Alert

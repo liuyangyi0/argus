@@ -123,7 +123,10 @@ def create_maintenance_tasks(
     if database:
         def cleanup_alerts():
             try:
-                count, image_paths = database.delete_old_alerts(days=retention_days)
+                count, image_paths, recording_paths = _delete_old_alerts_with_recording_paths(
+                    database,
+                    days=retention_days,
+                )
                 if count > 0:
                     # Delete image files from disk
                     deleted_files = 0
@@ -140,6 +143,8 @@ def create_maintenance_tasks(
                                 error=str(e),
                             )
 
+                    deleted_recording_dirs = _delete_recording_paths(recording_paths)
+
                     # Remove empty date directories
                     _cleanup_empty_dirs(alerts_path)
 
@@ -147,6 +152,7 @@ def create_maintenance_tasks(
                         "maintenance.cleanup_complete",
                         alerts_deleted=count,
                         files_deleted=deleted_files,
+                        recording_dirs_deleted=deleted_recording_dirs,
                         retention_days=retention_days,
                     )
                 else:
@@ -548,35 +554,16 @@ def create_retraining_task(
                     status=getattr(result, "status", None),
                 )
 
-                # Mark pending feedback as processed for this camera
-                if feedback_manager is not None:
-                    try:
-                        pending = feedback_manager.get_pending_for_training(
-                            camera_id=camera_id,
-                        )
-                        if pending:
-                            model_vid = getattr(result, "model_version_id", None) or "unknown"
-                            ids = [fb.feedback_id for fb in pending]
-                            count = feedback_manager.mark_batch_processed(ids, model_vid)
-                            logger.info(
-                                "retraining.feedback_processed",
-                                camera_id=camera_id,
-                                feedback_count=count,
-                                model_version_id=model_vid,
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "retraining.feedback_processing_failed",
-                            camera_id=camera_id,
-                            error=str(e),
-                        )
+                status_obj = getattr(result, "status", None)
+                status_value = getattr(status_obj, "value", status_obj)
+                result_complete = str(status_value).lower() == "complete"
+                model_version_for_feedback = getattr(result, "model_version_id", None)
 
                 # Auto-deploy if grade meets threshold
                 if (
                     retrain_cfg.auto_deploy
                     and _GRADE_RANK.get(grade, 0) >= min_grade_rank
-                    and getattr(result, "status", None) is not None
-                    and result.status.value == "COMPLETE"
+                    and result_complete
                 ):
                     version_id = None
                     try:
@@ -587,6 +574,7 @@ def create_retraining_task(
                             image_count=current_count,
                             quality_grade=grade,
                         )
+                        model_version_for_feedback = version_id
                         # P1 fix: never bypass the candidate→shadow→canary→production
                         # gate from a non-interactive scheduler. Auto-deploy now
                         # only succeeds when the operator (or an explicit canary
@@ -646,6 +634,42 @@ def create_retraining_task(
                         grade=grade,
                         min_grade=retrain_cfg.auto_deploy_min_grade,
                     )
+
+                # Mark pending feedback only when we have the actual model
+                # version ID that consumed it. Failed/unregistered runs stay
+                # pending so they can feed the next successful retrain.
+                if feedback_manager is not None:
+                    try:
+                        pending = feedback_manager.get_pending_for_training(
+                            camera_id=camera_id,
+                        )
+                        if pending and model_version_for_feedback and result_complete:
+                            ids = [fb.feedback_id for fb in pending]
+                            count = feedback_manager.mark_batch_processed(
+                                ids, model_version_for_feedback,
+                            )
+                            logger.info(
+                                "retraining.feedback_processed",
+                                camera_id=camera_id,
+                                feedback_count=count,
+                                model_version_id=model_version_for_feedback,
+                            )
+                        elif pending:
+                            logger.warning(
+                                "retraining.feedback_not_processed",
+                                camera_id=camera_id,
+                                feedback_count=len(pending),
+                                reason=(
+                                    "model_version_id unavailable"
+                                    if result_complete else "training incomplete"
+                                ),
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "retraining.feedback_processing_failed",
+                            camera_id=camera_id,
+                            error=str(e),
+                        )
 
             except Exception as e:
                 logger.error(
@@ -724,3 +748,51 @@ def _cleanup_empty_dirs(base_dir: Path) -> None:
                 child.rmdir()  # Only succeeds if empty
             except OSError:
                 pass  # Not empty, skip
+
+
+def _delete_recording_paths(recording_paths: list[str]) -> int:
+    """Remove alert recording directories returned by database cleanup."""
+    deleted = 0
+    cleanup_roots: set[Path] = set()
+    for recording_path in recording_paths:
+        try:
+            path = Path(recording_path)
+            if path.is_dir():
+                cleanup_roots.add(path.parents[2] if len(path.parents) > 2 else path.parent)
+                shutil.rmtree(path)
+                deleted += 1
+            elif path.exists():
+                cleanup_roots.add(path.parent)
+                path.unlink()
+                deleted += 1
+        except OSError as e:
+            logger.warning(
+                "maintenance.recording_delete_failed",
+                path=recording_path,
+                error=str(e),
+            )
+
+    for root in cleanup_roots:
+        _cleanup_empty_dirs(root)
+    return deleted
+
+
+def _delete_old_alerts_with_recording_paths(database, days: int) -> tuple[int, list[str], list[str]]:
+    """Call delete_old_alerts with recording path support when available."""
+    delete_fn = database.delete_old_alerts
+    try:
+        from inspect import signature
+
+        supports_recording_paths = "include_recording_paths" in signature(delete_fn).parameters
+    except (TypeError, ValueError):
+        supports_recording_paths = False
+
+    if supports_recording_paths:
+        count, image_paths, recording_paths = delete_fn(
+            days=days,
+            include_recording_paths=True,
+        )
+        return count, image_paths, recording_paths
+
+    count, image_paths = delete_fn(days=days)
+    return count, image_paths, []

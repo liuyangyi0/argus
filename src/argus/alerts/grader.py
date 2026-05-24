@@ -443,7 +443,7 @@ class AlertGrader:
 
             # Alert aggregation: assign event_group_id
             event_group_id, event_group_count = self._assign_event_group(
-                zone_key, alert_id, time.time(),
+                zone_key, alert_id, now,
             )
 
             alert = Alert(
@@ -578,7 +578,7 @@ class AlertGrader:
             alert_id = f"ALT-{self._node_id}-{ts}-{seq:04d}-{rnd:04x}"
 
             event_group_id, event_group_count = self._assign_event_group(
-                zone_key, alert_id, time.time(),
+                zone_key, alert_id, now,
             )
 
             alert = Alert(

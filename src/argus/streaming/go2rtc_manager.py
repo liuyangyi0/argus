@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,19 @@ import httpx
 import structlog
 
 logger = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class CameraSourceResolution:
+    """Resolved camera source split between persisted config and runtime input."""
+
+    camera_id: str
+    original_source: str
+    original_protocol: str
+    runtime_source: str
+    runtime_protocol: str
+    stream_name: str
+    go2rtc_managed: bool
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -481,61 +495,111 @@ class Go2RTCManager:
 
 
 # ---------------------------------------------------------------------------
-# Single entry point for application bootstrap (shared by __main__ and the
-# dashboard lifespan). Keeps the "start + register cameras + USB redirect"
-# sequence in one place so the two startup paths cannot drift apart.
+# Camera source resolution
 # ---------------------------------------------------------------------------
 
 
-def start_and_register_cameras(manager: Go2RTCManager, cameras: list) -> None:
-    """Start go2rtc (if not already running) and register every camera.
+def _camera_attr(camera: Any, name: str, default: Any = None) -> Any:
+    if isinstance(camera, dict):
+        return camera.get(name, default)
+    return getattr(camera, name, default)
 
-    Mutates ``cameras`` in place: for USB and GigE cameras, rewrites
-    ``source`` and ``protocol`` so the pipeline reads the RTSP re-stream
-    exposed by go2rtc instead of opening the device directly.
 
-    GigE cameras use go2rtc's ``exec:`` source with RTSP pushback
-    (``{output}`` placeholder).  Because go2rtc rejects exec sources
-    added via REST API, they are included in the initial config file
-    passed to ``manager.start()``.
+def _gige_capture_script(camera: Any) -> str | None:
+    gige = _camera_attr(camera, "gige")
+    if isinstance(gige, dict):
+        return gige.get("capture_script")
+    return getattr(gige, "capture_script", None)
 
-    Idempotent: safe to call multiple times. ``Go2RTCManager.start()``
-    short-circuits when the process is already running, and registering a
-    stream that already exists is a no-op on the go2rtc side.
-    """
-    # Collect GigE exec sources — must be in initial config, not via API.
+
+def _source_resolution(
+    *,
+    camera_id: str,
+    source: str,
+    protocol: str,
+    rtsp_url: str | None,
+) -> CameraSourceResolution:
+    runtime_source = source
+    runtime_protocol = protocol
+    if protocol == "usb" and rtsp_url:
+        runtime_source = rtsp_url
+        runtime_protocol = "rtsp"
+
+    return CameraSourceResolution(
+        camera_id=camera_id,
+        original_source=source,
+        original_protocol=protocol,
+        runtime_source=runtime_source,
+        runtime_protocol=runtime_protocol,
+        stream_name=camera_id,
+        go2rtc_managed=rtsp_url is not None and protocol in {"rtsp", "usb", "gige"},
+    )
+
+
+def register_go2rtc_stream(
+    manager: Go2RTCManager,
+    camera: Any,
+) -> CameraSourceResolution | None:
+    """Register one camera stream without mutating the persisted config object."""
+    registry = _manager_stream_registry(manager)
+    return registry.ensure_registered(camera, start_if_needed=False)
+
+
+def _gige_initial_streams(cameras: list) -> dict[str, str]:
+    """Collect GigE exec sources that must be present in go2rtc's config file."""
     initial_streams: dict[str, str] = {}
     for cam in cameras:
-        cam_id = getattr(cam, "camera_id", None)
-        protocol = getattr(cam, "protocol", None) or "rtsp"
-        if cam_id and protocol == "gige":
-            script = getattr(getattr(cam, "gige", None), "capture_script", None)
-            if script:
-                initial_streams[cam_id] = gige_to_go2rtc_source(script)
-
-    if not manager.running:
-        manager.start(initial_streams=initial_streams or None)
-
-    for cam in cameras:
-        cam_id = getattr(cam, "camera_id", None)
-        source = getattr(cam, "source", None)
-        protocol = getattr(cam, "protocol", None) or "rtsp"
-        if not cam_id or not source:
+        cam_id = str(_camera_attr(cam, "camera_id", "") or "")
+        protocol = str(_camera_attr(cam, "protocol", None) or "rtsp")
+        if not cam_id or protocol != "gige":
             continue
-        rtsp_url = manager.register_camera(cam_id, source, protocol)
-        if rtsp_url and protocol == "usb":
-            logger.info(
-                "go2rtc.device_redirect",
-                camera_id=cam_id,
-                protocol=protocol,
-                original=source,
-                redirected=rtsp_url,
-            )
-            cam.source = rtsp_url
-            cam.protocol = "rtsp"
-        elif rtsp_url and protocol == "gige":
-            logger.info(
-                "go2rtc.gige_preview_registered",
-                camera_id=cam_id,
-                preview_url=rtsp_url,
-            )
+        script = _gige_capture_script(cam)
+        if script:
+            initial_streams[cam_id] = gige_to_go2rtc_source(script)
+    return initial_streams
+
+
+def _manager_stream_registry(manager: Go2RTCManager):
+    """Return the manager-scoped desired stream registry."""
+    from argus.streaming.stream_registry import StreamRegistry
+
+    namespace = getattr(manager, "__dict__", None)
+    registry = (
+        namespace.get("_stream_registry")
+        if isinstance(namespace, dict)
+        else getattr(manager, "_stream_registry", None)
+    )
+    if not isinstance(registry, StreamRegistry):
+        registry = StreamRegistry(manager)
+        setattr(manager, "_stream_registry", registry)
+    return registry
+
+
+def register_go2rtc_streams(
+    manager: Go2RTCManager,
+    cameras: list,
+) -> dict[str, CameraSourceResolution]:
+    """Start go2rtc if needed and register camera streams without mutation."""
+    registry = _manager_stream_registry(manager)
+    registry.declare_plan(cameras)
+    return registry.reconcile(start_if_needed=True)
+
+
+def runtime_camera_config(camera: Any, resolution: CameraSourceResolution) -> Any:
+    """Return a runtime camera config copy using the resolved capture source."""
+    from argus.streaming.stream_registry import runtime_camera_config as _runtime_config
+
+    return _runtime_config(camera, resolution)
+
+
+def start_and_register_cameras(
+    manager: Go2RTCManager,
+    cameras: list,
+) -> dict[str, CameraSourceResolution]:
+    """Compatibility wrapper for the shared go2rtc bootstrap sequence.
+
+    This no longer mutates ``CameraConfig.source`` or ``CameraConfig.protocol``.
+    Call ``runtime_camera_config()`` with the returned resolution when a
+    pipeline needs a go2rtc runtime source.
+    """
+    return register_go2rtc_streams(manager, cameras)

@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import time
 
 import cv2
 import structlog
 from fastapi import APIRouter, Request
-from fastapi.responses import Response, StreamingResponse
 from argus.dashboard.api_response import (
     api_conflict,
     api_forbidden,
@@ -21,6 +19,10 @@ from argus.dashboard.api_response import (
 )
 from argus.dashboard.auth import require_role
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
+from argus.streaming.preview_gateway import (
+    PreviewGateway,
+    probe_source_blocking as _probe_source_blocking,
+)
 
 logger = structlog.get_logger()
 
@@ -39,68 +41,34 @@ _MAX_CONCURRENT_STREAMS = 8
 _stream_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_STREAMS)
 
 
-from typing import Callable
-
-
-def _mjpeg_response(request: Request, grab_fn: Callable[[], bytes | None]) -> Response:
-    """Build a StreamingResponse for an MJPEG stream, or 503 if overloaded.
-
-    ``grab_fn`` is a **synchronous** callable executed in the dedicated MJPEG
-    thread pool.  It should return JPEG bytes or ``None`` to skip a frame.
-    """
-    if _stream_semaphore.locked():
-        return Response(status_code=503, content="Too many active streams")
-
-    async def _generate():
-        loop = asyncio.get_running_loop()
-        async with _stream_semaphore:
-            start = time.monotonic()
-            try:
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    if time.monotonic() - start > _MAX_STREAM_DURATION:
-                        break
-                    jpeg = await loop.run_in_executor(_STREAM_EXECUTOR, grab_fn)
-                    if jpeg is not None:
-                        yield (
-                            b"--frame\r\n"
-                            b"Content-Type: image/jpeg\r\n\r\n"
-                            + jpeg
-                            + b"\r\n"
-                        )
-                    await asyncio.sleep(0.2)
-            except asyncio.CancelledError:
-                pass
-
-    return StreamingResponse(
-        _generate(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
+def _preview_gateway(request: Request) -> PreviewGateway:
+    return PreviewGateway.for_request(
+        request,
+        stream_executor=_STREAM_EXECUTOR,
+        stream_semaphore=_stream_semaphore,
+        max_stream_duration=_MAX_STREAM_DURATION,
+        source_probe=_probe_source_blocking,
     )
+
+
+def _active_orchestrator(request: Request):
+    """Return the orchestrator only when its stream manager is already running."""
+    orchestrator = getattr(request.app.state, "camera_orchestrator", None)
+    if orchestrator is None:
+        return None
+    registry = getattr(orchestrator, "stream_registry", None)
+    manager = getattr(registry, "manager", None)
+    if manager is not None and getattr(manager, "running", False):
+        return orchestrator
+    return None
 
 
 router = APIRouter()
 
 
-def _ensure_go2rtc_stream(request: Request, cam_config) -> None:
-    """Register camera with go2rtc and redirect USB sources to RTSP re-stream.
-
-    Delegates to ``Go2RTCManager.register_camera()`` for protocol dispatch.
-    Safe to call multiple times — skips if already redirected or go2rtc unavailable.
-    """
-    go2rtc = getattr(request.app.state, "go2rtc", None)
-    if go2rtc is None or not go2rtc.running:
-        return
-
-    # Already redirected by a previous call
-    if cam_config.protocol == "rtsp" and cam_config.source.startswith("rtsp://127.0.0.1"):
-        return
-
-    original_protocol = cam_config.protocol
-    rtsp_url = go2rtc.register_camera(cam_config.camera_id, cam_config.source, cam_config.protocol)
-    if rtsp_url and original_protocol == "usb":
-        cam_config.source = rtsp_url
-        cam_config.protocol = "rtsp"
+def _ensure_go2rtc_stream(request: Request, cam_config):
+    """Register camera with go2rtc without mutating the persisted config."""
+    return _preview_gateway(request).ensure_stream_registered(cam_config)
 
 
 _STAGE_IDS = ["capture", "review", "training", "deploy", "inference"]
@@ -108,17 +76,8 @@ _STAGE_NAMES = {"capture": "采集", "review": "基线审查", "training": "训�
 
 
 def _find_camera_config(request: Request, camera_id: str):
-    """Find camera config from the running manager first, then persisted app config."""
-    camera_manager = getattr(request.app.state, "camera_manager", None)
-    if camera_manager is not None:
-        config = next((c for c in getattr(camera_manager, "_cameras", []) if c.camera_id == camera_id), None)
-        if config is not None:
-            return config
-
-    app_config = getattr(request.app.state, "config", None)
-    if app_config is not None:
-        return next((c for c in getattr(app_config, "cameras", []) if c.camera_id == camera_id), None)
-    return None
+    """Find the persisted/original camera config for API responses."""
+    return _preview_gateway(request).find_camera_config(camera_id)
 
 
 def _get_region_info(request: Request, region_id: int | None) -> dict:
@@ -335,8 +294,12 @@ async def delete_camera(request: Request, camera_id: str):
         return api_not_found(f"摄像头 {camera_id} 不存在")
 
     # Stop the camera if it's running
+    orchestrator = _active_orchestrator(request)
     try:
-        await asyncio.to_thread(camera_manager.stop_camera, camera_id)
+        if orchestrator is not None:
+            await asyncio.to_thread(orchestrator.stop, camera_id)
+        else:
+            await asyncio.to_thread(camera_manager.stop_camera, camera_id)
     except Exception:
         logger.debug("camera.stop_on_delete_failed", camera_id=camera_id, exc_info=True)
 
@@ -347,13 +310,21 @@ async def delete_camera(request: Request, camera_id: str):
     if hasattr(camera_manager, "remove_camera_config"):
         camera_manager.remove_camera_config(camera_id)
 
-    # Remove go2rtc stream registration
-    go2rtc = getattr(request.app.state, "go2rtc_manager", None)
-    if go2rtc and hasattr(go2rtc, "remove_stream"):
+    # Remove go2rtc stream declaration/registration
+    stream_registry = getattr(request.app.state, "stream_registry", None)
+    stream_removed = False
+    if stream_registry is not None and hasattr(stream_registry, "undeclare_camera"):
         try:
-            go2rtc.remove_stream(camera_id)
+            stream_removed = bool(stream_registry.undeclare_camera(cam_config))
         except Exception:
-            logger.debug("camera.go2rtc_stream_remove_failed", camera_id=camera_id, exc_info=True)
+            logger.debug("camera.stream_undeclare_failed", camera_id=camera_id, exc_info=True)
+    if not stream_removed:
+        go2rtc = getattr(request.app.state, "go2rtc", None)
+        if go2rtc and hasattr(go2rtc, "remove_stream"):
+            try:
+                go2rtc.remove_stream(camera_id)
+            except Exception:
+                logger.debug("camera.go2rtc_stream_remove_failed", camera_id=camera_id, exc_info=True)
 
     # Persist to config file
     config_path = getattr(request.app.state, "config_path", None)
@@ -487,13 +458,16 @@ async def start_camera(request: Request, camera_id: str):
     if not camera_manager:
         return api_unavailable("不可用")
 
-    # Register with go2rtc and redirect USB → RTSP before pipeline opens the device
-    cam_config = next((c for c in camera_manager._cameras if c.camera_id == camera_id), None)
-    if cam_config:
-        _ensure_go2rtc_stream(request, cam_config)
-
     try:
-        success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
+        orchestrator = _active_orchestrator(request)
+        if orchestrator is not None:
+            success = await asyncio.to_thread(orchestrator.start, camera_id)
+        else:
+            # Register with go2rtc before the pipeline opens exclusive USB devices.
+            cam_config = next((c for c in camera_manager._cameras if c.camera_id == camera_id), None)
+            if cam_config:
+                _ensure_go2rtc_stream(request, cam_config)
+            success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
     except RuntimeError:
         return api_unavailable("服务正在关闭")
     if success:
@@ -508,58 +482,12 @@ async def stop_camera(request: Request, camera_id: str):
     if not camera_manager:
         return api_unavailable("不可用")
 
-    await asyncio.to_thread(camera_manager.stop_camera, camera_id)
+    orchestrator = _active_orchestrator(request)
+    if orchestrator is not None:
+        await asyncio.to_thread(orchestrator.stop, camera_id)
+    else:
+        await asyncio.to_thread(camera_manager.stop_camera, camera_id)
     return api_success({}, headers=htmx_toast_headers("摄像头已停止"))
-
-
-def _probe_source_blocking(source: str | int, timeout: float = 5.0) -> dict:
-    """Open a video source with a hard timeout and grab one frame.
-
-    Returns {ok, latency_ms, resolution, error}. Used by the test-connection
-    endpoints (痛点 8: surface camera reachability before saving) without
-    spinning up a full pipeline.
-    """
-    import threading
-
-    result: dict = {"ok": False}
-    start = time.monotonic()
-
-    def _worker() -> None:
-        cap = None
-        try:
-            # CAP_DSHOW for USB indices, default backend for URLs/files
-            if isinstance(source, int):
-                cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-            else:
-                # Convert pure-int strings to int for USB index detection
-                try:
-                    cap = cv2.VideoCapture(int(source), cv2.CAP_DSHOW)
-                except ValueError:
-                    cap = cv2.VideoCapture(str(source))
-            if not cap.isOpened():
-                result["error"] = "open_failed"
-                return
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                result["error"] = "no_frame"
-                return
-            result["ok"] = True
-            result["resolution"] = [int(frame.shape[1]), int(frame.shape[0])]
-        except Exception as e:  # noqa: BLE001
-            result["error"] = f"{type(e).__name__}: {e}"
-        finally:
-            if cap is not None:
-                cap.release()
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        # cv2.VideoCapture doesn't honour SIGTERM mid-open on Windows; we
-        # report timeout and let the thread clean up in the background.
-        result.setdefault("error", "timeout")
-    result["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
-    return result
 
 
 @router.post("/{camera_id}/test-connection")
@@ -567,12 +495,17 @@ async def test_camera_connection(request: Request, camera_id: str):
     """痛点 8: live-probe an already-configured camera in 5 seconds."""
     if not require_role(request, "admin", "engineer"):
         return api_forbidden("权限不足")
-    cam_config = _find_camera_config(request, camera_id)
+    gateway = _preview_gateway(request)
+    cam_config = gateway.find_camera_config(camera_id)
     if cam_config is None:
         return api_not_found(f"摄像头 {camera_id} 不存在")
 
+    running_probe = gateway.probe_running_camera_connection(camera_id)
+    if running_probe is not None:
+        return api_success(running_probe)
+
     try:
-        result = await asyncio.to_thread(_probe_source_blocking, cam_config.source, 5.0)
+        result = await gateway.probe_source(cam_config.source, 5.0)
     except RuntimeError:
         return api_unavailable("服务正在关闭")
     return api_success(result)
@@ -594,7 +527,7 @@ async def test_camera_connection_draft(request: Request):
     if source is None or source == "":
         return api_validation_error("source 不能为空")
     try:
-        result = await asyncio.to_thread(_probe_source_blocking, source, 5.0)
+        result = await _preview_gateway(request).probe_source(source, 5.0)
     except RuntimeError:
         return api_unavailable("服务正在关闭")
     return api_success(result)
@@ -606,11 +539,27 @@ async def usb_devices(request: Request):
     import asyncio
 
     camera_manager = getattr(request.app.state, "camera_manager", None)
-    # Indices already occupied by running USB cameras
+    app_config = getattr(request.app.state, "config", None)
+    # Indices already configured or occupied by USB cameras. Running USB
+    # cameras are usually owned by go2rtc, so probing them here can steal or
+    # disturb the exclusive device handle.
     in_use: set[int] = set()
+    configured_cameras = []
+    if app_config is not None:
+        configured_cameras.extend(getattr(app_config, "cameras", []) or [])
     if camera_manager:
-        for cfg in camera_manager._cameras:
-            if cfg.protocol == "usb" and cfg.camera_id in camera_manager._threads:
+        for cfg in getattr(camera_manager, "_cameras", []) or []:
+            if not any(existing.camera_id == cfg.camera_id for existing in configured_cameras):
+                configured_cameras.append(cfg)
+    for cfg in configured_cameras:
+        if getattr(cfg, "protocol", None) == "usb":
+            try:
+                in_use.add(int(getattr(cfg, "source", "")))
+            except (ValueError, TypeError):
+                pass
+    if camera_manager:
+        for cfg in getattr(camera_manager, "_cameras", []) or []:
+            if cfg.protocol == "usb" and cfg.camera_id in getattr(camera_manager, "_threads", {}):
                 try:
                     in_use.add(int(cfg.source))
                 except (ValueError, TypeError):
@@ -776,72 +725,19 @@ def camera_runner_snapshot(request: Request, camera_id: str):
 @router.get("/{camera_id}/snapshot")
 def camera_snapshot(request: Request, camera_id: str):
     """Get the latest frame from a camera as a JPEG image."""
-    camera_manager = request.app.state.camera_manager
-    if not camera_manager:
-        return Response(status_code=503)
-
-    frame = camera_manager.get_latest_frame(camera_id)
-    if frame is None:
-        return Response(status_code=404)
-
-    _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-    return Response(
-        content=buffer.tobytes(),
-        media_type="image/jpeg",
-        headers={"Cache-Control": "no-cache, no-store"},
-    )
+    return _preview_gateway(request).snapshot_response(camera_id)
 
 
 @router.get("/{camera_id}/stream")
 async def camera_stream(request: Request, camera_id: str):
     """MJPEG stream of the latest frames from a camera (~5 FPS)."""
-    camera_manager = request.app.state.camera_manager
-    if not camera_manager:
-        return Response(status_code=503)
-
-    def _grab():
-        frame = camera_manager.get_latest_frame(camera_id)
-        if frame is None:
-            return None
-        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        return buf.tobytes()
-
-    return _mjpeg_response(request, _grab)
+    return _preview_gateway(request).latest_frame_stream_response(request, camera_id)
 
 
 @router.get("/{camera_id}/heatmap-stream")
 async def camera_heatmap_stream(request: Request, camera_id: str):
     """MJPEG stream with anomaly heatmap overlay."""
-    camera_manager = request.app.state.camera_manager
-    if not camera_manager:
-        return Response(status_code=503)
-
-    import numpy as np
-
-    def _grab():
-        frame = camera_manager.get_latest_frame(camera_id)
-        if frame is None:
-            return None
-        anomaly_map = camera_manager.get_latest_anomaly_map(camera_id)
-        if anomaly_map is not None:
-            h, w = frame.shape[:2]
-            heatmap = cv2.resize(anomaly_map, (w, h))
-            heatmap_u8 = np.clip(heatmap * 255, 0, 255).astype(np.uint8)
-            heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
-            mask = heatmap > 0.3
-            blended = frame.copy()
-            if mask.any():
-                mask_3ch = np.stack([mask] * 3, axis=-1)
-                blended = np.where(
-                    mask_3ch,
-                    cv2.addWeighted(frame, 0.6, heatmap_color, 0.4, 0),
-                    frame,
-                )
-            frame = blended
-        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        return buf.tobytes()
-
-    return _mjpeg_response(request, _grab)
+    return _preview_gateway(request).heatmap_stream_response(request, camera_id)
 
 
 # ── Video Wall API (UX v2 §2) ──

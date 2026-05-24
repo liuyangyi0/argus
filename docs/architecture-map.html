@@ -1,0 +1,1220 @@
+<!-- architecture-map.html -->
+
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Argus 架构图</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --surface: #ffffff;
+      --surface-soft: #f0f5f7;
+      --text: #18212f;
+      --muted: #627083;
+      --line: #d8e0e7;
+      --line-strong: #9cafbd;
+      --blue: #2563eb;
+      --cyan: #0f8ea8;
+      --green: #198754;
+      --amber: #b7791f;
+      --red: #c2414a;
+      --violet: #7759c7;
+      --ink: #243447;
+      --shadow: 0 18px 48px rgba(31, 41, 55, 0.11);
+      --radius: 8px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        linear-gradient(180deg, rgba(15, 142, 168, 0.08), rgba(255, 255, 255, 0) 420px),
+        var(--bg);
+      font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .page {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .hero {
+      padding: 46px 0 22px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.6fr);
+      gap: 28px;
+      align-items: end;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    h1 {
+      font-size: 34px;
+      line-height: 1.2;
+      font-weight: 780;
+      letter-spacing: 0;
+    }
+
+    .hero p {
+      max-width: 760px;
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .meta-panel {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.74);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .meta-title {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .meta-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .meta-item {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      min-width: 0;
+      color: var(--ink);
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      flex: 0 0 9px;
+      margin-top: 7px;
+      border-radius: 50%;
+      background: var(--cyan);
+    }
+
+    .dot.blue { background: var(--blue); }
+    .dot.green { background: var(--green); }
+    .dot.amber { background: var(--amber); }
+
+    .toc-wrap {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      padding: 10px 0 14px;
+      background: linear-gradient(180deg, rgba(246, 247, 249, 0.96), rgba(246, 247, 249, 0.82));
+      backdrop-filter: blur(10px);
+    }
+
+    .toc {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.85);
+    }
+
+    .toc a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      padding: 6px 12px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      color: var(--ink);
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .toc a:hover {
+      border-color: var(--line);
+      background: var(--surface-soft);
+    }
+
+    main {
+      padding: 22px 0 64px;
+    }
+
+    section {
+      padding: 42px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(260px, 0.5fr);
+      gap: 24px;
+      align-items: end;
+      margin-bottom: 22px;
+    }
+
+    h2 {
+      font-size: 25px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    .section-head p {
+      color: var(--muted);
+    }
+
+    .note {
+      border-left: 4px solid var(--amber);
+      background: #fff7e6;
+      padding: 12px 14px;
+      border-radius: 0 var(--radius) var(--radius) 0;
+      color: #5a3e12;
+      font-weight: 650;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 3px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .tag.blue { border-color: rgba(37, 99, 235, 0.28); color: var(--blue); }
+    .tag.cyan { border-color: rgba(15, 142, 168, 0.28); color: var(--cyan); }
+    .tag.green { border-color: rgba(25, 135, 84, 0.28); color: var(--green); }
+    .tag.amber { border-color: rgba(183, 121, 31, 0.28); color: var(--amber); }
+    .tag.red { border-color: rgba(194, 65, 74, 0.28); color: var(--red); }
+    .tag.violet { border-color: rgba(119, 89, 199, 0.28); color: var(--violet); }
+
+    .diagram {
+      width: 100%;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow-x: auto;
+    }
+
+    .diagram-title {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 18px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .diagram-title strong {
+      color: var(--text);
+      font-size: 16px;
+    }
+
+    .function-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(190px, 1fr));
+      gap: 14px;
+      min-width: 860px;
+    }
+
+    .feature {
+      min-height: 170px;
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--cyan);
+      border-radius: var(--radius);
+      background: #fff;
+    }
+
+    .feature.blue { border-top-color: var(--blue); }
+    .feature.green { border-top-color: var(--green); }
+    .feature.amber { border-top-color: var(--amber); }
+    .feature.red { border-top-color: var(--red); }
+    .feature.violet { border-top-color: var(--violet); }
+
+    .feature h3 {
+      font-size: 18px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    .feature ul,
+    .entity ul {
+      margin: 10px 0 0;
+      padding: 0;
+      list-style: none;
+      color: var(--muted);
+    }
+
+    .feature li,
+    .entity li {
+      padding: 5px 0;
+      border-top: 1px solid rgba(216, 224, 231, 0.7);
+      overflow-wrap: anywhere;
+    }
+
+    .feature li:first-child,
+    .entity li:first-child {
+      border-top: 0;
+    }
+
+    .stack {
+      display: grid;
+      gap: 16px;
+      min-width: 900px;
+    }
+
+    .layer {
+      display: grid;
+      grid-template-columns: 138px minmax(0, 1fr);
+      gap: 16px;
+      align-items: stretch;
+    }
+
+    .layer-label {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 80px;
+      padding: 12px;
+      border-radius: var(--radius);
+      background: #e8eef2;
+      color: var(--ink);
+      font-weight: 800;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }
+
+    .layer-body {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
+      gap: 12px;
+    }
+
+    .node {
+      position: relative;
+      min-height: 80px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      overflow-wrap: anywhere;
+    }
+
+    .node::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 4px;
+      border-radius: var(--radius) 0 0 var(--radius);
+      background: var(--cyan);
+    }
+
+    .node.blue::before { background: var(--blue); }
+    .node.green::before { background: var(--green); }
+    .node.amber::before { background: var(--amber); }
+    .node.red::before { background: var(--red); }
+    .node.violet::before { background: var(--violet); }
+
+    .node strong {
+      display: block;
+      font-size: 15px;
+      line-height: 1.3;
+    }
+
+    .node span {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .lane {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(132px, 1fr));
+      align-items: stretch;
+      gap: 10px;
+      min-width: 1120px;
+    }
+
+    .flow-step {
+      position: relative;
+      min-height: 122px;
+      padding: 14px 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      overflow-wrap: anywhere;
+    }
+
+    .flow-step:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      right: -9px;
+      top: 50%;
+      width: 10px;
+      height: 10px;
+      border-top: 2px solid var(--line-strong);
+      border-right: 2px solid var(--line-strong);
+      transform: translateY(-50%) rotate(45deg);
+      background: var(--surface);
+      z-index: 2;
+    }
+
+    .flow-step .num {
+      display: inline-grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--surface-soft);
+      color: var(--ink);
+      font-weight: 800;
+      font-size: 12px;
+    }
+
+    .flow-step h3 {
+      margin-top: 10px;
+      font-size: 15px;
+      line-height: 1.3;
+    }
+
+    .flow-step p {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .rail-note {
+      margin-top: 16px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      min-width: 720px;
+    }
+
+    .rail-note .node {
+      min-height: auto;
+    }
+
+    .loop {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 12px;
+      min-width: 860px;
+      align-items: stretch;
+    }
+
+    .loop-card {
+      position: relative;
+      min-height: 136px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      overflow-wrap: anywhere;
+    }
+
+    .loop-card:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      right: -9px;
+      top: 50%;
+      width: 10px;
+      height: 10px;
+      border-top: 2px solid var(--line-strong);
+      border-right: 2px solid var(--line-strong);
+      transform: translateY(-50%) rotate(45deg);
+      background: var(--surface);
+      z-index: 2;
+    }
+
+    .loop-card h3 {
+      color: var(--ink);
+      font-size: 15px;
+    }
+
+    .loop-card p {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .loop-back {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border: 1px dashed var(--line-strong);
+      border-radius: var(--radius);
+      background: #f7faf9;
+      color: var(--green);
+      font-weight: 750;
+      min-width: 860px;
+    }
+
+    .db-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(205px, 1fr));
+      gap: 14px;
+      min-width: 980px;
+    }
+
+    .entity {
+      min-height: 184px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .entity h3 {
+      padding: 12px 14px;
+      background: var(--surface-soft);
+      color: var(--ink);
+      font-size: 15px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .entity-body {
+      padding: 12px 14px 14px;
+    }
+
+    code {
+      padding: 2px 5px;
+      border: 1px solid rgba(216, 224, 231, 0.8);
+      border-radius: 5px;
+      background: #f7fafc;
+      color: #1f4e79;
+      font-family: Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+      overflow-wrap: anywhere;
+    }
+
+    .relations {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+      min-width: 860px;
+    }
+
+    .relation {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 34px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      overflow-wrap: anywhere;
+    }
+
+    .relation .arrow {
+      display: grid;
+      place-items: center;
+      min-height: 28px;
+      color: var(--line-strong);
+      font-weight: 900;
+      font-size: 18px;
+    }
+
+    .source-list {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(160px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .source-list a {
+      display: block;
+      min-height: 52px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      color: var(--ink);
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .source-list span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    footer {
+      padding: 22px 0 44px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    @media (max-width: 980px) {
+      .page {
+        width: min(100% - 24px, 1180px);
+      }
+
+      .hero-grid,
+      .section-head {
+        grid-template-columns: 1fr;
+      }
+
+      .function-grid,
+      .stack,
+      .lane,
+      .loop,
+      .loop-back,
+      .db-grid,
+      .relations,
+      .rail-note {
+        min-width: 0;
+      }
+
+      .function-grid,
+      .layer-body,
+      .rail-note,
+      .loop,
+      .db-grid,
+      .relations,
+      .source-list {
+        grid-template-columns: 1fr;
+      }
+
+      .layer {
+        grid-template-columns: 1fr;
+      }
+
+      .layer-label {
+        min-height: auto;
+        justify-content: flex-start;
+        text-align: left;
+      }
+
+      .lane {
+        grid-template-columns: 1fr;
+      }
+
+      .flow-step:not(:last-child)::after,
+      .loop-card:not(:last-child)::after {
+        left: 50%;
+        right: auto;
+        top: auto;
+        bottom: -9px;
+        transform: translateX(-50%) rotate(135deg);
+      }
+
+      .relation {
+        grid-template-columns: 1fr;
+      }
+
+      .relation .arrow {
+        transform: rotate(90deg);
+      }
+    }
+
+    @media print {
+      body {
+        background: #fff;
+      }
+
+      .toc-wrap {
+        position: static;
+      }
+
+      .diagram,
+      .meta-panel {
+        box-shadow: none;
+      }
+
+      section {
+        page-break-inside: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="page hero">
+    <div class="hero-grid">
+      <div>
+        <h1>Argus 架构图</h1>
+        <p>
+          这是一份面向工程沟通和产品理解的静态架构地图。阅读顺序按功能、运行架构、核心数据流、训练闭环和数据库逻辑关系逐层展开。
+        </p>
+        <div class="legend" aria-label="图例">
+          <span class="tag cyan">前端与操作台</span>
+          <span class="tag blue">后端 API</span>
+          <span class="tag green">检测与训练</span>
+          <span class="tag amber">存储与审计</span>
+          <span class="tag red">告警与降级</span>
+          <span class="tag violet">可选增强</span>
+        </div>
+      </div>
+      <aside class="meta-panel" aria-label="文档元信息">
+        <div class="meta-title">Document Facts</div>
+        <div class="meta-list">
+          <div class="meta-item"><span class="dot cyan"></span><span>类型：独立静态 HTML，不接入 Vue 路由。</span></div>
+          <div class="meta-item"><span class="dot blue"></span><span>依据：当前代码、README 与 <code>docs/architecture.md</code>。</span></div>
+          <div class="meta-item"><span class="dot green"></span><span>范围：单节点边缘部署、Dashboard、检测、训练、存储。</span></div>
+          <div class="meta-item"><span class="dot amber"></span><span>核验日期：2026-05-23。</span></div>
+        </div>
+      </aside>
+    </div>
+  </header>
+
+  <div class="toc-wrap">
+    <nav class="page toc" aria-label="页面目录">
+      <a href="#features">功能图</a>
+      <a href="#runtime">系统架构图</a>
+      <a href="#pipeline">核心数据流图</a>
+      <a href="#training">训练闭环图</a>
+      <a href="#database">数据库逻辑关联图</a>
+      <a href="#sources">核验来源</a>
+    </nav>
+  </div>
+
+  <main class="page">
+    <section id="features">
+      <div class="section-head">
+        <div>
+          <h2>功能图</h2>
+          <p>先从用户能看到和操作的能力入手，建立对系统边界的第一层认知。</p>
+        </div>
+        <div class="note">Replay 是从告警进入的参数化页面，不在主侧栏中独立展示。</div>
+      </div>
+
+      <div class="diagram">
+        <div class="diagram-title">
+          <strong>Dashboard 功能入口</strong>
+          <span>Vue 3 + Pinia + Ant Design Vue</span>
+        </div>
+        <div class="function-grid">
+          <article class="feature cyan">
+            <h3>Overview 总览</h3>
+            <ul>
+              <li>值班视图与状态聚合</li>
+              <li>摄像头健康与运行摘要</li>
+              <li>实时 WebSocket 状态提示</li>
+            </ul>
+          </article>
+          <article class="feature blue">
+            <h3>Cameras 摄像头</h3>
+            <ul>
+              <li>摄像头清单与详情</li>
+              <li>播放、诊断、控制</li>
+              <li>区域编辑与快照</li>
+            </ul>
+          </article>
+          <article class="feature red">
+            <h3>Alerts 告警</h3>
+            <ul>
+              <li>告警列表、筛选、分级</li>
+              <li>处理状态与反馈</li>
+              <li>快照、热力图、回放入口</li>
+            </ul>
+          </article>
+          <article class="feature amber">
+            <h3>Reports 报表</h3>
+            <ul>
+              <li>告警统计与趋势</li>
+              <li>摄像头分布分析</li>
+              <li>模型与健康汇总</li>
+            </ul>
+          </article>
+          <article class="feature green">
+            <h3>Models 模型</h3>
+            <ul>
+              <li>基线版本管理</li>
+              <li>训练作业与评估</li>
+              <li>模型注册、发布、A/B 对比</li>
+              <li>标注队列与阈值预览</li>
+            </ul>
+          </article>
+          <article class="feature violet">
+            <h3>System 系统</h3>
+            <ul>
+              <li>配置、备份、审计</li>
+              <li>降级事件与模块开关</li>
+              <li>分类器、分割器、跨相机</li>
+              <li>用户与区域管理</li>
+            </ul>
+          </article>
+          <article class="feature red">
+            <h3>Replay 单机位回放</h3>
+            <ul>
+              <li>由 <code>/replay/:alertId</code> 进入</li>
+              <li>录像、信号轨、参考帧</li>
+              <li>面向告警取证</li>
+            </ul>
+          </article>
+          <article class="feature blue">
+            <h3>Storyboard 多机位回放</h3>
+            <ul>
+              <li>由 <code>/replay/:alertId/storyboard</code> 进入</li>
+              <li>关联摄像头与同组告警</li>
+              <li>辅助跨相机复盘</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="runtime">
+      <div class="section-head">
+        <div>
+          <h2>系统架构图</h2>
+          <p>这一层展示运行时对象如何组合：前端是操作门面，FastAPI 是 API 和状态注入层，摄像头检测与后台任务长期运行。</p>
+        </div>
+        <div class="note">默认是单节点边缘部署：SQLite 和文件目录都在本机。</div>
+      </div>
+
+      <div class="diagram">
+        <div class="diagram-title">
+          <strong>单节点运行拓扑</strong>
+          <span><code>python -m argus --config configs/default.yaml</code></span>
+        </div>
+        <div class="stack">
+          <div class="layer">
+            <div class="layer-label">用户与浏览器</div>
+            <div class="layer-body">
+              <div class="node cyan"><strong>Vue SPA</strong><span>主路由、模型页、系统页、回放页。</span></div>
+              <div class="node cyan"><strong>API Client</strong><span>Axios 请求 <code>/api/*</code>。</span></div>
+              <div class="node cyan"><strong>WebSocket Client</strong><span>订阅 health、alerts、tasks、degradation 等主题。</span></div>
+              <div class="node cyan"><strong>Video Player</strong><span>优先使用 go2rtc WebRTC/MSE/HLS，失败时回退。</span></div>
+            </div>
+          </div>
+
+          <div class="layer">
+            <div class="layer-label">FastAPI Dashboard</div>
+            <div class="layer-body">
+              <div class="node blue"><strong>REST API</strong><span>摄像头、告警、模型、训练、回放、系统管理。</span></div>
+              <div class="node blue"><strong>ConnectionManager</strong><span>janus 队列桥接同步线程和异步 WebSocket。</span></div>
+              <div class="node blue"><strong>ASGI Middleware</strong><span>安全头、限流、认证；避免 BaseHTTPMiddleware。</span></div>
+              <div class="node blue"><strong>app.state</strong><span>注入数据库、CameraManager、go2rtc、任务、降级、回放存储。</span></div>
+            </div>
+          </div>
+
+          <div class="layer">
+            <div class="layer-label">实时检测</div>
+            <div class="layer-body">
+              <div class="node green"><strong>CameraManager</strong><span>每路摄像头独立线程、状态汇总、共享模型资源，刷新发布运行态。</span></div>
+              <div class="node green"><strong>DetectionPipeline</strong><span>区域、预筛、YOLO、异常、Simplex、告警分级。</span></div>
+              <div class="node violet"><strong>go2rtc</strong><span>视频代理；USB 摄像头由它独占并转 RTSP。</span></div>
+              <div class="node red"><strong>AlertDispatcher</strong><span>告警落库、WebSocket 推送、Webhook、音频消息。</span></div>
+            </div>
+          </div>
+
+          <div class="layer">
+            <div class="layer-label">后台子系统</div>
+            <div class="layer-body">
+              <div class="node green"><strong>TaskScheduler</strong><span>维护任务、清理、备份、训练作业轮询。</span></div>
+              <div class="node green"><strong>ActiveLearningSampler</strong><span>从帧事件挑选不确定样本。</span></div>
+              <div class="node red"><strong>Health & Degradation</strong><span>健康汇总、降级状态、全局降级条。</span></div>
+              <div class="node amber"><strong>Audit & Backup</strong><span>审计日志、数据库和配置备份。</span></div>
+            </div>
+          </div>
+
+          <div class="layer">
+            <div class="layer-label">本地存储</div>
+            <div class="layer-body">
+              <div class="node amber"><strong>SQLite</strong><span><code>data/db/argus.db</code> 保存业务元数据。</span></div>
+              <div class="node amber"><strong>data/alerts</strong><span>告警快照、热力图和证据文件。</span></div>
+              <div class="node amber"><strong>data/recordings</strong><span>告警回放与连续录像片段。</span></div>
+              <div class="node amber"><strong>data/models / baselines</strong><span>模型、导出产物、基线版本和训练数据。</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pipeline">
+      <div class="section-head">
+        <div>
+          <h2>核心数据流图</h2>
+          <p>摄像头帧进入后，检测链先降吞吐压力，再做主异常检测和安全通道校验，最终进入告警、存储和回放链路。</p>
+        </div>
+        <div class="note">Simplex、健康检查、漂移检测、环形缓冲是默认运行路径的一部分。</div>
+      </div>
+
+      <div class="diagram">
+        <div class="diagram-title">
+          <strong>实时检测与告警路径</strong>
+          <span>每路摄像头一个 Pipeline / Runner</span>
+        </div>
+        <div class="lane">
+          <div class="flow-step">
+            <span class="num">1</span>
+            <h3>Camera Source</h3>
+            <p>RTSP、USB、视频文件。USB 默认先交给 go2rtc 接管。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">2</span>
+            <h3>CameraCapture</h3>
+            <p>采集、重连、帧率控制、状态统计。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">3</span>
+            <h3>Zone Mask</h3>
+            <p>应用 include / exclude 区域，多区域独立评估。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">4</span>
+            <h3>MOG2 Prefilter</h3>
+            <p>跳过无变化帧；heartbeat 与异常锁定可绕过预筛。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">5</span>
+            <h3>YOLO Filter</h3>
+            <p>人员或目标类别过滤，支持 tracking 和 SAHI。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">6</span>
+            <h3>Anomaly Detector</h3>
+            <p>PatchCore、EfficientAD、Dinomaly 等异常模型路径。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">7</span>
+            <h3>Simplex Safety</h3>
+            <p>低依赖传统 CV 安全通道，作为主模型旁路信号。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">8</span>
+            <h3>AlertGrader</h3>
+            <p>融合分数、证据、区域优先级和传感器 multiplier。</p>
+          </div>
+        </div>
+
+        <div class="rail-note">
+          <div class="node red"><strong>AlertDispatcher</strong><span>保存快照和热力图，写入 <code>alerts</code> 表，推送含证据状态的 WebSocket。</span></div>
+          <div class="node amber"><strong>Alert Ring Buffer</strong><span>触发后先固化前后帧，再生成回放录像和 <code>alert_recordings</code> 记录。</span></div>
+          <div class="node green"><strong>EventBus</strong><span>发布 <code>FrameAnalyzed</code> / <code>AlertRaised</code>，驱动主动学习和诊断。</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="training">
+      <div class="section-head">
+        <div>
+          <h2>训练闭环图</h2>
+          <p>训练不是同步请求内完成，而是从采样、反馈、标注进入训练作业队列，再通过模型注册和发布管线影响线上检测。</p>
+        </div>
+        <div class="note">训练完成的候选模型不会直接上线，需要经过模型发布阶段。</div>
+      </div>
+
+      <div class="diagram">
+        <div class="diagram-title">
+          <strong>Baseline / Labeling / Feedback 到 Production Model</strong>
+          <span>异步后台任务 + 发布管线</span>
+        </div>
+        <div class="loop">
+          <article class="loop-card">
+            <span class="tag green">Data</span>
+            <h3>Baseline Versions</h3>
+            <p>基线图片按 camera、zone、version 管理，支持 Draft、Verified、Active、Retired 状态。</p>
+          </article>
+          <article class="loop-card">
+            <span class="tag violet">Samples</span>
+            <h3>Labeling & Feedback</h3>
+            <p>主动学习、误报反馈和人工标注进入标注队列或反馈队列。</p>
+          </article>
+          <article class="loop-card">
+            <span class="tag green">Jobs</span>
+            <h3>Training Jobs</h3>
+            <p>API 创建任务，确认后由调度器定期消费 queued 作业。</p>
+          </article>
+          <article class="loop-card">
+            <span class="tag amber">Registry</span>
+            <h3>Model Registry</h3>
+            <p>记录模型版本、hash、路径、阈值、backbone 引用和发布阶段。</p>
+          </article>
+          <article class="loop-card">
+            <span class="tag red">Release</span>
+            <h3>Release Pipeline</h3>
+            <p>Candidate 经 Shadow、Canary、Production 流转；Shadow 旁路评分不告警，Canary 成为该摄像头主模型。</p>
+          </article>
+        </div>
+        <div class="loop-back">
+          stage transition 提交后由 CameraManager 刷新 shadow runner、canary primary routing 和 production 热载；Production Model 生效后，新的告警、反馈和不确定样本继续进入下一轮训练闭环。
+        </div>
+      </div>
+    </section>
+
+    <section id="database">
+      <div class="section-head">
+        <div>
+          <h2>数据库逻辑关联图</h2>
+          <p>当前 ORM 模型没有声明 <code>ForeignKey</code> 或 <code>relationship</code>，下图展示的是业务键上的逻辑关联，而不是数据库强约束。</p>
+        </div>
+        <div class="note">新增 ORM 字段时仍需同步检查 <code>_AUTO_MIGRATIONS</code>。</div>
+      </div>
+
+      <div class="diagram">
+        <div class="diagram-title">
+          <strong>主要表与业务键</strong>
+          <span>SQLite + SQLAlchemy ORM</span>
+        </div>
+        <div class="db-grid">
+          <article class="entity">
+            <h3>alerts</h3>
+            <div class="entity-body">
+              <span class="tag red">告警事实表</span>
+              <ul>
+                <li><code>alert_id</code> 唯一告警编号</li>
+                <li><code>camera_id</code> / <code>zone_id</code></li>
+                <li><code>event_group_id</code></li>
+                <li><code>model_version_id</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>alert_recordings</h3>
+            <div class="entity-body">
+              <span class="tag amber">回放证据</span>
+              <ul>
+                <li><code>alert_id</code></li>
+                <li><code>linked_alert_id</code></li>
+                <li><code>camera_id</code></li>
+                <li><code>recording_path</code></li>
+                <li>告警删除与保留清理同步移除</li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>inference_records</h3>
+            <div class="entity-body">
+              <span class="tag green">推理审计</span>
+              <ul>
+                <li><code>camera_id</code> / <code>zone_id</code></li>
+                <li><code>alert_id</code></li>
+                <li><code>model_version_id</code></li>
+                <li><code>deployment_stage</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>feedback_entries</h3>
+            <div class="entity-body">
+              <span class="tag violet">反馈队列</span>
+              <ul>
+                <li><code>feedback_id</code></li>
+                <li><code>alert_id</code></li>
+                <li><code>model_version_at_time</code></li>
+                <li><code>trained_into</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>labeling_queue</h3>
+            <div class="entity-body">
+              <span class="tag violet">人工标注</span>
+              <ul>
+                <li><code>camera_id</code> / <code>zone_id</code></li>
+                <li><code>frame_path</code></li>
+                <li><code>model_version_id</code></li>
+                <li><code>trained_into</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>baseline_versions</h3>
+            <div class="entity-body">
+              <span class="tag green">基线版本</span>
+              <ul>
+                <li><code>camera_id</code> / <code>zone_id</code></li>
+                <li><code>version</code></li>
+                <li><code>state</code></li>
+                <li><code>group_id</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>training_jobs</h3>
+            <div class="entity-body">
+              <span class="tag green">训练任务</span>
+              <ul>
+                <li><code>job_id</code></li>
+                <li><code>camera_id</code> / <code>zone_id</code></li>
+                <li><code>base_model_version</code></li>
+                <li><code>model_version_id</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>models</h3>
+            <div class="entity-body">
+              <span class="tag amber">模型注册表</span>
+              <ul>
+                <li><code>model_version_id</code> 唯一版本</li>
+                <li><code>camera_id</code></li>
+                <li><code>backbone_version_id</code></li>
+                <li><code>stage</code> / <code>is_active</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>training_records</h3>
+            <div class="entity-body">
+              <span class="tag green">训练结果</span>
+              <ul>
+                <li><code>camera_id</code> / <code>zone_id</code></li>
+                <li><code>baseline_version</code></li>
+                <li><code>baseline_versions</code></li>
+                <li><code>model_path</code> / <code>export_path</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>backbones</h3>
+            <div class="entity-body">
+              <span class="tag amber">骨干网络</span>
+              <ul>
+                <li><code>backbone_version_id</code></li>
+                <li><code>training_job_id</code></li>
+                <li><code>camera_ids_used</code></li>
+                <li><code>is_active</code></li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>users / audit_logs</h3>
+            <div class="entity-body">
+              <span class="tag blue">身份与审计</span>
+              <ul>
+                <li><code>users.username</code></li>
+                <li><code>audit_logs.user</code></li>
+                <li><code>action</code> / <code>target_id</code></li>
+                <li>系统页查询与导出</li>
+              </ul>
+            </div>
+          </article>
+
+          <article class="entity">
+            <h3>regions / segments</h3>
+            <div class="entity-body">
+              <span class="tag blue">管理辅助</span>
+              <ul>
+                <li><code>regions.name</code></li>
+                <li><code>regions.owner</code></li>
+                <li>摄像头和区域配置主要仍在 YAML</li>
+                <li>用于系统页区域管理</li>
+              </ul>
+            </div>
+          </article>
+        </div>
+
+        <div class="relations" aria-label="业务键关联">
+          <div class="relation">
+            <div><code>alerts.alert_id</code></div>
+            <div class="arrow">-></div>
+            <div><code>alert_recordings.alert_id</code> / <code>feedback_entries.alert_id</code></div>
+          </div>
+          <div class="relation">
+            <div><code>alerts.model_version_id</code></div>
+            <div class="arrow">-></div>
+            <div><code>models.model_version_id</code></div>
+          </div>
+          <div class="relation">
+            <div><code>training_jobs.model_version_id</code></div>
+            <div class="arrow">-></div>
+            <div><code>models.model_version_id</code> / <code>feedback_entries.trained_into</code></div>
+          </div>
+          <div class="relation">
+            <div><code>models.backbone_version_id</code></div>
+            <div class="arrow">-></div>
+            <div><code>backbones.backbone_version_id</code></div>
+          </div>
+          <div class="relation">
+            <div><code>camera_id</code> + <code>zone_id</code></div>
+            <div class="arrow">-></div>
+            <div><code>alerts</code>、<code>baselines</code>、<code>training_jobs</code>、<code>inference_records</code></div>
+          </div>
+          <div class="relation">
+            <div><code>audit_logs.user</code></div>
+            <div class="arrow">-></div>
+            <div><code>users.username</code> 逻辑对应，审计保留操作时身份文本</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="sources">
+      <div class="section-head">
+        <div>
+          <h2>核验来源</h2>
+          <p>图中内容应优先以这些文件为准。后续架构变化时，更新对应代码后也要同步更新本页面。</p>
+        </div>
+      </div>
+      <div class="source-list">
+        <a href="../src/argus/__main__.py"><code>src/argus/__main__.py</code><span>启动装配、go2rtc、调度器、CameraManager。</span></a>
+        <a href="../src/argus/dashboard/app.py"><code>src/argus/dashboard/app.py</code><span>FastAPI、路由、WebSocket、app.state。</span></a>
+        <a href="../web/src/router/index.ts"><code>web/src/router/index.ts</code><span>前端主路由与权限元信息。</span></a>
+        <a href="../src/argus/storage/models.py"><code>src/argus/storage/models.py</code><span>ORM 表、枚举、业务键字段。</span></a>
+        <a href="./architecture.md"><code>docs/architecture.md</code><span>当前实现架构说明。</span></a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page">
+    Argus 架构图网页。此页面为静态文档，不新增公共 API、路由、数据库字段或 TypeScript 类型。
+  </footer>
+</body>
+</html>

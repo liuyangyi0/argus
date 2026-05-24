@@ -314,6 +314,7 @@ class TrainingJobExecutor:
         camera_id = job.camera_id
         if not camera_id:
             raise ValueError("camera_id is required for anomaly_head jobs")
+        zone_id = job.zone_id or "default"
 
         # Resolve backbone checkpoint
         backbone_checkpoint = None
@@ -345,8 +346,7 @@ class TrainingJobExecutor:
 
         train_kwargs = dict(
             camera_id=camera_id,
-            #zone_id=job.zone_id or "default",
-            zone_id="default", # 基线采集图片默认存储路径是 baselines/{camera_id}/default，所以这里默认使用 default zone
+            zone_id=zone_id,
             model_type=job.model_type or params.get("model_type", "patchcore"),
             image_size=params.get("image_size", 256),
             export_format=params.get("export_format", "openvino"),
@@ -378,17 +378,21 @@ class TrainingJobExecutor:
 
         model_version_id = result.model_version_id
         if model_version_id is None and self._registry is not None and result.model_path:
-            baseline_dir = self._baselines_dir / camera_id / (job.zone_id or "default")
+            baseline_dir = self._baselines_dir / camera_id / zone_id
             model_version_id = self._registry.register(
                 model_path=result.model_path,
                 baseline_dir=baseline_dir,
                 camera_id=camera_id,
                 model_type=job.model_type or params.get("model_type", "patchcore"),
                 training_params={
+                    "zone_id": zone_id,
                     "image_size": params.get("image_size", 256),
                     "export_format": params.get("export_format", "openvino"),
                     "quantization": params.get("quantization", "fp16"),
                     "job_id": job.job_id,
+                    "labeling_entry_ids": _coerce_int_list(
+                        params.get("labeling_entry_ids")
+                    ),
                 },
             )
 
@@ -406,7 +410,7 @@ class TrainingJobExecutor:
         if self._packager and result.model_path:
             try:
                 model_dir = Path(result.model_path)
-                export_dir = self._trainer.exports_dir / camera_id / (job.zone_id or "default")
+                export_dir = self._trainer.exports_dir / camera_id / zone_id
                 calibration_path = model_dir / "calibration.json"
 
                 pkg_path = self._packager.package(
@@ -493,10 +497,13 @@ class TrainingJobExecutor:
             model_version_id=model_version_id,
         )
 
+        self._mark_labeling_entries_trained(job, params, model_version_id)
+
         logger.info(
             "job_executor.head_complete",
             job_id=job.job_id,
             camera_id=camera_id,
+            zone_id=zone_id,
             grade=result.quality_report.grade if result.quality_report else "?",
             version=model_version_id,
         )
@@ -512,3 +519,59 @@ class TrainingJobExecutor:
                 daemon=True,
                 name=f"hot-reload-{camera_id}",
             ).start()
+
+    def _mark_labeling_entries_trained(
+        self,
+        job,
+        params: dict,
+        model_version_id: str | None,
+    ) -> None:
+        """Consume active-learning labels only after a completed model exists."""
+        if not model_version_id:
+            return
+        entry_ids = _coerce_int_list(params.get("labeling_entry_ids"))
+        if not entry_ids:
+            return
+        mark_fn = getattr(self._db, "mark_labeling_trained", None)
+        if not callable(mark_fn):
+            logger.warning(
+                "job_executor.labeling_mark_unavailable",
+                job_id=job.job_id,
+                model_version_id=model_version_id,
+            )
+            return
+        try:
+            count = mark_fn(entry_ids, trained_into=model_version_id)
+            logger.info(
+                "job_executor.labeling_entries_trained",
+                job_id=job.job_id,
+                model_version_id=model_version_id,
+                labeling_count=count,
+            )
+        except Exception as e:
+            logger.warning(
+                "job_executor.labeling_mark_failed",
+                job_id=job.job_id,
+                model_version_id=model_version_id,
+                error=str(e),
+            )
+
+
+def _coerce_int_list(value: object) -> list[int]:
+    """Return a de-duplicated int list from untrusted JSON metadata."""
+    if not isinstance(value, list):
+        return []
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        try:
+            entry_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if entry_id <= 0 or entry_id in seen:
+            continue
+        seen.add(entry_id)
+        ids.append(entry_id)
+    return ids

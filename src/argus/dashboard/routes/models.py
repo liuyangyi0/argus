@@ -31,6 +31,7 @@ from argus.dashboard.model_runtime import (
     get_registry,
     rollback_camera_model,
     sync_active_camera_model,
+    sync_model_release_state,
 )
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.models import ModelRecord, ModelStage, ShadowInferenceLog
@@ -100,6 +101,58 @@ def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
     return pipeline
 
 
+def _expected_runtime_record(request: Request, model: ModelRecord) -> ModelRecord | None:
+    """Return the release-stage record this model should occupy at runtime."""
+    if model.stage == ModelStage.SHADOW.value:
+        getter_name = "get_shadow_model_for_camera"
+    elif model.stage in (ModelStage.CANARY.value, ModelStage.PRODUCTION.value):
+        getter_name = "get_model_for_camera"
+    else:
+        return None
+
+    session_factory = _get_session_factory(request)
+    if session_factory is None:
+        return None
+    try:
+        from argus.anomaly.model_router import ModelRouter
+
+        router = ModelRouter(session_factory=session_factory)
+        getter = getattr(router, getter_name)
+        return getter(model.camera_id)
+    except Exception as exc:  # pragma: no cover - defensive UI metadata
+        logger.warning(
+            "models.runtime_expected_lookup_failed",
+            camera_id=model.camera_id,
+            model_version_id=model.model_version_id,
+            error=str(exc),
+        )
+        return None
+
+
+def _model_runtime_state(request: Request, model: ModelRecord) -> str | None:
+    """Map registry state to the table's applied/waiting/failed UI contract."""
+    expected = _expected_runtime_record(request, model)
+    if expected is None or expected.model_version_id != model.model_version_id:
+        return None
+
+    manager = getattr(request.app.state, "camera_manager", None)
+    pipeline = getattr(manager, "_pipelines", {}).get(model.camera_id) if manager else None
+    if pipeline is None:
+        return "waiting"
+
+    if model.stage == ModelStage.SHADOW.value:
+        getter = getattr(pipeline, "get_shadow_runner_version", None)
+        current_shadow = getter() if callable(getter) else getattr(
+            getattr(pipeline, "_shadow_runner", None),
+            "shadow_version_id",
+            None,
+        )
+        return "applied" if current_shadow == model.model_version_id else "failed"
+
+    current_primary = getattr(pipeline, "_model_version_id", None)
+    return "applied" if current_primary == model.model_version_id else "failed"
+
+
 @router.get("/status")
 def models_status(request: Request) -> JSONResponse:
     """Aggregate health status of every detector across all cameras.
@@ -137,7 +190,13 @@ async def list_models(request: Request, camera_id: str | None = None):
 
     models = registry.list_models(camera_id=camera_id)
     return api_success({
-        "models": [m.to_dict() for m in models],
+        "models": [
+            {
+                **m.to_dict(),
+                "runtime_state": _model_runtime_state(request, m),
+            }
+            for m in models
+        ],
         "total": len(models),
     })
 
@@ -339,6 +398,19 @@ async def promote_model(request: Request, version_id: str):
         return api_validation_error("target_stage and triggered_by are required")
 
     try:
+        if target_stage == ModelStage.RETIRED.value:
+            registry = _get_registry(request)
+            if registry is None:
+                return api_unavailable("数据库不可用")
+            existing = registry.get_by_version_id(version_id)
+            if existing is None:
+                return api_not_found(f"Model not found: {version_id}")
+            if existing.stage == ModelStage.PRODUCTION.value and existing.is_active:
+                return api_validation_error(
+                    "Active production models cannot be retired directly; "
+                    "promote a replacement to production instead."
+                )
+
         record = pipeline.transition(
             model_version_id=version_id,
             target_stage=target_stage,
@@ -346,13 +418,19 @@ async def promote_model(request: Request, version_id: str):
             reason=body.get("reason"),
             canary_camera_id=body.get("canary_camera_id"),
         )
+        runtime_synced, runtime_state, attempted_runtime_sync = sync_model_release_state(
+            request,
+            record.camera_id,
+        )
+        if (
+            not attempted_runtime_sync
+            and target_stage == ModelStage.PRODUCTION.value
+        ):
+            runtime_synced = sync_active_camera_model(request, record.camera_id)
         return api_success({
             "model": record.to_dict(),
-            "runtime_synced": (
-                sync_active_camera_model(request, record.camera_id)
-                if target_stage == ModelStage.PRODUCTION.value
-                else False
-            ),
+            "runtime_synced": runtime_synced,
+            "runtime_state": runtime_state,
         })
     except ValueError as e:
         return api_validation_error(str(e))
@@ -371,6 +449,10 @@ async def retire_model(request: Request, version_id: str):
     if pipeline is None:
         return api_unavailable("数据库不可用")
 
+    registry = _get_registry(request)
+    if registry is None:
+        return api_unavailable("数据库不可用")
+
     try:
         body = await request.json()
     except Exception:
@@ -379,14 +461,29 @@ async def retire_model(request: Request, version_id: str):
     triggered_by = body.get("triggered_by", "system")
 
     try:
+        existing = registry.get_by_version_id(version_id)
+        if existing is None:
+            return api_not_found(f"Model not found: {version_id}")
+        if existing.stage == ModelStage.PRODUCTION.value and existing.is_active:
+            return api_validation_error(
+                "Active production models cannot be retired directly; "
+                "promote a replacement to production instead."
+            )
+
         record = pipeline.transition(
             model_version_id=version_id,
             target_stage=ModelStage.RETIRED.value,
             triggered_by=triggered_by,
             reason=body.get("reason", "manual retirement"),
         )
+        runtime_synced, runtime_state, _ = sync_model_release_state(
+            request,
+            record.camera_id,
+        )
         return api_success({
             "model": record.to_dict(),
+            "runtime_synced": runtime_synced,
+            "runtime_state": runtime_state,
         })
     except ValueError as e:
         return api_not_found(str(e))

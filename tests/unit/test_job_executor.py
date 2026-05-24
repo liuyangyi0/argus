@@ -26,6 +26,7 @@ from argus.anomaly.trainer import TrainingResult, TrainingStatus
 from argus.storage.database import Database
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.models import (
+    LabelingQueueRecord,
     ModelStage,
     TrainingJobRecord,
     TrainingJobStatus,
@@ -92,6 +93,27 @@ def _make_trainer(model_dir: Path, exports_dir: Path) -> MagicMock:
     return trainer
 
 
+def _save_labeled_entries(db: Database, tmp_path: Path, count: int = 5) -> list[int]:
+    """Create labeled queue rows that are still consumable by training."""
+    entry_ids: list[int] = []
+    for i in range(count):
+        frame = tmp_path / f"frame_{i}.jpg"
+        frame.write_bytes(b"jpg")
+        record = db.save_labeling_entry(
+            LabelingQueueRecord(
+                camera_id="cam_01",
+                zone_id="zone_a",
+                frame_number=i,
+                frame_path=str(frame),
+                anomaly_score=0.4,
+                entropy=0.8,
+            )
+        )
+        labeled = db.label_entry(record.id, label="anomaly", labeled_by="tester")
+        entry_ids.append(labeled.id)
+    return entry_ids
+
+
 def test_dataset_selection_drives_multi_version_training(
     db, registry, model_artifacts, tmp_path,
 ):
@@ -155,6 +177,129 @@ def test_dataset_selection_drives_multi_version_training(
     )
     assert kwargs["image_count_override"] == 6
     assert kwargs["baseline_versions_label"] == "v001+v003 / 6 frames"
+
+
+def test_non_default_zone_used_for_training_and_registration(
+    db, model_artifacts, tmp_path,
+):
+    """A queued anomaly_head job must train and hash the requested zone."""
+    model_dir, _ = model_artifacts
+    baselines_root = tmp_path / "baselines"
+    zone_baseline = baselines_root / "cam_01" / "zone_a"
+    zone_baseline.mkdir(parents=True)
+    (zone_baseline / "img.png").write_bytes(b"px")
+
+    job = TrainingJobRecord(
+        job_id="job-zone-a",
+        job_type=TrainingJobType.ANOMALY_HEAD.value,
+        camera_id="cam_01",
+        zone_id="zone_a",
+        model_type="patchcore",
+        trigger_type="manual",
+        status=TrainingJobStatus.QUEUED.value,
+        hyperparameters=json.dumps({"skip_baseline_validation": True}),
+    )
+    db.save_training_job(job)
+
+    registry = MagicMock()
+    registry.register.return_value = "cam_01-patchcore-zone-a"
+    trainer = _make_trainer(model_dir, tmp_path / "exports")
+    executor = TrainingJobExecutor(
+        database=db,
+        trainer=trainer,
+        model_registry=registry,
+        baselines_dir=baselines_root,
+        model_packages_dir=tmp_path / "packages",
+    )
+
+    executor.execute(job.job_id)
+
+    assert trainer.train.call_args.kwargs["zone_id"] == "zone_a"
+    assert registry.register.call_args.kwargs["baseline_dir"] == zone_baseline
+
+
+def test_completed_job_consumes_labeling_entries_with_model_version(
+    db, model_artifacts, tmp_path,
+):
+    """Active-learning labels are consumed only by the completed model ID."""
+    model_dir, _ = model_artifacts
+    entry_ids = _save_labeled_entries(db, tmp_path)
+    job = TrainingJobRecord(
+        job_id="job-labels-complete",
+        job_type=TrainingJobType.ANOMALY_HEAD.value,
+        camera_id="cam_01",
+        zone_id="zone_a",
+        model_type="patchcore",
+        trigger_type="drift_suggested",
+        status=TrainingJobStatus.QUEUED.value,
+        hyperparameters=json.dumps({
+            "skip_baseline_validation": True,
+            "labeling_entry_ids": entry_ids,
+        }),
+    )
+    db.save_training_job(job)
+
+    trainer = MagicMock()
+    trainer.exports_dir = tmp_path / "exports"
+    trainer.train.return_value = TrainingResult(
+        status=TrainingStatus.COMPLETE,
+        model_path=str(model_dir),
+        duration_seconds=1.0,
+        model_version_id="model-version-123",
+    )
+    executor = TrainingJobExecutor(
+        database=db,
+        trainer=trainer,
+        baselines_dir=tmp_path / "baselines",
+        model_packages_dir=tmp_path / "packages",
+    )
+
+    executor.execute(job.job_id)
+
+    consumed = db.get_labeled_entries(trained_into="model-version-123")
+    assert {entry.id for entry in consumed} == set(entry_ids)
+
+
+def test_failed_job_leaves_labeling_entries_reusable(
+    db, model_artifacts, tmp_path,
+):
+    """Failed training must not consume labels attached to the job."""
+    entry_ids = _save_labeled_entries(db, tmp_path)
+    job = TrainingJobRecord(
+        job_id="job-labels-failed",
+        job_type=TrainingJobType.ANOMALY_HEAD.value,
+        camera_id="cam_01",
+        zone_id="zone_a",
+        model_type="patchcore",
+        trigger_type="drift_suggested",
+        status=TrainingJobStatus.QUEUED.value,
+        hyperparameters=json.dumps({
+            "skip_baseline_validation": True,
+            "labeling_entry_ids": entry_ids,
+        }),
+    )
+    db.save_training_job(job)
+
+    trainer = MagicMock()
+    trainer.exports_dir = tmp_path / "exports"
+    trainer.train.return_value = TrainingResult(
+        status=TrainingStatus.FAILED,
+        error="training exploded",
+        duration_seconds=1.0,
+    )
+    executor = TrainingJobExecutor(
+        database=db,
+        trainer=trainer,
+        baselines_dir=tmp_path / "baselines",
+        model_packages_dir=tmp_path / "packages",
+    )
+
+    executor.execute(job.job_id)
+
+    updated = db.get_training_job(job.job_id)
+    assert updated.status == TrainingJobStatus.FAILED.value
+    reusable = db.get_labeled_entries(camera_id="cam_01", trained_into="")
+    assert {entry.id for entry in reusable} == set(entry_ids)
 
 
 def test_dataset_selection_camera_mismatch_fails_job(

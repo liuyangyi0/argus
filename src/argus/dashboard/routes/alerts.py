@@ -73,7 +73,8 @@ def _is_safe_path(file_path: str, alerts_dir: Path) -> bool:
     try:
         resolved = Path(file_path).resolve()
         safe_root = alerts_dir.resolve()
-        return str(resolved).startswith(str(safe_root))
+        resolved.relative_to(safe_root)
+        return True
     except (ValueError, OSError):
         return False
 
@@ -206,6 +207,9 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     JSON response: {success, severity, handling_policy, require_confirmation,
                     require_detail_view, next_actions}
     """
+    if not require_permission(request, "handle_alerts"):
+        return api_forbidden("权限不足")
+
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
@@ -304,6 +308,9 @@ async def alert_workflow_transition(request: Request, alert_id: str):
 @router.post("/bulk-acknowledge")
 async def bulk_acknowledge(request: Request):
     """Bulk acknowledge alerts."""
+    if not require_permission(request, "handle_alerts"):
+        return api_forbidden("权限不足")
+
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
@@ -311,9 +318,10 @@ async def bulk_acknowledge(request: Request):
     data = await request.json()
     alert_ids = data.get("alert_ids", [])
 
+    acknowledged_by = current_username(request)
     count = 0
     for aid in alert_ids:
-        if db.acknowledge_alert(aid, "operator"):
+        if db.acknowledge_alert(aid, acknowledged_by):
             count += 1
 
     audit = getattr(request.app.state, "audit_logger", None)
@@ -334,6 +342,9 @@ async def bulk_acknowledge(request: Request):
 @router.post("/bulk-false-positive")
 async def bulk_false_positive(request: Request):
     """Bulk mark alerts as false positive."""
+    if not require_permission(request, "handle_alerts"):
+        return api_forbidden("权限不足")
+
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
@@ -364,6 +375,9 @@ async def bulk_false_positive(request: Request):
 @router.post("/bulk-delete")
 async def bulk_delete(request: Request):
     """Bulk delete alerts."""
+    if not require_permission(request, "handle_alerts"):
+        return api_forbidden("权限不足")
+
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
@@ -527,10 +541,13 @@ def export_pdf_report(
 @router.post("/{alert_id}/acknowledge")
 def acknowledge_alert(request: Request, alert_id: str):
     """Acknowledge an alert."""
+    if not require_permission(request, "handle_alerts"):
+        return api_forbidden("权限不足")
+
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
-    if db.acknowledge_alert(alert_id, "operator"):
+    if db.acknowledge_alert(alert_id, current_username(request)):
         audit = getattr(request.app.state, "audit_logger", None)
         client_ip = request.client.host if request.client else ""
         if audit:
@@ -610,6 +627,9 @@ def mark_false_positive(request: Request, alert_id: str):
     triggers a false alarm, the feedback is queued for retraining and the
     snapshot is copied to the baseline directory via FeedbackManager.
     """
+    if not require_permission(request, "handle_alerts"):
+        return api_forbidden("权限不足")
+
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
@@ -635,6 +655,9 @@ def mark_false_positive(request: Request, alert_id: str):
 @router.delete("/{alert_id}")
 def delete_alert(request: Request, alert_id: str):
     """Delete a single alert by ID."""
+    if not require_permission(request, "handle_alerts"):
+        return api_forbidden("权限不足")
+
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
@@ -828,13 +851,19 @@ def alerts_json(
     camera_id: str | None = Query(None),
     severity: str | None = Query(None),
     limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     """JSON API for alerts (for external integrations)."""
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
 
-    alerts = db.get_alerts(camera_id=camera_id, severity=severity, limit=limit)
+    alerts = db.get_alerts(
+        camera_id=camera_id,
+        severity=severity,
+        limit=limit,
+        offset=offset,
+    )
 
     # Batch-fetch recording status to avoid N+1 queries
     recording_map: dict = {}

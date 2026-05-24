@@ -38,9 +38,11 @@ from argus.sensors.fusion import SensorFusion
 from argus.streaming.go2rtc_manager import Go2RTCManager
 
 if TYPE_CHECKING:
+    from argus.camera.orchestrator import CameraOrchestrator
     from argus.capture.manager import CameraManager
     from argus.core.health import HealthMonitor
     from argus.dashboard.tasks import TaskManager
+    from argus.streaming.stream_registry import StreamRegistry
     from argus.storage.database import Database
 
 logger = structlog.get_logger()
@@ -88,6 +90,8 @@ def create_app(
     config_path: str | None = None,
     task_manager: object | None = None,
     go2rtc_instance: Go2RTCManager | None = None,
+    stream_registry: StreamRegistry | None = None,
+    camera_orchestrator: CameraOrchestrator | None = None,
     sensor_fusion: SensorFusion | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
@@ -109,6 +113,22 @@ def create_app(
             binary_path=dashboard_config.go2rtc_binary,
         )
 
+    if stream_registry is None and go2rtc is not None:
+        from argus.streaming.stream_registry import StreamRegistry
+
+        stream_registry = StreamRegistry(go2rtc)
+    if go2rtc is not None and stream_registry is not None:
+        setattr(go2rtc, "_stream_registry", stream_registry)
+
+    if (
+        camera_orchestrator is None
+        and camera_manager is not None
+        and stream_registry is not None
+    ):
+        from argus.camera.orchestrator import CameraOrchestrator
+
+        camera_orchestrator = CameraOrchestrator(camera_manager, stream_registry)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Expand the default asyncio thread pool for non-streaming API requests
@@ -125,10 +145,14 @@ def create_app(
         # that path. Dashboard-only mode (tests, standalone) still needs to
         # run the full start-and-register sequence.
         if go2rtc is not None and not go2rtc.running:
-            from argus.streaming.go2rtc_manager import start_and_register_cameras
             cameras_cfg = list(getattr(config, "cameras", []) or [])
             try:
-                await asyncio.to_thread(start_and_register_cameras, go2rtc, cameras_cfg)
+                if stream_registry is not None:
+                    await asyncio.to_thread(stream_registry.reconcile, cameras_cfg)
+                else:
+                    from argus.streaming.go2rtc_manager import register_go2rtc_streams
+
+                    await asyncio.to_thread(register_go2rtc_streams, go2rtc, cameras_cfg)
             except Exception as exc:
                 logger.warning(
                     "go2rtc.start_failed",
@@ -168,7 +192,34 @@ def create_app(
     app.state.task_manager = task_manager
     app.state.ws_manager = ws_manager
     app.state.go2rtc = go2rtc
+    app.state.stream_registry = stream_registry
+    app.state.camera_orchestrator = camera_orchestrator
     app.state.baseline_lifecycle = BaselineLifecycle(database) if database else None
+
+    if (
+        camera_manager is not None
+        and go2rtc is not None
+        and getattr(camera_manager, "_source_resolver", None) is None
+        and hasattr(camera_manager, "set_source_resolver")
+    ):
+        def _dashboard_source_resolver(cam_config):
+            current_go2rtc = getattr(app.state, "go2rtc", None)
+            if current_go2rtc is None or not current_go2rtc.running:
+                return cam_config
+
+            orchestrator = getattr(app.state, "camera_orchestrator", None)
+            if orchestrator is not None:
+                return orchestrator.runtime_camera_config(cam_config)
+
+            registry = getattr(app.state, "stream_registry", None)
+            if registry is None:
+                return cam_config
+            resolution = registry.ensure_registered(cam_config, start_if_needed=False)
+            if resolution is None:
+                return registry.runtime_camera_config(cam_config)
+            return registry.runtime_camera_config(cam_config, resolution)
+
+        camera_manager.set_source_resolver(_dashboard_source_resolver)
 
     # External sensor fusion — generic (camera_id, zone_id) -> multiplier store.
     # When __main__ provides a shared instance, reuse it so the HTTP API and

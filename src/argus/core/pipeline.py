@@ -79,6 +79,7 @@ from argus.core.inference_record import (
 from argus.contracts.validation import validate_anomaly_result
 from argus.core.frame_quality import FrameQualityAssessor, QualityScore
 from argus.core.model_discovery import find_all_models, find_runtime_model, find_runtime_model_in_dir
+from argus.capture.base import CaptureAdapter
 from argus.capture.camera import CameraCapture, FrameData
 from argus.config.schema import AlertConfig, CameraConfig, ClassifierConfig, SegmenterConfig, ZonePriority
 from argus.core.zone_mask import ZoneMaskEngine
@@ -216,6 +217,7 @@ class DetectionPipeline:
         encode_executor: ThreadPoolExecutor | None = None,
         sensor_fusion: object | None = None,
         degradation_publisher: Callable[[str, dict], None] | None = None,
+        capture: CaptureAdapter | None = None,
     ):
         self.camera_config = camera_config
         self._on_alert = on_alert
@@ -230,6 +232,7 @@ class DetectionPipeline:
         self._encode_executor = encode_executor or self._inference_executor
         self._model_version_id = model_version_id
         self._shadow_runner = shadow_runner
+        self._shadow_runner_lock = threading.Lock()
         self._feedback_manager = feedback_manager
         self._recording_store = recording_store
         self._database = database
@@ -367,13 +370,15 @@ class DetectionPipeline:
         # Alert grading
         self._alert_grader = AlertGrader(config=alert_config, sensor_fusion=sensor_fusion)
 
-        # Camera — use GigECapture for GigE Vision cameras, CameraCapture
-        # for everything else (RTSP, USB, file).
-        if camera_config.protocol == "gige":
+        # Camera — use injected capture when provided; otherwise keep the
+        # existing protocol branch for backwards compatibility.
+        if capture is not None:
+            self._camera: CaptureAdapter = capture
+        elif camera_config.protocol == "gige":
             from argus.capture.gige_capture import GigECapture
 
             gige_cfg = camera_config.gige
-            self._camera: CameraCapture | GigECapture = GigECapture(
+            self._camera: CaptureAdapter = GigECapture(
                 camera_id=camera_config.camera_id,
                 source=camera_config.source,
                 fps_target=camera_config.fps_target,
@@ -2057,20 +2062,24 @@ class DetectionPipeline:
 
         self._update_latency(start)
 
-        # Shadow runner: parallel scoring for release pipeline evaluation
-        if self._shadow_runner is not None:
-            try:
-                self._shadow_runner.run_shadow(
-                    frame=frame_data.frame,
-                    production_score=anomaly_result.anomaly_score,
-                    production_alerted=alert is not None,
-                )
-            except Exception as e:
-                logger.warning(
-                    "pipeline.shadow_runner_failed",
-                    camera_id=self.camera_config.camera_id,
-                    error=str(e),
-                )
+        # Shadow runner: parallel scoring for release pipeline evaluation.
+        # Hold the lock while the runner is used so release-stage swaps do not
+        # flush an old runner that is still handling the current frame.
+        with self._shadow_runner_lock:
+            shadow_runner = self._shadow_runner
+            if shadow_runner is not None:
+                try:
+                    shadow_runner.run_shadow(
+                        frame=frame_data.frame,
+                        production_score=anomaly_result.anomaly_score,
+                        production_alerted=alert is not None,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "pipeline.shadow_runner_failed",
+                        camera_id=self.camera_config.camera_id,
+                        error=str(e),
+                    )
 
         # P1-P3: Physics enrichment (speed, trajectory, localization)
         active_tracks_payload: list[dict] = []
@@ -2244,8 +2253,6 @@ class DetectionPipeline:
 
             alert.model_version_id = self._model_version_id
             self.stats.alerts_emitted += 1
-            if self._on_alert:
-                self._on_alert(alert)
 
         diag.alert_emitted = alert is not None
         diag.total_duration_ms = (time.monotonic() - start) * 1000
@@ -2371,6 +2378,9 @@ class DetectionPipeline:
             active_tracks_payload,
         )
 
+        if alert is not None and self._on_alert:
+            self._on_alert(alert)
+
         return alert
 
     def _handle_ring_buffer(
@@ -2385,6 +2395,11 @@ class DetectionPipeline:
         active_tracks: list[dict] | None = None,
     ) -> None:
         """Ring buffer frame append, post-capture flush, and alert solidify."""
+        if alert is not None:
+            alert._has_recording = False
+            alert._recording_status = None
+            alert._recording_evidence_unavailable = False
+
         if self._alert_ring_buffer is None:
             return
 
@@ -2532,11 +2547,17 @@ class DetectionPipeline:
                                 path=rec_path,
                             )
                         except Exception:
+                            alert._recording_evidence_unavailable = True
                             logger.warning(
                                 "pipeline.recording_save_failed",
                                 alert_id=alert.alert_id,
                                 exc_info=True,
                             )
+                    else:
+                        alert._recording_evidence_unavailable = True
+                    if rec_path:
+                        alert._has_recording = True
+                        alert._recording_status = recording.status.value
                     if self._database is not None and rec_path:
                         try:
                             db_rec = AlertRecordingRecord(
@@ -2562,7 +2583,10 @@ class DetectionPipeline:
                                 exc_info=True,
                             )
                     alert._solidified_recording = recording
+                else:
+                    alert._recording_evidence_unavailable = True
             except Exception:
+                alert._recording_evidence_unavailable = True
                 logger.warning(
                     "pipeline.ring_buffer_solidify_failed",
                     camera_id=frame_data.camera_id,
@@ -2838,12 +2862,70 @@ class DetectionPipeline:
         """Update the model version tag used in alerts and inference records."""
         self._model_version_id = model_version_id
 
+    def get_shadow_runner_version(self) -> str | None:
+        """Return the attached shadow runner version, if any."""
+        if not hasattr(self, "_shadow_runner_lock"):
+            self._shadow_runner_lock = threading.Lock()
+        with self._shadow_runner_lock:
+            runner = self._shadow_runner
+        if runner is None:
+            return None
+        return getattr(runner, "shadow_version_id", None)
+
+    def set_shadow_runner(self, shadow_runner: object | None) -> dict:
+        """Atomically replace the shadow runner and flush the old one."""
+        if not hasattr(self, "_shadow_runner_lock"):
+            self._shadow_runner_lock = threading.Lock()
+        new_version = (
+            getattr(shadow_runner, "shadow_version_id", None)
+            if shadow_runner is not None
+            else None
+        )
+        with self._shadow_runner_lock:
+            old_runner = self._shadow_runner
+            old_version = (
+                getattr(old_runner, "shadow_version_id", None)
+                if old_runner is not None
+                else None
+            )
+            if old_version == new_version:
+                return {
+                    "shadow_previous_version": old_version,
+                    "shadow_model_version": new_version,
+                    "shadow_attached": False,
+                    "shadow_detached": False,
+                }
+            self._shadow_runner = shadow_runner
+
+        detached = old_runner is not None and old_version != new_version
+        if old_runner is not None:
+            try:
+                old_runner.flush()
+            except Exception as e:
+                logger.warning(
+                    "pipeline.shadow_flush_failed",
+                    camera_id=self.camera_config.camera_id,
+                    error=str(e),
+                )
+
+        return {
+            "shadow_previous_version": old_version,
+            "shadow_model_version": new_version,
+            "shadow_attached": shadow_runner is not None and old_version != new_version,
+            "shadow_detached": detached and shadow_runner is None,
+        }
+
     def shutdown(self) -> None:
         """Clean up all pipeline resources."""
         self._camera.stop()
-        if self._shadow_runner is not None:
+        if not hasattr(self, "_shadow_runner_lock"):
+            self._shadow_runner_lock = threading.Lock()
+        with self._shadow_runner_lock:
+            shadow_runner = self._shadow_runner
+            self._shadow_runner = None
+        if shadow_runner is not None:
             try:
-                self._shadow_runner.flush()
+                shadow_runner.flush()
             except Exception as e:
                 logger.warning(
                     "pipeline.shadow_flush_failed",

@@ -33,7 +33,7 @@ const emit = defineEmits<{
 }>()
 
 const store = useAlertStore()
-const { alerts, loading, totalAlerts, selectedAlert } = storeToRefs(store)
+const { alerts, loading, totalAlerts, selectedAlert, filters } = storeToRefs(store)
 
 // Bulk selection lives here because the bulk action bar is part of the table region.
 const selectedRowKeys = ref<(string | number)[]>([])
@@ -41,6 +41,17 @@ const tablePagination = reactive({
   current: 1,
   pageSize: 20,
 })
+
+function currentPageParams() {
+  return {
+    limit: tablePagination.pageSize,
+    offset: (tablePagination.current - 1) * tablePagination.pageSize,
+  }
+}
+
+async function fetchCurrentPage() {
+  await store.fetchData(currentPageParams())
+}
 
 // Event group popover state
 const groupAlerts = ref<any[]>([])
@@ -180,7 +191,9 @@ function rowClassName(record: any) {
 const tablePaginationConfig = computed(() => {
   if (selectedAlert.value) {
     return {
-      pageSize: 50,
+      current: tablePagination.current,
+      pageSize: tablePagination.pageSize,
+      total: totalAlerts.value,
       simple: true,
       size: 'small' as const,
     }
@@ -196,22 +209,32 @@ const tablePaginationConfig = computed(() => {
   }
 })
 
-function handleTableChange(pagination: { current?: number; pageSize?: number }) {
-  if (selectedAlert.value) return
-
+async function handleTableChange(pagination: { current?: number; pageSize?: number }) {
   const nextPageSize = pagination.pageSize ?? tablePagination.pageSize
   tablePagination.current = nextPageSize === tablePagination.pageSize
     ? pagination.current ?? tablePagination.current
     : 1
   tablePagination.pageSize = nextPageSize
+  selectedRowKeys.value = []
+  await fetchCurrentPage()
 }
 
 watch(totalAlerts, (total) => {
   const maxPage = Math.max(1, Math.ceil(total / tablePagination.pageSize))
   if (tablePagination.current > maxPage) {
     tablePagination.current = maxPage
+    void fetchCurrentPage()
   }
 })
+
+watch(
+  () => [filters.value.camera_id, filters.value.severity],
+  () => {
+    tablePagination.current = 1
+    selectedRowKeys.value = []
+    void fetchCurrentPage()
+  },
+)
 
 // Prefer the explicit prop, falling back to `selectedAlert` for existing call
 // sites. This guards against the column-width flicker that happened when a

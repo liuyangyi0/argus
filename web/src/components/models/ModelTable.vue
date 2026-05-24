@@ -5,13 +5,13 @@ import {
   Descriptions, Drawer, Steps, Tooltip, Dropdown, Menu, message,
 } from 'ant-design-vue'
 import {
-  ReloadOutlined, CheckOutlined, RollbackOutlined, DeleteOutlined,
+  ReloadOutlined, RollbackOutlined, DeleteOutlined,
   ExperimentOutlined, HistoryOutlined, LoadingOutlined,
   DownOutlined, ExportOutlined, AimOutlined, SwapOutlined,
 } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import {
-  activateModel, rollbackModel, deleteModel,
+  rollbackModel, deleteModel,
   promoteModel, retireModel,
   getStageHistory, getShadowReport,
   reexportModel, recalibrateModel,
@@ -59,7 +59,6 @@ const emit = defineEmits<{
 const router = useRouter()
 
 // ── State ──
-const activatingModel = ref<string | null>(null)
 const promotingModel = ref<string | null>(null)
 const promoteModalVisible = ref(false)
 const promoteForm = ref({ version_id: '', target_stage: '', triggered_by: '', reason: '', canary_camera_id: '' })
@@ -191,28 +190,31 @@ const sortedModels = computed(() => {
   )
 })
 
-// ── Actions: activate / rollback / delete ──
-
-function handleActivate(record: any) {
-  Modal.confirm({
-    title: '确认激活',
-    content: `确定要激活模型版本 ${record.model_version_id} 吗？这将停用该摄像头的其他模型。`,
-    okText: '确认',
-    cancelText: '取消',
-    async onOk() {
-      activatingModel.value = record.model_version_id
-      try {
-        await activateModel(record.model_version_id)
-        message.success(`模型 ${record.model_version_id} 已激活`)
-        emit('changed')
-      } catch (e) {
-        message.error(extractErrorMessage(e, '激活失败'))
-      } finally {
-        activatingModel.value = null
-      }
-    },
-  })
+const RUNTIME_STATE_MAP: Record<string, { text: string; color: string }> = {
+  applied: { text: '已应用到运行时', color: 'success' },
+  waiting: { text: '等待摄像头启动', color: 'processing' },
+  failed: { text: '应用失败', color: 'error' },
 }
+
+function runtimeStateDisplay(record: Record<string, any>): { text: string; color: string } {
+  const state = typeof record.runtime_state === 'string' ? record.runtime_state : ''
+  if (!state) return { text: '-', color: 'default' }
+  return RUNTIME_STATE_MAP[state] || { text: state, color: 'default' }
+}
+
+const promoteModelRecord = computed(() =>
+  props.models.find(m => m.model_version_id === promoteForm.value.version_id) || null
+)
+
+function promoteOwnCameraId(): string {
+  return promoteModelRecord.value?.camera_id || ''
+}
+
+function handlePromoteTargetChange(stage: unknown) {
+  promoteForm.value.canary_camera_id = stage === 'canary' ? promoteOwnCameraId() : ''
+}
+
+// ── Actions: rollback / delete ──
 
 function handleRollback(record: any) {
   Modal.confirm({
@@ -265,7 +267,7 @@ function handlePromote(record: any) {
     target_stage: transitions[0],
     triggered_by: '',
     reason: '',
-    canary_camera_id: '',
+    canary_camera_id: transitions[0] === 'canary' ? record.camera_id : '',
   }
   promoteModalVisible.value = true
 }
@@ -275,9 +277,13 @@ async function submitPromote() {
     message.warning('请输入操作人')
     return
   }
-  if (promoteForm.value.target_stage === 'canary' && !promoteForm.value.canary_camera_id) {
-    message.warning('金丝雀阶段需要选择目标摄像头')
-    return
+  if (promoteForm.value.target_stage === 'canary') {
+    const ownCameraId = promoteOwnCameraId()
+    if (!ownCameraId) {
+      message.warning('金丝雀阶段需要模型所属摄像头')
+      return
+    }
+    promoteForm.value.canary_camera_id = ownCameraId
   }
   promotingModel.value = promoteForm.value.version_id
   try {
@@ -424,7 +430,8 @@ const columns = [
   { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 90 },
   { title: '类型', dataIndex: 'model_type', key: 'model_type', width: 100 },
   { title: '阶段', key: 'stage', width: 240 },
-  { title: '状态', key: 'is_active', width: 80 },
+  { title: '运行态', key: 'runtime_state', width: 100 },
+  { title: '激活', key: 'is_active', width: 80 },
   { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 150 },
   { title: '操作', key: 'action', width: 220 },
 ]
@@ -435,8 +442,8 @@ const columns = [
   <Card size="small" style="margin-bottom: 16px">
     <Steps :current="-1" size="small" style="padding: 4px 0">
       <Steps.Step title="候选" :description="`${stageCounts.candidate} 个模型`" status="process" />
-      <Steps.Step title="影子" :description="`${stageCounts.shadow} 个模型`" :status="stageCounts.shadow > 0 ? 'process' : 'wait'" />
-      <Steps.Step title="金丝雀" :description="`${stageCounts.canary} 个模型`" :status="stageCounts.canary > 0 ? 'process' : 'wait'" />
+      <Steps.Step title="影子" :description="`${stageCounts.shadow} 个 · 旁路评分/不告警`" :status="stageCounts.shadow > 0 ? 'process' : 'wait'" />
+      <Steps.Step title="金丝雀" :description="`${stageCounts.canary} 个 · 该摄像头主模型`" :status="stageCounts.canary > 0 ? 'process' : 'wait'" />
       <Steps.Step title="生产" :description="`${stageCounts.production} 个模型`" :status="stageCounts.production > 0 ? 'finish' : 'wait'" />
     </Steps>
   </Card>
@@ -535,23 +542,14 @@ const columns = [
           <Tag v-if="record.is_active" color="green">已激活</Tag>
           <Tag v-else color="default">未激活</Tag>
         </template>
+        <template v-if="column.key === 'runtime_state'">
+          <Tag :color="runtimeStateDisplay(record).color">{{ runtimeStateDisplay(record).text }}</Tag>
+        </template>
         <template v-if="column.key === 'created_at'">
           {{ record.created_at ? record.created_at.replace('T', ' ').substring(0, 16) : '-' }}
         </template>
         <template v-if="column.key === 'action'">
           <Space :size="4">
-            <!-- Activate -->
-            <Tooltip title="激活此版本">
-              <Button
-                v-if="!record.is_active && (record.stage === 'production' || record.stage === 'retired')"
-                size="small"
-                type="primary"
-                :loading="activatingModel === record.model_version_id"
-                @click="handleActivate(record)"
-              >
-                <template #icon><CheckOutlined /></template>
-              </Button>
-            </Tooltip>
             <!-- Promote -->
             <Tooltip title="推进阶段">
               <Button
@@ -568,7 +566,7 @@ const columns = [
             <!-- Rollback -->
             <Tooltip title="回滚到上一版本">
               <Button
-                v-if="record.is_active"
+                v-if="record.is_active && record.stage !== 'retired'"
                 size="small"
                 danger
                 @click="handleRollback(record)"
@@ -581,26 +579,30 @@ const columns = [
               <Button size="small">更多 <DownOutlined /></Button>
               <template #overlay>
                 <Menu @click="handleMenuClick(record, $event)">
-                  <Menu.Item key="reexport">
-                    <ExportOutlined /> 重新导出
-                  </Menu.Item>
-                  <Menu.Item key="recalibrate">
-                    <AimOutlined /> 重新校准
-                  </Menu.Item>
-                  <Menu.Divider />
-                  <Menu.Item v-if="record.stage === 'shadow' || record.stage === 'canary'" key="shadow-report">
-                    <ExperimentOutlined /> 影子报告
-                  </Menu.Item>
-                  <Menu.Item v-if="record.stage === 'shadow' || record.stage === 'canary'" key="ab-compare">
-                    <SwapOutlined /> A/B 详细对比
-                  </Menu.Item>
+                  <template v-if="record.stage !== 'retired'">
+                    <Menu.Item key="reexport">
+                      <ExportOutlined /> 重新导出
+                    </Menu.Item>
+                    <Menu.Item key="recalibrate">
+                      <AimOutlined /> 重新校准
+                    </Menu.Item>
+                    <Menu.Divider />
+                    <Menu.Item v-if="record.stage === 'shadow' || record.stage === 'canary'" key="shadow-report">
+                      <ExperimentOutlined /> 影子报告
+                    </Menu.Item>
+                    <Menu.Item v-if="record.stage === 'shadow' || record.stage === 'canary'" key="ab-compare">
+                      <SwapOutlined /> A/B 详细对比
+                    </Menu.Item>
+                  </template>
                   <Menu.Item key="stage-history">
                     <HistoryOutlined /> 阶段历史
                   </Menu.Item>
-                  <Menu.Divider />
-                  <Menu.Item v-if="record.stage !== 'retired'" key="retire" danger>
-                    退役
-                  </Menu.Item>
+                  <Menu.Divider v-if="record.stage !== 'retired' || !record.is_active" />
+                  <template v-if="record.stage !== 'retired'">
+                    <Menu.Item key="retire" danger>
+                      退役
+                    </Menu.Item>
+                  </template>
                   <Menu.Item v-if="!record.is_active" key="delete" danger>
                     <DeleteOutlined /> 删除
                   </Menu.Item>
@@ -627,7 +629,7 @@ const columns = [
   >
     <Form layout="vertical" style="margin-top: 16px">
       <Form.Item label="目标阶段">
-        <Select v-model:value="promoteForm.target_stage" style="width: 100%">
+        <Select v-model:value="promoteForm.target_stage" style="width: 100%" @change="handlePromoteTargetChange">
           <Select.Option
             v-for="stage in (VALID_TRANSITIONS[models.find(m => m.model_version_id === promoteForm.version_id)?.stage ?? ''] || [])"
             :key="stage"
@@ -637,13 +639,19 @@ const columns = [
           </Select.Option>
         </Select>
       </Form.Item>
+      <div v-if="promoteForm.target_stage === 'shadow'" class="stage-hint">
+        影子阶段只做旁路评分，不触发告警。
+      </div>
+      <div v-else-if="promoteForm.target_stage === 'canary'" class="stage-hint">
+        金丝雀阶段会成为该摄像头的主模型。
+      </div>
       <Form.Item label="操作人" required>
         <Input v-model:value="promoteForm.triggered_by" placeholder="输入操作人姓名" />
       </Form.Item>
       <Form.Item v-if="promoteForm.target_stage === 'canary'" label="金丝雀摄像头" required>
-        <Select v-model:value="promoteForm.canary_camera_id" placeholder="选择目标摄像头" style="width: 100%">
-          <Select.Option v-for="cam in cameras" :key="cam.camera_id" :value="cam.camera_id">
-            {{ cam.camera_id }}
+        <Select v-model:value="promoteForm.canary_camera_id" style="width: 100%" disabled>
+          <Select.Option v-if="promoteOwnCameraId()" :key="promoteOwnCameraId()" :value="promoteOwnCameraId()">
+            {{ promoteOwnCameraId() }}
           </Select.Option>
         </Select>
       </Form.Item>
@@ -940,5 +948,16 @@ const columns = [
   color: #8890a0;
   font-size: 11px;
   font-family: monospace;
+}
+
+.stage-hint {
+  margin: -4px 0 12px;
+  padding: 8px 10px;
+  border: 1px solid #d6e4ff;
+  border-radius: 6px;
+  background: #f0f5ff;
+  color: #1d39c4;
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>

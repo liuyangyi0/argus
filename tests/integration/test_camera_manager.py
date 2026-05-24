@@ -13,8 +13,10 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import numpy as np
 import pytest
 
+from argus.camera import CameraRuntimePlanner
 from argus.alerts.grader import Alert
 from argus.capture.camera import CameraCapture, CameraState, FrameData
+from argus.capture.factory import CaptureFactory
 from argus.capture.manager import CameraManager, CameraStatus
 from argus.config.schema import (
     AlertConfig,
@@ -230,3 +232,106 @@ class TestCameraManagerIntegration:
 
         result = CameraManager._downgrade_severity(AlertSeverity.INFO, 1)
         assert result == AlertSeverity.INFO
+
+    @patch("argus.capture.manager.DetectionPipeline")
+    @patch("argus.person.detector.get_shared_yolo", return_value=MagicMock())
+    def test_source_resolver_feeds_runtime_copy_but_config_stays_original(
+        self, mock_yolo, MockPipeline
+    ):
+        """Runtime source resolution should not mutate persisted camera config."""
+        original = _cam_config("usb_cam", "USB Camera").model_copy(
+            update={"source": "0", "protocol": "usb"}
+        )
+        runtime_source = "rtsp://127.0.0.1:8554/usb_cam"
+        pipeline_instances = []
+
+        def make_pipeline(**kwargs):
+            instance = MagicMock()
+            instance.camera_config = kwargs["camera_config"]
+            instance.initialize.return_value = True
+            instance.get_detector_status.return_value = MagicMock(mode="loaded")
+            instance.stats = MagicMock(frames_captured=0)
+            instance._camera.state.connected = True
+            instance.run_once.return_value = None
+            instance.get_latest_anomaly_map.return_value = None
+            pipeline_instances.append(instance)
+            return instance
+
+        MockPipeline.side_effect = make_pipeline
+
+        def source_resolver(config: CameraConfig) -> CameraConfig:
+            assert config is original
+            return config.model_copy(
+                update={"source": runtime_source, "protocol": "rtsp"}
+            )
+
+        manager = CameraManager(
+            [original],
+            _alert_config(),
+            source_resolver=source_resolver,
+        )
+
+        try:
+            assert manager.start_all() == ["usb_cam"]
+
+            pipeline_config = MockPipeline.call_args.kwargs["camera_config"]
+            assert pipeline_config is not original
+            assert pipeline_config.source == runtime_source
+            assert pipeline_config.protocol == "rtsp"
+
+            persisted = manager.get_camera_config("usb_cam")
+            assert persisted is original
+            assert persisted.source == "0"
+            assert persisted.protocol == "usb"
+            assert original.source == "0"
+            assert original.protocol == "usb"
+        finally:
+            manager.stop_all()
+
+        assert pipeline_instances
+
+    def test_capture_factory_uses_runtime_detection_input(self):
+        """Factory should open the detection source, not the persisted USB source."""
+        config = _cam_config("usb_cam", "USB Camera").model_copy(
+            update={"source": "0", "protocol": "usb"}
+        )
+        plan = CameraRuntimePlanner.build(config)
+
+        with patch("argus.capture.factory.CameraCapture") as MockCameraCapture:
+            capture = CaptureFactory.create(plan.detection, config)
+
+        assert capture is MockCameraCapture.return_value
+        MockCameraCapture.assert_called_once_with(
+            camera_id="usb_cam",
+            source="rtsp://127.0.0.1:8554/usb_cam",
+            protocol="rtsp",
+            fps_target=config.fps_target,
+            resolution=config.resolution,
+            reconnect_delay=config.reconnect_delay,
+            max_reconnect_attempts=config.max_reconnect_attempts,
+        )
+
+    def test_detection_pipeline_uses_injected_capture(self):
+        """Injected capture adapters should bypass the legacy capture branch."""
+        cam_config = _cam_config("cam_a")
+        alert_config = _alert_config()
+        capture = MagicMock()
+        capture.protocol = "file"
+
+        with (
+            patch("argus.core.pipeline.CameraCapture") as MockCameraCapture,
+            patch("argus.core.pipeline.MOG2PreFilter"),
+            patch("argus.core.pipeline.YOLOObjectDetector"),
+            patch("argus.core.pipeline.AnomalibDetector"),
+            patch("argus.core.pipeline.AlertGrader"),
+            patch("argus.core.pipeline.ZoneMaskEngine"),
+            patch("argus.core.pipeline.METRICS"),
+        ):
+            pipeline = DetectionPipeline(
+                camera_config=cam_config,
+                alert_config=alert_config,
+                capture=capture,
+            )
+
+        assert pipeline._camera is capture
+        MockCameraCapture.assert_not_called()

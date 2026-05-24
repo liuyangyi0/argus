@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from argus.storage.database import Database
     from argus.storage.inference_buffer import InferenceBuffer
     from argus.storage.inference_store import InferenceRecordStore
+    from argus.storage.models import ModelRecord
 
 logger = structlog.get_logger()
 
@@ -83,11 +84,13 @@ class CameraManager:
         event_bus: object | None = None,
         sensor_fusion: object | None = None,
         inference_buffer: InferenceBuffer | None = None,
+        source_resolver: Callable[[CameraConfig], CameraConfig] | None = None,
     ):
         self._cameras = cameras
         self._alert_config = alert_config
         self._on_alert = on_alert
         self._on_status_change = on_status_change
+        self._source_resolver = source_resolver
         self._segmenter_config = segmenter_config
         self._classifier_config = classifier_config
         self._physics_config = physics_config
@@ -210,43 +213,41 @@ class CameraManager:
             )
             return self._shared_anomaly_detector
 
-    def _create_shadow_runner(self, cam_config) -> object | None:
+    def _create_shadow_runner(
+        self,
+        cam_config: CameraConfig,
+        shadow_record: ModelRecord | None = None,
+        primary_record: ModelRecord | None = None,
+    ) -> object | None:
         """Create a ShadowRunner if a shadow-stage model exists for this camera."""
         try:
             db = getattr(self, "_db", None)
             if db is None:
                 return None
 
-            from argus.storage.model_registry import ModelRegistry
-            from argus.storage.models import ModelStage
-
-            registry = ModelRegistry(session_factory=db.get_session)
-            shadow_models = registry.get_by_stage(
-                cam_config.camera_id, ModelStage.SHADOW.value,
-            )
-            if not shadow_models:
+            if shadow_record is None:
+                shadow_record = self._get_shadow_model_record(cam_config.camera_id)
+            if shadow_record is None:
                 return None
-
-            shadow_record = shadow_models[0]  # Most recent shadow model
-            if not shadow_record.model_path:
-                return None
-
-            from pathlib import Path
 
             from argus.anomaly.shadow_runner import ShadowRunner
 
-            # Get current production model version
-            active = registry.get_active(cam_config.camera_id)
-            prod_version = active.model_version_id if active else None
+            if primary_record is None:
+                primary_record = self._get_primary_model_record(cam_config.camera_id)
+            primary_version = (
+                primary_record.model_version_id if primary_record is not None else None
+            )
 
             sample_rate = getattr(cam_config.anomaly, "shadow_sample_rate", 5)
 
-            shadow_model_path = Path(shadow_record.model_path)
-            if not shadow_model_path.exists():
+            shadow_model_path = self._resolve_model_record_path(
+                shadow_record, cam_config.camera_id,
+            )
+            if shadow_model_path is None or not shadow_model_path.exists():
                 logger.warning(
                     "manager.shadow_model_missing",
                     camera_id=cam_config.camera_id,
-                    model_path=str(shadow_model_path),
+                    model_path=str(getattr(shadow_record, "model_path", None)),
                     shadow_version=shadow_record.model_version_id,
                 )
                 return None
@@ -254,7 +255,7 @@ class CameraManager:
             runner = ShadowRunner(
                 shadow_model_path=shadow_model_path,
                 shadow_version_id=shadow_record.model_version_id,
-                production_version_id=prod_version,
+                production_version_id=primary_version,
                 camera_id=cam_config.camera_id,
                 session_factory=db.get_session,
                 sample_rate=sample_rate,
@@ -484,6 +485,17 @@ class CameraManager:
             return None
         return pipeline.get_raw_frame()
 
+    def set_source_resolver(
+        self,
+        source_resolver: Callable[[CameraConfig], CameraConfig] | None,
+    ) -> None:
+        """Set the runtime source resolver used when starting pipelines."""
+        self._source_resolver = source_resolver
+
+    def get_camera_config(self, camera_id: str) -> CameraConfig | None:
+        """Return the persisted/original camera config, not the runtime copy."""
+        return next((c for c in self._cameras if c.camera_id == camera_id), None)
+
     def is_anomaly_locked(self, camera_id: str) -> bool:
         """Check if a camera's pipeline has an active anomaly lock."""
         pipeline = self._pipelines.get(camera_id)
@@ -609,6 +621,100 @@ class CameraManager:
 
         self._notify_camera_status(camera_id)
         return True
+
+    def apply_model_release_state(
+        self,
+        camera_id: str,
+        reason: str = "release_transition",
+    ) -> dict:
+        """Apply registry release-stage state to a running camera pipeline."""
+        state: dict = {
+            "camera_id": camera_id,
+            "reason": reason,
+            "running": camera_id in self._pipelines,
+            "primary_model_version": None,
+            "primary_model_stage": None,
+            "primary_model_path": None,
+            "primary_reloaded": False,
+            "shadow_previous_version": None,
+            "shadow_model_version": None,
+            "shadow_attached": False,
+            "shadow_detached": False,
+            "errors": [],
+        }
+
+        pipeline = self._pipelines.get(camera_id)
+        cam_config = (
+            getattr(pipeline, "camera_config", None)
+            if pipeline is not None
+            else self.get_camera_config(camera_id)
+        )
+        if cam_config is None:
+            state["errors"].append("camera_not_found")
+            return state
+
+        primary_record = self._get_primary_model_record(camera_id)
+        if primary_record is not None:
+            state["primary_model_version"] = primary_record.model_version_id
+            state["primary_model_stage"] = primary_record.stage
+            primary_path = self._resolve_model_record_path(primary_record, camera_id)
+            if primary_path is None:
+                state["errors"].append("primary_model_file_not_found")
+            else:
+                state["primary_model_path"] = str(primary_path)
+                if pipeline is None:
+                    state["errors"].append("camera_not_running")
+                else:
+                    current_version = getattr(pipeline, "_model_version_id", None)
+                    should_reload = current_version != primary_record.model_version_id
+                    if should_reload:
+                        state["primary_reloaded"] = self.reload_model(
+                            camera_id,
+                            str(primary_path),
+                            version_tag=primary_record.model_version_id,
+                        )
+                        if not state["primary_reloaded"]:
+                            state["errors"].append("primary_reload_failed")
+                    else:
+                        pipeline.set_model_version_id(primary_record.model_version_id)
+                        runner = self._runners.get(camera_id)
+                        if runner is not None:
+                            runner.set_version_tag(primary_record.model_version_id)
+        else:
+            state["errors"].append("primary_model_not_found")
+
+        if pipeline is not None:
+            shadow_record = self._get_shadow_model_record(camera_id)
+            if shadow_record is not None:
+                state["shadow_model_version"] = shadow_record.model_version_id
+            shadow_runner = self._create_shadow_runner(
+                cam_config,
+                shadow_record=shadow_record,
+                primary_record=primary_record,
+            )
+            if shadow_record is not None and shadow_runner is None:
+                state["errors"].append("shadow_runner_create_failed")
+            if hasattr(pipeline, "set_shadow_runner"):
+                shadow_state = pipeline.set_shadow_runner(shadow_runner)
+                state.update(shadow_state)
+                if shadow_record is not None:
+                    state["shadow_model_version"] = shadow_record.model_version_id
+            else:
+                state["errors"].append("shadow_runner_hot_swap_unavailable")
+
+        logger.info(
+            "manager.release_state_applied",
+            camera_id=camera_id,
+            reason=reason,
+            primary=state["primary_model_version"],
+            primary_stage=state["primary_model_stage"],
+            primary_reloaded=state["primary_reloaded"],
+            shadow=state["shadow_model_version"],
+            shadow_attached=state["shadow_attached"],
+            shadow_detached=state["shadow_detached"],
+            errors=state["errors"],
+        )
+        return state
 
     def _broadcast_activation_failed(
         self,
@@ -748,26 +854,79 @@ class CameraManager:
             logger.warning("manager.active_model_lookup_failed", camera_id=camera_id, error=str(e))
             return None
 
+    def _get_primary_model_record(self, camera_id: str):
+        db = getattr(self, "_db", None)
+        if db is None:
+            return None
+        try:
+            from argus.anomaly.model_router import ModelRouter
+
+            return ModelRouter(session_factory=db.get_session).get_model_for_camera(camera_id)
+        except Exception as e:
+            logger.warning("manager.primary_model_lookup_failed", camera_id=camera_id, error=str(e))
+            return self._get_active_model_record(camera_id)
+
+    def _get_shadow_model_record(self, camera_id: str):
+        db = getattr(self, "_db", None)
+        if db is None:
+            return None
+        try:
+            from argus.anomaly.model_router import ModelRouter
+
+            return ModelRouter(session_factory=db.get_session).get_shadow_model_for_camera(camera_id)
+        except Exception as e:
+            logger.warning("manager.shadow_model_lookup_failed", camera_id=camera_id, error=str(e))
+            return None
+
+    def _has_registered_model_records(self, camera_id: str) -> bool:
+        db = getattr(self, "_db", None)
+        if db is None:
+            return False
+        try:
+            from argus.anomaly.model_router import ModelRouter
+
+            return ModelRouter(session_factory=db.get_session).has_model_records(camera_id)
+        except Exception as e:
+            logger.warning("manager.model_records_lookup_failed", camera_id=camera_id, error=str(e))
+            return False
+
+    def _resolve_model_record_path(self, record, camera_id: str) -> Path | None:
+        model_path_raw = getattr(record, "model_path", None)
+        if not model_path_raw:
+            return None
+        model_path = Path(model_path_raw)
+        if model_path.is_file():
+            return model_path
+        if model_path.is_dir():
+            resolved = DetectionPipeline._find_model_in_dir(model_path, camera_id)
+            if resolved:
+                return resolved
+        return None
+
     def _resolve_model_path(self, cam_config: CameraConfig) -> Path | None:
-        record = self._get_active_model_record(cam_config.camera_id)
-        if record and record.model_path:
-            model_path = Path(record.model_path)
-            if model_path.is_file():
-                return model_path
-            # Registry path is a directory — resolve to actual model file
-            if model_path.is_dir():
-                resolved = DetectionPipeline._find_model_in_dir(
-                    model_path, cam_config.camera_id
-                )
-                if resolved:
-                    return resolved
+        record = self._get_primary_model_record(cam_config.camera_id)
+        if record is not None:
+            resolved = self._resolve_model_record_path(record, cam_config.camera_id)
+            if resolved is not None:
+                return resolved
+            logger.warning(
+                "manager.primary_model_missing",
+                camera_id=cam_config.camera_id,
+                model_version=getattr(record, "model_version_id", None),
+                model_path=getattr(record, "model_path", None),
+            )
+            return None
+        if self._has_registered_model_records(cam_config.camera_id):
+            return None
         return DetectionPipeline._find_model(cam_config.camera_id)
 
     def _model_version_id(self, cam_config: CameraConfig, model_path: Path | None = None) -> str:
         """Derive a version tag for the camera's model."""
-        record = self._get_active_model_record(cam_config.camera_id)
+        record = self._get_primary_model_record(cam_config.camera_id)
         if record is not None:
             return record.model_version_id
+        if self._has_registered_model_records(cam_config.camera_id):
+            return f"{cam_config.anomaly.model_type}:ssim_fallback"
         resolved_model_path = model_path or DetectionPipeline._find_model(cam_config.camera_id)
         if resolved_model_path:
             return f"{cam_config.anomaly.model_type}:{resolved_model_path.parent.name}"
@@ -796,6 +955,19 @@ class CameraManager:
             if camera_id in self._threads and self._threads[camera_id].is_alive():
                 logger.warning("manager.already_running", camera_id=camera_id)
                 return True
+
+        runtime_cam_config = cam_config
+        if self._source_resolver is not None:
+            try:
+                resolved = self._source_resolver(cam_config)
+                if resolved is not None:
+                    runtime_cam_config = resolved
+            except Exception as exc:
+                logger.warning(
+                    "manager.source_resolve_failed",
+                    camera_id=camera_id,
+                    error=str(exc),
+                )
 
         def _alert_handler(alert: Alert):
             # C3: Cross-camera correlation check before emitting
@@ -851,7 +1023,7 @@ class CameraManager:
 
         # B1-5: Use shared detector for dinomaly multi-class mode
         shared_detector = None
-        anomaly_cfg = cam_config.anomaly
+        anomaly_cfg = runtime_cam_config.anomaly
         if (
             anomaly_cfg.model_type == "dinomaly2"
             and anomaly_cfg.dinomaly_multi_class
@@ -859,12 +1031,12 @@ class CameraManager:
             shared_detector = self._get_shared_detector(anomaly_cfg)
 
         # Shadow runner: check for shadow-stage model to evaluate
-        shadow_runner = self._create_shadow_runner(cam_config)
-        model_path = self._resolve_model_path(cam_config)
-        model_version_id = self._model_version_id(cam_config, model_path)
+        shadow_runner = self._create_shadow_runner(runtime_cam_config)
+        model_path = self._resolve_model_path(runtime_cam_config)
+        model_version_id = self._model_version_id(runtime_cam_config, model_path)
 
         pipeline = DetectionPipeline(
-            camera_config=cam_config,
+            camera_config=runtime_cam_config,
             alert_config=self._alert_config,
             on_alert=_alert_handler,
             shared_yolo_model=self._shared_yolo,
@@ -886,7 +1058,7 @@ class CameraManager:
         )
 
         # 5.1: Wrap pipeline in CameraInferenceRunner
-        deg_config = cam_config.degradation
+        deg_config = runtime_cam_config.degradation
         runner = CameraInferenceRunner(
             pipeline=pipeline,
             health_monitor=self._health_monitor,
@@ -923,7 +1095,14 @@ class CameraManager:
             self._threads[camera_id] = thread
 
         thread.start()
-        logger.info("manager.camera_started", camera_id=camera_id, source=cam_config.source)
+        logger.info(
+            "manager.camera_started",
+            camera_id=camera_id,
+            source=cam_config.source,
+            protocol=cam_config.protocol,
+            runtime_source=runtime_cam_config.source,
+            runtime_protocol=runtime_cam_config.protocol,
+        )
         return True
 
     def _camera_loop(self, camera_id: str, runner: CameraInferenceRunner) -> None:

@@ -167,6 +167,12 @@ class ModelRegistry:
             if record is None:
                 raise ValueError(f"Model version not found: {model_version_id}")
 
+            if canary_camera_id is not None and canary_camera_id != record.camera_id:
+                raise ValueError(
+                    "canary_camera_id must match model camera_id "
+                    f"({record.camera_id})"
+                )
+
             current_stage = record.stage
             allowed = VALID_TRANSITIONS.get(current_stage, set())
             if target_stage not in allowed:
@@ -242,9 +248,9 @@ class ModelRegistry:
 
         Also sets stage to production and records a version event.
 
-        By default, only models already at PRODUCTION or RETIRED stage can be
-        activated (for rollback / reactivation). Set ``allow_bypass=True`` to
-        skip this check (e.g. scheduler auto-deploy after retraining).
+        By default, only models already at PRODUCTION stage can be activated.
+        Set ``allow_bypass=True`` only for explicit internal recovery paths that
+        intentionally skip the release-stage gate.
         """
         with self._session_factory() as session:
             record = (
@@ -255,10 +261,12 @@ class ModelRegistry:
             if record is None:
                 raise ValueError(f"Model version not found: {model_version_id}")
 
-            if not allow_bypass and record.stage not in (
-                ModelStage.PRODUCTION.value,
-                ModelStage.RETIRED.value,
-            ):
+            if not allow_bypass and record.stage != ModelStage.PRODUCTION.value:
+                if record.stage == ModelStage.RETIRED.value:
+                    raise ValueError(
+                        "Cannot activate retired model; retired is terminal "
+                        "for normal activation."
+                    )
                 raise ValueError(
                     f"Cannot activate model at stage '{record.stage}'. "
                     f"Use the release pipeline to promote through "

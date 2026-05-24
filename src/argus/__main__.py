@@ -150,6 +150,16 @@ def main():
         alerts_dir=config.storage.alerts_dir,
         audio_config=getattr(config.dashboard, "audio_alerts", None),
     )
+    from argus.alerts.feedback import FeedbackManager
+    from argus.config.schema import FeedbackConfig
+
+    feedback_cfg = getattr(config, "feedback", None) or FeedbackConfig()
+    feedback_manager = FeedbackManager(
+        database=db,
+        baselines_dir=str(config.storage.baselines_dir),
+        alerts_dir=str(config.storage.alerts_dir),
+        config=feedback_cfg,
+    )
 
     def on_alert(alert: Alert):
         # Console output
@@ -199,19 +209,49 @@ def main():
     # pipeline reads from go2rtc instead of opening the device directly.
     # This also gives the browser WebRTC/MSE playback without MJPEG fallback.
     _go2rtc = None
+    _stream_registry = None
+    _camera_orchestrator = None
     dashboard_cfg = getattr(config, "dashboard", None)
     if dashboard_cfg and dashboard_cfg.go2rtc_enabled:
-        from argus.streaming.go2rtc_manager import Go2RTCManager, start_and_register_cameras
+        from argus.streaming.go2rtc_manager import Go2RTCManager
+        from argus.streaming.stream_registry import StreamRegistry
+
         _go2rtc = Go2RTCManager(
             api_port=dashboard_cfg.go2rtc_api_port,
             rtsp_port=dashboard_cfg.go2rtc_rtsp_port,
             binary_path=dashboard_cfg.go2rtc_binary,
         )
+        _stream_registry = StreamRegistry(_go2rtc)
+        setattr(_go2rtc, "_stream_registry", _stream_registry)
         try:
-            start_and_register_cameras(_go2rtc, cameras)
+            _stream_registry.reconcile(cameras)
         except Exception as exc:
             logger.warning("go2rtc.start_failed", error=str(exc))
             _go2rtc = None
+            _stream_registry = None
+
+    def _resolve_camera_source(cam_config):
+        if _go2rtc is None or not _go2rtc.running:
+            return cam_config
+        try:
+            if _camera_orchestrator is not None:
+                return _camera_orchestrator.runtime_camera_config(cam_config)
+            if _stream_registry is None:
+                return cam_config
+            resolution = _stream_registry.ensure_registered(
+                cam_config,
+                start_if_needed=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "go2rtc.runtime_source_resolve_failed",
+                camera_id=getattr(cam_config, "camera_id", None),
+                error=str(exc),
+            )
+            return cam_config
+        if resolution is None:
+            return cam_config
+        return _stream_registry.runtime_camera_config(cam_config, resolution)
 
     # Active learning sampler — subscribes to FrameAnalyzed events and
     # pushes high-uncertainty frames to the labeling queue for operators.
@@ -252,7 +292,12 @@ def main():
         event_bus=event_bus,
         sensor_fusion=sensor_fusion,
         inference_buffer=inference_buffer,
+        source_resolver=_resolve_camera_source if _go2rtc is not None else None,
     )
+    if _stream_registry is not None:
+        from argus.camera.orchestrator import CameraOrchestrator
+
+        _camera_orchestrator = CameraOrchestrator(manager, _stream_registry)
 
     # Graceful shutdown
     running = True
@@ -268,6 +313,8 @@ def main():
     # Start dashboard in a background thread
     dashboard_thread = None
     app = None
+    recording_manager = None
+    retention_manager = None
     if not args.no_dashboard:
         task_mgr = TaskManager(max_concurrent=2)
         audit_logger = AuditLogger(database=db)
@@ -285,12 +332,15 @@ def main():
             config_path=args.config,
             task_manager=task_mgr,
             go2rtc_instance=_go2rtc,
+            stream_registry=_stream_registry,
+            camera_orchestrator=_camera_orchestrator,
             sensor_fusion=sensor_fusion,
         )
         app.state.audit_logger = audit_logger
         app.state.recording_store = alert_recording_store  # FR-033: shared with pipelines
         app.state.active_learning_sampler = active_learning_sampler
         app.state.inference_buffer = inference_buffer
+        app.state.feedback_manager = feedback_manager
 
         # Wire camera status changes → WebSocket broadcast so dashboard
         # updates immediately when cameras start/stop (not just on poll).
@@ -305,8 +355,6 @@ def main():
         app.state.backup_manager = backup_mgr
 
         # M6: Continuous recording + retention (if enabled)
-        recording_manager = None
-        retention_manager = None
         if config.continuous_recording.enabled:
             from argus.storage.continuous_recorder import ContinuousRecordingManager
             from argus.storage.retention import RetentionManager
@@ -330,6 +378,7 @@ def main():
                 archive_path=config.continuous_recording.archive_path,
                 archive_retention_days=config.continuous_recording.archive_retention_days,
                 cleanup_interval_hours=config.continuous_recording.cleanup_interval_hours,
+                database=db,
             )
             retention_manager.start()
             logger.info("main.retention_manager_started")
@@ -381,6 +430,10 @@ def main():
         from argus.storage.model_registry import ModelRegistry
 
         model_reg = ModelRegistry(session_factory=db.get_session)
+        baseline_lifecycle = (
+            getattr(app.state, "baseline_lifecycle", None)
+            if app is not None else None
+        )
         create_retraining_task(
             scheduler=scheduler,
             config=config,
@@ -388,7 +441,8 @@ def main():
             trainer=model_trainer,
             model_registry=model_reg,
             baseline_manager=baseline_manager,
-            baseline_lifecycle=getattr(app.state, "baseline_lifecycle", None),
+            feedback_manager=feedback_manager,
+            baseline_lifecycle=baseline_lifecycle,
             database=db,
         )
         create_backbone_retraining_task(
@@ -475,8 +529,18 @@ def main():
                 if not _go2rtc.running:
                     logger.error("go2rtc.crashed", msg="Process died, attempting restart")
                     try:
-                        _go2rtc.start()
-                        logger.info("go2rtc.auto_restarted")
+                        if _camera_orchestrator is not None:
+                            resolutions = _camera_orchestrator.reconcile_streams()
+                        elif _stream_registry is not None:
+                            resolutions = _stream_registry.reconcile(cameras)
+                        else:
+                            from argus.streaming.go2rtc_manager import register_go2rtc_streams
+
+                            resolutions = register_go2rtc_streams(_go2rtc, cameras)
+                        logger.info(
+                            "go2rtc.auto_restarted",
+                            streams=len(resolutions),
+                        )
                     except Exception as e:
                         logger.error("go2rtc.restart_failed", error=str(e))
 

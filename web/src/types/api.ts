@@ -432,6 +432,8 @@ export interface TrainingJobInfo {
 
 // ── Model Types ──
 
+export type ModelRuntimeState = 'applied' | 'waiting' | 'failed'
+
 export interface ModelInfo {
   id: number
   model_version_id: string
@@ -449,6 +451,7 @@ export interface ModelInfo {
   component_type: string
   model_path: string | null
   canary_camera_id: string | null
+  runtime_state?: ModelRuntimeState | null
 }
 
 export interface ModelVersionEvent {
@@ -482,7 +485,14 @@ export interface DegradationEvent {
 // ── Response Payload Shapes (used as T in ApiResponse<T>) ──
 
 export interface CamerasPayload { cameras: CameraSummary[] }
-export interface AlertsPayload { alerts: AlertSummary[]; total?: number }
+export interface AlertQueryParams {
+  camera_id?: string
+  severity?: string
+  limit?: number
+  offset?: number
+}
+
+export interface AlertsPayload { alerts: AlertSummary[]; total: number }
 export interface TasksPayload { tasks: TaskInfo[] }
 export interface HealthPayload extends HealthInfo {}
 export interface UsersPayload { users: UserInfo[] }
