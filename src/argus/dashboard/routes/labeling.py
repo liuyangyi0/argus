@@ -7,6 +7,7 @@ accumulated.
 
 from __future__ import annotations
 
+import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,7 +84,7 @@ async def label_entry(
 
     # If labeled as "normal", copy frame to baselines for retraining
     if label == "normal" and record.frame_path:
-        _copy_to_baselines(record.camera_id, record.frame_path)
+        _copy_to_baselines(record.camera_id, record.frame_path, record.zone_id)
 
     # If labeled as "anomaly", frame can be used as positive sample in future
     # (stored in labeling_queue with label='anomaly' for incremental training)
@@ -176,7 +177,7 @@ async def trigger_retrain(
     copied = 0
     for entry in normal_entries:
         if entry.frame_path and Path(entry.frame_path).exists():
-            _copy_to_baselines(entry.camera_id, entry.frame_path)
+            _copy_to_baselines(entry.camera_id, entry.frame_path, entry.zone_id)
             copied += 1
 
     # Create a training job if training_jobs infrastructure is available
@@ -186,37 +187,45 @@ async def trigger_retrain(
     job_id = f"al-{uuid.uuid4().hex[:12]}"
     model_type = body.get("model_type", "patchcore")
     target_camera = camera_id or (labeled[0].camera_id if labeled else "unknown")
+    target_zone = body.get("zone_id") or (labeled[0].zone_id if labeled else "default")
 
     triggered_by = body.get("triggered_by", "active_learning")
+    entry_ids = [e.id for e in labeled]
+    hyperparameters = body.get("hyperparameters") or {}
+    if not isinstance(hyperparameters, dict):
+        return api_validation_error("hyperparameters 必须为对象")
+    hyperparameters = dict(hyperparameters)
+    hyperparameters["labeling_entry_ids"] = entry_ids
 
     job = TrainingJobRecord(
         job_id=job_id,
         job_type="anomaly_head",
         camera_id=target_camera,
+        zone_id=target_zone,
         model_type=model_type,
-        trigger_type=TrainingTriggerType.DRIFT_SUGGESTED,
+        trigger_type=TrainingTriggerType.DRIFT_SUGGESTED.value,
         triggered_by=triggered_by,
         confirmation_required=True,
-        status=TrainingJobStatus.PENDING_CONFIRMATION,
+        status=TrainingJobStatus.PENDING_CONFIRMATION.value,
+        hyperparameters=json.dumps(hyperparameters),
     )
     db.save_training_job(job)
-
-    # Mark labeled entries as pending training (will be finalized after training completes)
-    entry_ids = [e.id for e in labeled]
-    db.mark_labeling_trained(entry_ids, trained_into=job_id)
 
     logger.info(
         "labeling.retrain_triggered",
         job_id=job_id,
         camera_id=target_camera,
+        zone_id=target_zone,
         normal_count=len(normal_entries),
         anomaly_count=len(anomaly_entries),
         copied_baselines=copied,
+        labeling_entry_count=len(entry_ids),
     )
 
     return api_success(data={
         "job_id": job_id,
         "camera_id": target_camera,
+        "zone_id": target_zone,
         "normal_count": len(normal_entries),
         "anomaly_count": len(anomaly_entries),
         "copied_baselines": copied,
@@ -251,13 +260,13 @@ def labeling_image(
     return FileResponse(frame_path, media_type="image/jpeg")
 
 
-def _copy_to_baselines(camera_id: str, frame_path: str) -> bool:
+def _copy_to_baselines(camera_id: str, frame_path: str, zone_id: str = "default") -> bool:
     """Copy a labeled frame to the baselines directory for retraining."""
     src = Path(frame_path)
     if not src.exists():
         return False
 
-    baselines_dir = Path("data/baselines") / camera_id / "default"
+    baselines_dir = Path("data/baselines") / camera_id / (zone_id or "default")
     baselines_dir.mkdir(parents=True, exist_ok=True)
 
     dst = baselines_dir / f"al_{src.name}"

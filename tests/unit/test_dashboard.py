@@ -649,6 +649,153 @@ class TestCameraControlRoutes:
         assert calls[0][0] == camera_manager.stop_camera
         assert calls[0][1] == ("cam_01",)
 
+    def test_config_endpoint_keeps_original_usb_source_after_stream_registration(
+        self, db, health, alerts_dir,
+    ):
+        """go2rtc registration must not leak runtime RTSP URLs into config APIs."""
+        camera_config = CameraConfig(
+            camera_id="usb_cam",
+            name="USB Camera",
+            source="0",
+            protocol="usb",
+        )
+        config = ArgusConfig(cameras=[camera_config])
+        camera_manager = MagicMock()
+        camera_manager._cameras = [camera_config]
+        go2rtc = MagicMock()
+        type(go2rtc).running = property(lambda self: True)
+        go2rtc.register_camera.return_value = "rtsp://127.0.0.1:8554/usb_cam"
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+            go2rtc_instance=go2rtc,
+        )
+        client = TestClient(app)
+
+        stream_resp = client.get("/api/streaming/usb_cam")
+        config_resp = client.get("/api/cameras/usb_cam/config")
+
+        assert stream_resp.status_code == 200
+        assert config_resp.status_code == 200
+        payload = config_resp.json()["data"]
+        assert payload["source"] == "0"
+        assert payload["protocol"] == "usb"
+        go2rtc.register_camera.assert_called_with("usb_cam", "0", "usb")
+
+    def test_delete_camera_removes_go2rtc_stream_from_app_state(
+        self, db, health, alerts_dir,
+    ):
+        camera_config = CameraConfig(
+            camera_id="cam_01",
+            name="Camera 01",
+            source="rtsp://example/stream",
+            protocol="rtsp",
+        )
+        config = ArgusConfig(cameras=[camera_config])
+        camera_manager = MagicMock()
+        camera_manager._cameras = [camera_config]
+        go2rtc = MagicMock()
+        type(go2rtc).running = property(lambda self: True)
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+            go2rtc_instance=go2rtc,
+        )
+        client = TestClient(app)
+
+        response = client.delete("/api/cameras/cam_01")
+
+        assert response.status_code == 200
+        go2rtc.remove_stream.assert_called_once_with("cam_01")
+
+    def test_streaming_register_uses_camera_manager_config_lookup(
+        self, db, health, alerts_dir,
+    ):
+        camera_config = CameraConfig(
+            camera_id="usb_cam",
+            name="USB Camera",
+            source="0",
+            protocol="usb",
+        )
+        config = ArgusConfig(cameras=[camera_config])
+        camera_manager = MagicMock()
+        camera_manager._cameras = [camera_config]
+        camera_manager.get_camera_config.return_value = camera_config
+        go2rtc = MagicMock()
+        type(go2rtc).running = property(lambda self: True)
+        go2rtc.register_camera.return_value = "rtsp://127.0.0.1:8554/usb_cam"
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+            go2rtc_instance=go2rtc,
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/streaming/usb_cam/register")
+
+        assert response.status_code == 200
+        payload = response.json()["data"]
+        assert payload["runtime_source"] == "rtsp://127.0.0.1:8554/usb_cam"
+        assert payload["runtime_protocol"] == "rtsp"
+
+    def test_running_camera_connection_probe_uses_latest_frame(
+        self, db, health, alerts_dir, monkeypatch,
+    ):
+        """Running cameras should not be probed by reopening the physical source."""
+        camera_config = CameraConfig(
+            camera_id="usb_cam",
+            name="USB Camera",
+            source="0",
+            protocol="usb",
+        )
+        config = ArgusConfig(cameras=[camera_config])
+        camera_manager = MagicMock()
+        camera_manager._cameras = [camera_config]
+        camera_manager.get_status.return_value = [
+            SimpleNamespace(
+                camera_id="usb_cam",
+                name="USB Camera",
+                connected=True,
+                running=True,
+                stats=None,
+            ),
+        ]
+        camera_manager.get_latest_frame.return_value = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        def fail_probe(*_args, **_kwargs):
+            raise AssertionError("physical source should not be reopened")
+
+        monkeypatch.setattr("argus.dashboard.routes.cameras._probe_source_blocking", fail_probe)
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/cameras/usb_cam/test-connection")
+
+        assert response.status_code == 200
+        payload = response.json()["data"]
+        assert payload["ok"] is True
+        assert payload["resolution"] == [640, 480]
+        assert payload["source"] == "running_pipeline"
+
     def test_restart_camera_offloads_stop_and_start(self, db, health, alerts_dir, monkeypatch):
         """Camera restart route should offload stop/start instead of blocking the server."""
         camera_manager = MagicMock()

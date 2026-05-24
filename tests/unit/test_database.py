@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from argus.storage.database import Database
+from argus.storage.models import AlertRecordingRecord
 
 
 @pytest.fixture
@@ -324,6 +325,79 @@ class TestDatabase:
         remaining = db.get_alerts()
         assert len(remaining) == 1
         assert remaining[0].alert_id == "ALT-NEW"
+
+    def test_delete_alert_removes_recording_metadata(self, db):
+        """Deleting one alert should not leave stale alert_recordings rows."""
+        now = datetime.now(tz=timezone.utc)
+        db.save_alert("ALT-REC", now, "cam_01", "z1", "high", 0.96)
+        db.save_alert_recording(
+            AlertRecordingRecord(
+                alert_id="ALT-REC",
+                camera_id="cam_01",
+                severity="high",
+                recording_path="/tmp/recordings/ALT-REC",
+                start_timestamp=1.0,
+                end_timestamp=2.0,
+                trigger_timestamp=1.5,
+                frame_count=10,
+                fps=5,
+                file_size_bytes=1234,
+            )
+        )
+
+        success, paths = db.delete_alert("ALT-REC")
+
+        assert success is True
+        assert paths == []
+        assert db.get_alert("ALT-REC") is None
+        assert db.get_alert_recording("ALT-REC") is None
+
+    def test_delete_old_alerts_can_return_recording_paths(self, db):
+        """Scheduled cleanup can request recording dirs while old callers cannot."""
+        old_time = datetime.now(tz=timezone.utc) - timedelta(days=100)
+        recent_time = datetime.now(tz=timezone.utc)
+
+        db.save_alert("ALT-OLD-REC", old_time, "cam_01", "z1", "high", 0.96)
+        db.save_alert("ALT-NEW-REC", recent_time, "cam_01", "z1", "high", 0.96)
+        db.save_alert_recording(
+            AlertRecordingRecord(
+                alert_id="ALT-OLD-REC",
+                camera_id="cam_01",
+                severity="high",
+                recording_path="/tmp/recordings/2020-01-01/cam_01/ALT-OLD-REC",
+                start_timestamp=1.0,
+                end_timestamp=2.0,
+                trigger_timestamp=1.5,
+                frame_count=10,
+                fps=5,
+                file_size_bytes=1234,
+            )
+        )
+        db.save_alert_recording(
+            AlertRecordingRecord(
+                alert_id="ALT-NEW-REC",
+                camera_id="cam_01",
+                severity="high",
+                recording_path="/tmp/recordings/2099-01-01/cam_01/ALT-NEW-REC",
+                start_timestamp=1.0,
+                end_timestamp=2.0,
+                trigger_timestamp=1.5,
+                frame_count=10,
+                fps=5,
+                file_size_bytes=1234,
+            )
+        )
+
+        count, image_paths, recording_paths = db.delete_old_alerts(
+            days=90,
+            include_recording_paths=True,
+        )
+
+        assert count == 1
+        assert image_paths == []
+        assert recording_paths == ["/tmp/recordings/2020-01-01/cam_01/ALT-OLD-REC"]
+        assert db.get_alert_recording("ALT-OLD-REC") is None
+        assert db.get_alert_recording("ALT-NEW-REC") is not None
 
     def test_delete_old_alerts_none_to_delete(self, db):
         """Should handle case where no alerts are old enough."""

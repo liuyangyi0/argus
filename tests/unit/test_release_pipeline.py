@@ -216,6 +216,30 @@ class TestTimingValidation:
         with pytest.raises(ValueError, match="canary_camera_id required"):
             pipeline.transition(vid, "canary", "engineer_b", now=now)
 
+    def test_canary_camera_id_must_match_model_camera(self, session_factory, pipeline):
+        vid = _create_model(session_factory, stage="shadow", camera_id="cam-01")
+        now = datetime.now(timezone.utc)
+        with session_factory() as session:
+            session.add(ModelVersionEvent(
+                timestamp=now - timedelta(days=5),
+                camera_id="cam-01",
+                from_version=vid,
+                to_version=vid,
+                from_stage="candidate",
+                to_stage="shadow",
+                triggered_by="engineer_a",
+            ))
+            session.commit()
+
+        with pytest.raises(ValueError, match="canary_camera_id must match"):
+            pipeline.transition(
+                vid,
+                "canary",
+                "engineer_b",
+                canary_camera_id="other-cam",
+                now=now,
+            )
+
 
 class TestVersionEvents:
     """Test that version events are recorded correctly."""

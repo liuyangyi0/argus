@@ -125,8 +125,9 @@ Frame Source
 ### 4.8 Alerting
 
 - `AlertGrader` 负责把分数、时序证据、区域优先级和检测类型转换为最终告警等级。
-- `AlertDispatcher` 负责落库和对外分发。
-- 告警图像、录像、工作流状态和反馈队列都围绕这一阶段沉淀。
+- `DetectionPipeline` 在触发告警后先固化 ring buffer 证据，再进入实时回调；这样 WebSocket 告警可以携带快照、热力图和录像状态。
+- `AlertDispatcher` 负责保存快照/热力图、落库和对外分发；实时 payload 会标记 `has_recording`、`recording_status` 和证据不可用状态。
+- 告警图像、录像、工作流状态和反馈队列都围绕这一阶段沉淀；事件组使用单调时钟做过期清理，避免长期运行泄漏。
 
 ## 5. 事件、反馈与主动学习
 
@@ -271,6 +272,7 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 - Models：基线、训练与评估、模型发布、A/B 对比、标注队列、阈值预览。
 - System：系统概览、配置管理、备份、审计、降级历史、音频告警、用户管理、存储清理。
 - ReplayView / StoryboardReplay：从告警进入的录像回放视图，分别是单机位回放和多机位故事板回放。
+- Alerts 列表使用后端分页契约：`/api/alerts/json` 支持 `limit` 和 `offset`，响应中的 `total` 表示过滤后的总数。
 
 ### 8.2 前后端边界
 
@@ -306,6 +308,7 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 - `ModelRegistry`：模型版本、激活状态和查询入口。
 - `InferenceRecordStore`：逐帧推理结果落盘。
 - `AlertRecordingStore`：录像归档、修复与回放素材管理。
+- 告警删除和周期清理会同步处理 `alert_recordings` 元数据与录像目录，避免数据库和文件系统互相悬空。
 - `BackupManager`：备份创建与保留。
 
 ## 10. 调度、训练与后台维护
@@ -390,6 +393,8 @@ go2rtc 是当前视频访问链条中的关键节点：
 - Release pipeline 接入 WebSocket：阶段流转事件实时推送到前端，Models 页可观察 shadow → canary → production 的进度。
 - `activate` 端点不再有 bypass 路径，所有激活动作都必须先通过 stage gate。
 - 训练阶段不再热载候选模型：训练完成的产物先注册为 `CANDIDATE`，等通过 release pipeline 才会被任何 pipeline 采用，避免“训练即上线”的污染风险。
+- stage transition 是运行时绑定边界：变更提交后由 `CameraManager` 刷新对应摄像头的发布状态，shadow 只挂载旁路评分 runner 且不触发告警，canary 作为该摄像头当前 primary model 参与检测，production promotion 刷新/热载生产模型并替换旧 production。
+- Models 页的 release 表以 API 返回的 `runtime_state` 为准显示 `applied` / `waiting` / `failed`，避免只看 registry stage 就误判运行时已经生效。
 
 ### 14.3 训练管线（commit `da9453e`）
 

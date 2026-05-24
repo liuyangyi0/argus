@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { getAlerts, getCameras, acknowledgeAlert, markFalsePositive, deleteAlert, bulkDeleteAlerts, bulkAcknowledge, bulkFalsePositive } from '../api'
+import type { AlertQueryParams } from '../types/api'
 
 export const useAlertStore = defineStore('alertStore', () => {
   // State
@@ -11,6 +12,8 @@ export const useAlertStore = defineStore('alertStore', () => {
 
   // Filters
   const filters = ref({ camera_id: '', severity: '' })
+  const pageParams = ref({ limit: 20, offset: 0 })
+  let lastFilterKey = ''
 
   // Selection
   const selectedAlert = ref<any>(null)
@@ -20,10 +23,21 @@ export const useAlertStore = defineStore('alertStore', () => {
   const resolvedCount = computed(() => alerts.value.filter(a => ['resolved', 'closed'].includes(a.workflow_status)).length)
 
   // Actions
-  async function fetchData(paramsOverride?: Record<string, any>) {
+  async function fetchData(paramsOverride: AlertQueryParams = {}) {
     loading.value = true
     try {
-      const params: Record<string, any> = { limit: 100, ...paramsOverride }
+      const filterKey = `${filters.value.camera_id}\u0000${filters.value.severity}`
+      if (filterKey !== lastFilterKey && !Object.prototype.hasOwnProperty.call(paramsOverride, 'offset')) {
+        pageParams.value.offset = 0
+      }
+
+      const params: AlertQueryParams = { ...pageParams.value, ...paramsOverride }
+      pageParams.value = {
+        limit: params.limit ?? pageParams.value.limit,
+        offset: params.offset ?? pageParams.value.offset,
+      }
+      lastFilterKey = filterKey
+
       if (filters.value.camera_id) params.camera_id = filters.value.camera_id
       if (filters.value.severity) params.severity = filters.value.severity
       

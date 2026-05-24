@@ -30,7 +30,12 @@ from argus.config.schema import BaselineCaptureConfig
 from argus.core.model_discovery import resolve_runtime_model_path
 from argus.dashboard.auth import current_username, require_role
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
-from argus.dashboard.model_runtime import activate_model_version, find_registered_model_by_path
+from argus.dashboard.model_runtime import (
+    activate_model_version,
+    find_registered_model_by_path,
+    get_registry,
+)
+from argus.storage.models import ModelStage
 
 logger = structlog.get_logger()
 
@@ -559,22 +564,24 @@ async def deploy_model(request: Request):
             resolved,
             camera_id=camera_id,
         )
-    if registry_record is not None:
-        try:
-            _, success = activate_model_version(
-                request,
-                registry_record.model_version_id,
-                triggered_by="dashboard",
-            )
-        except ValueError as e:
-            # P1 fix: registry.activate now refuses to skip the stage gate.
-            # Surface the message so the user knows to promote first.
-            return api_validation_error(
-                f"模型仍处于 candidate 阶段，无法直接部署。"
-                f"请先通过 shadow → canary → production 发布流程晋升。错误: {e}"
-            )
-    else:
-        success = camera_manager.reload_model(camera_id, str(resolved))
+    if get_registry(request) is None:
+        return api_unavailable("数据库不可用")
+    if registry_record is None:
+        return api_validation_error("模型未注册，无法直接部署。请先完成模型注册与发布流程。")
+    if registry_record.stage != ModelStage.PRODUCTION.value:
+        return api_validation_error(
+            f"模型仍处于 {registry_record.stage} 阶段，无法直接部署。"
+            "请先通过 shadow → canary → production 发布流程晋升。"
+        )
+
+    try:
+        _, success = activate_model_version(
+            request,
+            registry_record.model_version_id,
+            triggered_by="dashboard",
+        )
+    except ValueError as e:
+        return api_validation_error(str(e))
 
     if success:
         audit = getattr(request.app.state, "audit_logger", None)

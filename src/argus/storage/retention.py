@@ -9,12 +9,17 @@ Periodically scans recording directories and enforces:
 
 from __future__ import annotations
 
+import json
 import shutil
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
+
+if TYPE_CHECKING:
+    from argus.storage.database import Database
 
 logger = structlog.get_logger()
 
@@ -42,6 +47,9 @@ class RetentionManager:
         Days to keep alert evidence (snapshots, heatmaps, clips).
     cleanup_interval_hours:
         Hours between cleanup scans.
+    database:
+        Optional database manager used to remove alert_recordings metadata when
+        alert recording directories are deleted by retention.
     """
 
     def __init__(
@@ -54,6 +62,7 @@ class RetentionManager:
         archive_retention_days: int = 360,
         alert_retention_days: int = 180,
         cleanup_interval_hours: float = 6.0,
+        database: Database | None = None,
     ) -> None:
         self._cont_dir = Path(continuous_recording_dir)
         self._alert_dir = Path(alert_recording_dir)
@@ -63,6 +72,7 @@ class RetentionManager:
         self._archive_days = archive_retention_days
         self._alert_days = alert_retention_days
         self._interval_s = cleanup_interval_hours * 3600.0
+        self._database = database
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -240,7 +250,7 @@ class RetentionManager:
     def _cleanup_alert_evidence(self) -> int:
         """Clean up old alert snapshots and recordings."""
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=self._alert_days)
-        return self._delete_old_date_dirs(self._alert_dir, cutoff)
+        return self._delete_old_alert_recording_dirs(self._alert_dir, cutoff)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -269,6 +279,111 @@ class RetentionManager:
                     exc_info=True,
                 )
         return deleted
+
+    def _delete_old_alert_recording_dirs(self, root: Path, cutoff: datetime) -> int:
+        """Delete old alert recording directories and matching DB metadata."""
+        deleted = 0
+        if not root.exists():
+            return 0
+
+        for date_dir in sorted(root.iterdir()):
+            if not date_dir.is_dir():
+                continue
+            dir_date = self._parse_date_dir(date_dir.name)
+            if dir_date is None or dir_date >= cutoff:
+                continue
+
+            for rec_dir in self._iter_alert_recording_dirs(date_dir):
+                alert_id = self._alert_id_from_recording_dir(rec_dir)
+                try:
+                    if alert_id and not self._delete_alert_recording_metadata(alert_id):
+                        continue
+                    shutil.rmtree(rec_dir)
+                    deleted += 1
+                    self._remove_empty_ancestors(rec_dir.parent, stop_at=root)
+                    logger.debug(
+                        "retention.deleted_alert_recording_dir",
+                        path=str(rec_dir),
+                        alert_id=alert_id,
+                    )
+                except OSError:
+                    logger.warning(
+                        "retention.alert_recording_delete_error",
+                        path=str(rec_dir),
+                        alert_id=alert_id,
+                        exc_info=True,
+                    )
+
+            self._remove_empty_ancestors(date_dir, stop_at=root)
+        return deleted
+
+    @staticmethod
+    def _iter_alert_recording_dirs(date_dir: Path):
+        """Yield alert recording directories below a date partition."""
+        for camera_or_recording_dir in sorted(date_dir.iterdir()):
+            if not camera_or_recording_dir.is_dir():
+                continue
+            if (camera_or_recording_dir / "metadata.json").exists():
+                yield camera_or_recording_dir
+                continue
+            for rec_dir in sorted(camera_or_recording_dir.iterdir()):
+                if rec_dir.is_dir():
+                    yield rec_dir
+
+    @staticmethod
+    def _alert_id_from_recording_dir(rec_dir: Path) -> str | None:
+        """Read alert_id from metadata.json, falling back to directory name."""
+        meta_path = rec_dir / "metadata.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                alert_id = meta.get("alert_id")
+                if isinstance(alert_id, str) and alert_id:
+                    return alert_id
+            except (OSError, json.JSONDecodeError, TypeError):
+                logger.debug(
+                    "retention.alert_recording_metadata_read_failed",
+                    path=str(meta_path),
+                    exc_info=True,
+                )
+        return rec_dir.name or None
+
+    def _delete_alert_recording_metadata(self, alert_id: str) -> bool:
+        if self._database is None:
+            return True
+        delete_fn = getattr(self._database, "delete_alert_recording_metadata", None)
+        if delete_fn is None:
+            return True
+        try:
+            delete_fn(alert_id)
+            return True
+        except Exception:
+            logger.warning(
+                "retention.alert_recording_metadata_delete_failed",
+                alert_id=alert_id,
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
+    def _remove_empty_ancestors(path: Path, stop_at: Path) -> None:
+        """Remove empty directories from path upward, stopping before stop_at."""
+        try:
+            stop_resolved = stop_at.resolve()
+        except OSError:
+            stop_resolved = stop_at
+        current = path
+        while True:
+            try:
+                if current.resolve() == stop_resolved:
+                    break
+                current.rmdir()
+            except OSError:
+                break
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
 
     @staticmethod
     def _parse_date_dir(name: str) -> datetime | None:

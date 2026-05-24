@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 
 from argus.storage.continuous_recorder import ContinuousRecorder, ContinuousRecordingManager
+from argus.storage.database import Database
+from argus.storage.models import AlertRecordingRecord
 from argus.storage.retention import RetentionManager
 
 
@@ -104,6 +106,49 @@ class TestRetentionManager:
         cutoff = datetime(2025, 1, 1, tzinfo=timezone.utc)
         deleted = mgr._delete_old_date_dirs(tmp_path / "nonexistent", cutoff)
         assert deleted == 0
+
+    def test_alert_retention_removes_recording_metadata(self, tmp_path):
+        """Alert recording directory retention should remove DB metadata too."""
+        db = Database(database_url=f"sqlite:///{tmp_path / 'retention.db'}")
+        db.initialize()
+        try:
+            recordings_root = tmp_path / "recordings"
+            rec_dir = recordings_root / "2020-01-01" / "cam_01" / "ALT-RET"
+            rec_dir.mkdir(parents=True)
+            (rec_dir / "metadata.json").write_text(
+                '{"alert_id": "ALT-RET", "camera_id": "cam_01"}',
+                encoding="utf-8",
+            )
+            (rec_dir / "recording.mp4").write_bytes(b"mp4")
+            db.save_alert_recording(
+                AlertRecordingRecord(
+                    alert_id="ALT-RET",
+                    camera_id="cam_01",
+                    severity="high",
+                    recording_path=str(rec_dir),
+                    start_timestamp=1.0,
+                    end_timestamp=2.0,
+                    trigger_timestamp=1.5,
+                    frame_count=10,
+                    fps=5,
+                    file_size_bytes=3,
+                )
+            )
+
+            mgr = RetentionManager(
+                continuous_recording_dir=tmp_path / "continuous",
+                alert_recording_dir=recordings_root,
+                alert_retention_days=1,
+                database=db,
+            )
+
+            deleted = mgr._cleanup_alert_evidence()
+
+            assert deleted == 1
+            assert not rec_dir.exists()
+            assert db.get_alert_recording("ALT-RET") is None
+        finally:
+            db.close()
 
 
 class TestContinuousRecordingConfig:

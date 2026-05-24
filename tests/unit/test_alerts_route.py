@@ -5,8 +5,10 @@ from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 
+from argus.config.schema import ArgusConfig, AuthConfig
 from argus.core.health import HealthMonitor
 from argus.dashboard.app import create_app
+from argus.dashboard.auth import create_session_token
 from argus.storage.database import Database
 from argus.storage.models import AlertRecord
 
@@ -42,6 +44,18 @@ def client(db, health, alerts_dir):
     return TestClient(app)
 
 
+@pytest.fixture
+def auth_client(db, health, alerts_dir):
+    config = ArgusConfig(auth=AuthConfig(enabled=True, api_token="alerts-test-token"))
+    app = create_app(
+        database=db,
+        health_monitor=health,
+        alerts_dir=str(alerts_dir),
+        config=config,
+    )
+    return TestClient(app), app
+
+
 def _insert_alert(db: Database, alert_id: str = "test-alert-001", **overrides):
     """Helper to insert a test alert record."""
     defaults = {
@@ -60,6 +74,11 @@ def _insert_alert(db: Database, alert_id: str = "test-alert-001", **overrides):
         alert = AlertRecord(**defaults)
         session.add(alert)
         session.commit()
+
+
+def _set_role_cookie(client: TestClient, app, role: str) -> None:
+    token = create_session_token(f"{role}_user", role, app.state.session_secret)
+    client.cookies.set("argus_session", token)
 
 
 # ── GET /api/alerts/json ──
@@ -118,6 +137,49 @@ class TestAlertsJsonEndpoint:
         # total should still reflect all alerts
         assert body["data"]["total"] == 5
 
+    def test_get_alerts_json_offset(self, client, db):
+        """Offset parameter should skip earlier rows while preserving total."""
+        for i in range(5):
+            _insert_alert(
+                db,
+                f"off-{i}",
+                timestamp=datetime(2026, 4, 10, 12, i, 0),
+            )
+
+        resp = client.get("/api/alerts/json?limit=2&offset=2")
+        body = resp.json()
+
+        assert resp.status_code == 200
+        assert [a["alert_id"] for a in body["data"]["alerts"]] == ["off-2", "off-1"]
+        assert body["data"]["total"] == 5
+
+
+# ── Image path safety ──
+
+
+class TestAlertImageSafety:
+    def test_rejects_sibling_path_with_shared_prefix(self, client, db, alerts_dir):
+        """Resolved path containment must not accept startswith-style siblings."""
+        evil_dir = alerts_dir.parent / f"{alerts_dir.name}_evil"
+        evil_dir.mkdir()
+        evil_file = evil_dir / "snapshot.jpg"
+        evil_file.write_bytes(b"not really a jpeg")
+        _insert_alert(db, "evil-prefix", snapshot_path=str(evil_file))
+
+        resp = client.get("/api/alerts/evil-prefix/image/snapshot")
+
+        assert resp.status_code == 403
+
+    def test_allows_file_under_alerts_dir(self, client, db, alerts_dir):
+        safe_file = alerts_dir / "snapshot.jpg"
+        safe_file.write_bytes(b"jpeg bytes")
+        _insert_alert(db, "safe-image", snapshot_path=str(safe_file))
+
+        resp = client.get("/api/alerts/safe-image/image/snapshot")
+
+        assert resp.status_code == 200
+        assert resp.content == b"jpeg bytes"
+
 
 # ── POST /api/alerts/{alert_id}/acknowledge ──
 
@@ -142,6 +204,45 @@ class TestAcknowledgeAlert:
         assert resp.status_code == 404
         body = resp.json()
         assert body["code"] == 40400
+
+
+# ── handle_alerts permission checks ──
+
+
+class TestAlertMutationPermissions:
+    @pytest.mark.parametrize(
+        ("method", "path", "json_body"),
+        [
+            ("post", "/api/alerts/perm-001/acknowledge", None),
+            ("post", "/api/alerts/perm-001/false-positive", None),
+            ("delete", "/api/alerts/perm-001", None),
+            ("post", "/api/alerts/perm-001/workflow", {"status": "investigating"}),
+            ("post", "/api/alerts/bulk-acknowledge", {"alert_ids": ["perm-001"]}),
+            ("post", "/api/alerts/bulk-false-positive", {"alert_ids": ["perm-001"]}),
+            ("post", "/api/alerts/bulk-delete", {"alert_ids": ["perm-001"]}),
+        ],
+    )
+    def test_viewer_cannot_mutate_alerts(self, auth_client, db, method, path, json_body):
+        """Viewer role lacks handle_alerts and must be blocked from mutations."""
+        client, app = auth_client
+        _set_role_cookie(client, app, "viewer")
+        _insert_alert(db, "perm-001")
+
+        resp = client.request(method.upper(), path, json=json_body)
+
+        assert resp.status_code == 403
+        assert resp.json()["code"] == 40300
+
+    def test_operator_can_acknowledge_alert(self, auth_client, db):
+        """Operator role has handle_alerts and can use mutation endpoints."""
+        client, app = auth_client
+        _set_role_cookie(client, app, "operator")
+        _insert_alert(db, "perm-op")
+
+        resp = client.post("/api/alerts/perm-op/acknowledge")
+
+        assert resp.status_code == 200
+        assert resp.json()["code"] == 0
 
 
 # ── POST /api/alerts/bulk-acknowledge ──

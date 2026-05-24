@@ -392,6 +392,48 @@ class TestAnomalyDetection:
         assert result is mock_alert
         assert pipeline.stats.anomalies_detected == 1
 
+    def test_on_alert_sees_solidified_recording_metadata(self, tmp_path):
+        """Realtime alert callback should run after ring-buffer solidification."""
+        from argus.alerts.grader import Alert, AlertSeverity
+        from argus.core.alert_ring_buffer import AlertFrameBuffer
+
+        captured: dict[str, object] = {}
+        alert = Alert(
+            alert_id="ALT-recording-order",
+            camera_id="test_cam",
+            zone_id="default",
+            severity=AlertSeverity.MEDIUM,
+            anomaly_score=0.95,
+            timestamp=time.time() + 1.0,
+            frame_number=1,
+        )
+        pipeline = _build_pipeline()
+        pipeline._alert_ring_buffer = AlertFrameBuffer(
+            fps=5, pre_seconds=10, post_seconds=10,
+        )
+        pipeline._ring_buffer_jpeg_quality = 85
+        pipeline._recording_store = MagicMock()
+        pipeline._recording_store.save.return_value = (str(tmp_path / "alert.mp4"), 123)
+        pipeline._on_alert = lambda a: captured.update(
+            has_recording=getattr(a, "_has_recording", None),
+            recording_status=getattr(a, "_recording_status", None),
+            solidified=getattr(a, "_solidified_recording", None),
+            evidence_unavailable=getattr(a, "_recording_evidence_unavailable", None),
+        )
+
+        result = self._run_with_anomaly(
+            pipeline,
+            anomaly_score=0.95,
+            is_anomalous=True,
+            alert_to_return=alert,
+        )
+
+        assert result is alert
+        assert captured["has_recording"] is True
+        assert captured["recording_status"] == "recording"
+        assert captured["solidified"] is not None
+        assert captured["evidence_unavailable"] is False
+
     def test_anomalous_but_grader_suppresses(self):
         """Anomaly detected but grader suppresses (temporal / cool-down) -> None."""
         pipeline = _build_pipeline()

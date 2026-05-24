@@ -115,6 +115,12 @@ class ReleasePipeline:
             if record is None:
                 raise ValueError(f"Model not found: {model_version_id}")
 
+            if canary_camera_id is not None and canary_camera_id != record.camera_id:
+                raise ValueError(
+                    "canary_camera_id must match model camera_id "
+                    f"({record.camera_id})"
+                )
+
             current_stage = record.stage
             self._validate_transition(current_stage, target_stage)
 

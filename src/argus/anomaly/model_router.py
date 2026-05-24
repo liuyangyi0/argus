@@ -62,12 +62,34 @@ class ModelRouter:
             )
             return production
 
+    def get_shadow_model_for_camera(self, camera_id: str) -> ModelRecord | None:
+        """Get the newest shadow-stage model for a camera, if any."""
+        with self._session_factory() as session:
+            return (
+                session.query(ModelRecord)
+                .filter_by(
+                    camera_id=camera_id,
+                    stage=ModelStage.SHADOW.value,
+                )
+                .order_by(ModelRecord.created_at.desc())
+                .first()
+            )
+
     def get_model_path(self, camera_id: str) -> Path | None:
         """Get the model file path for a camera, considering canary routing."""
         record = self.get_model_for_camera(camera_id)
         if record is None or record.model_path is None:
             return None
         return Path(record.model_path)
+
+    def has_model_records(self, camera_id: str) -> bool:
+        """Return True when the registry knows about any model for a camera."""
+        with self._session_factory() as session:
+            return (
+                session.query(ModelRecord)
+                .filter_by(camera_id=camera_id)
+                .first()
+            ) is not None
 
     def is_canary(self, camera_id: str) -> bool:
         """Check if a camera is currently running a canary model."""

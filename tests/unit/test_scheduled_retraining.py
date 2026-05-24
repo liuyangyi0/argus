@@ -153,6 +153,48 @@ class TestCreateRetrainingTask:
 
         trainer.train.assert_called_once()
 
+    def test_scheduled_retraining_marks_feedback_with_model_version(self):
+        from argus.core.scheduler import create_retraining_task
+
+        scheduler = MagicMock()
+        config = self._make_config(min_new_baselines=10)
+        trainer = MagicMock()
+        result = MagicMock()
+        result.quality_grade = "B"
+        result.status.value = "COMPLETE"
+        result.model_version_id = "model-version-123"
+        trainer.train.return_value = result
+
+        baseline_mgr = MagicMock()
+        baseline_mgr.count_images.return_value = 50
+
+        registry = MagicMock()
+        registry.list_models.return_value = []
+
+        feedback = MagicMock()
+        feedback.get_pending_for_training.return_value = [
+            MagicMock(feedback_id="fb-1"),
+            MagicMock(feedback_id="fb-2"),
+        ]
+
+        create_retraining_task(
+            scheduler=scheduler,
+            config=config,
+            camera_configs=[self._make_camera()],
+            trainer=trainer,
+            model_registry=registry,
+            baseline_manager=baseline_mgr,
+            feedback_manager=feedback,
+        )
+
+        callback = scheduler.add_interval_task.call_args[0][1]
+        callback()
+
+        feedback.get_pending_for_training.assert_called_once_with(camera_id="cam_01")
+        feedback.mark_batch_processed.assert_called_once_with(
+            ["fb-1", "fb-2"], "model-version-123",
+        )
+
     def test_auto_deploy_on_good_grade(self):
         from argus.core.scheduler import create_retraining_task
 

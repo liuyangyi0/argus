@@ -599,6 +599,44 @@ class TestGraderConcurrency:
         assert "cam_old:z_old" not in grader._trackers
 
 
+class TestEventGroupPruning:
+    """Alert aggregation event groups are pruned using monotonic time."""
+
+    def test_prune_removes_event_groups_created_from_alerts(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80,
+                evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=10,
+                same_camera_window_seconds=5,
+            ),
+        )
+        grader = AlertGrader(config)
+        grader._aggregation_window = 300.0
+
+        with (
+            patch("argus.alerts.grader.time.monotonic", side_effect=[1000.0, 2001.0]),
+            patch("argus.alerts.grader.time.time", return_value=1_700_000_000.0),
+        ):
+            alert = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.8,
+                frame_number=1,
+            )
+            assert alert is not None
+            assert "cam1:z1" in grader._event_groups
+
+            pruned = grader.prune_stale_trackers()
+
+        assert pruned == 1
+        assert grader._event_groups == {}
+
+
 class TestEarlyWarningFastPath:
     """F1: single-frame early-warning bypass of CUSUM evidence accumulation."""
 

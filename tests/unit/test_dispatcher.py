@@ -268,6 +268,53 @@ class TestWebSocketBroadcaster:
         finally:
             d.close()
 
+    def test_alert_websocket_payload_includes_evidence_fields(self, db, tmp_path):
+        config = AlertConfig()
+        captured: list[tuple[str, dict]] = []
+        d = AlertDispatcher(
+            config=config,
+            database=db,
+            alerts_dir=tmp_path / "alerts",
+            on_alert=lambda topic, payload: captured.append((topic, payload)),
+        )
+        try:
+            alert = make_alert(with_snapshot=True, with_heatmap=True)
+            alert._has_recording = True
+            alert._recording_status = "recording"
+
+            d.dispatch(alert)
+
+            payload = next(payload for topic, payload in captured if topic == "alerts")
+            assert payload["snapshot_path"].endswith("_snapshot.jpg")
+            assert payload["heatmap_path"].endswith("_heatmap.jpg")
+            assert payload["has_recording"] is True
+            assert payload["recording_status"] == "recording"
+            assert "evidence_unavailable" not in payload
+        finally:
+            d.close()
+
+    def test_alert_websocket_payload_marks_evidence_unavailable(self, db, tmp_path, monkeypatch):
+        config = AlertConfig()
+        captured: list[tuple[str, dict]] = []
+        d = AlertDispatcher(
+            config=config,
+            database=db,
+            alerts_dir=tmp_path / "alerts",
+            on_alert=lambda topic, payload: captured.append((topic, payload)),
+        )
+        try:
+            monkeypatch.setattr(d, "_save_heatmap", lambda alert: None)
+
+            d.dispatch(make_alert(with_heatmap=True))
+
+            payload = next(payload for topic, payload in captured if topic == "alerts")
+            assert payload["has_recording"] is False
+            assert payload["recording_status"] is None
+            assert payload["evidence_unavailable"] is True
+            assert "heatmap_path" not in payload
+        finally:
+            d.close()
+
     def test_set_websocket_broadcaster_can_clear(self, db, tmp_path):
         d = AlertDispatcher(config=AlertConfig(), database=db, alerts_dir=tmp_path / "alerts")
         try:

@@ -622,27 +622,47 @@ class Database:
         return result
 
     def delete_alert(self, alert_id: str) -> tuple[bool, list[str]]:
-        """Delete a single alert by ID. Returns (success, image_paths)."""
+        """Delete a single alert by ID. Returns (success, image_paths).
+
+        Alert recording metadata is deleted in the same transaction so replay
+        rows cannot outlive their parent alert. Disk cleanup remains the
+        caller's responsibility for backwards compatibility with existing
+        routes that use AlertRecordingStore.
+        """
         with self.get_session() as session:
             record = session.scalar(
                 select(AlertRecord).where(AlertRecord.alert_id == alert_id)
             )
             if record is None:
                 return False, []
+            recording = session.scalar(
+                select(AlertRecordingRecord).where(
+                    AlertRecordingRecord.alert_id == alert_id
+                )
+            )
             image_paths = []
             if record.snapshot_path:
                 image_paths.append(record.snapshot_path)
             if record.heatmap_path:
                 image_paths.append(record.heatmap_path)
+            if recording is not None:
+                session.delete(recording)
             session.delete(record)
             session.commit()
             logger.info("database.alert_deleted", alert_id=alert_id)
             return True, image_paths
 
-    def delete_old_alerts(self, days: int = 90) -> tuple[int, list[str]]:
-        """Delete alerts older than N days. Returns (count_deleted, image_paths).
+    def delete_old_alerts(
+        self,
+        days: int = 90,
+        include_recording_paths: bool = False,
+    ) -> tuple[int, list[str]] | tuple[int, list[str], list[str]]:
+        """Delete alerts older than N days.
 
-        Image paths are returned so the caller can delete files from disk.
+        By default returns ``(count_deleted, image_paths)`` to preserve the
+        historical API. When ``include_recording_paths`` is true, returns
+        ``(count_deleted, image_paths, recording_paths)`` so scheduled cleanup
+        can remove alert recording directories after the DB transaction.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         with self.get_session() as session:
@@ -653,16 +673,36 @@ class Database:
             )
 
             if not old_alerts:
+                if include_recording_paths:
+                    return 0, [], []
                 return 0, []
 
             # Collect image paths before deleting records
             image_paths = []
+            alert_ids = []
             for alert in old_alerts:
+                alert_ids.append(alert.alert_id)
                 if alert.snapshot_path:
                     image_paths.append(alert.snapshot_path)
                 if alert.heatmap_path:
                     image_paths.append(alert.heatmap_path)
 
+            recording_records = []
+            for i in range(0, len(alert_ids), 900):
+                chunk = alert_ids[i : i + 900]
+                recording_records.extend(
+                    session.scalars(
+                        select(AlertRecordingRecord).where(
+                            AlertRecordingRecord.alert_id.in_(chunk)
+                        )
+                    ).all()
+                )
+            recording_paths = [
+                rec.recording_path for rec in recording_records if rec.recording_path
+            ]
+
+            for recording in recording_records:
+                session.delete(recording)
             for alert in old_alerts:
                 session.delete(alert)
             session.commit()
@@ -672,7 +712,10 @@ class Database:
                 deleted=len(old_alerts),
                 cutoff_days=days,
                 images=len(image_paths),
+                recordings=len(recording_paths),
             )
+            if include_recording_paths:
+                return len(old_alerts), image_paths, recording_paths
             return len(old_alerts), image_paths
 
     # ── Training records ──
@@ -1223,6 +1266,22 @@ class Database:
                 record.file_size_bytes = file_size_bytes
             session.commit()
             return True
+
+    def delete_alert_recording_metadata(self, alert_id: str) -> str | None:
+        """Delete recording metadata for one alert and return its path if found."""
+        with self.get_session() as session:
+            record = session.scalar(
+                select(AlertRecordingRecord).where(
+                    AlertRecordingRecord.alert_id == alert_id
+                )
+            )
+            if record is None:
+                return None
+            recording_path = record.recording_path
+            session.delete(record)
+            session.commit()
+            logger.info("database.alert_recording_deleted", alert_id=alert_id)
+            return recording_path
 
     def cleanup_old_recordings(self, max_age_days: int = 30) -> int:
         """Delete recording records older than max_age_days. Returns count."""

@@ -116,6 +116,16 @@ class AlertDispatcher:
             "handling_policy": alert.handling_policy,
             "event_group_count": alert.event_group_count,
         }
+        recording = getattr(alert, "_solidified_recording", None)
+        has_recording = getattr(alert, "_has_recording", None)
+        recording_status = getattr(alert, "_recording_status", None)
+        if recording_status is None and recording is not None:
+            status = getattr(recording, "status", None)
+            recording_status = getattr(status, "value", status)
+        if has_recording is None:
+            has_recording = recording is not None
+        payload["has_recording"] = bool(has_recording)
+        payload["recording_status"] = recording_status
         if snapshot_path is not None:
             payload["snapshot_path"] = snapshot_path
         if heatmap_path is not None:
@@ -179,7 +189,7 @@ class AlertDispatcher:
 
     def dispatch(self, alert: Alert) -> None:
         """Send an alert to all configured channels."""
-        evidence_unavailable = False
+        evidence_unavailable = bool(getattr(alert, "_recording_evidence_unavailable", False))
 
         # Check disk space before writing images
         if not self._check_disk_space():
@@ -195,6 +205,8 @@ class AlertDispatcher:
             snapshot_path = self._save_snapshot(alert)
             heatmap_path = self._save_heatmap(alert)
             if alert.snapshot is not None and snapshot_path is None:
+                evidence_unavailable = True
+            if alert.heatmap is not None and heatmap_path is None:
                 evidence_unavailable = True
 
         # Channel 1: Database (non-blocking, queued to background thread)
@@ -279,7 +291,9 @@ class AlertDispatcher:
 
         # Channel 3: WebSocket push (real-time dashboard notification)
         # HIGH severity → priority dispatch (bypass queue, push directly)
-        ws_payload = self._alert_to_dict(alert, evidence_unavailable=evidence_unavailable)
+        ws_payload = self._alert_to_dict(
+            alert, snapshot_path, heatmap_path, evidence_unavailable,
+        )
         if self._on_alert_ws:
             try:
                 self._on_alert_ws("alerts", ws_payload)
