@@ -87,11 +87,12 @@ python scripts/smoke_core_loop.py --timeout 75 --recording-timeout 45
 python scripts/smoke_dashboard_routes.py --timeout 75
 
 # 真实业务数据 + 浏览器页面：Camera detail -> Alerts -> Replay -> Models -> System -> Reports
-python scripts/smoke_dashboard_business_flow.py --timeout 90 --recording-timeout 55 --browser required
+python scripts/smoke_dashboard_business_flow.py --timeout 90 --recording-timeout 90 --browser required
 
 # 同一条业务路径也可指向真实 USB/RTSP 源；先 preflight，确认摄像头/go2rtc 能读到帧
 # USB preflight 会在 Windows 上附带系统识别到的 Camera 设备清单，便于定位设备枚举问题
 python scripts/smoke_dashboard_business_flow.py --preflight --camera-source 0 --camera-protocol usb --require-go2rtc
+python scripts/smoke_dashboard_business_flow.py --preflight --camera-source 0 --camera-protocol usb --camera-resolution 1920,1080 --usb-device-name "OBSBOT Meet 2 StreamCamera" --require-go2rtc --preflight-measure-seconds 30
 
 # 无 RTSP 硬件时，可用本地 go2rtc 夹具把生成视频发布成 RTSP，再验证 RTSP + go2rtc 路径
 python scripts/smoke_dashboard_business_flow.py --preflight --rtsp-fixture --require-go2rtc

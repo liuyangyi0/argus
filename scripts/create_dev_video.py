@@ -19,10 +19,10 @@ import sys
 from pathlib import Path
 
 try:
-    from argus.runtime.dev_video import create_dev_video
+    from argus.runtime.dev_video import DEV_VIDEO_MOTIONS, create_dev_video
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from argus.runtime.dev_video import create_dev_video
+    from argus.runtime.dev_video import DEV_VIDEO_MOTIONS, create_dev_video
 
 
 def main() -> None:
@@ -40,9 +40,12 @@ def main() -> None:
     parser.add_argument("--anomaly-start-s", type=float, default=6.0)
     parser.add_argument(
         "--motion",
-        choices=("settle", "moving"),
+        choices=DEV_VIDEO_MOTIONS,
         default="settle",
-        help="Anomaly motion pattern: settle triggers stable foreign-object alerts; moving is for tracking demos.",
+        help=(
+            "Anomaly pattern: settle triggers stable foreign-object alerts, "
+            "moving is for tracking demos, book simulates a book placed on the table."
+        ),
     )
     args = parser.parse_args()
 

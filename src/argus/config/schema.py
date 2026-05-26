@@ -129,7 +129,25 @@ class FastMotionConfig(BaseModel):
     min_area_px: int = Field(default=2, ge=1, le=100000)
     max_area_px: int = Field(default=1500, ge=1, le=500000)
     min_streak_length_px: int = Field(default=4, ge=1, le=1000)
-    min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    max_motion_fraction: float = Field(
+        default=0.015,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Suppress fast-projectile alerts when too much of the frame changed; "
+            "large scene changes should continue through the normal anomaly path."
+        ),
+    )
+    max_streak_frame_fraction: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Suppress fast-projectile alerts when a thin connected component spans "
+            "too much of the frame; long structural edges are scene changes."
+        ),
+    )
     instant_alert_score: float = Field(default=0.96, ge=0.5, le=0.99)
     max_candidates_per_frame: int = Field(default=5, ge=1, le=50)
     min_runtime_fps: float = Field(default=50.0, ge=1.0, le=120.0)

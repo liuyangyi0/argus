@@ -83,7 +83,9 @@ cameras:
     min_area_px: 2
     max_area_px: 1500
     min_streak_length_px: 4
-    min_confidence: 0.55
+    min_confidence: 0.60
+    max_motion_fraction: 0.015
+    max_streak_frame_fraction: 0.25
     instant_alert_score: 0.96
     max_candidates_per_frame: 5
     min_runtime_fps: 50.0

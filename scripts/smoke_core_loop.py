@@ -52,7 +52,7 @@ from argus.capture.manager import CameraManager
 from argus.config.loader import load_config
 from argus.core.health import HealthMonitor
 from argus.dashboard.app import create_app
-from argus.runtime.dev_video import create_dev_video
+from argus.runtime.dev_video import DEV_VIDEO_MOTIONS, create_dev_video
 from argus.streaming.preview_gateway import PreviewGateway
 from argus.storage.alert_recording import AlertRecordingStore
 from argus.storage.database import Database
@@ -1398,7 +1398,7 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
                 fps=10,
                 seconds=max(args.video_seconds, 3),
                 anomaly_start_s=1.0,
-                motion="settle",
+                motion=args.dev_video_motion,
             )
 
         config = _prepare_config(
@@ -1470,6 +1470,7 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
             str(probe_source),
             str(probe_protocol),
             timeout_ms=int(args.preflight_timeout * 1000),
+            measure_seconds=args.preflight_measure_seconds,
         )
 
         errors: list[str] = []
@@ -1606,7 +1607,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 fps=10,
                 seconds=max(args.video_seconds, 20),
                 anomaly_start_s=6.0,
-                motion="settle",
+                motion=args.dev_video_motion,
             )
         config = _prepare_config(
             config_path,
@@ -1775,6 +1776,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Length of generated looping dev video (default: 20)",
     )
     parser.add_argument(
+        "--dev-video-motion",
+        choices=DEV_VIDEO_MOTIONS,
+        default="settle",
+        help=(
+            "Generated dev video anomaly pattern. Use book to simulate a book "
+            "being placed on an empty table."
+        ),
+    )
+    parser.add_argument(
         "--camera-source",
         default=None,
         help=(
@@ -1840,6 +1850,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Seconds to wait per capture backend during --preflight (default: 3).",
     )
     parser.add_argument(
+        "--preflight-measure-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds to sample decoded frames for preflight FPS measurement (default: 2).",
+    )
+    parser.add_argument(
         "--use-yolo",
         action="store_true",
         help="Use the config's YOLO person detector instead of forcing graceful offline mode.",
@@ -1853,6 +1869,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--activation-delay must be non-negative")
     if args.preflight_timeout <= 0:
         parser.error("--preflight-timeout must be positive")
+    if args.preflight_measure_seconds <= 0:
+        parser.error("--preflight-measure-seconds must be positive")
     return args
 
 
