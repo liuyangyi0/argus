@@ -13,7 +13,6 @@ of how long detection takes.
 from __future__ import annotations
 
 import threading
-import time
 
 import structlog
 

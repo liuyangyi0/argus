@@ -1,7 +1,6 @@
 """Tests for the alert dispatcher module."""
 
 import time
-from datetime import datetime, timezone
 
 import numpy as np
 import pytest
@@ -104,7 +103,7 @@ class TestWebhookDispatch:
 
     def test_webhook_posts_to_url(self, db, tmp_path):
         """Webhook should POST alert payload to configured URL."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         config = AlertConfig(
             webhook=WebhookConfig(enabled=True, url="http://localhost:9999/alerts"),
@@ -136,7 +135,6 @@ class TestWebhookDispatch:
 
     def test_webhook_circuit_breaker_blocks_after_failures(self, db, tmp_path):
         """Circuit breaker should open after consecutive failures."""
-        from unittest.mock import MagicMock
 
         config = AlertConfig(
             webhook=WebhookConfig(enabled=True, url="http://localhost:9999/alerts"),
@@ -213,7 +211,7 @@ class TestDiskSpaceCheck:
 
     def test_low_disk_space_skips_images(self, db, tmp_path):
         """When disk space is low, images should be skipped but DB record persisted."""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
         from collections import namedtuple
 
         DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
@@ -281,6 +279,10 @@ class TestWebSocketBroadcaster:
             alert = make_alert(with_snapshot=True, with_heatmap=True)
             alert._has_recording = True
             alert._recording_status = "recording"
+            alert.category = "projectile"
+            alert.trajectory_model = "projectile"
+            alert.speed_px_per_sec = 1234.5
+            alert.trajectory_points = [(1.25, 10.0, 20.0), (1.30, 18.5, 21.0)]
 
             d.dispatch(alert)
 
@@ -289,6 +291,13 @@ class TestWebSocketBroadcaster:
             assert payload["heatmap_path"].endswith("_heatmap.jpg")
             assert payload["has_recording"] is True
             assert payload["recording_status"] == "recording"
+            assert payload["category"] == "projectile"
+            assert payload["trajectory_model"] == "projectile"
+            assert payload["speed_px_per_sec"] == 1234.5
+            assert payload["trajectory_points"] == [
+                {"t": 1.25, "x": 10.0, "y": 20.0},
+                {"t": 1.3, "x": 18.5, "y": 21.0},
+            ]
             assert "evidence_unavailable" not in payload
         finally:
             d.close()

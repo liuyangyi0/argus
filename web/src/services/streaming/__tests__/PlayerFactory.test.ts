@@ -57,6 +57,27 @@ describe('PlayerFactory', () => {
     expect(info?.go2rtc).toBe(true)
     expect(info?.webrtc_ws).toBe('ws://localhost/webrtc')
   })
+
+  it('returns null immediately when backend advertises MJPEG fallback only', async () => {
+    vi.mocked(axios.get).mockResolvedValue({
+      data: {
+        code: 0,
+        msg: 'ok',
+        data: {
+          camera_id: 'file_cam',
+          go2rtc: false,
+          fallback: '/api/cameras/file_cam/stream',
+        },
+      },
+    })
+
+    const isCancelled = vi.fn().mockReturnValue(false)
+    const player = await PlayerFactory.create('file_cam', dummyVideoEl, isCancelled)
+
+    expect(player).toBeNull()
+    expect(axios.get).toHaveBeenCalledTimes(1)
+    expect(axios.get).toHaveBeenCalledWith('/api/streaming/file_cam')
+  })
   
   it('returns null if stream info not found', async () => {
     vi.mocked(axios.get).mockRejectedValue(new Error('Network error'))

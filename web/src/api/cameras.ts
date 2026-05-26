@@ -1,7 +1,9 @@
 import type {
   ApiResponse,
+  CameraModeMutation,
   CamerasPayload,
   ConnectionTestResult,
+  PipelineMode,
   SystemModeSummary,
 } from '../types/api'
 import { api, unwrap, u } from './client'
@@ -13,6 +15,8 @@ export const getCameraDetail = (id: string) =>
   api.get(`/cameras/${id}/detail/json`).then(u)
 export const startCamera = (id: string) => api.post(`/cameras/${id}/start`).then(u)
 export const stopCamera = (id: string) => api.post(`/cameras/${id}/stop`).then(u)
+export const setCameraMode = (id: string, mode: PipelineMode) =>
+  api.post<ApiResponse<CameraModeMutation>>(`/cameras/${id}/mode`, { mode }).then(unwrap)
 export const getUsbDevices = () => api.get('/cameras/usb-devices').then(u)
 export const addCamera = (data: FormData) => api.post('/cameras', data).then(u)
 export const updateCamera = (id: string, data: FormData) => api.put(`/cameras/${id}`, data).then(u)

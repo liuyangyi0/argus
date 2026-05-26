@@ -146,7 +146,6 @@ class TestCusumSnapshot:
         assert grader.get_cusum_state("cam-01:zone-a") is None
 
         # Feed a score to create a tracker
-        import numpy as np
         grader.evaluate(
             camera_id="cam-01",
             zone_id="zone-a",

@@ -345,8 +345,10 @@ class TestCreateRetrainingTask:
 
         # Lifecycle returns 2 eligible versions (VERIFIED + ACTIVE)
         lifecycle = MagicMock()
-        v1 = MagicMock(); v1.version = "v001"
-        v2 = MagicMock(); v2.version = "v003"
+        v1 = MagicMock()
+        v1.version = "v001"
+        v2 = MagicMock()
+        v2.version = "v003"
         lifecycle.get_eligible_versions.return_value = [v1, v2]
 
         with patch("argus.anomaly.trainer._DatasetMerger") as merger_cls, \

@@ -1,5 +1,5 @@
 import { api, u } from './client'
-import type { TrainingMetricsResponse } from '../types/api'
+import type { DatasetSelection, TrainingMetricsResponse } from '../types/api'
 
 // ── Training ──
 export const getTrainingHistory = (params?: Record<string, any>) =>
@@ -17,7 +17,7 @@ export const getTrainingJob = (jobId: string) => api.get(`/training-jobs/${jobId
 export const createTrainingJob = (data: {
   job_type: string; camera_id?: string; zone_id?: string;
   model_type?: string; trigger_type?: string; triggered_by?: string;
-  hyperparameters?: Record<string, any>;
+  hyperparameters?: Record<string, any>; dataset_selection?: DatasetSelection;
 }) => api.post('/training-jobs/', data).then(u)
 export const confirmTrainingJob = (jobId: string, data?: { confirmed_by?: string }) =>
   api.post(`/training-jobs/${jobId}/confirm`, data || {}).then(u)

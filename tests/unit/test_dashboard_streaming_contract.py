@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from argus.config.schema import ArgusConfig, CameraConfig
 from argus.dashboard.app import create_app
+from argus.streaming.go2rtc_manager import gige_to_go2rtc_source, usb_to_go2rtc_source
 
 
 class _FakeGo2RTC:
@@ -24,7 +25,38 @@ class _FakeGo2RTC:
         self.running = running
         self.api_port = api_port
         self.register_camera = MagicMock(return_value=rtsp_url)
+        self.start = MagicMock(side_effect=self._start)
         self.close = MagicMock()
+
+    def _start(self, *, initial_streams=None) -> None:
+        self.running = True
+
+
+class _RouteCameraManager:
+    def __init__(self, camera: CameraConfig) -> None:
+        self._cameras = [camera]
+        self._source_resolver = None
+        self.start_calls: list[str] = []
+        self.resolved_sources: list[tuple[str, str]] = []
+
+    def set_source_resolver(self, resolver):
+        self._source_resolver = resolver
+
+    def get_camera_config(self, camera_id: str):
+        return next(
+            (camera for camera in self._cameras if camera.camera_id == camera_id),
+            None,
+        )
+
+    def start_camera(self, camera_id: str) -> bool:
+        self.start_calls.append(camera_id)
+        camera = self.get_camera_config(camera_id)
+        if camera is not None and self._source_resolver is not None:
+            runtime_camera = self._source_resolver(camera)
+            self.resolved_sources.append(
+                (runtime_camera.source, runtime_camera.protocol),
+            )
+        return True
 
 
 def _client(
@@ -53,6 +85,15 @@ def _camera_manager(camera: CameraConfig) -> MagicMock:
     manager.get_pipeline_mode.return_value = None
     manager.is_anomaly_locked.return_value = False
     return manager
+
+
+def _expected_usb_source(camera: CameraConfig) -> str:
+    return usb_to_go2rtc_source(
+        camera.source,
+        resolution=camera.resolution,
+        fps=camera.fps_target,
+        pixel_format=camera.usb.pixel_format,
+    )
 
 
 def test_streaming_info_contract_returns_go2rtc_urls():
@@ -116,6 +157,29 @@ def test_streaming_info_contract_falls_back_when_go2rtc_unavailable():
     go2rtc.register_camera.assert_not_called()
 
 
+def test_file_streaming_info_uses_mjpeg_fallback_even_when_go2rtc_running():
+    camera = CameraConfig(
+        camera_id="file_cam",
+        name="File Camera",
+        source="data/dev/demo.avi",
+        protocol="file",
+    )
+    go2rtc = _FakeGo2RTC(running=True)
+    client = _client(camera, go2rtc=go2rtc)
+
+    response = client.get("/api/streaming/file_cam")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 0
+    assert body["data"] == {
+        "camera_id": "file_cam",
+        "go2rtc": False,
+        "fallback": "/api/cameras/file_cam/stream",
+    }
+    go2rtc.register_camera.assert_not_called()
+
+
 def test_streaming_info_contract_falls_back_when_go2rtc_registration_fails():
     camera = CameraConfig(
         camera_id="usb_cam",
@@ -136,7 +200,11 @@ def test_streaming_info_contract_falls_back_when_go2rtc_registration_fails():
         "go2rtc": False,
         "fallback": "/api/cameras/usb_cam/stream",
     }
-    go2rtc.register_camera.assert_called_once_with("usb_cam", "0", "usb")
+    go2rtc.register_camera.assert_called_once_with(
+        "usb_cam",
+        _expected_usb_source(camera),
+        "rtsp",
+    )
 
 
 def test_usb_go2rtc_runtime_rtsp_does_not_leak_to_config_or_detail_api():
@@ -208,3 +276,111 @@ def test_running_usb_connection_probe_uses_latest_frame_not_physical_source(
         "resolution": [640, 480],
         "source": "running_pipeline",
     }
+
+
+def test_start_usb_camera_uses_go2rtc_runtime_source_without_mutating_config():
+    runtime_rtsp = "rtsp://127.0.0.1:8554/usb_cam"
+    camera = CameraConfig(
+        camera_id="usb_cam",
+        name="USB Camera",
+        source="0",
+        protocol="usb",
+    )
+    manager = _RouteCameraManager(camera)
+    go2rtc = _FakeGo2RTC(rtsp_url=runtime_rtsp)
+    client = _client(camera, camera_manager=manager, go2rtc=go2rtc)
+
+    response = client.post("/api/cameras/usb_cam/start")
+
+    assert response.status_code == 200
+    go2rtc.register_camera.assert_called_once_with(
+        "usb_cam",
+        _expected_usb_source(camera),
+        "rtsp",
+    )
+    assert manager.start_calls == ["usb_cam"]
+    assert manager.resolved_sources == [(runtime_rtsp, "rtsp")]
+    assert camera.source == "0"
+    assert camera.protocol == "usb"
+
+
+def test_start_usb_camera_falls_back_to_original_source_when_go2rtc_not_running():
+    camera = CameraConfig(
+        camera_id="usb_cam",
+        name="USB Camera",
+        source="0",
+        protocol="usb",
+    )
+    manager = _RouteCameraManager(camera)
+    go2rtc = _FakeGo2RTC(running=False)
+    client = _client(camera, camera_manager=manager, go2rtc=go2rtc)
+
+    response = client.post("/api/cameras/usb_cam/start")
+
+    assert response.status_code == 200
+    go2rtc.register_camera.assert_not_called()
+    assert manager.start_calls == ["usb_cam"]
+    assert manager.resolved_sources == [("0", "usb")]
+
+
+def test_dashboard_lifespan_starts_go2rtc_before_usb_camera_start():
+    runtime_rtsp = "rtsp://127.0.0.1:8554/usb_cam"
+    camera = CameraConfig(
+        camera_id="usb_cam",
+        name="USB Camera",
+        source="0",
+        protocol="usb",
+    )
+    manager = _RouteCameraManager(camera)
+    go2rtc = _FakeGo2RTC(running=False, rtsp_url=runtime_rtsp)
+    config = ArgusConfig(cameras=[camera])
+
+    with TestClient(
+        create_app(
+            camera_manager=manager,
+            config=config,
+            go2rtc_instance=go2rtc,
+        )
+    ) as client:
+        response = client.post("/api/cameras/usb_cam/start")
+
+    assert response.status_code == 200
+    go2rtc.start.assert_called_once_with(initial_streams=None)
+    go2rtc.register_camera.assert_called_once_with(
+        "usb_cam",
+        _expected_usb_source(camera),
+        "rtsp",
+    )
+    assert manager.start_calls == ["usb_cam"]
+    assert manager.resolved_sources == [(runtime_rtsp, "rtsp")]
+    assert camera.source == "0"
+    assert camera.protocol == "usb"
+
+
+def test_dashboard_lifespan_preloads_gige_go2rtc_initial_stream():
+    camera = CameraConfig(
+        camera_id="gige_cam",
+        name="GigE Camera",
+        source="192.168.1.20",
+        protocol="gige",
+    )
+    camera.gige.capture_script = "scripts/gige_capture.ps1"
+    go2rtc = _FakeGo2RTC(
+        running=False,
+        rtsp_url="rtsp://127.0.0.1:8554/gige_cam",
+    )
+    config = ArgusConfig(cameras=[camera])
+
+    with TestClient(create_app(config=config, go2rtc_instance=go2rtc)):
+        pass
+
+    go2rtc.start.assert_called_once_with(
+        initial_streams={
+            "gige_cam": gige_to_go2rtc_source("scripts/gige_capture.ps1"),
+        },
+    )
+    go2rtc.register_camera.assert_called_once_with(
+        "gige_cam",
+        "192.168.1.20",
+        "gige",
+    )

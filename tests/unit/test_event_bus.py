@@ -10,8 +10,6 @@ from argus.core.event_bus import (
     CameraConnected,
     CameraDisconnected,
     DriftDetected,
-    Event,
-    EventBus,
     FrameAnalyzed,
     ModelLoaded,
     PipelineStageCompleted,

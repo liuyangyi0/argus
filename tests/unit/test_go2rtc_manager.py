@@ -10,13 +10,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from argus.config.schema import CameraConfig
+from argus.config.schema import CameraConfig, USBCaptureConfig
 from argus.streaming.go2rtc_manager import (
     CameraSourceResolution,
     gige_to_go2rtc_source,
     register_go2rtc_streams,
     runtime_camera_config,
     start_and_register_cameras,
+    usb_to_go2rtc_source,
 )
 
 
@@ -47,6 +48,40 @@ def _manager(
 
 
 class TestStartAndRegisterCameras:
+    def test_usb_source_includes_explicit_high_fps_mode(self):
+        source = usb_to_go2rtc_source(
+            "0",
+            resolution=(1920, 1080),
+            fps=60,
+            pixel_format="mjpeg",
+        )
+
+        assert source == (
+            "ffmpeg:device?video=0&input_format=mjpeg"
+            "&video_size=1920x1080&framerate=60#video=h264"
+        )
+
+    def test_usb_source_can_select_device_by_name_or_id(self):
+        by_name = usb_to_go2rtc_source(
+            "0",
+            device_name="OBSBOT Meet 2 StreamCamera",
+            resolution=(1920, 1080),
+            fps=60,
+            pixel_format="mjpeg",
+        )
+        by_id = usb_to_go2rtc_source(
+            "0",
+            device_id="@device_pnp_\\\\?\\usb#vid_3564&pid_3022",
+            resolution=(1920, 1080),
+            fps=60,
+            pixel_format="mjpeg",
+        )
+
+        assert "video=OBSBOT+Meet+2+StreamCamera" in by_name
+        assert "video=%40device_pnp_" in by_id
+        assert "video=0" not in by_name
+        assert "video=0" not in by_id
+
     def test_starts_when_not_running(self):
         mgr = _manager(running=False)
         cameras = [_make_cam("cam_01", "rtsp://192.168.1.10/s1", "rtsp")]
@@ -86,11 +121,45 @@ class TestStartAndRegisterCameras:
         resolutions = register_go2rtc_streams(mgr, [cam])
         runtime_cam = runtime_camera_config(cam, resolutions["cam_usb"])
 
+        mgr.register_camera.assert_called_once_with(
+            "cam_usb",
+            usb_to_go2rtc_source(
+                "0",
+                resolution=cam.resolution,
+                fps=cam.fps_target,
+                pixel_format=cam.usb.pixel_format,
+            ),
+            "rtsp",
+        )
         assert cam.source == "0"
         assert cam.protocol == "usb"
         assert runtime_cam is not cam
         assert runtime_cam.source == "rtsp://127.0.0.1:8554/cam_usb"
         assert runtime_cam.protocol == "rtsp"
+
+    def test_usb_camera_can_be_registered_by_stable_device_id(self):
+        mgr = _manager(running=False, register_return="rtsp://127.0.0.1:8554/cam_usb")
+        cam = CameraConfig(
+            camera_id="cam_usb",
+            name="USB",
+            source="0",
+            protocol="usb",
+            usb=USBCaptureConfig(device_id="@device_pnp_usb_vid_3564_pid_3022"),
+        )
+
+        register_go2rtc_streams(mgr, [cam])
+
+        mgr.register_camera.assert_called_once_with(
+            "cam_usb",
+            usb_to_go2rtc_source(
+                "0",
+                device_id="@device_pnp_usb_vid_3564_pid_3022",
+                resolution=cam.resolution,
+                fps=cam.fps_target,
+                pixel_format=cam.usb.pixel_format,
+            ),
+            "rtsp",
+        )
 
     def test_rtsp_camera_source_is_not_rewritten(self):
         """RTSP cameras keep their original source even if register_camera returned a URL."""
@@ -111,6 +180,11 @@ class TestStartAndRegisterCameras:
 
         resolutions = register_go2rtc_streams(mgr, [cam])
 
+        mgr.register_camera.assert_called_once_with(
+            "cam_usb",
+            usb_to_go2rtc_source("/dev/video0"),
+            "rtsp",
+        )
         assert cam.source == "/dev/video0"
         assert cam.protocol == "usb"
         assert resolutions["cam_usb"].runtime_source == "/dev/video0"

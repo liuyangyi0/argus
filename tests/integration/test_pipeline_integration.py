@@ -10,11 +10,8 @@ import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
 
-from argus.anomaly.detector import AnomalibDetector, AnomalyResult
 from argus.capture.camera import FrameData
-from argus.config.schema import SimplexConfig
 from argus.core.pipeline import DetectionPipeline, PipelineMode
 
 def make_gray_frame(width=640, height=480, value=128):

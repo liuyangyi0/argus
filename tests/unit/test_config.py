@@ -1,7 +1,5 @@
 """Tests for configuration loading and validation."""
 
-import tempfile
-from pathlib import Path
 
 import pytest
 import yaml
@@ -9,7 +7,7 @@ from pydantic import ValidationError
 
 from argus.config.loader import load_config
 from argus.config.schema import (
-    ArgusConfig, AlertSeverity, ZonePriority,
+    ArgusConfig, ZonePriority,
     SeverityThresholds, MOG2Config, CameraConfig, TemporalConfirmation,
     AnomalyConfig, CalibrationConfig, SimplexConfig,
 )

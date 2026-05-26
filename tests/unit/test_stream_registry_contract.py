@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from argus.config.schema import CameraConfig
+from argus.camera import CameraRuntimePlanner
+from argus.config.schema import CameraConfig, GigEConfig
+from argus.streaming.go2rtc_manager import gige_to_go2rtc_source, usb_to_go2rtc_source
 from argus.streaming.stream_registry import StreamRegistry
 
 
@@ -80,7 +82,7 @@ def test_reconcile_registers_plan_and_removes_stale_streams():
     assert manager.start_calls == [None]
     assert manager.register_calls == [
         ("cam_rtsp", "rtsp://192.168.1.10/s1", "rtsp"),
-        ("cam_usb", "0", "usb"),
+        ("cam_usb", usb_to_go2rtc_source("0"), "rtsp"),
     ]
     assert resolutions["cam_usb"].runtime_source == "rtsp://127.0.0.1:8554/cam_usb"
     assert resolutions["cam_usb"].runtime_protocol == "rtsp"
@@ -151,3 +153,52 @@ def test_reconcile_re_registers_after_go2rtc_restart():
         ("cam_01", "rtsp://192.168.1.10/s1", "rtsp"),
         ("cam_01", "rtsp://192.168.1.10/s1", "rtsp"),
     ]
+
+
+def test_reconcile_accepts_runtime_plan_for_gige_initial_streams():
+    manager = FakeGo2RTCManager(running=False)
+    registry = StreamRegistry(manager)
+    capture_script = "scripts/gige_capture.ps1"
+    camera = CameraConfig(
+        camera_id="gige_01",
+        name="GigE",
+        source="192.168.1.20",
+        protocol="gige",
+        gige=GigEConfig(capture_script=capture_script),
+    )
+    plan = CameraRuntimePlanner.build(camera)
+
+    resolutions = registry.reconcile([plan])
+
+    assert manager.start_calls == [{
+        "gige_01": gige_to_go2rtc_source(capture_script),
+    }]
+    assert manager.register_calls == [
+        ("gige_01", "192.168.1.20", "gige"),
+    ]
+    assert resolutions["gige_01"].go2rtc_managed is True
+    assert resolutions["gige_01"].runtime_source == "192.168.1.20"
+    assert resolutions["gige_01"].runtime_protocol == "gige"
+    assert resolutions["gige_01"].stream_name == "gige_01"
+
+
+def test_reconcile_accepts_runtime_plan_for_usb_runtime_redirect():
+    manager = FakeGo2RTCManager(running=True)
+    registry = StreamRegistry(manager)
+    camera = CameraConfig(camera_id="usb_01", name="USB", source="0", protocol="usb")
+    plan = CameraRuntimePlanner.build(camera)
+
+    resolutions = registry.reconcile([plan], start_if_needed=False)
+
+    assert manager.register_calls == [(
+        "usb_01",
+        usb_to_go2rtc_source(
+            "0",
+            resolution=camera.resolution,
+            fps=camera.fps_target,
+            pixel_format=camera.usb.pixel_format,
+        ),
+        "rtsp",
+    )]
+    assert resolutions["usb_01"].runtime_source == "rtsp://127.0.0.1:8554/usb_01"
+    assert resolutions["usb_01"].runtime_protocol == "rtsp"

@@ -59,21 +59,47 @@ export const useAlertStore = defineStore('alertStore', () => {
   }
 
   // Handle incoming WS data
+  function matchesCurrentFilters(alert: any): boolean {
+    if (filters.value.camera_id && alert.camera_id !== filters.value.camera_id) {
+      return false
+    }
+    if (filters.value.severity && alert.severity !== filters.value.severity) {
+      return false
+    }
+    return true
+  }
+
   function updateFromWebSocket(data: any) {
     if (data && typeof data === 'object' && !Array.isArray(data) && data.alert_id) {
       const idx = alerts.value.findIndex(a => a.alert_id === data.alert_id)
+      const selectedMatches = selectedAlert.value?.alert_id === data.alert_id
       if (idx >= 0) {
-        alerts.value[idx] = { ...alerts.value[idx], ...data }
-        if (selectedAlert.value?.alert_id === data.alert_id) {
+        const merged = { ...alerts.value[idx], ...data }
+        if (matchesCurrentFilters(merged)) {
+          alerts.value[idx] = merged
+        } else {
+          alerts.value.splice(idx, 1)
+          totalAlerts.value = Math.max(0, totalAlerts.value - 1)
+        }
+        if (selectedMatches) {
           selectedAlert.value = { ...selectedAlert.value, ...data }
         }
       } else {
-        alerts.value.unshift(data)
-        totalAlerts.value++
+        if (selectedMatches) {
+          selectedAlert.value = { ...selectedAlert.value, ...data }
+        }
+        if (matchesCurrentFilters(data)) {
+          alerts.value.unshift(data)
+          totalAlerts.value++
+          if (pageParams.value.limit > 0 && alerts.value.length > pageParams.value.limit) {
+            alerts.value = alerts.value.slice(0, pageParams.value.limit)
+          }
+        }
       }
     } else if (Array.isArray(data)) {
-      alerts.value = data
-      totalAlerts.value = data.length
+      const filtered = data.filter(matchesCurrentFilters)
+      alerts.value = filtered.slice(0, pageParams.value.limit)
+      totalAlerts.value = filtered.length
     }
   }
 

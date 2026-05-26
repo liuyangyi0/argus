@@ -463,7 +463,7 @@ class GlobalDegradationManager:
                 return None
             return min(
                 (e.level for e in self._active.values()),
-                key=lambda l: _DEGRADATION_LEVEL_ORDER.get(l, 99),
+                key=lambda level: _DEGRADATION_LEVEL_ORDER.get(level, 99),
             )
 
     @staticmethod

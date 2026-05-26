@@ -1,6 +1,5 @@
 """Tests for PipelineModeGuard / GlobalPipelineModeGuard (PR2)."""
 
-from unittest.mock import MagicMock
 
 import pytest
 

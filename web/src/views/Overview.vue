@@ -8,18 +8,25 @@ import { getDailyTrend } from '../api/reports'
 import { getTrainingJobs } from '../api/training'
 import { getAnomalyDegradation, type AnomalyDegradationStatus } from '../api/system'
 import { useWebSocket } from '../composables/useWebSocket'
+import { useAuthStore } from '../stores/useAuthStore'
 import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 defineOptions({ name: 'OverviewPage' })
 
 const router = useRouter()
+const auth = useAuthStore()
 const wallStore = useWallStore()
 const { cameras, health, loading } = storeToRefs(wallStore)
 
 // Pending training-job banner — surfaces audit C-11 pending_confirmation jobs
-// so operators have a single discoverable entry point from the dashboard.
+// so model managers have a single discoverable entry point from the dashboard.
+const canManageTraining = computed(() => auth.hasRole(['admin', 'engineer']))
 const pendingCount = ref(0)
 async function fetchPendingCount() {
+  if (!canManageTraining.value) {
+    pendingCount.value = 0
+    return
+  }
   try {
     const res = await getTrainingJobs({ status: 'pending_confirmation', limit: 1 })
     // Backend returns pending_count regardless of status filter (total pending).
@@ -357,7 +364,7 @@ function sparklineFill(values: number[]): string {
       </a-alert>
 
       <a-alert
-        v-if="pendingCount > 0"
+        v-if="canManageTraining && pendingCount > 0"
         type="warning"
         show-icon
         style="margin: 0 18px 4px"
@@ -454,7 +461,7 @@ function sparklineFill(values: number[]): string {
               <div class="a-marker"></div>
             </div>
             <div class="a-num">{{ ((item.alert.anomaly_score ?? 0) * 100).toFixed(0) }}<small>分</small></div>
-            <button class="a-btn" @click="$router.push(`/alerts?camera=${item.camera.camera_id}`)">查看详情 →</button>
+            <button class="a-btn" @click="$router.push(`/alerts?id=${item.alert.alert_id}`)">查看详情 →</button>
           </div>
         </template>
         

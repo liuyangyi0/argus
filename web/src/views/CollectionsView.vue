@@ -14,12 +14,15 @@ import {
 import type { BaselineCollection } from '../types/api'
 import { extractErrorMessage } from '../utils/error'
 import ErrorDetailModal from '../components/common/ErrorDetailModal.vue'
+import { useAuthStore } from '../stores/useAuthStore'
 
 defineOptions({ name: 'CollectionsView' })
 
 const router = useRouter()
+const auth = useAuthStore()
 const collections = ref<BaselineCollection[]>([])
 const loading = ref(false)
+const canManageBaselines = computed(() => auth.hasRole(['admin', 'engineer']))
 
 async function load() {
   loading.value = true
@@ -157,22 +160,23 @@ const rows = computed(() => collections.value)
                 @click="showError(record as BaselineCollection)"
               >查看错误</Button>
               <Button
-                v-if="record.status !== 'failed' && !record.is_current"
+                v-if="canManageBaselines && record.status !== 'failed' && !record.is_current"
                 size="small"
                 type="primary"
                 @click="handleActivate(record as BaselineCollection)"
               >激活</Button>
               <Button
-                v-if="record.status !== 'failed'"
+                v-if="canManageBaselines && record.status !== 'failed'"
                 size="small"
                 @click="trainWithThis(record as BaselineCollection)"
               >用这批训练</Button>
               <Button
-                v-if="record.status !== 'failed' && record.state !== 'retired'"
+                v-if="canManageBaselines && record.status !== 'failed' && record.state !== 'retired'"
                 size="small"
                 @click="handleRetire(record as BaselineCollection)"
               >Retire</Button>
               <Popconfirm
+                v-if="canManageBaselines"
                 :title="record.is_current
                   ? '此版本是当前激活基线，删除后该摄像头将没有可用基线，确定？'
                   : '确认删除此版本？'"

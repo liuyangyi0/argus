@@ -39,6 +39,11 @@ function redirectFromTabQuery(prefix: string, mapping: Record<string, string>, d
   }
 }
 
+function defaultModelsChild(): string {
+  const auth = useAuthStore()
+  return auth.hasRole(['admin', 'engineer']) ? 'baseline' : 'collections'
+}
+
 const router = createRouter({
   history: createWebHistory(),
   routes: [
@@ -85,7 +90,7 @@ const router = createRouter({
             // Only redirect when targeting the parent itself (no child segment)
             // and a legacy ?tab= param needs to be honored, OR no child at all (default).
             if (to.matched.length && to.path.replace(/\/$/, '') === '/models') {
-              return redirectFromTabQuery('/models', MODELS_TAB_TO_PATH, 'baseline')(to)
+              return redirectFromTabQuery('/models', MODELS_TAB_TO_PATH, defaultModelsChild())(to)
             }
             return true
           },

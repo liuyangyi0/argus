@@ -7,12 +7,23 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from argus.dashboard.api_response import api_success, api_not_found, api_unavailable
-from argus.dashboard.auth import current_username
+from argus.dashboard.api_response import (
+    api_forbidden,
+    api_not_found,
+    api_success,
+    api_unavailable,
+)
+from argus.dashboard.auth import current_username, require_role
 from argus.dashboard.forms import htmx_toast_headers
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _deny_without_zone_edit(request: Request):
+    if require_role(request, "admin", "engineer"):
+        return None
+    return api_forbidden("权限不足")
 
 
 def _persist_zones(request: Request, camera_id: str, zones: list) -> None:
@@ -53,6 +64,10 @@ class ZoneCreateRequest(BaseModel):
 @router.post("")
 async def create_zone(request: Request, zone_req: ZoneCreateRequest):
     """Add a new zone to a camera's pipeline."""
+    denied = _deny_without_zone_edit(request)
+    if denied:
+        return denied
+
     from argus.config.schema import ZoneConfig, ZonePriority
 
     camera_manager = request.app.state.camera_manager
@@ -112,6 +127,10 @@ class ZoneBulkItem(BaseModel):
 @router.put("/{camera_id}")
 async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkItem]):
     """Replace all zones for a camera with the provided list."""
+    denied = _deny_without_zone_edit(request)
+    if denied:
+        return denied
+
     from argus.config.schema import ZoneConfig, ZonePriority
 
     camera_manager = request.app.state.camera_manager
@@ -164,6 +183,10 @@ async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkI
 @router.delete("/{camera_id}/{zone_id}")
 async def delete_zone(request: Request, camera_id: str, zone_id: str):
     """Remove a zone from a camera's pipeline."""
+    denied = _deny_without_zone_edit(request)
+    if denied:
+        return denied
+
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("摄像头管理器不可用")

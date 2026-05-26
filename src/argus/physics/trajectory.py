@@ -26,7 +26,7 @@ import numpy as np
 import structlog
 
 if TYPE_CHECKING:
-    from argus.physics.calibration import CameraCalibration, WorldPoint
+    from argus.physics.calibration import CameraCalibration
 
 logger = structlog.get_logger()
 

@@ -2,9 +2,8 @@
 
 import json
 import threading
-import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -13,11 +12,9 @@ from argus.capture.baseline_job import (
     BaselineCaptureJobConfig,
     run_baseline_capture_job,
     _write_manifest,
-    _write_stats,
     _distribution,
     _create_sampler,
 )
-from argus.capture.quality import CaptureStats
 from argus.config.schema import CaptureQualityConfig
 
 

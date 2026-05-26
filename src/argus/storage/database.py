@@ -15,9 +15,6 @@ from argus.storage.models import (
     AlertWorkflowStatus,
     BackboneRecord,
     Base,
-    BaselineRecord,
-    BaselineVersionRecord,
-    ContinuousRecordingSegment,
     FeedbackRecord,
     FeedbackStatus,
     InferenceRecord,
@@ -848,7 +845,7 @@ class Database:
         """Get the currently active backbone."""
         with self.get_session() as session:
             return session.scalar(
-                select(BackboneRecord).where(BackboneRecord.is_active == True)
+                select(BackboneRecord).where(BackboneRecord.is_active.is_(True))
             )
 
     def list_backbones(self, limit: int = 20) -> list[BackboneRecord]:
@@ -876,7 +873,7 @@ class Database:
             # Atomic: deactivate all then activate target in one flush
             session.execute(
                 update(BackboneRecord).where(
-                    BackboneRecord.is_active == True
+                    BackboneRecord.is_active.is_(True)
                 ).values(is_active=False)
             )
             record.is_active = True

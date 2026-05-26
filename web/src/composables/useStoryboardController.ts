@@ -1,4 +1,4 @@
-import { ref, computed, onBeforeUnmount } from 'vue'
+import { ref, computed, onBeforeUnmount, unref, type Ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { getStoryboard, getReplayMetadata } from '../api'
 import type { StoryboardCamera } from '../types/api'
@@ -16,7 +16,9 @@ import type { StoryboardCamera } from '../types/api'
  * they never drive the clock themselves. This keeps all cameras locked to
  * the same wall-clock moment even when one player stalls or buffers.
  */
-export function useStoryboardController(alertId: string) {
+type MaybeRef<T> = T | Ref<T>
+
+export function useStoryboardController(alertId: MaybeRef<string>) {
   const cameras = ref<StoryboardCamera[]>([])
   const loading = ref(true)
   const error = ref<string | null>(null)
@@ -30,6 +32,11 @@ export function useStoryboardController(alertId: string) {
   const masterTime = ref(0)
   const playing = ref(false)
   const speed = ref(1)
+  let loadGeneration = 0
+
+  function isCurrentLoad(generation: number, currentAlertId: string): boolean {
+    return generation === loadGeneration && currentAlertId === unref(alertId)
+  }
 
   // Scrubber bounds — computed from per-camera durations and offsets.
   // timelineStart is the earliest moment any camera has footage for;
@@ -140,10 +147,24 @@ export function useStoryboardController(alertId: string) {
   /* ── Data loading ── */
 
   async function load(): Promise<void> {
+    const currentAlertId = unref(alertId)
+    const generation = ++loadGeneration
+    if (!currentAlertId) {
+      pause()
+      cameras.value = []
+      durations.value = {}
+      error.value = '缺少告警 ID'
+      loading.value = false
+      return
+    }
+
+    pause()
     loading.value = true
     error.value = null
+    durations.value = {}
     try {
-      const res = await getStoryboard(alertId)
+      const res = await getStoryboard(currentAlertId)
+      if (!isCurrentLoad(generation, currentAlertId)) return
       const list = (res?.cameras ?? []).slice(0, 4) // Hard cap
       cameras.value = list
       // Pre-fetch durations from metadata so the scrubber is accurate before
@@ -155,6 +176,7 @@ export function useStoryboardController(alertId: string) {
             const fps = meta?.fps || 15
             const frames = meta?.frame_count || 0
             if (fps > 0 && frames > 0) {
+              if (!isCurrentLoad(generation, currentAlertId)) return
               reportDuration(c.alert_id, frames / fps)
             }
           } catch (e) {
@@ -162,15 +184,19 @@ export function useStoryboardController(alertId: string) {
           }
         }),
       )
+      if (!isCurrentLoad(generation, currentAlertId)) return
       // Default master time = 0 (primary trigger moment).
       masterTime.value = 0
     } catch (e) {
+      if (!isCurrentLoad(generation, currentAlertId)) return
       const msg = e instanceof Error ? e.message : '多机位回放加载失败'
       error.value = msg
       message.error(msg)
       cameras.value = []
     } finally {
-      loading.value = false
+      if (isCurrentLoad(generation, currentAlertId)) {
+        loading.value = false
+      }
     }
   }
 

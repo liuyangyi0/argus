@@ -5,10 +5,10 @@ learning mode suppression, mode management, and pipeline stats.
 """
 
 import time
-from unittest.mock import MagicMock, patch, PropertyMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
 
 from argus.anomaly.detector import AnomalyResult
 from argus.capture.camera import FrameData
@@ -35,6 +35,7 @@ def _make_configs():
     """Create minimal camera + alert configs with simplex/drift/ring_buffer disabled."""
     from argus.config.schema import (
         DriftConfig,
+        FastMotionConfig,
         LowLightConfig,
         RingBufferConfig,
         SimplexConfig,
@@ -54,6 +55,7 @@ def _make_configs():
         ),
         anomaly=AnomalyConfig(threshold=0.7),
         simplex=SimplexConfig(enabled=False),
+        fast_motion=FastMotionConfig(enabled=False),
         drift=DriftConfig(enabled=False),
         ring_buffer=RingBufferConfig(enabled=False),
         low_light=LowLightConfig(enabled=False),
@@ -252,6 +254,140 @@ class TestMOG2PreFilter:
         pipeline._anomaly_detector.predict.assert_called_once()
         assert pipeline.stats.frames_heartbeat == 1
 
+    def test_ssim_calibration_bypasses_no_change_prefilter(self):
+        """Cold-start SSIM calibration must see stable frames, not only MOG2 changes."""
+        pipeline = _build_pipeline()
+        pipeline._last_heartbeat_time = time.monotonic()
+        pipeline._anomaly_detector.get_status.return_value = SimpleNamespace(
+            mode="ssim_fallback",
+            ssim_calibrated=False,
+        )
+        pipeline._prefilter.process.return_value = PreFilterResult(
+            has_change=False,
+            change_ratio=0.0,
+        )
+        pipeline._anomaly_detector.predict.return_value = AnomalyResult(
+            anomaly_score=0.0,
+            anomaly_map=None,
+            is_anomalous=False,
+            threshold=0.7,
+        )
+        pipeline._object_detector.detect.return_value = ObjectDetectionResult()
+
+        result = pipeline.process_frame(_make_frame_data())
+
+        assert result is None
+        pipeline._prefilter.process.assert_called_once()
+        pipeline._anomaly_detector.predict.assert_called_once()
+        assert pipeline.stats.frames_skipped_no_change == 0
+
+
+# ---------------------------------------------------------------------------
+# TestFastMotion
+# ---------------------------------------------------------------------------
+
+class TestFastMotion:
+    """Fast projectile branch should bypass heavy inference in alert modes."""
+
+    def _fast_pipeline(self):
+        from argus.config.schema import FastMotionConfig
+
+        cam, alert_cfg = _make_configs()
+        cam.fast_motion = FastMotionConfig(
+            enabled=True,
+            process_width=320,
+            diff_threshold=18,
+            min_area_px=2,
+            max_area_px=1500,
+            min_streak_length_px=4,
+            min_confidence=0.55,
+            instant_alert_score=0.96,
+            max_candidates_per_frame=5,
+            required_resolution=(640, 480),
+        )
+        pipeline = _build_pipeline(cam, alert_cfg)
+        pipeline._prefilter.process.return_value = PreFilterResult(
+            has_change=False,
+            change_ratio=0.0,
+        )
+        pipeline._last_heartbeat_time = time.monotonic()
+        return pipeline
+
+    def test_fast_motion_alerts_as_projectile_and_skips_heavy_inference(self):
+        from argus.alerts.grader import Alert, AlertSeverity, DetectionType
+        from argus.core.alert_ring_buffer import AlertFrameBuffer
+
+        pipeline = self._fast_pipeline()
+        alert = Alert(
+            alert_id="ALT-fast-motion",
+            camera_id="test_cam",
+            zone_id="default",
+            severity=AlertSeverity.HIGH,
+            anomaly_score=0.96,
+            timestamp=time.time(),
+            frame_number=2,
+        )
+        pipeline._alert_grader.evaluate.return_value = alert
+        pipeline._alert_ring_buffer = AlertFrameBuffer(
+            fps=5,
+            pre_seconds=10,
+            post_seconds=1,
+        )
+        pipeline._ring_buffer_jpeg_quality = 85
+
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        pipeline.process_frame(_make_frame_data(blank, frame_number=1))
+
+        frame = blank.copy()
+        frame[120:127, 250:260] = 255
+        result = pipeline.process_frame(_make_frame_data(frame, frame_number=2))
+
+        assert result is alert
+        call = pipeline._alert_grader.evaluate.call_args
+        assert call.kwargs["detection_type"] == DetectionType.PROJECTILE
+        assert call.kwargs["detected_objects"][0]["class_name"] == "fast_projectile"
+        assert alert.category == "projectile"
+        assert alert.trajectory_model == "projectile"
+        assert alert.trajectory_points
+        pipeline._object_detector.detect.assert_not_called()
+        pipeline._anomaly_detector.predict.assert_not_called()
+        assert pipeline.stats.frames_analyzed == 1
+        assert pipeline.stats.alerts_emitted == 1
+        latest_snapshot = pipeline._alert_ring_buffer._frames[-1]
+        assert latest_snapshot.yolo_boxes[0]["class"] == "fast_projectile"
+        assert latest_snapshot.active_tracks[0]["track_id"] > 0
+
+    def test_collection_mode_does_not_run_fast_motion(self):
+        pipeline = self._fast_pipeline()
+        pipeline._fast_motion = MagicMock()
+        pipeline.set_mode(PipelineMode.COLLECTION)
+
+        result = pipeline.process_frame(_make_frame_data(np.zeros((480, 640, 3), dtype=np.uint8)))
+
+        assert result is None
+        pipeline._fast_motion.process.assert_not_called()
+        pipeline._fast_motion.reset.assert_called_once()
+
+    def test_fast_motion_uses_real_early_warning_grader(self):
+        from argus.alerts.grader import AlertGrader, DetectionType
+
+        pipeline = self._fast_pipeline()
+        _cam_cfg, alert_cfg = _make_configs()
+        pipeline._alert_grader = AlertGrader(alert_cfg)
+
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        pipeline.process_frame(_make_frame_data(blank, frame_number=1))
+
+        frame = blank.copy()
+        frame[160:168, 300:315] = 255
+        result = pipeline.process_frame(_make_frame_data(frame, frame_number=2))
+
+        assert result is not None
+        assert result.triggered_by_early_warning is True
+        assert result.detection_type == DetectionType.PROJECTILE
+        assert result.detected_objects[0]["class_name"] == "fast_projectile"
+        assert result.category == "projectile"
+
 
 # ---------------------------------------------------------------------------
 # TestPersonFilter
@@ -404,7 +540,7 @@ class TestAnomalyDetection:
             zone_id="default",
             severity=AlertSeverity.MEDIUM,
             anomaly_score=0.95,
-            timestamp=time.time() + 1.0,
+            timestamp=time.time() - 0.05,
             frame_number=1,
         )
         pipeline = _build_pipeline()
@@ -704,7 +840,7 @@ class TestStationarySuppressionIntegrationF5:
         pipeline._alert_grader.evaluate.assert_not_called()
 
     @staticmethod
-    def _real_alert(severity: "AlertSeverity", score: float) -> "Alert":
+    def _real_alert(severity, score: float):
         from argus.alerts.grader import Alert
         return Alert(
             alert_id="ALT-test",

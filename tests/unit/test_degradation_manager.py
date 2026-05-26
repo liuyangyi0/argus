@@ -1,13 +1,10 @@
 """Tests for GlobalDegradationManager (UX v2 §5)."""
 
-import time
 
-import pytest
 
 from argus.core.degradation import (
     DEGRADATION_TEMPLATES,
     DegradationLevel,
-    GlobalDegradationEvent,
     GlobalDegradationManager,
 )
 
@@ -21,7 +18,7 @@ class TestGlobalDegradationManager:
 
     def test_report_with_format_kwargs(self):
         mgr = GlobalDegradationManager()
-        event_id = mgr.report(
+        mgr.report(
             "rtsp_broken",
             camera_id="cam_02",
             camera="cam_02",
@@ -104,7 +101,7 @@ class TestGlobalDegradationManager:
 
     def test_unknown_category_creates_generic(self):
         mgr = GlobalDegradationManager()
-        eid = mgr.report("unknown_thing")
+        mgr.report("unknown_thing")
         assert mgr.active_count == 1
         active = mgr.get_active()
         assert "未知降级" in active[0]["title"]

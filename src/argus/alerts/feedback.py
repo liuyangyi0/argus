@@ -16,7 +16,6 @@ import json
 import shutil
 import threading
 import uuid
-from datetime import datetime
 from pathlib import Path
 
 import structlog

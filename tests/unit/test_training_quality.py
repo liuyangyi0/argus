@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
-import pytest
 
 from argus.anomaly.quality import (
     DatasetSplitter,
@@ -15,7 +14,6 @@ from argus.anomaly.quality import (
     OutputValidator,
     PostTrainingValidator,
     TrainingValidator,
-    ValidationResult,
     _compute_grade,
     recommend_threshold,
 )
@@ -372,7 +370,7 @@ class TestPostTrainingValidator:
         val_dir = tmp_path / "val"
         val_dir.mkdir()
 
-        with patch("argus.anomaly.detector.AnomalibDetector") as MockDetector:
+        with patch("argus.anomaly.detector.AnomalibDetector"):
             validator = PostTrainingValidator()
             model_path = tmp_path / "model.ckpt"
             model_path.write_bytes(b"fake")

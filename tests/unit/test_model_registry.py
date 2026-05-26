@@ -1,11 +1,14 @@
 """Tests for model registry (C4) and deployment state machine (Section 7)."""
 
-import numpy as np
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from argus.storage.models import Base, ModelRecord, ModelStage
+from argus.storage import model_registry as registry_module
+from argus.storage.models import Base
 from argus.storage.model_registry import ModelRegistry
 
 
@@ -100,6 +103,46 @@ class TestModelRegistry:
         vid2 = registry.register(m2, baseline_dir, "cam_01", "patchcore")
 
         assert vid1 != vid2
+
+    def test_register_retries_unique_id_collision_across_registry_instances(
+        self,
+        model_dir,
+        baseline_dir,
+        monkeypatch,
+    ):
+        """Two registry objects in the same second must not collide."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session_factory = sessionmaker(bind=engine)
+
+        class FixedDatetime:
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 5, 26, 4, 54, 0, tzinfo=tz or timezone.utc)
+
+        suffixes = iter([
+            "deadbeef000000000000000000000000",
+            "deadbeef000000000000000000000000",
+            "cafebabe000000000000000000000000",
+        ])
+
+        monkeypatch.setattr(registry_module, "datetime", FixedDatetime)
+        monkeypatch.setattr(
+            registry_module.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex=next(suffixes)),
+        )
+
+        first = ModelRegistry(session_factory=session_factory)
+        second = ModelRegistry(session_factory=session_factory)
+
+        vid1 = first.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        vid2 = second.register(model_dir, baseline_dir, "cam_01", "patchcore")
+
+        assert vid1 != vid2
+        assert vid1.endswith("deadbeef")
+        assert vid2.endswith("cafebabe")
+        assert len(first.list_models(camera_id="cam_01")) == 2
 
     def test_rollback_to_previous(self, registry, baseline_dir, tmp_path):
         """Rollback should reactivate the previous model version."""

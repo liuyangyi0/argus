@@ -58,6 +58,14 @@ python -m argus --config configs/default.yaml
 ```
 
 默认情况下 Dashboard 运行在 http://127.0.0.1:8080。
+如果本机没有 USB / RTSP 摄像头，可用同一份默认配置启动可复现的本地视频源：
+
+```powershell
+python -m argus --config configs/default.yaml --dev-video
+```
+
+这会生成 `data/dev/demo_camera.avi`，并在本次进程中把摄像头切到 `file` 输入，便于验证 Cameras → Alerts → Replay → Models → System → Reports 闭环。
+需要在本机快速验证训练/导出 UI 链路时，可额外加 `--dev-fast-training`；它会生成可被 OpenVINO 加载的确定性开发模型工件，不会替代正常 anomalib 训练。
 
 ### 前端开发模式
 
@@ -71,7 +79,34 @@ npm run dev
 
 ```powershell
 python -m pytest tests/ -v
+
+# 核心业务闭环：Cameras -> Alerts -> Replay -> Models -> System -> Reports
+python scripts/smoke_core_loop.py --timeout 75 --recording-timeout 45
+
+# 后端实际托管的 Dashboard 路由与媒体入口
+python scripts/smoke_dashboard_routes.py --timeout 75
+
+# 真实业务数据 + 浏览器页面：Camera detail -> Alerts -> Replay -> Models -> System -> Reports
+python scripts/smoke_dashboard_business_flow.py --timeout 90 --recording-timeout 55 --browser required
+
+# 同一条业务路径也可指向真实 USB/RTSP 源；先 preflight，确认摄像头/go2rtc 能读到帧
+# USB preflight 会在 Windows 上附带系统识别到的 Camera 设备清单，便于定位设备枚举问题
+python scripts/smoke_dashboard_business_flow.py --preflight --camera-source 0 --camera-protocol usb --require-go2rtc
+
+# 无 RTSP 硬件时，可用本地 go2rtc 夹具把生成视频发布成 RTSP，再验证 RTSP + go2rtc 路径
+python scripts/smoke_dashboard_business_flow.py --preflight --rtsp-fixture --require-go2rtc
+python scripts/smoke_dashboard_business_flow.py --rtsp-fixture --require-go2rtc --browser required
+
+# preflight 通过后再跑完整业务闭环；activation-delay 留给操作员放入测试目标
+python scripts/smoke_dashboard_business_flow.py --camera-source 0 --camera-protocol usb --require-go2rtc --activation-delay 10 --browser required
+python scripts/smoke_dashboard_business_flow.py --camera-source rtsp://user:pass@host/stream --camera-protocol rtsp --require-go2rtc --activation-delay 10 --browser required
+
+# 真实 anomalib 训练链路（比 dev-fast 慢；会先在临时目录生成 baseline）
+python scripts/smoke_dashboard_business_flow.py --training-mode normal --training-timeout 420 --browser off
 ```
+
+`smoke_dashboard_routes.py` 在本机找到 Chrome / Edge / Chromium 时，会额外以 headless 浏览器执行前端 JS 并检查核心页面 DOM；需要强制浏览器检查时可加 `--browser required`。
+`smoke_dashboard_business_flow.py` 会派生临时配置和数据目录，启动真实 Dashboard 服务，通过 WebSocket 验证告警实时推送，生成 Replay 证据，并默认用 `--dev-fast-training` 完成可复现的训练任务、导出、模型发布 / 回滚 API 和浏览器页面检查。需要验证真实训练时改用 `--training-mode normal`；需要验证硬件时先跑 `--preflight --camera-source ...`，USB preflight 会输出 Windows 摄像头设备清单、OpenCV 运行时包信息和排查提示，完整业务运行会同时检查 snapshot JPEG、Streaming/go2rtc 合同和业务页面 DOM。没有 RTSP 设备时可加 `--rtsp-fixture`，脚本会启动一个本地 go2rtc，把生成视频以 RTSP 发布，再让 Argus 以真实 RTSP 输入和独立 go2rtc 浏览器代理路径消费它。
 
 ## 默认配置要点
 
@@ -79,6 +114,7 @@ python -m pytest tests/ -v
 
 - 默认示例摄像头使用 USB 输入。
 - Dashboard 默认开启 go2rtc 集成。
+- 本地无硬件时可用 `--dev-video` 显式切到可循环的视频文件输入，不修改 `configs/default.yaml`。
 - Simplex 安全通道、健康检查、漂移检测、环形缓冲默认开启。
 - 分类器、分割器、跨摄像头、自动重训练默认关闭。
 

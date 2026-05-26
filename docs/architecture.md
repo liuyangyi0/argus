@@ -1,6 +1,6 @@
 # Argus 系统架构文档
 
-> 最后更新：2026-05-04
+> 最后更新：2026-05-25
 
 本文档描述当前仓库已经落地的系统结构、运行时关系和主要边界，内容以实际代码路径为准，而不是历史规划中的理想版本。
 
@@ -189,7 +189,7 @@ DetectionPipeline
 FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 
 - HTTP API：配置、摄像头、告警、模型、训练作业、回放、系统管理等。
-- WebSocket：向前端广播 health、cameras、alerts、tasks、degradation 等主题消息。
+- WebSocket：向前端广播 health、cameras、alerts、tasks、degradation、system_degradation 等主题消息。
 - SPA 托管：生产模式下直接托管 `web/dist`。
 
 ### 7.1 App State 注入
@@ -235,7 +235,8 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 ### 7.3 WebSocket
 
 - `ConnectionManager` 使用 janus 队列桥接同步线程和异步 WebSocket 客户端。
-- 广播主题目前包括 health、cameras、alerts、tasks、wall、degradation、heatmap。
+- 广播主题目前包括 health、cameras、alerts、tasks、wall、degradation、heatmap、audio_alert、models、model_release、system_degradation、system_errors。
+- `degradation` 面向全局降级事件条，`system_degradation` 面向每路 pipeline 的异常检测 fallback 状态，前端 System/Overview 会在收到该主题后重新查询 `/api/system/anomaly-degradation`。
 - 这层设计的目标是让摄像头线程、告警分发器和后台任务可以线程安全地向前端推送状态，而不直接依赖事件循环。
 
 ### 7.4 中间件与安全
@@ -260,7 +261,7 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 
 另有：
 
-- `/training` 重定向到 `/models?tab=training`，不是独立页面。
+- `/training` 重定向到 `/models/training`，不是独立页面。
 - `/replay/:alertId` 和 `/replay/:alertId/storyboard` 是从告警跳转的参数化子路由，由 `views/ReplayView.vue` 和 `views/StoryboardReplay.vue` 渲染，不在侧栏出现。
 
 ### 8.1 页面职责
@@ -270,7 +271,7 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 - Alerts：告警列表、筛选、工作流操作和回放详情。
 - Reports：报表与统计分析。
 - Models：基线、训练与评估、模型发布、A/B 对比、标注队列、阈值预览。
-- System：系统概览、配置管理、备份、审计、降级历史、音频告警、用户管理、存储清理。
+- System：系统概览、配置管理、备份、审计、降级历史、异常检测 fallback、模块开关、音频告警、用户管理、存储清理。
 - ReplayView / StoryboardReplay：从告警进入的录像回放视图，分别是单机位回放和多机位故事板回放。
 - Alerts 列表使用后端分页契约：`/api/alerts/json` 支持 `limit` 和 `offset`，响应中的 `total` 表示过滤后的总数。
 
@@ -279,6 +280,30 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 - 前端只消费后端已经稳定提供的 API 与 WebSocket 主题。
 - “后端有 API”不等于“前端有独立主页面”。
 - 训练、标注、配置、审计等能力当前主要表现为模型页或系统页下的标签聚合。
+
+### 8.3 核心业务闭环验收顺序
+
+面对系统性问题时，优先按真实操作路径逐段验证，再回到架构层定位共用组件：
+
+```text
+Cameras -> Alerts -> Replay -> Models -> System -> Reports
+```
+
+每段的最低验收证据如下：
+
+- Cameras：摄像头进程运行、持续取帧、快照 JPEG 有效，浏览器播放元数据正确；RTSP/USB 场景还要确认 go2rtc 注册成功。
+- Alerts：视频触发真实告警，后端 `/api/alerts/json` 和 WebSocket `alerts` 主题看到同一条告警。
+- Replay：告警详情有快照、热力图、录像完成状态，Replay metadata/signals/evidence zip 都可读取。
+- Models：训练作业确认后完成，导出和 re-export 成功，模型能按 shadow -> canary -> production 发布并 rollback。
+- System：检测参数热更新能反馈到 pipeline，模型 fallback / 降级状态能在系统 API 和前端系统页观察。
+- Reports：报表统计来自真实告警和证据记录，至少验证总告警数、Replay 覆盖率、完整证据率和摄像头分布。
+
+本地开发环境的可复现入口：
+
+- `python -m argus --config configs/default.yaml --dev-video --dev-fast-training`：启动一个使用生成视频和确定性训练工件的本地操作台，不修改默认配置文件。
+- `python scripts/smoke_dashboard_business_flow.py --browser required`：启动真实 Dashboard，默认使用生成视频和 dev-fast trainer，检查 JSON API、WebSocket、浏览器 DOM 和完整业务 checklist。
+- `python scripts/smoke_dashboard_business_flow.py --rtsp-fixture --require-go2rtc --browser required`：额外启动一个本地 go2rtc，把生成视频发布为 RTSP，验证 RTSP 输入与 Argus 自己的 go2rtc 播放代理路径。
+- `python scripts/smoke_dashboard_business_flow.py --preflight --camera-source 0 --camera-protocol usb --require-go2rtc`：真实硬件先跑 preflight，确认设备、go2rtc 注册和首帧读取后再跑完整闭环；Windows USB 场景会附带系统识别到的 Camera 设备清单、OpenCV 运行时包信息和 hints，便于区分“系统未枚举设备”、“设备已枚举但 OpenCV/go2rtc 读不到帧”和“环境包冲突”。
 
 ## 9. 数据与存储
 
@@ -346,6 +371,7 @@ go2rtc 是当前视频访问链条中的关键节点：
 - 对 USB 摄像头，go2rtc 会先独占设备，再重定向成 RTSP 给检测链消费。
 - Dashboard-only 模式下，FastAPI 生命周期也可启动 go2rtc。
 - 当 go2rtc 不可用时，前端会回退到 MJPEG 相关路径。
+- go2rtc 端口由 `dashboard.go2rtc_api_port`、`dashboard.go2rtc_rtsp_port` 和 `dashboard.go2rtc_webrtc_port` 控制；本地 smoke 会改用临时空闲端口，避免干扰正在运行的默认开发服务。
 
 因此流媒体子系统不是单纯的“播放器配套”，而是同时影响浏览器访问和检测链视频来源。
 

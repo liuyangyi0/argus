@@ -8,7 +8,8 @@ import numpy as np
 from starlette.requests import Request
 
 from argus.config.schema import CameraConfig
-from argus.streaming.preview_gateway import PreviewGateway
+from argus.streaming import preview_gateway
+from argus.streaming.preview_gateway import PreviewGateway, probe_source_blocking
 
 
 class FakeGo2RTC:
@@ -73,6 +74,54 @@ def _camera() -> CameraConfig:
         source="rtsp://camera.local/stream",
         protocol="rtsp",
     )
+
+
+def test_probe_source_blocking_opens_usb_numeric_source_as_device_index(monkeypatch):
+    calls = []
+
+    class FakeCapture:
+        def __init__(self, source, backend=None):
+            calls.append((source, backend))
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            return True, np.zeros((12, 16, 3), dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(preview_gateway.cv2, "VideoCapture", FakeCapture)
+
+    result = probe_source_blocking("0", protocol="usb")
+
+    assert result["ok"] is True
+    assert calls == [(0, preview_gateway.cv2.CAP_DSHOW)]
+
+
+def test_probe_source_blocking_keeps_file_numeric_source_as_path(monkeypatch):
+    calls = []
+
+    class FakeCapture:
+        def __init__(self, source, backend=None):
+            calls.append((source, backend))
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            return True, np.zeros((12, 16, 3), dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(preview_gateway.cv2, "VideoCapture", FakeCapture)
+
+    result = probe_source_blocking("0", protocol="file")
+
+    assert result["ok"] is True
+    assert calls == [("0", None)]
 
 
 def test_snapshot_contract_returns_raw_jpeg_with_cache_headers():

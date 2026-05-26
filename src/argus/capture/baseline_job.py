@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -31,7 +30,7 @@ from argus.capture.samplers import (
     ScheduledSampler,
     get_active_sampler_unavailable_reason,
 )
-from argus.config.schema import CaptureQualityConfig, BaselineCaptureConfig
+from argus.config.schema import CaptureQualityConfig
 from argus.core.pipeline import PipelineMode
 from argus.core.pipeline_mode_guard import PipelineModeGuard
 

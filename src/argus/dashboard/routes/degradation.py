@@ -10,9 +10,6 @@ from fastapi import APIRouter, Query, Request
 
 from argus.dashboard.api_response import (
     api_success,
-    api_not_found,
-    api_unavailable,
-    api_validation_error,
 )
 
 router = APIRouter()

@@ -63,7 +63,33 @@ export interface CameraSummary {
   running: boolean
   pipeline_mode?: PipelineMode | null
   health?: CameraHealth | null
+  capture_status?: CameraCaptureStatus | null
   stats: CameraStats | null
+}
+
+export interface FastMotionStatus {
+  enabled: boolean
+  active: boolean
+  process_width: number
+  min_runtime_fps: number
+  required_resolution: [number, number] | number[]
+  current_fps?: number | null
+  degraded: boolean
+  degradation_reason?: string | null
+}
+
+export interface CameraCaptureStatus {
+  backend?: string | null
+  requested_pixel_format?: string | null
+  pixel_format?: string | null
+  requested_resolution?: [number, number] | number[] | null
+  actual_resolution?: [number, number] | number[] | null
+  requested_fps?: number | null
+  reported_fps?: number | null
+  actual_fps?: number | null
+  degraded: boolean
+  degradation_reason?: string | null
+  fast_motion?: FastMotionStatus | null
 }
 
 export interface ConnectionTestResult {
@@ -76,6 +102,12 @@ export interface ConnectionTestResult {
 export interface SystemModeSummary {
   cameras: Record<string, PipelineMode>
   global_state: 'normal' | 'capturing' | 'training' | 'maintenance'
+}
+
+export interface CameraModeMutation {
+  camera_id: string
+  previous_mode: PipelineMode | null
+  pipeline_mode: PipelineMode
 }
 
 export interface BaselineCollection {
@@ -498,11 +530,49 @@ export interface HealthPayload extends HealthInfo {}
 export interface UsersPayload { users: UserInfo[] }
 export interface AuditPayload { entries: AuditEntry[] }
 
+export interface ReportEvidenceStats {
+  total_alerts: number
+  alerts_with_snapshot: number
+  alerts_with_heatmap: number
+  alerts_with_recording: number
+  evidence_complete_count: number
+  snapshot_rate: number
+  heatmap_rate: number
+  recording_rate: number
+  evidence_complete_rate: number
+}
+
+export interface ReportStats {
+  total_alerts: number
+  by_severity: Record<'high' | 'medium' | 'low' | 'info', number>
+  false_positive_count: number
+  false_positive_rate: number
+  acknowledged_count: number
+  acknowledged_rate: number
+  evidence: ReportEvidenceStats
+}
+
 // ── Model API Response Shapes ──
 
 export interface ModelRegistryResponse {
   models: ModelInfo[]
   total: number
+}
+
+export interface ModelRuntimeMutationResponse {
+  activated: string
+  camera_id: string
+  runtime_synced: boolean
+  runtime_state?: ModelRuntimeState | null
+  model?: ModelInfo
+}
+
+export type ModelReleaseRuntimeState = ModelRuntimeState | Record<string, unknown> | null
+
+export interface ModelReleaseMutationResponse {
+  model: ModelInfo
+  runtime_synced: boolean
+  runtime_state?: ModelReleaseRuntimeState
 }
 
 export interface TrainingJobsResponse {

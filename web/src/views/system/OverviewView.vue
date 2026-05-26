@@ -8,8 +8,8 @@ import { useWebSocket } from '../../composables/useWebSocket'
 
 // Anomaly head degradation card — shows whether each pipeline's anomaly
 // detector is in the simplex-only fallback mode (see core/pipeline.py).
-// Uses initial fetch + WebSocket push; no polling because state changes are
-// rare and the WS broadcast covers the live transitions.
+// Uses initial fetch + WebSocket push, with fallback polling if the shared
+// WebSocket drops so the degradation card does not freeze on stale state.
 const degradation = ref<AnomalyDegradationStatus['anomaly'] | null>(null)
 const loading = ref(true)
 
@@ -31,6 +31,8 @@ useWebSocket({
     // for the authoritative aggregated view.
     fetchDegradation()
   },
+  fallbackPoll: fetchDegradation,
+  fallbackInterval: 15000,
 })
 
 onMounted(fetchDegradation)
@@ -79,7 +81,7 @@ function formatSince(since: number | null): string {
             </div>
           </div>
           <a-tag :color="cam.degraded ? 'red' : 'green'">
-            {{ cam.degraded ? 'degraded' : '正常' }}
+            {{ cam.degraded ? '降级' : '正常' }}
           </a-tag>
         </div>
       </div>

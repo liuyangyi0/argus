@@ -17,6 +17,7 @@ import {
   type CrossCameraConfigPayload,
 } from '../../api'
 import { extractErrorMessage } from '../../utils/error'
+import { notifyModuleToggleResult } from '../../utils/moduleToggleFeedback'
 
 defineOptions({ name: 'CrossCameraPanel' })
 
@@ -86,11 +87,9 @@ async function handleToggle(checked: string | number | boolean) {
   const next = Boolean(checked)
   toggling.value = true
   try {
-    await toggleModule('cross_camera.enabled', next)
+    const result = await toggleModule('cross_camera.enabled', next)
     cfg.value.enabled = next
-    message.success(next
-      ? '跨相机关联已启用（已运行的摄像头需要重启才会生效）'
-      : '跨相机关联已关闭')
+    notifyModuleToggleResult('跨相机关联', next, result)
     await load()
   } catch (e) {
     message.error(extractErrorMessage(e, '切换失败'))

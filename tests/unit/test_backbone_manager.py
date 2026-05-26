@@ -1,8 +1,6 @@
 """Tests for the BackboneManager and HeadDetector."""
 
 import sys
-import types
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest

@@ -2,7 +2,7 @@
 
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -128,14 +128,40 @@ def test_learning_progress_active():
     assert 0 <= progress["progress"] <= 1.0
 
 
-def test_learning_duration_calculation():
-    """DET-010: duration = max(history / fps * 3, 600)."""
+def test_set_mode_learning_starts_learning_progress():
     cam_config, alert_config = _make_config()
-    # fps=5, history=500: 500/5*3 = 300 < 600 → 600
     pipeline = DetectionPipeline(
         camera_config=cam_config,
         alert_config=alert_config,
     )
+
+    pipeline.set_mode(PipelineMode.LEARNING)
+
+    progress = pipeline.get_learning_progress()
+    assert progress["active"] is True
+    assert progress["complete"] is False
+    assert progress["total_seconds"] == 600.0
+
+
+def test_set_mode_active_clears_learning_progress():
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(
+        camera_config=cam_config,
+        alert_config=alert_config,
+    )
+    pipeline.set_mode(PipelineMode.LEARNING)
+
+    pipeline.set_mode(PipelineMode.ACTIVE)
+
+    progress = pipeline.get_learning_progress()
+    assert progress["active"] is False
+    assert progress["complete"] is True
+
+
+def test_learning_duration_calculation():
+    """DET-010: duration = max(history / fps * 3, 600)."""
+    cam_config, alert_config = _make_config()
+    # fps=5, history=500: 500/5*3 = 300 < 600 → 600
     # The learning duration is set in initialize(), but we can verify
     # the formula manually since initialize() requires a real camera
     fps = max(1, cam_config.fps_target)

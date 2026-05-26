@@ -3,7 +3,6 @@
 import time
 
 import numpy as np
-import pytest
 
 from argus.alerts.grader import Alert, AlertGrader
 from argus.config.schema import (

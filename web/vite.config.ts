@@ -8,6 +8,10 @@ const backendHost = '127.0.0.1'
 export default defineConfig({
   plugins: [vue()],
   build: {
+    // Vendor libraries are intentionally split into cacheable chunks. The
+    // largest one is Ant Design Vue, so keep the warning limit above that
+    // known vendor size instead of reporting it as an application chunk issue.
+    chunkSizeWarningLimit: 1600,
     rollupOptions: {
       output: {
         manualChunks(id: string) {

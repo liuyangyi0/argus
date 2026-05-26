@@ -8,16 +8,13 @@ from __future__ import annotations
 
 import threading
 import time
-from unittest.mock import MagicMock, patch, PropertyMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-import numpy as np
-import pytest
 
 from argus.camera import CameraRuntimePlanner
-from argus.alerts.grader import Alert
-from argus.capture.camera import CameraCapture, CameraState, FrameData
 from argus.capture.factory import CaptureFactory
-from argus.capture.manager import CameraManager, CameraStatus
+from argus.capture.manager import CameraManager
 from argus.config.schema import (
     AlertConfig,
     AnomalyConfig,
@@ -142,6 +139,43 @@ class TestCameraManagerIntegration:
         running_ids = {s.camera_id for s in statuses if s.running}
         assert "cam_b" in running_ids
 
+        manager.stop_all()
+
+    @patch("argus.capture.manager.DetectionPipeline")
+    @patch("argus.person.detector.get_shared_yolo", return_value=MagicMock())
+    def test_concurrent_start_same_camera_is_idempotent(self, mock_yolo, MockPipeline):
+        """Startup and manual start must not create duplicate pipelines."""
+        init_entered = threading.Event()
+        release_init = threading.Event()
+        mock_instance = MagicMock()
+        mock_instance.stats = MagicMock(frames_captured=0)
+        mock_instance._camera.state.connected = True
+        mock_instance.run_once.return_value = None
+        mock_instance.get_latest_anomaly_map.return_value = None
+        mock_instance.get_detector_status.return_value = SimpleNamespace(mode="ssim_fallback")
+
+        def _initialize():
+            init_entered.set()
+            assert release_init.wait(timeout=5)
+            return True
+
+        mock_instance.initialize.side_effect = _initialize
+        MockPipeline.return_value = mock_instance
+
+        manager = CameraManager([_cam_config("cam_a")], _alert_config())
+        first_result: list[bool] = []
+        first = threading.Thread(target=lambda: first_result.append(manager.start_camera("cam_a")))
+        first.start()
+        assert init_entered.wait(timeout=5)
+
+        second_result = manager.start_camera("cam_a")
+        release_init.set()
+        first.join(timeout=5)
+
+        assert first_result == [True]
+        assert second_result is True
+        assert MockPipeline.call_count == 1
+        assert list(manager._threads) == ["cam_a"]
         manager.stop_all()
 
     @patch("argus.capture.manager.DetectionPipeline")

@@ -1,7 +1,7 @@
 """Tests for the shadow inference runner."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest

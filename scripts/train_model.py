@@ -99,10 +99,10 @@ def main():
         print(f"Model exported to {output_dir}")
 
     print(f"\nModel saved to: {output_dir}")
-    print(f"\nNext steps:")
-    print(f"  1. Copy model to your deployment target")
-    print(f"  2. Update configs/default.yaml with the model path")
-    print(f"  3. Restart argus: python -m argus --config configs/default.yaml")
+    print("\nNext steps:")
+    print("  1. Copy model to your deployment target")
+    print("  2. Update configs/default.yaml with the model path")
+    print("  3. Restart argus: python -m argus --config configs/default.yaml")
 
 
 if __name__ == "__main__":

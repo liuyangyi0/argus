@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from argus.core.temporal_tracker import TemporalAnomalyTracker, TemporalAnalysis, TrackedAnomaly
+from argus.core.temporal_tracker import TemporalAnomalyTracker
 
 
 @dataclass

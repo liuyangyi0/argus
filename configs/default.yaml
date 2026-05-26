@@ -4,10 +4,10 @@ cameras:
   name: c
   source: "0"
   protocol: usb
-  fps_target: 15
+  fps_target: 60
   resolution:
-  - 640
-  - 480
+  - 1920
+  - 1080
   zones: []
   reconnect_delay: 5.0
   max_reconnect_attempts: -1
@@ -72,6 +72,24 @@ cameras:
     min_static_seconds: 30.0
     morph_kernel_size: 5
     match_radius_px: 50
+  usb:
+    preferred_backend: dshow
+    pixel_format: mjpeg
+    min_runtime_fps: 50.0
+  fast_motion:
+    enabled: true
+    process_width: 960
+    diff_threshold: 18
+    min_area_px: 2
+    max_area_px: 1500
+    min_streak_length_px: 4
+    min_confidence: 0.55
+    instant_alert_score: 0.96
+    max_candidates_per_frame: 5
+    min_runtime_fps: 50.0
+    required_resolution:
+    - 1920
+    - 1080
   drift:
     enabled: true
     reference_window: 500
@@ -171,6 +189,7 @@ dashboard:
   go2rtc_enabled: true
   go2rtc_api_port: 1984
   go2rtc_rtsp_port: 8554
+  go2rtc_webrtc_port: 8555
   go2rtc_binary: null
 storage:
   database_url: sqlite:///data/db/argus.db

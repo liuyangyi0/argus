@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from argus.anomaly.detector import AnomalyResult
-from argus.anomaly.model_compare import ComparisonResult, ModelComparator
+from argus.anomaly.model_compare import ModelComparator
 
 
 @pytest.fixture

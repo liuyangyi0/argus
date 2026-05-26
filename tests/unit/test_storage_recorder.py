@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import shutil
-import tempfile
 import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from datetime import datetime, timezone
 
 import numpy as np
 import pytest
 
-from argus.storage.continuous_recorder import ContinuousRecorder, ContinuousRecordingManager
+from argus.storage.continuous_recorder import ContinuousRecorder
 from argus.storage.database import Database
 from argus.storage.models import AlertRecordingRecord
 from argus.storage.retention import RetentionManager

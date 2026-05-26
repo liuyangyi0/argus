@@ -74,7 +74,7 @@ async def upload_calibration(
         K = np.array(data["camera_matrix"], dtype=np.float64)
         R = np.array(data["rotation_matrix"], dtype=np.float64)
         t = np.array(data["translation_vector"], dtype=np.float64)
-        dist = np.array(data["dist_coeffs"], dtype=np.float64)
+        dist_coeffs = np.array(data["dist_coeffs"], dtype=np.float64)
 
         if K.shape != (3, 3):
             return api_validation_error("camera_matrix must be 3x3")
@@ -82,8 +82,12 @@ async def upload_calibration(
             return api_validation_error("rotation_matrix must be 3x3")
         if t.size < 3:
             return api_validation_error("translation_vector must have 3 elements")
+        if dist_coeffs.size < 4:
+            return api_validation_error("dist_coeffs must have at least 4 elements")
         if np.any(np.isnan(K)) or np.any(np.isinf(K)):
             return api_validation_error("camera_matrix contains NaN/Inf")
+        if np.any(np.isnan(dist_coeffs)) or np.any(np.isinf(dist_coeffs)):
+            return api_validation_error("dist_coeffs contains NaN/Inf")
         if abs(np.linalg.det(R) - 1.0) > 0.1:
             return api_validation_error("rotation_matrix is not orthogonal")
 

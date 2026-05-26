@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass, field
 
 import pytest
 
-from argus.physics.speed import PixelSpeedEstimator, SpeedEstimate
+from argus.physics.speed import PixelSpeedEstimator
 
 
 @dataclass

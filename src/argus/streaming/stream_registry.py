@@ -11,6 +11,7 @@ import structlog
 from argus.streaming.go2rtc_manager import (
     CameraSourceResolution,
     gige_to_go2rtc_source,
+    usb_to_go2rtc_source,
 )
 
 logger = structlog.get_logger()
@@ -35,6 +36,7 @@ class StreamDeclaration:
     protocol: str
     stream_name: str | None = None
     capture_script: str | None = None
+    go2rtc_source: str | None = None
     camera: Any = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -43,13 +45,13 @@ class StreamDeclaration:
 
     @property
     def registration_signature(self) -> tuple[str, str, str | None]:
-        return (self.source, self.protocol, self.capture_script)
+        return (self.source, self.protocol, self.capture_script or self.go2rtc_source)
 
     @property
     def supported_by_go2rtc(self) -> bool:
         if self.protocol in {"rtsp", "usb"}:
             return True
-        return self.protocol == "gige" and bool(self.capture_script)
+        return self.protocol == "gige" and bool(self.capture_script or self.go2rtc_source)
 
 
 def _attr(obj: Any, name: str, default: Any = None) -> Any:
@@ -74,6 +76,31 @@ def _gige_capture_script(camera: Any) -> str | None:
         return None
     script = _attr(gige, "capture_script")
     return str(script) if script else None
+
+
+def _usb_go2rtc_source(camera: Any, source: str, protocol: str) -> str | None:
+    if protocol != "usb":
+        return None
+
+    go2rtc_stream = _attr(camera, "go2rtc_stream")
+    explicit = _attr(go2rtc_stream, "source")
+    if explicit:
+        return str(explicit)
+
+    usb_cfg = _attr(camera, "usb")
+    pixel_format = _attr(usb_cfg, "pixel_format", None)
+    device_name = _attr(usb_cfg, "device_name", None)
+    device_id = _attr(usb_cfg, "device_id", None)
+    resolution = _attr(camera, "resolution", None)
+    fps = _attr(camera, "fps_target", None)
+    return usb_to_go2rtc_source(
+        source,
+        device_name=device_name,
+        device_id=device_id,
+        resolution=resolution,
+        fps=fps,
+        pixel_format=pixel_format,
+    )
 
 
 def _is_iterable_plan(value: Any) -> bool:
@@ -151,8 +178,19 @@ def _declaration_from_camera(
         or _attr(camera, "runtime_protocol")
         or "rtsp"
     )
-    resolved_stream_name = stream_name or _attr(camera, "stream_name") or resolved_camera_id
+    go2rtc_stream = _attr(camera, "go2rtc_stream")
+    resolved_stream_name = (
+        stream_name
+        or _attr(camera, "stream_name")
+        or _attr(go2rtc_stream, "name")
+        or resolved_camera_id
+    )
     resolved_capture_script = capture_script or _gige_capture_script(camera)
+    resolved_go2rtc_source = _usb_go2rtc_source(
+        camera, str(resolved_source), str(resolved_protocol),
+    )
+    if resolved_go2rtc_source is None:
+        resolved_go2rtc_source = _attr(go2rtc_stream, "source")
 
     return StreamDeclaration(
         camera_id=str(resolved_camera_id),
@@ -162,6 +200,7 @@ def _declaration_from_camera(
         capture_script=(
             str(resolved_capture_script) if resolved_capture_script else None
         ),
+        go2rtc_source=str(resolved_go2rtc_source) if resolved_go2rtc_source else None,
         camera=camera,
     )
 
@@ -406,10 +445,15 @@ class StreamRegistry:
         rtsp_url: str | None = None
         if declaration.supported_by_go2rtc:
             try:
+                register_source = declaration.source
+                register_protocol = declaration.protocol
+                if declaration.protocol == "usb" and declaration.go2rtc_source:
+                    register_source = declaration.go2rtc_source
+                    register_protocol = "rtsp"
                 rtsp_url = self.manager.register_camera(
                     stream_name,
-                    declaration.source,
-                    declaration.protocol,
+                    register_source,
+                    register_protocol,
                 )
             except Exception:
                 logger.warning(
@@ -443,7 +487,11 @@ class StreamRegistry:
     def _initial_streams(self) -> dict[str, str]:
         initial_streams: dict[str, str] = {}
         for declaration in self._desired.values():
-            if declaration.protocol == "gige" and declaration.capture_script:
+            if declaration.protocol != "gige":
+                continue
+            if declaration.go2rtc_source:
+                initial_streams[str(declaration.stream_name)] = declaration.go2rtc_source
+            elif declaration.capture_script:
                 initial_streams[str(declaration.stream_name)] = gige_to_go2rtc_source(
                     declaration.capture_script,
                 )

@@ -1,9 +1,7 @@
 """Tests for pipeline reliability fixes (CRIT/HIGH/MED issues)."""
 
-import re
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -40,6 +38,27 @@ class TestAnomalyResultDetectionFailed:
         frame = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
         result = detector.predict(frame)
         assert result.detection_failed is False
+
+    def test_ssim_fallback_heatmap_is_normalized(self):
+        """SSIM fallback must honor the AnomalyResult heatmap 0-1 contract."""
+        detector = AnomalibDetector(
+            threshold=0.7,
+            image_size=(64, 64),
+            ssim_baseline_frames=3,
+        )
+        detector.load()  # Loads SSIM fallback
+        baseline = np.full((80, 80, 3), 120, dtype=np.uint8)
+        for _ in range(3):
+            detector.predict(baseline)
+
+        frame = baseline.copy()
+        frame[28:52, 30:54] = (0, 0, 255)
+        result = detector.predict(frame)
+
+        assert result.is_anomalous is True
+        assert result.anomaly_map is not None
+        assert float(result.anomaly_map.max()) == pytest.approx(1.0)
+        assert np.count_nonzero(result.anomaly_map > 0.5) > 0
 
     def test_invalid_frame_returns_detection_failed(self):
         detector = AnomalibDetector(threshold=0.7)
@@ -81,7 +100,7 @@ class TestPhaseCorrelationNaN:
         frame2 = np.zeros((100, 100, 3), dtype=np.uint8)
 
         # First call initializes prev_gray
-        result1 = prefilter._align_frame(frame1)
+        prefilter._align_frame(frame1)
 
         # Identical frames should not cause crash (could produce NaN in edge cases)
         result2 = prefilter._align_frame(frame2)

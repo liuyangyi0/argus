@@ -13,6 +13,7 @@ import {
   type ClassifierConfigPayload,
 } from '../../api'
 import { extractErrorMessage } from '../../utils/error'
+import { notifyModuleToggleResult } from '../../utils/moduleToggleFeedback'
 
 defineOptions({ name: 'ClassifierPanel' })
 
@@ -52,9 +53,9 @@ async function handleToggle(checked: string | number | boolean) {
   const next = Boolean(checked)
   toggling.value = true
   try {
-    await toggleModule('classifier.enabled', next)
+    const result = await toggleModule('classifier.enabled', next)
     cfg.value.enabled = next
-    message.success(next ? '分类器已启用' : '分类器已关闭')
+    notifyModuleToggleResult('分类器', next, result)
     // Re-fetch so runtime counters reflect the new state.
     await load()
   } catch (e) {

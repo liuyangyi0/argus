@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import math
 
 import pytest
 
-from argus.core.adaptive_threshold import AdaptiveThreshold, ThresholdState
+from argus.core.adaptive_threshold import AdaptiveThreshold
 
 
 class TestAdaptiveThreshold:

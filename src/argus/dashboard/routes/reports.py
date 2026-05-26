@@ -19,33 +19,90 @@ router = APIRouter()
 
 
 @router.get("/json")
-async def reports_json(request: Request):
+async def reports_json(
+    request: Request,
+    days: int | None = Query(None, ge=7, le=365),
+):
     """JSON statistics API for external consumption."""
     db = request.app.state.db
     if not db:
         return JSONResponse({"error": "数据库不可用"}, status_code=503)
 
-    total = db.get_alert_count()
     all_alerts = db.get_alerts(limit=50000)
-    fp_count = sum(1 for a in all_alerts if a.false_positive)
-    ack_count = sum(1 for a in all_alerts if a.acknowledged)
+    scoped_alerts = _filter_alerts_by_days(all_alerts, days)
+    total = len(scoped_alerts)
+    fp_count = sum(1 for a in scoped_alerts if a.false_positive)
+    ack_count = sum(1 for a in scoped_alerts if a.acknowledged)
+    evidence = _compute_evidence_stats(scoped_alerts, db)
 
     return api_success({
         "total_alerts": total,
-        "by_severity": {
-            "high": db.get_alert_count(severity="high"),
-            "medium": db.get_alert_count(severity="medium"),
-            "low": db.get_alert_count(severity="low"),
-            "info": db.get_alert_count(severity="info"),
-        },
+        "by_severity": _compute_severity_counts(scoped_alerts),
         "false_positive_count": fp_count,
-        "false_positive_rate": round(fp_count / total * 100, 2) if total > 0 else 0,
+        "false_positive_rate": _rate(fp_count, total),
         "acknowledged_count": ack_count,
-        "acknowledged_rate": round(ack_count / total * 100, 2) if total > 0 else 0,
+        "acknowledged_rate": _rate(ack_count, total),
+        "evidence": evidence,
     })
 
 
 # ── Shared query helpers ──────────
+
+
+def _rate(count: int, total: int) -> float:
+    """Return a percentage rounded for API/report display."""
+    return round(count / total * 100, 2) if total > 0 else 0
+
+
+def _compute_evidence_stats(alerts, db) -> dict:
+    """Compute evidence coverage for alerts using existing alert + replay metadata."""
+    alert_list = list(alerts)
+    total = len(alert_list)
+    alert_ids = [a.alert_id for a in alert_list]
+    recordings = db.get_alert_recordings_batch(alert_ids) if alert_ids else {}
+
+    snapshot_count = sum(1 for a in alert_list if getattr(a, "snapshot_path", None))
+    heatmap_count = sum(1 for a in alert_list if getattr(a, "heatmap_path", None))
+    recording_count = sum(1 for a in alert_list if a.alert_id in recordings)
+    complete_count = sum(
+        1
+        for a in alert_list
+        if (
+            getattr(a, "snapshot_path", None)
+            and getattr(a, "heatmap_path", None)
+            and a.alert_id in recordings
+        )
+    )
+
+    return {
+        "total_alerts": total,
+        "alerts_with_snapshot": snapshot_count,
+        "alerts_with_heatmap": heatmap_count,
+        "alerts_with_recording": recording_count,
+        "evidence_complete_count": complete_count,
+        "snapshot_rate": _rate(snapshot_count, total),
+        "heatmap_rate": _rate(heatmap_count, total),
+        "recording_rate": _rate(recording_count, total),
+        "evidence_complete_rate": _rate(complete_count, total),
+    }
+
+
+def _filter_alerts_by_days(alerts, days: int | None):
+    """Return alerts scoped to the selected report period."""
+    alert_list = list(alerts)
+    if days is None:
+        return alert_list
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None)
+    return [a for a in alert_list if a.timestamp and a.timestamp >= cutoff]
+
+
+def _compute_severity_counts(alerts) -> dict[str, int]:
+    """Count severities for an already-scoped alert list."""
+    counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
+    for alert in alerts:
+        if alert.severity in counts:
+            counts[alert.severity] += 1
+    return counts
 
 
 def _compute_daily_trend(alerts, days: int):
@@ -121,26 +178,29 @@ async def daily_trend_json(request: Request, days: int = Query(30, ge=7, le=90))
 
 
 @router.get("/severity-dist/json")
-async def severity_dist_json(request: Request):
+async def severity_dist_json(
+    request: Request,
+    days: int | None = Query(None, ge=7, le=365),
+):
     """Severity distribution as JSON."""
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
-    return api_success({
-        "high": db.get_alert_count(severity="high"),
-        "medium": db.get_alert_count(severity="medium"),
-        "low": db.get_alert_count(severity="low"),
-        "info": db.get_alert_count(severity="info"),
-    })
+    alerts = _filter_alerts_by_days(db.get_alerts(limit=50000), days)
+    return api_success(_compute_severity_counts(alerts))
 
 
 @router.get("/camera-dist/json")
-async def camera_dist_json(request: Request):
+async def camera_dist_json(
+    request: Request,
+    days: int | None = Query(None, ge=7, le=365),
+):
     """Alerts per camera as JSON."""
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")
-    return api_success({"cameras": _compute_camera_dist(db.get_alerts(limit=50000))})
+    alerts = _filter_alerts_by_days(db.get_alerts(limit=50000), days)
+    return api_success({"cameras": _compute_camera_dist(alerts)})
 
 
 @router.get("/fp-trend/json")
@@ -201,8 +261,9 @@ def _generate_compliance_data(
     period_alerts = [a for a in all_alerts if a.timestamp and a.timestamp >= since_naive]
     fp_count = sum(1 for a in period_alerts if a.false_positive)
     ack_count = sum(1 for a in period_alerts if a.acknowledged)
-    fp_rate = round(fp_count / len(period_alerts) * 100, 2) if period_alerts else 0
-    ack_rate = round(ack_count / len(period_alerts) * 100, 2) if period_alerts else 0
+    fp_rate = _rate(fp_count, len(period_alerts))
+    ack_rate = _rate(ack_count, len(period_alerts))
+    evidence_stats = _compute_evidence_stats(period_alerts, db)
 
     # ── Daily trend ──
     daily_trend = _compute_daily_trend(all_alerts, days)
@@ -287,6 +348,7 @@ def _generate_compliance_data(
             "acknowledged_count": ack_count,
             "acknowledged_rate": ack_rate,
         },
+        "evidence_stats": evidence_stats,
         "daily_trend": daily_trend,
         "model_status": model_status,
         "audit_summary": audit_summary,
@@ -325,6 +387,16 @@ def _render_csv(data: dict) -> str:
     w.writerow(["误报率(%)", a["false_positive_rate"]])
     w.writerow(["已确认数", a["acknowledged_count"]])
     w.writerow(["确认率(%)", a["acknowledged_rate"]])
+    w.writerow([])
+
+    # Evidence coverage
+    e = data["evidence_stats"]
+    w.writerow(["## 证据完整性"])
+    w.writerow(["指标", "数量", "覆盖率(%)"])
+    w.writerow(["触发截图", e["alerts_with_snapshot"], e["snapshot_rate"]])
+    w.writerow(["热力图", e["alerts_with_heatmap"], e["heatmap_rate"]])
+    w.writerow(["Replay录像", e["alerts_with_recording"], e["recording_rate"]])
+    w.writerow(["完整证据", e["evidence_complete_count"], e["evidence_complete_rate"]])
     w.writerow([])
 
     # Daily trend table
@@ -482,6 +554,19 @@ def _render_pdf(data: dict) -> bytes:
     sev_rows.append(["确认率", f'{a["acknowledged_rate"]}%'])
     _add_table(["严重度 / 指标", "数量 / 值"], sev_rows)
 
+    # Evidence coverage
+    e = data["evidence_stats"]
+    _add_heading("证据完整性")
+    _add_table(
+        ["指标", "数量", "覆盖率"],
+        [
+            ["触发截图", str(e["alerts_with_snapshot"]), f'{e["snapshot_rate"]}%'],
+            ["热力图", str(e["alerts_with_heatmap"]), f'{e["heatmap_rate"]}%'],
+            ["Replay录像", str(e["alerts_with_recording"]), f'{e["recording_rate"]}%'],
+            ["完整证据", str(e["evidence_complete_count"]), f'{e["evidence_complete_rate"]}%'],
+        ],
+    )
+
     # Daily trend (show up to 31 days in the PDF table)
     dt = data["daily_trend"]
     _add_heading("每日告警趋势")
@@ -543,6 +628,13 @@ async def compliance_report(
     format: str = Query("csv"),
 ):
     """Generate a downloadable compliance report (CSV or PDF)."""
+    if format not in {"csv", "pdf"}:
+        return api_error(
+            40000,
+            "报告格式仅支持 csv 或 pdf",
+            status_code=400,
+        )
+
     db = request.app.state.db
     if not db:
         return api_unavailable("数据库不可用")

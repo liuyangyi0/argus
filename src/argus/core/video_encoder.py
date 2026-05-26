@@ -13,7 +13,10 @@ Reading / seeking uses PyAV which has superior seeking performance.
 from __future__ import annotations
 
 import io
+import shutil
+import subprocess
 from pathlib import Path
+from typing import Protocol
 
 import av
 import cv2
@@ -27,6 +30,94 @@ _BYTES_PER_MB = 1_048_576
 
 # Preferred H.264 fourcc codes in order of preference
 _H264_FOURCCS = ["avc1", "H264", "h264", "x264"]
+
+
+class _VideoWriterLike(Protocol):
+    """Minimal writer API shared by OpenCV and FFmpeg subprocess writers."""
+
+    def write(self, frame: np.ndarray) -> None:
+        ...
+
+    def isOpened(self) -> bool:  # noqa: N802 - cv2-compatible API
+        ...
+
+    def release(self) -> None:
+        ...
+
+
+class _FFmpegVideoWriter:
+    """H.264 writer backed by an FFmpeg subprocess.
+
+    This avoids OpenCV's Windows OpenH264 DLL discovery path, which can emit
+    codec-loader errors to stderr even when later encoding succeeds.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        ffmpeg: str,
+        fps: int,
+        width: int,
+        height: int,
+        crf: int,
+        preset: str,
+    ) -> None:
+        self._proc = subprocess.Popen(
+            [
+                ffmpeg,
+                "-y",
+                "-f",
+                "rawvideo",
+                "-vcodec",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                str(fps),
+                "-i",
+                "-",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-crf",
+                str(crf),
+                "-preset",
+                preset,
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._proc.stdin is None or self._proc.poll() is not None:
+            return
+        try:
+            self._proc.stdin.write(frame.tobytes())
+        except (BrokenPipeError, OSError):
+            logger.debug("video_encoder.ffmpeg_write_failed", exc_info=True)
+
+    def isOpened(self) -> bool:  # noqa: N802 - cv2-compatible API
+        return self._proc.poll() is None
+
+    def release(self) -> None:
+        if self._proc.stdin is not None:
+            try:
+                self._proc.stdin.close()
+            except OSError:
+                logger.debug("video_encoder.ffmpeg_stdin_close_failed", exc_info=True)
+        try:
+            self._proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait(timeout=5)
 
 
 def decode_jpeg(jpeg_bytes: bytes) -> np.ndarray | None:
@@ -48,14 +139,29 @@ def jpeg_dimensions(jpeg_bytes: bytes) -> tuple[int, int] | None:
 
 
 def _create_video_writer(
-    path: Path, fps: int, width: int, height: int,
-) -> cv2.VideoWriter:
-    """Create a cv2.VideoWriter with H.264 codec, falling back to mp4v.
+    path: Path,
+    fps: int,
+    width: int,
+    height: int,
+    crf: int = 23,
+    preset: str = "veryfast",
+) -> _VideoWriterLike:
+    """Create an H.264 writer, falling back to OpenCV/mp4v if needed.
 
-    cv2.VideoWriter manages PTS automatically — no manual timestamp
-    management needed, eliminating the class of bugs where PyAV's
-    time_base negotiation with libx264 caused wrong playback speed.
+    FFmpeg is preferred when available because it avoids OpenCV's Windows
+    OpenH264 DLL loader path and preserves CRF/preset control. The OpenCV
+    fallback keeps deployments without ``ffmpeg`` functional.
     """
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is not None:
+        try:
+            writer = _FFmpegVideoWriter(path, ffmpeg, fps, width, height, crf, preset)
+            if writer.isOpened():
+                return writer
+            writer.release()
+        except Exception:
+            logger.debug("video_encoder.ffmpeg_open_failed", path=str(path), exc_info=True)
+
     for fourcc_str in _H264_FOURCCS:
         fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
         writer = cv2.VideoWriter(str(path), fourcc, float(fps), (width, height))
@@ -84,6 +190,7 @@ def _remux_faststart(mp4_path: Path) -> None:
     lossless remux (no re-encoding — just moves the moov atom).
     Skips silently if the moov is already at the front.
     """
+    tmp_path = mp4_path.with_suffix(".faststart.mp4")
     try:
         # Quick check: read first 32 bytes to see if moov is already at front
         with open(mp4_path, "rb") as f:
@@ -91,13 +198,15 @@ def _remux_faststart(mp4_path: Path) -> None:
         if b"moov" in header:
             return  # already faststart
 
-        tmp_path = mp4_path.with_suffix(".faststart.mp4")
         inp = av.open(str(mp4_path))
         try:
             out = av.open(str(tmp_path), mode="w", options={"movflags": "+faststart"})
             try:
                 in_stream = inp.streams.video[0]
-                out_stream = out.add_stream(template=in_stream)
+                if hasattr(out, "add_stream_from_template"):
+                    out_stream = out.add_stream_from_template(in_stream)
+                else:
+                    out_stream = out.add_stream(template=in_stream)
                 for packet in inp.demux(in_stream):
                     if packet.dts is None:
                         continue
@@ -109,9 +218,15 @@ def _remux_faststart(mp4_path: Path) -> None:
             inp.close()
 
         tmp_path.replace(mp4_path)
+    except TypeError as exc:
+        logger.debug(
+            "video_encoder.faststart_unsupported",
+            path=str(mp4_path),
+            error=str(exc),
+        )
     except Exception:
         logger.debug("video_encoder.faststart_skip", path=str(mp4_path), exc_info=True)
-        tmp_path = mp4_path.with_suffix(".faststart.mp4")
+    finally:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
 
@@ -147,7 +262,7 @@ class Mp4Encoder:
         self._frame_count = 0
 
         self._writer = _create_video_writer(
-            self._output_path, fps, width, height,
+            self._output_path, fps, width, height, crf=crf, preset=preset,
         )
 
     def write_jpeg_frame(self, jpeg_bytes: bytes) -> None:
@@ -212,7 +327,7 @@ def concat_mp4(
             fps = int(pre_stream.average_rate) if pre_stream.average_rate else 15
 
         width, height = pre_stream.width, pre_stream.height
-        writer = _create_video_writer(output_path, fps, width, height)
+        writer = _create_video_writer(output_path, fps, width, height, crf=crf, preset=preset)
 
         for frame in in_pre.decode(pre_stream):
             bgr = frame.to_ndarray(format="bgr24")
@@ -336,7 +451,7 @@ def repair_video_timestamps(mp4_path: Path, fps: int, crf: int = 23, preset: str
                 return False  # already correct
 
             width, height = stream.width, stream.height
-            writer = _create_video_writer(tmp_path, fps, width, height)
+            writer = _create_video_writer(tmp_path, fps, width, height, crf=crf, preset=preset)
             frame_count = 0
             try:
                 for frame in container.decode(video=0):

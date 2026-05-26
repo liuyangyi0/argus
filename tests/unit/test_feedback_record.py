@@ -1,7 +1,6 @@
 """Tests for FeedbackRecord ORM and database CRUD operations (Phase 1)."""
 
 import uuid
-from datetime import datetime, timezone
 
 import pytest
 
@@ -117,9 +116,7 @@ class TestPendingFeedback:
 
     def test_ordered_by_created_at_asc(self, db):
         """Pending feedback should be ordered oldest-first for FIFO processing."""
-        from datetime import timedelta
 
-        t0 = datetime(2026, 3, 1, tzinfo=timezone.utc)
         db.save_feedback(_make_feedback(
             feedback_id="old", camera_id="cam_01",
         ))

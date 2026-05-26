@@ -44,7 +44,7 @@ def main():
 
     export_mode = ExportMode.OPENVINO if args.format == "openvino" else ExportMode.ONNX
 
-    print(f"Exporting model")
+    print("Exporting model")
     print(f"  Checkpoint: {ckpt_path}")
     print(f"  Format:     {args.format}")
     print(f"  Output:     {output_dir}")

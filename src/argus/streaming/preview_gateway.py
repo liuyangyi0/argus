@@ -15,7 +15,7 @@ from fastapi.responses import Response, StreamingResponse
 
 logger = structlog.get_logger()
 
-SourceProbe = Callable[[str | int, float], dict[str, Any]]
+SourceProbe = Callable[[str | int, float, str | None], dict[str, Any]]
 
 
 def _camera_attr(camera: Any, name: str, default: Any = None) -> Any:
@@ -35,7 +35,11 @@ def _encode_jpeg(frame: Any, quality: int) -> bytes | None:
     return buffer.tobytes()
 
 
-def probe_source_blocking(source: str | int, timeout: float = 5.0) -> dict[str, Any]:
+def probe_source_blocking(
+    source: str | int,
+    timeout: float = 5.0,
+    protocol: str | None = None,
+) -> dict[str, Any]:
     """Open a video source with a hard timeout and grab one frame."""
     import threading
 
@@ -45,7 +49,15 @@ def probe_source_blocking(source: str | int, timeout: float = 5.0) -> dict[str, 
     def _worker() -> None:
         cap = None
         try:
-            if isinstance(source, int):
+            if protocol == "usb":
+                try:
+                    usb_source = int(source)
+                except (TypeError, ValueError):
+                    usb_source = source
+                cap = cv2.VideoCapture(usb_source, cv2.CAP_DSHOW)
+            elif protocol in {"rtsp", "file", "gige", "event"}:
+                cap = cv2.VideoCapture(str(source))
+            elif isinstance(source, int):
                 cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
             else:
                 try:
@@ -335,8 +347,13 @@ class PreviewGateway:
             "source": "running_pipeline",
         }
 
-    async def probe_source(self, source: str | int, timeout: float = 5.0) -> dict[str, Any]:
-        return await asyncio.to_thread(self._source_probe, source, timeout)
+    async def probe_source(
+        self,
+        source: str | int,
+        timeout: float = 5.0,
+        protocol: str | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._source_probe, source, timeout, protocol)
 
     def _mjpeg_response(
         self,

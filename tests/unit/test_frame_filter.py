@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 import cv2
-import pytest
 
-from argus.capture.frame_filter import FilterConfig, FilterResult, FrameFilter
+from argus.capture.frame_filter import FilterConfig, FrameFilter
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,6 +33,48 @@ def test_cli_help_exits_zero() -> None:
     assert "Argus" in result.stdout
     assert "--config" in result.stdout
     assert "--no-dashboard" in result.stdout
+    assert "--dev-video" in result.stdout
+
+
+def test_main_loop_stays_alive_for_dashboard_recovery_without_running_cameras() -> None:
+    """Dashboard mode must stay up so operators can fix a failed camera source."""
+    from argus.__main__ import _should_continue_main_loop
+
+    stopped_manager = SimpleNamespace(is_running=False)
+    running_manager = SimpleNamespace(is_running=True)
+    live_dashboard = SimpleNamespace(is_alive=lambda: True)
+    dead_dashboard = SimpleNamespace(is_alive=lambda: False)
+
+    assert _should_continue_main_loop(True, running_manager, dead_dashboard) is True
+    assert _should_continue_main_loop(True, stopped_manager, live_dashboard) is True
+    assert _should_continue_main_loop(True, stopped_manager, dead_dashboard) is False
+    assert _should_continue_main_loop(False, running_manager, live_dashboard) is False
+
+
+def test_dev_video_cli_source_updates_selected_camera(tmp_path) -> None:
+    from argus.__main__ import _apply_dev_video_source
+    from argus.config.schema import ArgusConfig, CameraConfig
+
+    camera = CameraConfig(
+        camera_id="cam_01",
+        name="USB Camera",
+        source="0",
+        protocol="usb",
+        fps_target=1,
+        resolution=(80, 60),
+    )
+    config = ArgusConfig(cameras=[camera])
+    video_path = tmp_path / "dev_camera.avi"
+
+    updated = _apply_dev_video_source(config, config.cameras, video_path)
+
+    assert video_path.exists()
+    assert updated[0].camera_id == "cam_01"
+    assert updated[0].source == str(video_path)
+    assert updated[0].protocol == "file"
+    assert config.cameras[0].source == str(video_path)
+    assert config.cameras[0].protocol == "file"
+    assert config.dashboard.go2rtc_enabled is False
 
 
 # ── Public symbol surface (Stage 3 backwards-compat guard) ──────────────────

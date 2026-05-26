@@ -2,7 +2,6 @@
 
 import cv2
 import numpy as np
-import pytest
 
 from argus.validation.recall_test import load_synthetic_pairs, evaluate_recall
 from argus.validation.synthetic import (

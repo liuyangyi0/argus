@@ -46,6 +46,70 @@ from argus.storage.inference_store import InferenceRecordStore
 logger = structlog.get_logger()
 
 
+def _dashboard_thread_alive(dashboard_thread: threading.Thread | None) -> bool:
+    """Return whether the dashboard server thread can still accept recovery actions."""
+    return dashboard_thread is not None and dashboard_thread.is_alive()
+
+
+def _should_continue_main_loop(
+    running: bool,
+    manager: CameraManager,
+    dashboard_thread: threading.Thread | None,
+) -> bool:
+    """Keep the process alive while cameras run, or while Dashboard can recover them."""
+    return running and (manager.is_running or _dashboard_thread_alive(dashboard_thread))
+
+
+def _apply_dev_video_source(config, cameras, video_path: Path):
+    """Switch selected cameras to a deterministic local file source."""
+
+    if not cameras:
+        return cameras
+
+    from argus.runtime.dev_video import create_dev_video
+
+    resolution = tuple(int(v) for v in cameras[0].resolution)
+    width, height = resolution
+    fps = max(1, int(round(float(cameras[0].fps_target or 10))))
+    meta = create_dev_video(
+        video_path,
+        width=width,
+        height=height,
+        fps=fps,
+        seconds=20,
+        anomaly_start_s=6.0,
+        motion="settle",
+    )
+
+    selected_ids = {camera.camera_id for camera in cameras}
+    updated_by_id = {
+        camera.camera_id: camera.model_copy(
+            update={
+                "source": str(video_path),
+                "protocol": "file",
+            },
+        )
+        for camera in cameras
+    }
+    config.cameras = [
+        updated_by_id.get(camera.camera_id, camera)
+        for camera in config.cameras
+    ]
+    if getattr(config, "dashboard", None) is not None:
+        config.dashboard.go2rtc_enabled = False
+
+    logger.info(
+        "dev_video.enabled",
+        path=str(video_path),
+        cameras=sorted(selected_ids),
+        width=meta["width"],
+        height=meta["height"],
+        fps=meta["fps"],
+        frames=meta["frames"],
+    )
+    return [updated_by_id[camera.camera_id] for camera in cameras]
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -69,6 +133,22 @@ def main():
         "--no-dashboard",
         action="store_true",
         help="Disable the web dashboard",
+    )
+    parser.add_argument(
+        "--dev-video",
+        action="store_true",
+        help="Use a generated deterministic file camera for local development",
+    )
+    parser.add_argument(
+        "--dev-video-path",
+        type=Path,
+        default=Path("data/dev/demo_camera.avi"),
+        help="Path for --dev-video output (default: data/dev/demo_camera.avi)",
+    )
+    parser.add_argument(
+        "--dev-fast-training",
+        action="store_true",
+        help="Use a deterministic no-ML trainer for local development smoke tests",
     )
     args = parser.parse_args()
 
@@ -106,6 +186,17 @@ def main():
         print("Error: No cameras configured", file=sys.stderr)
         sys.exit(1)
 
+    if args.dev_video:
+        try:
+            cameras = _apply_dev_video_source(
+                config,
+                cameras,
+                args.dev_video_path,
+            )
+        except Exception as exc:
+            print(f"Error: Failed to prepare dev video source: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     # ── GPU / CUDA environment check ──────────────────────────────────
     _log_gpu_environment()
 
@@ -136,11 +227,21 @@ def main():
     from argus.anomaly.trainer import ModelTrainer
 
     baseline_manager = BaselineManager(baselines_dir=config.storage.baselines_dir)
-    model_trainer = ModelTrainer(
-        baseline_manager=baseline_manager,
-        models_dir=config.storage.models_dir,
-        exports_dir=config.storage.exports_dir,
-    )
+    if args.dev_fast_training:
+        from argus.runtime.dev_training import DevFastModelTrainer
+
+        model_trainer = DevFastModelTrainer(
+            baseline_manager=baseline_manager,
+            models_dir=config.storage.models_dir,
+            exports_dir=config.storage.exports_dir,
+        )
+        logger.info("dev_fast_training.enabled")
+    else:
+        model_trainer = ModelTrainer(
+            baseline_manager=baseline_manager,
+            models_dir=config.storage.models_dir,
+            exports_dir=config.storage.exports_dir,
+        )
 
     health = HealthMonitor()
 
@@ -219,6 +320,7 @@ def main():
         _go2rtc = Go2RTCManager(
             api_port=dashboard_cfg.go2rtc_api_port,
             rtsp_port=dashboard_cfg.go2rtc_rtsp_port,
+            webrtc_port=dashboard_cfg.go2rtc_webrtc_port,
             binary_path=dashboard_cfg.go2rtc_binary,
         )
         _stream_registry = StreamRegistry(_go2rtc)
@@ -335,6 +437,8 @@ def main():
             stream_registry=_stream_registry,
             camera_orchestrator=_camera_orchestrator,
             sensor_fusion=sensor_fusion,
+            baseline_manager=baseline_manager,
+            model_trainer=model_trainer,
         )
         app.state.audit_logger = audit_logger
         app.state.recording_store = alert_recording_store  # FR-033: shared with pipelines
@@ -423,6 +527,7 @@ def main():
         baseline_manager=baseline_manager,
         model_trainer=model_trainer,
         camera_manager=manager,
+        interval_seconds=2.0 if args.dev_fast_training else 60.0,
     )
 
     # Scheduled retraining (C4 + A4: active learning loop)
@@ -467,9 +572,19 @@ def main():
     started = manager.start_all()
 
     if not started:
-        print("Error: No cameras could be started", file=sys.stderr)
-        db.close()
-        sys.exit(1)
+        if args.no_dashboard:
+            print("Error: No cameras could be started", file=sys.stderr)
+            db.close()
+            sys.exit(1)
+        logger.error(
+            "argus.no_cameras_started",
+            configured=len(cameras),
+            msg="Dashboard remains online so operators can fix camera configuration",
+        )
+        print(
+            "Warning: No cameras could be started; Dashboard remains online for recovery",
+            file=sys.stderr,
+        )
 
     # Wire ws_manager.broadcast into each pipeline's degradation publisher
     # so anomaly head fallback events surface to the dashboard banner.
@@ -480,9 +595,21 @@ def main():
     if app is not None:
         ws_mgr_for_pipeline = getattr(app.state, "ws_manager", None)
         if ws_mgr_for_pipeline is not None:
+            from argus.dashboard.degradation_bridge import publish_pipeline_degradation
+
+            degradation_manager = getattr(app.state, "degradation_manager", None)
+
+            def _publish_pipeline_degradation(topic: str, payload: dict) -> None:
+                publish_pipeline_degradation(
+                    ws_mgr_for_pipeline,
+                    degradation_manager,
+                    topic,
+                    payload,
+                )
+
             for cam_id, pipeline in manager._pipelines.items():
                 try:
-                    pipeline.set_degradation_publisher(ws_mgr_for_pipeline.broadcast)
+                    pipeline.set_degradation_publisher(_publish_pipeline_degradation)
                 except Exception as exc:
                     logger.warning(
                         "main.degradation_publisher_wire_failed",
@@ -508,7 +635,7 @@ def main():
     _go2rtc_check_counter = 0
 
     try:
-        while running and manager.is_running:
+        while _should_continue_main_loop(running, manager, dashboard_thread):
             time.sleep(1.0)
 
             # Update health and Prometheus metrics for each camera
@@ -578,7 +705,7 @@ def main():
 
         # Final summary
         h = health.get_health()
-        print(f"\nSession summary:")
+        print("\nSession summary:")
         print(f"  Uptime:    {h.uptime_seconds:.0f}s")
         print(f"  Cameras:   {len(h.cameras)}")
         print(f"  Alerts:    {h.total_alerts}")

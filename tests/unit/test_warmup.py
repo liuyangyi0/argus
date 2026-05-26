@@ -50,7 +50,7 @@ def mock_deploy():
     """Auto-mock anomalib.deploy for all tests in this module."""
     mock_engine = MagicMock()
     mock_engine.predict.return_value = MagicMock()
-    mod = _mock_anomalib_deploy(mock_engine)
+    _mock_anomalib_deploy(mock_engine)
     yield mock_engine
     sys.modules.pop("anomalib.deploy", None)
 

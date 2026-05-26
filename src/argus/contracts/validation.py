@@ -9,7 +9,7 @@ that could cause outages in a nuclear environment.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import structlog
 

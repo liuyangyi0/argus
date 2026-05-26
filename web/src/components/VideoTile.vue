@@ -27,6 +27,12 @@ export interface CameraTileData {
     description?: string;
   } | null
   degradation: string | null
+  capture_status?: {
+    degradation_reason?: string | null
+    fast_motion?: {
+      degradation_reason?: string | null
+    } | null
+  } | null
   frames_dropped?: number
   backpressured?: boolean
 }
@@ -50,6 +56,13 @@ const borderStyle = computed(() => {
   }
   if (props.camera.current_score > 0.5) return { border: '2px solid var(--amber)' }
   return { border: '1px solid var(--line-2)' }
+})
+
+const degradationTitle = computed(() => {
+  const reason = props.camera.capture_status?.degradation_reason
+    || props.camera.capture_status?.fast_motion?.degradation_reason
+    || props.camera.degradation
+  return reason ? `降级: ${reason}` : '降级'
 })
 
 // go2rtc WebRTC/MSE player
@@ -150,7 +163,7 @@ function handleAlertBadgeClick(e: MouseEvent) {
           <span v-else class="inline-block w-2 h-2 rounded-full bg-slate-500" />
         </Tooltip>
         <!-- Degradation warning -->
-        <Tooltip v-if="camera.degradation" :title="`降级: ${camera.degradation}`">
+        <Tooltip v-if="camera.degradation" :title="degradationTitle">
           <WarningOutlined class="text-xs text-amber-500" />
         </Tooltip>
         <!-- Active alert -->

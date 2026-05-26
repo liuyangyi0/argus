@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from argus.anomaly.detector import AnomalibDetector, MultiScaleDetector
 from argus.core.health import HealthMonitor
 from argus.core.model_status import ModelStatus
 from argus.dashboard.app import create_app
@@ -90,3 +91,30 @@ class TestModelsStatusRoute:
         resp = client.get("/api/models/status")
         assert resp.status_code == 200
         assert resp.json()["data"]["models"] == []
+
+    def test_includes_multiscale_wrapped_anomaly_status(self, client):
+        base = AnomalibDetector(camera_id="cam1")
+        base.status.mark_loaded(backend="ssim-fallback")
+        base.status.set_extra(reason="no_model_found")
+        wrapped = MultiScaleDetector(base_detector=base)
+
+        yolo = ModelStatus(name="yolo", camera_id="cam1")
+        yolo.mark_loaded(backend="cpu", model_path="yolo11n.pt")
+
+        manager = MagicMock()
+        manager._runners = {
+            "cam1": SimpleNamespace(
+                _pipeline=SimpleNamespace(
+                    _anomaly_detector=wrapped,
+                    _object_detector=SimpleNamespace(status=yolo),
+                ),
+            ),
+        }
+        client.app.state.camera_manager = manager
+
+        resp = client.get("/api/models/status")
+        assert resp.status_code == 200
+        body = resp.json()["data"]["models"]
+        by_key = {(m["camera_id"], m["name"]): m for m in body}
+        assert by_key[("cam1", "anomaly")]["backend"] == "ssim-fallback"
+        assert by_key[("cam1", "anomaly")]["extra"]["reason"] == "no_model_found"

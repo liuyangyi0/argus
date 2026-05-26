@@ -1,12 +1,10 @@
 """Tests for AlertRecordingStore disk persistence with H.264 MP4 (FR-033)."""
 
-import json
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-import pytest
 
 from argus.core.alert_ring_buffer import (
     FrameSnapshot,

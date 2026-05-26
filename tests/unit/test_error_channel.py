@@ -14,7 +14,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-import pytest
 
 from argus.core.error_channel import (
     SEVERITY_CRITICAL,

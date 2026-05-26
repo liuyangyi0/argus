@@ -4,7 +4,6 @@ import time
 from unittest.mock import patch
 
 import numpy as np
-import pytest
 
 from argus.alerts.grader import AlertGrader, _AnomalyTracker
 from argus.config.schema import (
@@ -353,12 +352,10 @@ class TestCUSUMEvidence:
     def test_mixed_signal_accumulates(self):
         """交替 score=0.6 和 score=0.0 → evidence 缓慢累积但可能不触发。"""
         grader = AlertGrader(self._make_cusum_config(lam=0.95, threshold=3.0))
-        triggered = False
         for i in range(20):
             score = 0.6 if i % 2 == 0 else 0.0
             alert = self._eval(grader, score=score, frame_number=i)
             if alert is not None:
-                triggered = True
                 break
         # With alternating 0.6/0.0, evidence grows slowly due to decay on zero frames
         # May or may not trigger in 20 frames depending on exact math

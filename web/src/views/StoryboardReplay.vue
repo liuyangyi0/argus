@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { CaretRightOutlined, PauseOutlined } from '@ant-design/icons-vue'
 import StoryboardPlayer from '../components/replay/StoryboardPlayer.vue'
@@ -10,7 +10,7 @@ defineOptions({ name: 'StoryboardReplayPage' })
 
 const route = useRoute()
 const router = useRouter()
-const alertId = route.params.alertId as string
+const alertId = computed(() => String(route.params.alertId || ''))
 
 const ctrl = useStoryboardController(alertId)
 const speeds = [0.25, 0.5, 1, 2, 4]
@@ -47,9 +47,12 @@ function onDurationReport(id: string, seconds: number): void {
 }
 
 onMounted(() => {
-  ctrl.load()
   window.addEventListener('keydown', ctrl.handleKeydown)
 })
+
+watch(alertId, () => {
+  ctrl.load()
+}, { immediate: true })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', ctrl.handleKeydown)

@@ -1,9 +1,8 @@
 """Tests for KS drift monitoring (C2)."""
 
 import numpy as np
-import pytest
 
-from argus.anomaly.drift import DriftDetector, DriftStatus
+from argus.anomaly.drift import DriftDetector
 
 
 class TestDriftDetector:
@@ -19,7 +18,7 @@ class TestDriftDetector:
             detector.update(rng.normal(0.2, 0.05))
 
         status = detector.get_status()
-        assert status.is_drifted == False
+        assert not status.is_drifted
 
     def test_drift_detected_shifted_distribution(self):
         """参考 mean=0.1, 当前 mean=0.5 → is_drifted=True。"""
@@ -37,7 +36,7 @@ class TestDriftDetector:
             detector.update(rng.normal(0.5, 0.02))
 
         status = detector.get_status()
-        assert status.is_drifted == True
+        assert status.is_drifted
         assert status.ks_statistic > 0.05
 
     def test_ks_2samp_known_values(self):

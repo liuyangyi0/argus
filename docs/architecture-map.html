@@ -384,6 +384,14 @@
       min-width: 1120px;
     }
 
+    .business-lane {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(156px, 1fr));
+      align-items: stretch;
+      gap: 10px;
+      min-width: 1040px;
+    }
+
     .flow-step {
       position: relative;
       min-height: 122px;
@@ -612,6 +620,7 @@
       .function-grid,
       .stack,
       .lane,
+      .business-lane,
       .loop,
       .loop-back,
       .db-grid,
@@ -641,6 +650,10 @@
       }
 
       .lane {
+        grid-template-columns: 1fr;
+      }
+
+      .business-lane {
         grid-template-columns: 1fr;
       }
 
@@ -705,7 +718,7 @@
           <div class="meta-item"><span class="dot cyan"></span><span>类型：独立静态 HTML，不接入 Vue 路由。</span></div>
           <div class="meta-item"><span class="dot blue"></span><span>依据：当前代码、README 与 <code>docs/architecture.md</code>。</span></div>
           <div class="meta-item"><span class="dot green"></span><span>范围：单节点边缘部署、Dashboard、检测、训练、存储。</span></div>
-          <div class="meta-item"><span class="dot amber"></span><span>核验日期：2026-05-23。</span></div>
+          <div class="meta-item"><span class="dot amber"></span><span>核验日期：2026-05-25。</span></div>
         </div>
       </aside>
     </div>
@@ -714,6 +727,7 @@
   <div class="toc-wrap">
     <nav class="page toc" aria-label="页面目录">
       <a href="#features">功能图</a>
+      <a href="#business-loop">业务闭环</a>
       <a href="#runtime">系统架构图</a>
       <a href="#pipeline">核心数据流图</a>
       <a href="#training">训练闭环图</a>
@@ -783,7 +797,7 @@
             <h3>System 系统</h3>
             <ul>
               <li>配置、备份、审计</li>
-              <li>降级事件与模块开关</li>
+              <li>降级事件、异常检测 fallback 与模块开关</li>
               <li>分类器、分割器、跨相机</li>
               <li>用户与区域管理</li>
             </ul>
@@ -808,6 +822,61 @@
       </div>
     </section>
 
+    <section id="business-loop">
+      <div class="section-head">
+        <div>
+          <h2>核心业务闭环</h2>
+          <p>排查和修复优先按用户真实路径推进：先证明每一段功能能工作，再回到架构层定位共用组件和长期治理问题。</p>
+        </div>
+        <div class="note">本地无硬件时先用 <code>--dev-video</code> 或 <code>--rtsp-fixture</code> 复现；真实 USB / RTSP 再用 preflight 单独验证。</div>
+      </div>
+
+      <div class="diagram">
+        <div class="diagram-title">
+          <strong>Cameras -> Alerts -> Replay -> Models -> System -> Reports</strong>
+          <span><code>scripts/smoke_dashboard_business_flow.py</code></span>
+        </div>
+        <div class="business-lane">
+          <div class="flow-step">
+            <span class="num">1</span>
+            <h3>Cameras</h3>
+            <p>接入源、稳定取帧、快照和浏览器播放路径同时可用。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">2</span>
+            <h3>Alerts</h3>
+            <p>检测链产生告警，Alerts 页面通过 WebSocket 实时看到同一条告警。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">3</span>
+            <h3>Replay</h3>
+            <p>告警有快照、热力图、证据包和可回放录像。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">4</span>
+            <h3>Models</h3>
+            <p>训练、导出、re-export、shadow、canary、production 和 rollback 状态一致。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">5</span>
+            <h3>System</h3>
+            <p>关键检测参数可热更新，fallback / 降级状态能被系统页观察。</p>
+          </div>
+          <div class="flow-step">
+            <span class="num">6</span>
+            <h3>Reports</h3>
+            <p>统计必须来自真实告警与证据记录，不能只看页面空壳。</p>
+          </div>
+        </div>
+
+        <div class="rail-note">
+          <div class="node green"><strong>默认本地闭环</strong><span><code>python -m argus --config configs/default.yaml --dev-video --dev-fast-training</code> 用生成视频和确定性模型工件验证操作台。</span></div>
+          <div class="node violet"><strong>RTSP / go2rtc 夹具</strong><span><code>python scripts/smoke_dashboard_business_flow.py --rtsp-fixture --require-go2rtc --browser required</code> 验证 RTSP 输入与独立 go2rtc 播放代理。</span></div>
+          <div class="node amber"><strong>硬件闸门</strong><span>真实 USB / RTSP 先跑 <code>--preflight --camera-source ... --require-go2rtc</code>，确认设备、注册和首帧后再跑完整业务闭环；Windows USB 会输出 Camera 清单、OpenCV 运行时和 hints。</span></div>
+        </div>
+      </div>
+    </section>
+
     <section id="runtime">
       <div class="section-head">
         <div>
@@ -828,7 +897,7 @@
             <div class="layer-body">
               <div class="node cyan"><strong>Vue SPA</strong><span>主路由、模型页、系统页、回放页。</span></div>
               <div class="node cyan"><strong>API Client</strong><span>Axios 请求 <code>/api/*</code>。</span></div>
-              <div class="node cyan"><strong>WebSocket Client</strong><span>订阅 health、alerts、tasks、degradation 等主题。</span></div>
+              <div class="node cyan"><strong>WebSocket Client</strong><span>订阅 health、alerts、tasks、degradation、system_degradation 等主题。</span></div>
               <div class="node cyan"><strong>Video Player</strong><span>优先使用 go2rtc WebRTC/MSE/HLS，失败时回退。</span></div>
             </div>
           </div>
@@ -858,7 +927,7 @@
             <div class="layer-body">
               <div class="node green"><strong>TaskScheduler</strong><span>维护任务、清理、备份、训练作业轮询。</span></div>
               <div class="node green"><strong>ActiveLearningSampler</strong><span>从帧事件挑选不确定样本。</span></div>
-              <div class="node red"><strong>Health & Degradation</strong><span>健康汇总、降级状态、全局降级条。</span></div>
+              <div class="node red"><strong>Health & Degradation</strong><span>健康汇总、全局降级条、异常检测 fallback 状态。</span></div>
               <div class="node amber"><strong>Audit & Backup</strong><span>审计日志、数据库和配置备份。</span></div>
             </div>
           </div>
@@ -1208,6 +1277,8 @@
         <a href="../src/argus/dashboard/app.py"><code>src/argus/dashboard/app.py</code><span>FastAPI、路由、WebSocket、app.state。</span></a>
         <a href="../web/src/router/index.ts"><code>web/src/router/index.ts</code><span>前端主路由与权限元信息。</span></a>
         <a href="../src/argus/storage/models.py"><code>src/argus/storage/models.py</code><span>ORM 表、枚举、业务键字段。</span></a>
+        <a href="../scripts/smoke_dashboard_business_flow.py"><code>scripts/smoke_dashboard_business_flow.py</code><span>端到端业务闭环、RTSP 夹具、浏览器 DOM 验证。</span></a>
+        <a href="../scripts/smoke_core_loop.py"><code>scripts/smoke_core_loop.py</code><span>核心 API 闭环与摄像头 / go2rtc preflight。</span></a>
         <a href="./architecture.md"><code>docs/architecture.md</code><span>当前实现架构说明。</span></a>
       </div>
     </section>

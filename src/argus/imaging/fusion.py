@@ -6,7 +6,7 @@ zero-filled so the output shape is deterministic.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np

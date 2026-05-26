@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -14,7 +13,6 @@ from unittest.mock import MagicMock, patch
 from argus.anomaly.baseline import BaselineManager
 from argus.anomaly.trainer import (
     ModelTrainer,
-    QualityReport,
     TrainingStatus,
     _resolve_dinomaly_backbone,
 )
