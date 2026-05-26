@@ -35,9 +35,14 @@ def test_on_model_trained_does_not_call_pipeline_reload(tmp_path):
         def __init__(self, **kwargs):
             captured_callbacks["on_model_trained"] = kwargs.get("on_model_trained")
 
+    captured_interval: dict = {}
+
+    def _capture_job_task(*args, **kwargs):
+        captured_interval.update(kwargs)
+
     with patch(
         "argus.runtime.training_job_wiring.create_job_processing_task",
-        lambda *a, **kw: None,
+        _capture_job_task,
     ), patch(
         "argus.anomaly.job_executor.TrainingJobExecutor", _ExecutorSpy,
     ), patch(
@@ -52,10 +57,12 @@ def test_on_model_trained_does_not_call_pipeline_reload(tmp_path):
             baseline_manager=MagicMock(),
             model_trainer=MagicMock(),
             camera_manager=camera_manager,
+            interval_seconds=2.0,
         )
 
     on_trained = captured_callbacks["on_model_trained"]
     assert on_trained is not None
+    assert captured_interval["interval_seconds"] == 2.0
 
     on_trained("cam_01", Path(tmp_path / "fake_model.xml"))
 

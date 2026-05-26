@@ -50,6 +50,7 @@ function shortVid(vid: string): string {
 const props = defineProps<{
   models: ModelInfo[]
   cameras: CameraSummary[]
+  focusedVersionId?: string
 }>()
 
 const emit = defineEmits<{
@@ -142,7 +143,15 @@ function connectorClass(i: number, record: Record<string, any>): string {
 // 入参类型放宽到 Record<string, any>:ant-design-vue 的 row-class-name 回调
 // 在内部按通用对象传 record,严格 TS 模式下不能直接绑定 ModelInfo 签名。
 function rowClassName(record: Record<string, any>): string {
-  return record.stage === 'retired' ? 'row-retired' : ''
+  const classes: string[] = []
+  if (record.stage === 'retired') classes.push('row-retired')
+  if (
+    props.focusedVersionId &&
+    record.model_version_id === props.focusedVersionId
+  ) {
+    classes.push('row-focused')
+  }
+  return classes.join(' ')
 }
 
 // ── T3: Expandable row — stage history ──
@@ -185,9 +194,21 @@ const stageCounts = computed(() => {
 
 const sortedModels = computed(() => {
   const order: Record<string, number> = { production: 0, canary: 1, shadow: 2, candidate: 3, retired: 4 }
-  return [...props.models].sort((a: ModelInfo, b: ModelInfo) =>
+  const ordered = [...props.models].sort((a: ModelInfo, b: ModelInfo) =>
     (order[a.stage] ?? 5) - (order[b.stage] ?? 5)
   )
+  const focusId = props.focusedVersionId
+  if (!focusId) return ordered
+
+  const focusIdx = ordered.findIndex(model => model.model_version_id === focusId)
+  if (focusIdx <= 0) return ordered
+
+  const focused = ordered[focusIdx]
+  return [
+    focused,
+    ...ordered.slice(0, focusIdx),
+    ...ordered.slice(focusIdx + 1),
+  ]
 })
 
 const RUNTIME_STATE_MAP: Record<string, { text: string; color: string }> = {
@@ -214,6 +235,17 @@ function handlePromoteTargetChange(stage: unknown) {
   promoteForm.value.canary_camera_id = stage === 'canary' ? promoteOwnCameraId() : ''
 }
 
+function notifyRuntimeResult(
+  result: { runtime_synced?: boolean } | null | undefined,
+  successText: string,
+) {
+  if (result?.runtime_synced === false) {
+    message.warning(`${successText}，但运行时尚未同步；请检查运行态`)
+    return
+  }
+  message.success(successText)
+}
+
 // ── Actions: rollback / delete ──
 
 function handleRollback(record: any) {
@@ -226,7 +258,7 @@ function handleRollback(record: any) {
     async onOk() {
       try {
         const res = await rollbackModel(record.model_version_id)
-        message.success(`已回滚到 ${res.activated}`)
+        notifyRuntimeResult(res, `已回滚到 ${res.activated}`)
         emit('changed')
       } catch (e) {
         message.error(extractErrorMessage(e, '回滚失败'))
@@ -273,10 +305,6 @@ function handlePromote(record: any) {
 }
 
 async function submitPromote() {
-  if (!promoteForm.value.triggered_by) {
-    message.warning('请输入操作人')
-    return
-  }
   if (promoteForm.value.target_stage === 'canary') {
     const ownCameraId = promoteOwnCameraId()
     if (!ownCameraId) {
@@ -287,13 +315,23 @@ async function submitPromote() {
   }
   promotingModel.value = promoteForm.value.version_id
   try {
-    await promoteModel(promoteForm.value.version_id, {
+    const payload: {
+      target_stage: string
+      triggered_by?: string
+      reason?: string
+      canary_camera_id?: string
+    } = {
       target_stage: promoteForm.value.target_stage,
-      triggered_by: promoteForm.value.triggered_by,
-      reason: promoteForm.value.reason || undefined,
-      canary_camera_id: promoteForm.value.canary_camera_id || undefined,
-    })
-    message.success(`模型已推进到 ${STAGE_MAP[promoteForm.value.target_stage]?.text || promoteForm.value.target_stage}`)
+    }
+    if (promoteForm.value.triggered_by) payload.triggered_by = promoteForm.value.triggered_by
+    if (promoteForm.value.reason) payload.reason = promoteForm.value.reason
+    if (promoteForm.value.canary_camera_id) payload.canary_camera_id = promoteForm.value.canary_camera_id
+
+    const res = await promoteModel(promoteForm.value.version_id, payload)
+    notifyRuntimeResult(
+      res,
+      `模型已推进到 ${STAGE_MAP[promoteForm.value.target_stage]?.text || promoteForm.value.target_stage}`,
+    )
     promoteModalVisible.value = false
     emit('changed')
   } catch (e) {
@@ -312,8 +350,8 @@ function handleRetire(record: any) {
     okType: 'danger',
     async onOk() {
       try {
-        await retireModel(record.model_version_id, { triggered_by: 'operator' })
-        message.success('模型已退役')
+        const res = await retireModel(record.model_version_id)
+        notifyRuntimeResult(res, '模型已退役')
         emit('changed')
       } catch (e) {
         message.error(extractErrorMessage(e, '退役失败'))
@@ -406,8 +444,8 @@ function handleRecalibrate(record: any) {
 
 function handleOpenABCompare(record: any) {
   router.push({
-    path: '/models',
-    query: { tab: 'comparison', camera: record.camera_id, shadow: record.model_version_id },
+    path: '/models/comparison',
+    query: { camera: record.camera_id, shadow: record.model_version_id },
   })
 }
 
@@ -645,8 +683,8 @@ const columns = [
       <div v-else-if="promoteForm.target_stage === 'canary'" class="stage-hint">
         金丝雀阶段会成为该摄像头的主模型。
       </div>
-      <Form.Item label="操作人" required>
-        <Input v-model:value="promoteForm.triggered_by" placeholder="输入操作人姓名" />
+      <Form.Item label="操作人">
+        <Input v-model:value="promoteForm.triggered_by" placeholder="留空则使用当前登录用户" />
       </Form.Item>
       <Form.Item v-if="promoteForm.target_stage === 'canary'" label="金丝雀摄像头" required>
         <Select v-model:value="promoteForm.canary_camera_id" style="width: 100%" disabled>
@@ -909,6 +947,16 @@ const columns = [
 }
 :deep(.row-retired) td {
   background: rgba(0, 0, 0, 0.02);
+}
+:deep(.row-focused) td {
+  background: #fff7e6 !important;
+  box-shadow: inset 0 1px 0 rgba(250, 173, 20, 0.35), inset 0 -1px 0 rgba(250, 173, 20, 0.35);
+}
+:deep(.row-focused td:first-child) {
+  box-shadow:
+    inset 3px 0 0 #faad14,
+    inset 0 1px 0 rgba(250, 173, 20, 0.35),
+    inset 0 -1px 0 rgba(250, 173, 20, 0.35);
 }
 
 /* T3: 展开行内的阶段历史面板 */

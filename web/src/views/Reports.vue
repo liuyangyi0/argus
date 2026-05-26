@@ -11,6 +11,7 @@ import ContentSkeleton from '../components/ContentSkeleton.vue'
 
 use([CanvasRenderer, BarChart, LineChart, PieChart, GridComponent, TooltipComponent, LegendComponent])
 import { getReportStats, getDailyTrend, getSeverityDist, getCameraDist, getFPTrend, downloadComplianceReport } from '../api/reports'
+import type { ReportStats } from '../types/api'
 import { SEVERITY_COLORS } from '../utils/colors'
 
 const loading = ref(true)
@@ -18,7 +19,7 @@ const loading = ref(true)
 // previous data visible while the inline <Spin> overlays it.
 const initialLoading = ref(true)
 const days = ref(30)
-const stats = ref<any>(null)
+const stats = ref<ReportStats | null>(null)
 const trendData = ref<any>(null)
 const severityData = ref<any>(null)
 const cameraData = ref<any>(null)
@@ -33,10 +34,10 @@ async function fetchAll() {
   loading.value = true
   try {
     const [s, t, sev, cam, fp] = await Promise.all([
-      getReportStats(),
+      getReportStats(days.value),
       getDailyTrend(days.value),
-      getSeverityDist(),
-      getCameraDist(),
+      getSeverityDist(days.value),
+      getCameraDist(days.value),
       getFPTrend(days.value),
     ])
     stats.value = s
@@ -65,6 +66,8 @@ async function handleDownloadCompliance() {
 
 function handleDaysChange() { fetchAll() }
 onMounted(fetchAll)
+
+const evidence = computed(() => stats.value?.evidence ?? null)
 
 // ── ECharts options ──
 
@@ -189,6 +192,34 @@ const fpOption = computed(() => {
         <Col :span="6"><Card size="small"><Statistic title="高严重度" :value="stats.by_severity?.high ?? 0" :value-style="{ color: SEVERITY_COLORS.high }" /></Card></Col>
         <Col :span="6"><Card size="small"><Statistic title="误报率" :value="stats.false_positive_rate" suffix="%" :value-style="{ color: '#d97706' }" /></Card></Col>
         <Col :span="6"><Card size="small"><Statistic title="确认率" :value="stats.acknowledged_rate" suffix="%" :value-style="{ color: '#15a34a' }" /></Card></Col>
+      </Row>
+
+      <!-- Evidence coverage -->
+      <Row :gutter="16" style="margin-bottom: 12px;" v-if="evidence">
+        <Col :span="6">
+          <Card size="small">
+            <Statistic title="截图覆盖率" :value="evidence.snapshot_rate" suffix="%" />
+            <Typography.Text type="secondary">{{ evidence.alerts_with_snapshot }} / {{ evidence.total_alerts }}</Typography.Text>
+          </Card>
+        </Col>
+        <Col :span="6">
+          <Card size="small">
+            <Statistic title="热力图覆盖率" :value="evidence.heatmap_rate" suffix="%" />
+            <Typography.Text type="secondary">{{ evidence.alerts_with_heatmap }} / {{ evidence.total_alerts }}</Typography.Text>
+          </Card>
+        </Col>
+        <Col :span="6">
+          <Card size="small">
+            <Statistic title="Replay录像覆盖率" :value="evidence.recording_rate" suffix="%" />
+            <Typography.Text type="secondary">{{ evidence.alerts_with_recording }} / {{ evidence.total_alerts }}</Typography.Text>
+          </Card>
+        </Col>
+        <Col :span="6">
+          <Card size="small">
+            <Statistic title="完整证据率" :value="evidence.evidence_complete_rate" suffix="%" :value-style="{ color: '#15a34a' }" />
+            <Typography.Text type="secondary">{{ evidence.evidence_complete_count }} / {{ evidence.total_alerts }}</Typography.Text>
+          </Card>
+        </Col>
       </Row>
 
       <!-- Daily trend -->

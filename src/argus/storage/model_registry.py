@@ -9,13 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from argus.storage.models import ModelRecord, ModelStage, ModelVersionEvent
 from argus.storage.release_pipeline import VALID_TRANSITIONS
@@ -26,19 +25,10 @@ logger = structlog.get_logger()
 class ModelRegistry:
     """Manages model version registration and activation."""
 
+    _REGISTER_ATTEMPTS = 5
+
     def __init__(self, session_factory):
         self._session_factory = session_factory
-        self._counter_lock = threading.Lock()
-        self._counter = self._init_counter_from_db()
-
-    def _init_counter_from_db(self) -> int:
-        """Initialize counter from existing record count to avoid ID collisions on restart."""
-        try:
-            with self._session_factory() as session:
-                count = session.scalar(select(func.count(ModelRecord.id)))
-                return count or 0
-        except Exception:
-            return 0
 
     def register(
         self,
@@ -58,29 +48,43 @@ class ModelRegistry:
         data_hash = self._compute_dir_hash(baseline_dir)
         code_version = self._get_git_hash()
 
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        with self._counter_lock:
-            self._counter += 1
-            counter_val = self._counter
-        model_version_id = f"{camera_id}-{model_type}-{ts}-{counter_val:04d}"
+        last_error: IntegrityError | None = None
+        for attempt in range(1, self._REGISTER_ATTEMPTS + 1):
+            model_version_id = self._new_model_version_id(camera_id, model_type)
+            record = ModelRecord(
+                model_version_id=model_version_id,
+                camera_id=camera_id,
+                model_type=model_type,
+                model_hash=model_hash,
+                data_hash=data_hash,
+                code_version=code_version,
+                training_params=json.dumps(training_params) if training_params else None,
+                stage=ModelStage.CANDIDATE.value,
+                component_type=component_type,
+                model_path=str(model_path),
+                backbone_version_id=backbone_ref,
+            )
 
-        record = ModelRecord(
-            model_version_id=model_version_id,
-            camera_id=camera_id,
-            model_type=model_type,
-            model_hash=model_hash,
-            data_hash=data_hash,
-            code_version=code_version,
-            training_params=json.dumps(training_params) if training_params else None,
-            stage=ModelStage.CANDIDATE.value,
-            component_type=component_type,
-            model_path=str(model_path),
-            backbone_version_id=backbone_ref,
-        )
-
-        with self._session_factory() as session:
-            session.add(record)
-            session.commit()
+            with self._session_factory() as session:
+                session.add(record)
+                try:
+                    session.commit()
+                except IntegrityError as exc:
+                    session.rollback()
+                    last_error = exc
+                    logger.warning(
+                        "model_registry.version_id_collision",
+                        model_version_id=model_version_id,
+                        attempt=attempt,
+                        max_attempts=self._REGISTER_ATTEMPTS,
+                    )
+                    continue
+            break
+        else:
+            raise RuntimeError(
+                "Failed to generate a unique model_version_id after "
+                f"{self._REGISTER_ATTEMPTS} attempts"
+            ) from last_error
 
         logger.info(
             "model_registry.registered",
@@ -90,6 +94,13 @@ class ModelRegistry:
             stage=ModelStage.CANDIDATE.value,
         )
         return model_version_id
+
+    @staticmethod
+    def _new_model_version_id(camera_id: str, model_type: str) -> str:
+        """Generate a DB-safe model version ID across registry instances."""
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
+        suffix = uuid.uuid4().hex[:8]
+        return f"{camera_id}-{model_type}-{ts}-{suffix}"
 
     def get_active(self, camera_id: str) -> ModelRecord | None:
         """Get the active model for a camera."""

@@ -107,7 +107,7 @@ class OpenVocabClassifier:
     def add_labels(self, labels: list[str]) -> None:
         """Append new labels to the vocabulary (deduplicated)."""
         existing = set(self._vocabulary)
-        added = [l for l in labels if l not in existing]
+        added = [label for label in labels if label not in existing]
         if added:
             self._vocabulary.extend(added)
             if self._model is not None:

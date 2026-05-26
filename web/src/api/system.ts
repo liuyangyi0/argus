@@ -169,7 +169,21 @@ export interface ClassifierVocabularyUpdate {
 export const updateClassifierVocabulary = (payload: ClassifierVocabularyUpdate) =>
   api.put('/config/classifier/vocabulary', payload).then(u)
 
-export const toggleModule = (key: string, value: boolean) =>
+export interface ModuleToggleResult {
+  key: string
+  value: boolean
+  restart_required: boolean
+  hot_reloaded: number
+  hot_reloadable: boolean
+  hot_reload_failed: number
+  pipelines_seen: number
+  persisted: boolean
+}
+
+export const getModuleStates = (): Promise<Record<string, boolean>> =>
+  api.get('/config/modules').then(u)
+
+export const toggleModule = (key: string, value: boolean): Promise<ModuleToggleResult> =>
   api.post('/config/modules', { key, value }).then(u)
 
 // ── Config management ──

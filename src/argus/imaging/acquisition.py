@@ -11,7 +11,7 @@ Supports three backends:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 import cv2
@@ -25,7 +25,6 @@ logger = structlog.get_logger()
 # ---------------------------------------------------------------------------
 try:
     from arena_api.system import system as _arena_system  # type: ignore[import-untyped]
-    from arena_api import enums as _arena_enums  # type: ignore[import-untyped]
 
     _HAS_ARENA = True
 except ImportError:

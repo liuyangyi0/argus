@@ -16,6 +16,7 @@ import {
 import { useRouter } from 'vue-router'
 import { useAlertStore } from '../../stores/useAlertStore'
 import { useAuthStore } from '../../stores/useAuthStore'
+import { downloadEvidencePackage } from '../../api/alerts'
 import { scoreColor } from '../../utils/colors'
 import { formatTimestamp } from '../../utils/time'
 import { extractErrorMessage } from '../../utils/error'
@@ -35,7 +36,8 @@ const { selectedAlert } = storeToRefs(store)
 // Viewer can read alerts but must not mutate workflow state. Backend RBAC
 // 403s these endpoints anyway; we just hide the buttons to remove dead clicks.
 const auth = useAuthStore()
-const canMutateAlert = computed(() => auth.hasRole(['admin', 'operator']))
+const canMutateAlert = computed(() => auth.hasRole(['admin', 'operator', 'engineer']))
+const canViewModelRegistry = computed(() => auth.hasRole(['admin', 'engineer']))
 
 const imageMode = ref<'composite' | 'snapshot' | 'heatmap' | 'compare'>('composite')
 const annotationMode = ref(false)
@@ -170,10 +172,18 @@ function handleDelete() {
   })
 }
 
+async function handleEvidenceExport() {
+  if (!selectedAlert.value) return
+  try {
+    await downloadEvidencePackage(selectedAlert.value.alert_id)
+    message.success('证据包下载已开始')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '导出证据包失败'))
+  }
+}
+
 // C-AlertTrainingLink: jump to model registry page with the version_id as a
-// query hint. ModelsRegistryView ignores unknown query params today, so this
-// is "navigate to the page" rather than "highlight that row" — but the value
-// of the link is the lineage trace, not the highlight.
+// query hint so the registry can pin and highlight the lineage row.
 function goToModelVersion() {
   const versionId = selectedAlert.value?.model_version_id
   if (!versionId) return
@@ -225,7 +235,12 @@ function goToModelVersion() {
           </Button>
         </Tooltip>
         <Tooltip title="导出证据包">
-          <Button size="small" type="text" style="color: var(--argus-text-muted)">
+          <Button
+            size="small"
+            type="text"
+            style="color: var(--argus-text-muted)"
+            @click="handleEvidenceExport"
+          >
             <template #icon><ExportOutlined /></template>
           </Button>
         </Tooltip>
@@ -447,6 +462,7 @@ function goToModelVersion() {
               </span>
               <span class="meta-v meta-v--model-link">
                 <Button
+                  v-if="canViewModelRegistry"
                   type="link"
                   size="small"
                   style="padding: 0; height: auto; font-family: monospace; font-size: 12px"
@@ -454,6 +470,9 @@ function goToModelVersion() {
                 >
                   {{ selectedAlert.model_version_id }}
                 </Button>
+                <span v-else class="model-version-readonly">
+                  {{ selectedAlert.model_version_id }}
+                </span>
               </span>
             </div>
             <div v-if="selectedAlert.workflow_status === 'false_positive'" class="meta-row meta-row--feedback-hint">
@@ -712,6 +731,10 @@ function goToModelVersion() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.model-version-readonly {
+  font-family: monospace;
+  font-size: 12px;
 }
 .meta-row--feedback-hint {
   justify-content: center;

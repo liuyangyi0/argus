@@ -11,7 +11,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -49,6 +49,7 @@ class CameraStatus:
     connected: bool = False
     running: bool = False
     stats: PipelineStats | None = None
+    capture_status: dict | None = None
     error: str | None = None
 
 
@@ -106,6 +107,7 @@ class CameraManager:
         self._runners: dict[str, CameraInferenceRunner] = {}
         self._pipelines: dict[str, DetectionPipeline] = {}  # backward compat
         self._threads: dict[str, threading.Thread] = {}
+        self._starting_cameras: set[str] = set()
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._alert_count = 0
@@ -362,6 +364,11 @@ class CameraManager:
                     connected=pipeline._camera.state.connected,
                     running=cam_config.camera_id in self._threads,
                     stats=pipeline.stats,
+                    capture_status=(
+                        pipeline.get_capture_status()
+                        if hasattr(pipeline, "get_capture_status")
+                        else None
+                    ),
                 ))
             else:
                 statuses.append(CameraStatus(
@@ -955,155 +962,163 @@ class CameraManager:
             if camera_id in self._threads and self._threads[camera_id].is_alive():
                 logger.warning("manager.already_running", camera_id=camera_id)
                 return True
+            if camera_id in self._starting_cameras:
+                logger.warning("manager.already_starting", camera_id=camera_id)
+                return True
+            self._starting_cameras.add(camera_id)
 
-        runtime_cam_config = cam_config
-        if self._source_resolver is not None:
-            try:
-                resolved = self._source_resolver(cam_config)
-                if resolved is not None:
-                    runtime_cam_config = resolved
-            except Exception as exc:
-                logger.warning(
-                    "manager.source_resolve_failed",
-                    camera_id=camera_id,
-                    error=str(exc),
-                )
+        try:
+            runtime_cam_config = cam_config
+            if self._source_resolver is not None:
+                try:
+                    resolved = self._source_resolver(cam_config)
+                    if resolved is not None:
+                        runtime_cam_config = resolved
+                except Exception as exc:
+                    logger.warning(
+                        "manager.source_resolve_failed",
+                        camera_id=camera_id,
+                        error=str(exc),
+                    )
 
-        def _alert_handler(alert: Alert):
-            # C3: Cross-camera correlation check before emitting
-            if self._correlator is not None:
-                anomaly_map = pipeline.get_latest_anomaly_map()
-                location = self._anomaly_peak_location(anomaly_map)
-                max_age = (
-                    self._cross_camera_config.max_age_seconds
-                    if self._cross_camera_config
-                    else 5.0
-                )
-                result = self._correlator.check(
-                    camera_id=alert.camera_id,
-                    anomaly_location=location,
-                    timestamp=time.time(),
-                    max_age_seconds=max_age,
-                )
-                alert.corroborated = result.corroborated
-                alert.correlation_partner = result.partner_camera
-                if not result.corroborated:
-                    # F4: Force-corroboration mode — drop the alert entirely
-                    # instead of downgrading, when the zone demands it.
-                    if self._zone_requires_corroboration(alert.camera_id, alert.zone_id):
-                        logger.info(
-                            "alerts.suppressed_uncorroborated",
-                            alert_id=alert.alert_id,
-                            camera_id=alert.camera_id,
-                            zone_id=alert.zone_id,
-                            partner=result.partner_camera,
-                        )
-                        return
-
-                    downgrade = (
-                        self._cross_camera_config.uncorroborated_severity_downgrade
+            def _alert_handler(alert: Alert):
+                # C3: Cross-camera correlation check before emitting
+                if self._correlator is not None:
+                    anomaly_map = pipeline.get_latest_anomaly_map()
+                    location = self._anomaly_peak_location(anomaly_map)
+                    max_age = (
+                        self._cross_camera_config.max_age_seconds
                         if self._cross_camera_config
-                        else 1
+                        else 5.0
                     )
-                    if downgrade > 0:
-                        alert.severity = self._downgrade_severity(
-                            alert.severity, downgrade
-                        )
-                    logger.info(
-                        "manager.alert_uncorroborated",
+                    result = self._correlator.check(
                         camera_id=alert.camera_id,
-                        partner=result.partner_camera,
-                        severity=alert.severity.value,
+                        anomaly_location=location,
+                        timestamp=time.time(),
+                        max_age_seconds=max_age,
                     )
+                    alert.corroborated = result.corroborated
+                    alert.correlation_partner = result.partner_camera
+                    if not result.corroborated:
+                        # F4: Force-corroboration mode — drop the alert entirely
+                        # instead of downgrading, when the zone demands it.
+                        if self._zone_requires_corroboration(alert.camera_id, alert.zone_id):
+                            logger.info(
+                                "alerts.suppressed_uncorroborated",
+                                alert_id=alert.alert_id,
+                                camera_id=alert.camera_id,
+                                zone_id=alert.zone_id,
+                                partner=result.partner_camera,
+                            )
+                            return
+
+                        downgrade = (
+                            self._cross_camera_config.uncorroborated_severity_downgrade
+                            if self._cross_camera_config
+                            else 1
+                        )
+                        if downgrade > 0:
+                            alert.severity = self._downgrade_severity(
+                                alert.severity, downgrade
+                            )
+                        logger.info(
+                            "manager.alert_uncorroborated",
+                            camera_id=alert.camera_id,
+                            partner=result.partner_camera,
+                            severity=alert.severity.value,
+                        )
+
+                with self._lock:
+                    self._alert_count += 1
+                if self._on_alert:
+                    self._on_alert(alert)
+
+            # B1-5: Use shared detector for dinomaly multi-class mode
+            shared_detector = None
+            anomaly_cfg = runtime_cam_config.anomaly
+            if (
+                anomaly_cfg.model_type == "dinomaly2"
+                and anomaly_cfg.dinomaly_multi_class
+            ):
+                shared_detector = self._get_shared_detector(anomaly_cfg)
+
+            # Shadow runner: check for shadow-stage model to evaluate
+            shadow_runner = self._create_shadow_runner(runtime_cam_config)
+            model_path = self._resolve_model_path(runtime_cam_config)
+            model_version_id = self._model_version_id(runtime_cam_config, model_path)
+
+            pipeline = DetectionPipeline(
+                camera_config=runtime_cam_config,
+                alert_config=self._alert_config,
+                on_alert=_alert_handler,
+                shared_yolo_model=self._shared_yolo,
+                on_drift=self._on_status_change,
+                segmenter_config=self._segmenter_config,
+                classifier_config=self._classifier_config,
+                physics_config=self._physics_config,
+                imaging_config=self._imaging_config,
+                model_version_id=model_version_id,
+                model_path=model_path,
+                shared_anomaly_detector=shared_detector,
+                shadow_runner=shadow_runner,
+                recording_store=self._alert_recording_store,
+                database=self._db,
+                event_bus=self._event_bus,
+                inference_executor=self._inference_executor,
+                encode_executor=self._encode_executor,
+                sensor_fusion=self._sensor_fusion,
+            )
+
+            # 5.1: Wrap pipeline in CameraInferenceRunner
+            deg_config = runtime_cam_config.degradation
+            runner = CameraInferenceRunner(
+                pipeline=pipeline,
+                health_monitor=self._health_monitor,
+                version_tag=model_version_id,
+                audit_logger=self._audit_logger,
+                max_consecutive_failures=deg_config.max_consecutive_failures,
+                refuse_start_on_backbone_failure=deg_config.refuse_start_on_backbone_failure,
+                inference_buffer=self._inference_buffer,
+            )
+            if self._record_store is not None:
+                runner.set_record_store(self._record_store)
+
+            if not runner.initialize():
+                logger.error("manager.init_failed", camera_id=camera_id)
+                get_error_channel().emit(
+                    severity=SEVERITY_WARNING,
+                    source="capture_manager",
+                    code="init_failed",
+                    message=f"摄像头 {camera_id} 初始化失败",
+                    context={"camera_id": camera_id},
+                )
+                return False
+
+            thread = threading.Thread(
+                target=self._camera_loop,
+                args=(camera_id, runner),
+                name=f"argus-{camera_id}",
+                daemon=True,
+            )
 
             with self._lock:
-                self._alert_count += 1
-            if self._on_alert:
-                self._on_alert(alert)
+                self._runners[camera_id] = runner
+                self._pipelines[camera_id] = pipeline  # backward compat
+                self._threads[camera_id] = thread
 
-        # B1-5: Use shared detector for dinomaly multi-class mode
-        shared_detector = None
-        anomaly_cfg = runtime_cam_config.anomaly
-        if (
-            anomaly_cfg.model_type == "dinomaly2"
-            and anomaly_cfg.dinomaly_multi_class
-        ):
-            shared_detector = self._get_shared_detector(anomaly_cfg)
-
-        # Shadow runner: check for shadow-stage model to evaluate
-        shadow_runner = self._create_shadow_runner(runtime_cam_config)
-        model_path = self._resolve_model_path(runtime_cam_config)
-        model_version_id = self._model_version_id(runtime_cam_config, model_path)
-
-        pipeline = DetectionPipeline(
-            camera_config=runtime_cam_config,
-            alert_config=self._alert_config,
-            on_alert=_alert_handler,
-            shared_yolo_model=self._shared_yolo,
-            on_drift=self._on_status_change,
-            segmenter_config=self._segmenter_config,
-            classifier_config=self._classifier_config,
-            physics_config=self._physics_config,
-            imaging_config=self._imaging_config,
-            model_version_id=model_version_id,
-            model_path=model_path,
-            shared_anomaly_detector=shared_detector,
-            shadow_runner=shadow_runner,
-            recording_store=self._alert_recording_store,
-            database=self._db,
-            event_bus=self._event_bus,
-            inference_executor=self._inference_executor,
-            encode_executor=self._encode_executor,
-            sensor_fusion=self._sensor_fusion,
-        )
-
-        # 5.1: Wrap pipeline in CameraInferenceRunner
-        deg_config = runtime_cam_config.degradation
-        runner = CameraInferenceRunner(
-            pipeline=pipeline,
-            health_monitor=self._health_monitor,
-            version_tag=model_version_id,
-            audit_logger=self._audit_logger,
-            max_consecutive_failures=deg_config.max_consecutive_failures,
-            refuse_start_on_backbone_failure=deg_config.refuse_start_on_backbone_failure,
-            inference_buffer=self._inference_buffer,
-        )
-        if self._record_store is not None:
-            runner.set_record_store(self._record_store)
-
-        if not runner.initialize():
-            logger.error("manager.init_failed", camera_id=camera_id)
-            get_error_channel().emit(
-                severity=SEVERITY_WARNING,
-                source="capture_manager",
-                code="init_failed",
-                message=f"摄像头 {camera_id} 初始化失败",
-                context={"camera_id": camera_id},
+            thread.start()
+            logger.info(
+                "manager.camera_started",
+                camera_id=camera_id,
+                source=cam_config.source,
+                protocol=cam_config.protocol,
+                runtime_source=runtime_cam_config.source,
+                runtime_protocol=runtime_cam_config.protocol,
             )
-            return False
-
-        thread = threading.Thread(
-            target=self._camera_loop,
-            args=(camera_id, runner),
-            name=f"argus-{camera_id}",
-            daemon=True,
-        )
-
-        with self._lock:
-            self._runners[camera_id] = runner
-            self._pipelines[camera_id] = pipeline  # backward compat
-            self._threads[camera_id] = thread
-
-        thread.start()
-        logger.info(
-            "manager.camera_started",
-            camera_id=camera_id,
-            source=cam_config.source,
-            protocol=cam_config.protocol,
-            runtime_source=runtime_cam_config.source,
-            runtime_protocol=runtime_cam_config.protocol,
-        )
-        return True
+            return True
+        finally:
+            with self._lock:
+                self._starting_cameras.discard(camera_id)
 
     def _camera_loop(self, camera_id: str, runner: CameraInferenceRunner) -> None:
         """Main loop for a single camera thread with frame-rate watchdog."""

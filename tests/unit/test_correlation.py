@@ -3,11 +3,9 @@
 import time
 
 import numpy as np
-import pytest
 
 from argus.core.correlation import (
     CameraOverlapPair,
-    CorrelationResult,
     CrossCameraCorrelator,
 )
 

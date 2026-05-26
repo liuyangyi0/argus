@@ -315,14 +315,14 @@ class ReleasePipeline:
                 }
 
             total = len(logs)
-            shadow_alerts = sum(1 for l in logs if l.shadow_would_alert)
-            prod_alerts = sum(1 for l in logs if l.production_alerted)
+            shadow_alerts = sum(1 for log in logs if log.shadow_would_alert)
+            prod_alerts = sum(1 for log in logs if log.production_alerted)
             score_diffs = [
-                abs(l.shadow_score - l.production_score)
-                for l in logs
-                if l.production_score is not None
+                abs(log.shadow_score - log.production_score)
+                for log in logs
+                if log.production_score is not None
             ]
-            latencies = [l.latency_ms for l in logs if l.latency_ms is not None]
+            latencies = [log.latency_ms for log in logs if log.latency_ms is not None]
 
             return {
                 "total_samples": total,

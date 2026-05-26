@@ -1,6 +1,5 @@
 """Tests for the Prometheus metrics registry."""
 
-import pytest
 
 from argus.core.metrics import METRICS, MetricsRegistry
 

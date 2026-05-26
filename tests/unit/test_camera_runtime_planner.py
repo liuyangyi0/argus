@@ -7,7 +7,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from argus.camera import CameraRuntimePlanner
-from argus.config.schema import CameraConfig, GigEConfig
+from argus.config.schema import CameraConfig, GigEConfig, USBCaptureConfig
 from argus.streaming.go2rtc_manager import (
     gige_to_go2rtc_source,
     usb_to_go2rtc_source,
@@ -36,10 +36,37 @@ def test_usb_detection_reads_go2rtc_rtsp_without_mutating_config():
     assert plan.detection.via_go2rtc is True
     assert plan.detection.stream_name == "usb_01"
     assert plan.go2rtc_stream is not None
-    assert plan.go2rtc_stream.source == usb_to_go2rtc_source("0")
+    assert plan.go2rtc_stream.source == usb_to_go2rtc_source(
+        "0",
+        resolution=config.resolution,
+        fps=config.fps_target,
+        pixel_format=config.usb.pixel_format,
+    )
     assert plan.go2rtc_stream.registration == "rest_api"
     assert plan.preview.mode == "go2rtc"
     assert plan.preview.stream_name == "usb_01"
+
+
+def test_usb_planner_uses_configured_device_name_for_go2rtc_source():
+    config = CameraConfig(
+        camera_id="usb_01",
+        name="USB",
+        source="0",
+        protocol="usb",
+        usb=USBCaptureConfig(device_name="OBSBOT Meet 2 StreamCamera", pixel_format="mjpeg"),
+    )
+
+    plan = _plan(config)
+
+    assert plan.go2rtc_stream is not None
+    assert plan.go2rtc_stream.source == usb_to_go2rtc_source(
+        "0",
+        device_name="OBSBOT Meet 2 StreamCamera",
+        resolution=config.resolution,
+        fps=config.fps_target,
+        pixel_format=config.usb.pixel_format,
+    )
+    assert "video=0" not in plan.go2rtc_stream.source
 
 
 def test_rtsp_detection_reads_original_source_while_preview_uses_go2rtc():

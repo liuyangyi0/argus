@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   Card, Button, Form, Select, Input, Modal, Space, Checkbox,
@@ -40,11 +40,13 @@ onMounted(() => {
   if (typeof raw === 'string' && raw.length > 0) {
     try {
       const decoded = JSON.parse(atob(raw))
-      datasetSelection.value = decoded
       if (decoded?.items?.[0]?.camera_id) {
         createForm.value.camera_id = decoded.items[0].camera_id
       }
-      createModalVisible.value = true
+      void nextTick(() => {
+        datasetSelection.value = decoded
+        createModalVisible.value = true
+      })
     } catch {
       // ignore malformed deep-link
     }

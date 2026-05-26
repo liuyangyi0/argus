@@ -29,7 +29,7 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
     // Request budget for WebRTC/MSE connection
     if (!StreamManager.requestSlot()) {
       logger.warn(`[go2rtc] connection budget exhausted limit(${StreamManager.MAX_STREAMS})`)
-      status.value = 'error'
+      status.value = 'fallback'
       return
     }
     _counted = true
@@ -38,7 +38,12 @@ export function useGo2RTC(cameraId: Ref<string> | string) {
 
     const isCancelled = () => thisGen !== generation
 
-    playerInstance = await PlayerFactory.create(getCameraId(), videoRef.value, isCancelled)
+    try {
+      playerInstance = await PlayerFactory.create(getCameraId(), videoRef.value, isCancelled)
+    } catch (e) {
+      logger.warn(`[go2rtc] player creation failed for ${getCameraId()}, falling back to MJPEG`, e)
+      playerInstance = null
+    }
     
     if (isCancelled()) return
 

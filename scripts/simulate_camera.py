@@ -75,7 +75,7 @@ def main():
 
     try:
         while True:
-            alert = pipeline.run_once()
+            pipeline.run_once()
 
             if args.display:
                 # Show the latest frame in a window

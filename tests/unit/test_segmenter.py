@@ -10,7 +10,6 @@ import pytest
 from argus.anomaly.segmenter import (
     InstanceSegmenter,
     SegmentationResult,
-    SegmentedObject,
     extract_peak_points,
 )
 

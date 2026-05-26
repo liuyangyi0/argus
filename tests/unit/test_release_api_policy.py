@@ -8,7 +8,9 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from argus.config.loader import load_config
 from argus.dashboard.app import create_app
+from argus.dashboard.routes.models import _get_release_anomaly_config
 from argus.storage.database import Database
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.models import ModelStage
@@ -95,6 +97,18 @@ def _register_model(db, model_dir: Path, baseline_dir: Path, stage: str) -> str:
     return version_id
 
 
+def test_release_pipeline_uses_camera_anomaly_stage_waits():
+    config = load_config(Path("configs/default.yaml"))
+    config.cameras[0].anomaly.min_shadow_days = 0
+    config.cameras[0].anomaly.min_canary_days = 0
+
+    anomaly_cfg = _get_release_anomaly_config(config)
+
+    assert anomaly_cfg is config.cameras[0].anomaly
+    assert anomaly_cfg.min_shadow_days == 0
+    assert anomaly_cfg.min_canary_days == 0
+
+
 def test_promote_shadow_canary_production_returns_runtime_state(db, alerts_dir, tmp_path):
     model_dir, baseline_dir = _create_model_tree(tmp_path)
     registry = ModelRegistry(session_factory=db.get_session)
@@ -127,6 +141,25 @@ def test_promote_shadow_canary_production_returns_runtime_state(db, alerts_dir, 
     assert camera_manager.release_state_calls == ["cam_01", "cam_01", "cam_01"]
 
 
+def test_promote_defaults_triggered_by_to_authenticated_user(db, alerts_dir, tmp_path):
+    model_dir, baseline_dir = _create_model_tree(tmp_path)
+    registry = ModelRegistry(session_factory=db.get_session)
+    version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+
+    camera_manager = ReleaseStateCameraManager()
+    client = TestClient(_make_app(db, camera_manager, alerts_dir))
+
+    response = client.post(
+        f"/api/models/{version_id}/promote",
+        json={"target_stage": "shadow"},
+    )
+
+    assert response.status_code == 200
+    event = registry.get_version_events(model_version_id=version_id, limit=1)[0]
+    assert event.to_stage == "shadow"
+    assert event.triggered_by == "system"
+
+
 def test_retire_returns_runtime_state(db, alerts_dir, tmp_path):
     model_dir, baseline_dir = _create_model_tree(tmp_path)
     registry = ModelRegistry(session_factory=db.get_session)
@@ -145,6 +178,40 @@ def test_retire_returns_runtime_state(db, alerts_dir, tmp_path):
     assert data["model"]["stage"] == "retired"
     assert data["runtime_synced"] is True
     assert data["runtime_state"] == {"camera_id": "cam_01", "call_count": 1}
+
+
+def test_rollback_returns_runtime_state_and_model(db, alerts_dir, tmp_path):
+    model_dir_1, baseline_dir_1 = _create_model_tree(tmp_path / "v1")
+    version_id_1 = _register_model(
+        db,
+        model_dir_1,
+        baseline_dir_1,
+        ModelStage.PRODUCTION.value,
+    )
+    model_dir_2, baseline_dir_2 = _create_model_tree(tmp_path / "v2")
+    version_id_2 = _register_model(
+        db,
+        model_dir_2,
+        baseline_dir_2,
+        ModelStage.PRODUCTION.value,
+    )
+
+    camera_manager = LegacyCameraManager()
+    client = TestClient(_make_app(db, camera_manager, alerts_dir))
+
+    response = client.post(f"/api/models/{version_id_2}/rollback")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["activated"] == version_id_1
+    assert data["model"]["model_version_id"] == version_id_1
+    assert data["runtime_synced"] is True
+    assert data["runtime_state"] == "applied"
+    camera_manager.reload_model.assert_called_once_with(
+        "cam_01",
+        str(model_dir_1 / "model.xml"),
+        version_tag=version_id_1,
+    )
 
 
 @pytest.mark.parametrize(

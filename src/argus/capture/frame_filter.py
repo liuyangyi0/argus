@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
+import structlog
 from skimage.metrics import structural_similarity
+
+logger = structlog.get_logger()
 
 
 @dataclass

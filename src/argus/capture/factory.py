@@ -75,15 +75,23 @@ class CaptureFactory:
         source: str,
         protocol: str,
     ) -> CaptureAdapter:
-        return CameraCapture(
-            camera_id=camera_config.camera_id,
-            source=source,
-            protocol=protocol,
-            fps_target=camera_config.fps_target,
-            resolution=camera_config.resolution,
-            reconnect_delay=camera_config.reconnect_delay,
-            max_reconnect_attempts=camera_config.max_reconnect_attempts,
-        )
+        kwargs = {
+            "camera_id": camera_config.camera_id,
+            "source": source,
+            "protocol": protocol,
+            "fps_target": camera_config.fps_target,
+            "resolution": camera_config.resolution,
+            "reconnect_delay": camera_config.reconnect_delay,
+            "max_reconnect_attempts": camera_config.max_reconnect_attempts,
+        }
+        if protocol == "usb":
+            usb_cfg = camera_config.usb
+            kwargs.update(
+                usb_backend=usb_cfg.preferred_backend,
+                usb_pixel_format=usb_cfg.pixel_format,
+                usb_min_runtime_fps=usb_cfg.min_runtime_fps,
+            )
+        return CameraCapture(**kwargs)
 
     @staticmethod
     def _create_gige(

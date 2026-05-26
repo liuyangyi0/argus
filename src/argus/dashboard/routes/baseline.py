@@ -9,11 +9,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
 import numpy as np
 import structlog
 from fastapi import APIRouter, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from starlette.datastructures import UploadFile
 
 from argus.dashboard.api_response import (
@@ -26,7 +25,6 @@ from argus.dashboard.api_response import (
     api_validation_error,
 )
 from argus.capture.baseline_job import run_baseline_capture_job, BaselineCaptureJobConfig
-from argus.config.schema import BaselineCaptureConfig
 from argus.core.model_discovery import resolve_runtime_model_path
 from argus.dashboard.auth import current_username, require_role
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
@@ -422,7 +420,6 @@ async def training_history_metrics(request: Request, record_id: int):
         find_optimal_threshold,
     )
 
-    import numpy as np
     y_scores = np.asarray(scores, dtype=np.float64)
     y_true = np.asarray(labels, dtype=np.int64)
 
@@ -872,7 +869,7 @@ def _train_model_task(
                 if getattr(vr, "real_scores", None) is not None:
                     val_scores_json_str = _json.dumps([round(float(s), 6) for s in vr.real_scores])
                 if getattr(vr, "real_labels", None) is not None:
-                    val_labels_json_str = _json.dumps([int(l) for l in vr.real_labels])
+                    val_labels_json_str = _json.dumps([int(label) for label in vr.real_labels])
 
             record = TrainingRecord(
                 camera_id=camera_id,

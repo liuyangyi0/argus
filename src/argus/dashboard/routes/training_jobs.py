@@ -20,12 +20,11 @@ from argus.dashboard.api_response import (
     api_conflict,
     api_forbidden,
     api_success,
-    api_internal_error,
     api_not_found,
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import require_permission
+from argus.dashboard.auth import current_username, require_permission
 from argus.anomaly.job_executor import validate_hyperparameters
 from argus.storage.models import (
     AlertRecord,
@@ -290,7 +289,7 @@ async def create_training_job(request: Request):
         zone_id=body.get("zone_id", "default"),
         model_type=body.get("model_type"),
         trigger_type=body.get("trigger_type", TrainingTriggerType.MANUAL.value),
-        triggered_by=body.get("triggered_by", "dashboard"),
+        triggered_by=body.get("triggered_by") or current_username(request),
         confirmation_required=True,
         status=TrainingJobStatus.PENDING_CONFIRMATION.value,
         base_model_version=base_model_version,
@@ -330,7 +329,7 @@ async def confirm_training_job(request: Request, job_id: str):
     except Exception:
         body = {}
 
-    confirmed_by = body.get("confirmed_by", "operator")
+    confirmed_by = body.get("confirmed_by") or current_username(request)
     now = datetime.now(timezone.utc)
 
     # Atomic compare-and-swap: only transition if still pending_confirmation
@@ -373,7 +372,7 @@ async def reject_training_job(request: Request, job_id: str):
     except Exception:
         body = {}
 
-    rejected_by = body.get("rejected_by", "operator")
+    rejected_by = body.get("rejected_by") or current_username(request)
     reason = body.get("reason", "")
 
     updated = db.update_training_job(

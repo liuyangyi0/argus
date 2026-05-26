@@ -1,6 +1,5 @@
 """Tests for the WebSocket connection manager and endpoint."""
 
-import asyncio
 import json
 import time
 
@@ -190,7 +189,7 @@ class TestTaskManagerCallback:
             progress_callback(50, "halfway")
             return "done"
 
-        task_id = manager.submit("test_task", dummy_task)
+        manager.submit("test_task", dummy_task)
         # Give thread time to execute
         time.sleep(0.5)
 
@@ -220,4 +219,3 @@ class TestDashboardWithWebSocket:
         response = client.get("/")
         assert response.status_code == 200
         assert '<div id="app">' in response.text
-

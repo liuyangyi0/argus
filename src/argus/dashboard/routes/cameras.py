@@ -8,6 +8,7 @@ import concurrent.futures
 import cv2
 import structlog
 from fastapi import APIRouter, Request
+from argus.core.pipeline import PipelineMode
 from argus.dashboard.api_response import (
     api_conflict,
     api_forbidden,
@@ -191,6 +192,9 @@ def _get_lifecycle_stages(request: Request, camera_id: str, *, cam_status=None) 
 @router.post("")
 async def add_camera(request: Request):
     """Add a new camera configuration."""
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("权限不足")
+
     camera_manager = request.app.state.camera_manager
     config = request.app.state.config
     if not camera_manager or not config:
@@ -283,6 +287,9 @@ async def add_camera(request: Request):
 @router.delete("/{camera_id}")
 async def delete_camera(request: Request, camera_id: str):
     """Delete a camera configuration. Stops the camera first if running."""
+    if not require_role(request, "admin"):
+        return api_forbidden("权限不足")
+
     camera_manager = request.app.state.camera_manager
     config = request.app.state.config
     if not camera_manager or not config:
@@ -366,6 +373,9 @@ async def get_camera_config(request: Request, camera_id: str):
 @router.put("/{camera_id}")
 async def update_camera(request: Request, camera_id: str):
     """Update an existing camera's configuration."""
+    if not require_role(request, "admin", "engineer"):
+        return api_forbidden("权限不足")
+
     camera_manager = request.app.state.camera_manager
     config = request.app.state.config
     if not camera_manager or not config:
@@ -451,9 +461,55 @@ async def update_camera(request: Request, camera_id: str):
     })
 
 
+@router.post("/{camera_id}/mode")
+async def set_camera_mode(request: Request, camera_id: str):
+    """Switch a running camera pipeline between active/learning/maintenance modes."""
+    if not require_role(request, "admin", "operator", "engineer"):
+        return api_forbidden("权限不足")
+
+    camera_manager = request.app.state.camera_manager
+    if not camera_manager:
+        return api_unavailable("不可用")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return api_validation_error("无效的JSON请求")
+
+    raw_mode = str(body.get("mode", "")).strip().lower()
+    try:
+        mode = PipelineMode(raw_mode)
+    except ValueError:
+        allowed = ", ".join(item.value for item in PipelineMode)
+        return api_validation_error(f"无效运行模式: {raw_mode or '<empty>'}; 可选: {allowed}")
+
+    previous = (
+        camera_manager.get_pipeline_mode(camera_id)
+        if hasattr(camera_manager, "get_pipeline_mode") else None
+    )
+    if previous is None:
+        return api_not_found(f"摄像头 {camera_id} 未运行")
+
+    try:
+        ok = await asyncio.to_thread(camera_manager.set_pipeline_mode, camera_id, mode)
+    except RuntimeError:
+        return api_unavailable("服务正在关闭")
+    if not ok:
+        return api_not_found(f"摄像头 {camera_id} 未运行")
+
+    return api_success({
+        "camera_id": camera_id,
+        "previous_mode": previous,
+        "pipeline_mode": mode.value,
+    })
+
+
 @router.post("/{camera_id}/start")
 async def start_camera(request: Request, camera_id: str):
     """Start a stopped camera."""
+    if not require_role(request, "admin", "operator", "engineer"):
+        return api_forbidden("权限不足")
+
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("不可用")
@@ -478,6 +534,9 @@ async def start_camera(request: Request, camera_id: str):
 @router.post("/{camera_id}/stop")
 async def stop_camera(request: Request, camera_id: str):
     """Stop a running camera."""
+    if not require_role(request, "admin", "operator", "engineer"):
+        return api_forbidden("权限不足")
+
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("不可用")
@@ -505,7 +564,11 @@ async def test_camera_connection(request: Request, camera_id: str):
         return api_success(running_probe)
 
     try:
-        result = await gateway.probe_source(cam_config.source, 5.0)
+        result = await gateway.probe_source(
+            cam_config.source,
+            5.0,
+            getattr(cam_config, "protocol", None),
+        )
     except RuntimeError:
         return api_unavailable("服务正在关闭")
     return api_success(result)
@@ -526,8 +589,9 @@ async def test_camera_connection_draft(request: Request):
     source = body.get("source")
     if source is None or source == "":
         return api_validation_error("source 不能为空")
+    protocol = body.get("protocol")
     try:
-        result = await _preview_gateway(request).probe_source(source, 5.0)
+        result = await _preview_gateway(request).probe_source(source, 5.0, protocol)
     except RuntimeError:
         return api_unavailable("服务正在关闭")
     return api_success(result)
@@ -616,6 +680,7 @@ def cameras_json(request: Request):
             "running": s.running,
             "pipeline_mode": pipeline_mode,
             "health": health,
+            "capture_status": getattr(s, "capture_status", None),
             "stats": {
                 "frames_captured": s.stats.frames_captured,
                 "frames_analyzed": s.stats.frames_analyzed,
@@ -675,6 +740,7 @@ def camera_detail_json(request: Request, camera_id: str):
             "pipeline_mode": pipeline_mode,
             "anomaly_locked": anomaly_locked,
             "learning_progress": learning,
+            "capture_status": getattr(status, "capture_status", None) if status is not None else None,
         },
         "runner": {
             "model_ref": runner.model_ref,
@@ -833,6 +899,12 @@ async def wall_status(request: Request):
                     tile["degradation"] = "rtsp_broken"
                 elif health and health.get("error"):
                     tile["degradation"] = "error"
+
+            capture_status = getattr(cam_status, "capture_status", None)
+            if tile["degradation"] is None and capture_status and capture_status.get("degraded"):
+                tile["degradation"] = "capture_degraded"
+            if capture_status:
+                tile["capture_status"] = capture_status
 
             cameras.append(tile)
         return cameras

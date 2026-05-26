@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import Event
 from typing import TYPE_CHECKING
 
@@ -46,6 +46,16 @@ class CameraState:
     total_frames: int = 0
     reconnect_count: int = 0
     error: str | None = None
+    backend: str | None = None
+    requested_pixel_format: str | None = None
+    pixel_format: str | None = None
+    requested_resolution: tuple[int, int] | None = None
+    actual_resolution: tuple[int, int] | None = None
+    requested_fps: float | None = None
+    reported_fps: float | None = None
+    actual_fps: float | None = None
+    degraded: bool = False
+    degradation_reason: str | None = None
 
 
 class CameraCapture:
@@ -64,6 +74,9 @@ class CameraCapture:
         resolution: tuple[int, int] = (1920, 1080),
         reconnect_delay: float = 5.0,
         max_reconnect_attempts: int = -1,
+        usb_backend: str = "auto",
+        usb_pixel_format: str = "auto",
+        usb_min_runtime_fps: float = 0.0,
     ):
         self.camera_id = camera_id
         self.source = source
@@ -72,6 +85,9 @@ class CameraCapture:
         self.resolution = resolution
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_attempts = max_reconnect_attempts
+        self.usb_backend = usb_backend
+        self.usb_pixel_format = usb_pixel_format
+        self.usb_min_runtime_fps = usb_min_runtime_fps
 
         self._cap: cv2.VideoCapture | None = None
         self._state = CameraState()
@@ -92,6 +108,18 @@ class CameraCapture:
 
     def _usb_backend_candidates(self) -> list[tuple[int | None, str]]:
         """Return preferred OpenCV backends for USB cameras."""
+        preferred = (self.usb_backend or "auto").strip().lower()
+        backend_map = {
+            "dshow": (getattr(cv2, "CAP_DSHOW", None), "dshow"),
+            "msmf": (getattr(cv2, "CAP_MSMF", None), "msmf"),
+            "ffmpeg": (getattr(cv2, "CAP_FFMPEG", None), "ffmpeg"),
+            "default": (None, "default"),
+        }
+        if preferred in backend_map and preferred != "auto":
+            backend, name = backend_map[preferred]
+            if backend is not None or preferred == "default":
+                return [(backend, name)]
+
         if sys.platform.startswith("win"):
             candidates = []
             if hasattr(cv2, "CAP_DSHOW"):
@@ -101,6 +129,137 @@ class CameraCapture:
             candidates.append((None, "default"))
             return candidates
         return [(None, "default")]
+
+    @staticmethod
+    def _normalise_fourcc(pixel_format: str | None) -> str | None:
+        fmt = (pixel_format or "").strip().lower()
+        if fmt in {"", "auto"}:
+            return None
+        if fmt in {"mjpeg", "mjpg"}:
+            return "MJPG"
+        if fmt in {"yuy2", "yuyv422"}:
+            return "YUY2"
+        if len(fmt) == 4:
+            return fmt.upper()
+        return None
+
+    @staticmethod
+    def _decode_fourcc(value: float | int) -> str | None:
+        try:
+            raw = int(value)
+            chars = [chr((raw >> 8 * i) & 0xFF) for i in range(4)]
+            text = "".join(chars).strip("\x00").strip()
+            return text or None
+        except Exception:
+            return None
+
+    def _capture_get(self, prop: int) -> float | None:
+        cap = self._cap
+        if cap is None or not hasattr(cap, "get"):
+            return None
+        try:
+            return float(cap.get(prop))
+        except Exception:
+            return None
+
+    def _measure_usb_read_fps(
+        self,
+        *,
+        warmup_seconds: float = 0.5,
+        sample_seconds: float = 2.0,
+    ) -> float | None:
+        """Measure decoded USB read FPS instead of trusting advertised FPS."""
+        cap = self._cap
+        if cap is None or not hasattr(cap, "read"):
+            return None
+        if sample_seconds <= 0:
+            return None
+
+        try:
+            warmup_deadline = time.perf_counter() + max(0.0, warmup_seconds)
+            while time.perf_counter() < warmup_deadline:
+                cap.read()
+
+            frames = 0
+            start = time.perf_counter()
+            deadline = start + sample_seconds
+            while time.perf_counter() < deadline:
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    frames += 1
+            elapsed = time.perf_counter() - start
+            if elapsed <= 0 or frames <= 0:
+                return None
+            return frames / elapsed
+        except Exception:
+            logger.debug(
+                "camera.usb_fps_measure_failed",
+                camera_id=self.camera_id,
+                exc_info=True,
+            )
+            return None
+
+    def _refresh_runtime_state(self, backend_name: str | None) -> None:
+        width = self._capture_get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = self._capture_get(cv2.CAP_PROP_FRAME_HEIGHT)
+        fps = self._capture_get(cv2.CAP_PROP_FPS)
+        fourcc = self._capture_get(cv2.CAP_PROP_FOURCC)
+
+        self._state.backend = backend_name
+        self._state.requested_resolution = tuple(self.resolution)
+        self._state.requested_fps = float(self.fps_target)
+        self._state.requested_pixel_format = self._normalise_fourcc(self.usb_pixel_format)
+        if width and height:
+            self._state.actual_resolution = (int(round(width)), int(round(height)))
+        else:
+            self._state.actual_resolution = None
+        reported_fps = fps if fps and fps > 0 else None
+        self._state.reported_fps = reported_fps
+        measured_fps = (
+            self._measure_usb_read_fps()
+            if self.protocol == "usb" and self.usb_min_runtime_fps > 0
+            else None
+        )
+        self._state.actual_fps = measured_fps or reported_fps
+        self._state.pixel_format = self._decode_fourcc(fourcc) if fourcc is not None else None
+
+        self._state.degraded = False
+        self._state.degradation_reason = None
+        if self.protocol == "usb":
+            reasons: list[str] = []
+            actual_resolution = self._state.actual_resolution
+            if actual_resolution is not None and actual_resolution != tuple(self.resolution):
+                reasons.append(
+                    f"resolution {actual_resolution[0]}x{actual_resolution[1]} "
+                    f"below requested {self.resolution[0]}x{self.resolution[1]}"
+                )
+            actual_fps = self._state.actual_fps
+            if self.usb_min_runtime_fps > 0 and actual_fps is not None and actual_fps < self.usb_min_runtime_fps:
+                reasons.append(
+                    f"fps {actual_fps:.1f} below required {self.usb_min_runtime_fps:.1f}"
+                )
+            requested_format = self._state.requested_pixel_format
+            actual_format = self._state.pixel_format
+            if requested_format and actual_format and actual_format.upper() != requested_format:
+                reasons.append(f"pixel format {actual_format} != requested {requested_format}")
+            if reasons:
+                self._state.degraded = True
+                self._state.degradation_reason = "; ".join(reasons)
+
+    def runtime_status(self) -> dict:
+        """Return capture mode/status metadata for dashboard diagnostics."""
+        return {
+            "backend": self._state.backend,
+            "requested_pixel_format": self._state.requested_pixel_format,
+            "pixel_format": self._state.pixel_format,
+            "requested_resolution": self._state.requested_resolution,
+            "actual_resolution": self._state.actual_resolution,
+            "requested_fps": self._state.requested_fps,
+            "reported_fps": self._state.reported_fps,
+            "actual_fps": self._state.actual_fps,
+            "degraded": self._state.degraded,
+            "degradation_reason": self._state.degradation_reason,
+        }
 
     def _open_capture(self) -> tuple[cv2.VideoCapture | None, str | None]:
         """Open a VideoCapture with protocol-appropriate backend fallbacks."""
@@ -152,10 +311,22 @@ class CameraCapture:
             # Minimise internal OpenCV buffer to reduce stale-frame accumulation
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+            if self.protocol == "usb":
+                fourcc = self._normalise_fourcc(self.usb_pixel_format)
+                if fourcc:
+                    self._cap.set(
+                        cv2.CAP_PROP_FOURCC,
+                        cv2.VideoWriter_fourcc(*fourcc),
+                    )
+
             # Set resolution for live sources
             if self.protocol != "file":
                 self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
                 self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+                if self.protocol == "usb":
+                    self._cap.set(cv2.CAP_PROP_FPS, float(self.fps_target))
+
+            self._refresh_runtime_state(backend_name)
 
             self._state.connected = True
             self._state.error = None
@@ -187,22 +358,29 @@ class CameraCapture:
         # This MUST happen before _cap.read() — decoding frames only to discard
         # them wastes CPU, especially for video files at 25-30fps with a low
         # fps_target (e.g. 5).
+        now = time.monotonic()
         if self._frame_interval > 0:
-            now = time.monotonic()
             elapsed = now - self._state.last_frame_time
             remaining = self._frame_interval - elapsed
             if remaining > 0:
-                time.sleep(remaining)
+                if self._stop_event.wait(remaining):
+                    return None
+                now = time.monotonic()
 
-        ret, frame = self._cap.read()
+        cap = self._cap
+        if cap is None or not self._state.connected:
+            return None
+
+        ret, frame = cap.read()
         # CRIT-05: Copy immediately to decouple from VideoCapture's internal buffer
         if ret and frame is not None:
             frame = frame.copy()
         if not ret or frame is None:
             # For video files: loop back to beginning instead of disconnecting
-            if self.protocol == "file" and self._cap is not None:
-                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = self._cap.read()
+            cap = self._cap
+            if self.protocol == "file" and cap is not None and not self._stop_event.is_set():
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
                 if ret and frame is not None:
                     frame = frame.copy()
                     logger.debug("camera.file_loop", camera_id=self.camera_id)

@@ -1,7 +1,6 @@
 """Tests for the zone mask engine."""
 
 import numpy as np
-import pytest
 
 from argus.config.schema import ZoneConfig, ZonePriority
 from argus.core.zone_mask import ZoneMaskEngine

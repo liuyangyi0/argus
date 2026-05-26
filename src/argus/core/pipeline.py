@@ -16,18 +16,58 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError
-from dataclasses import dataclass, field
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable
 
 import cv2
 import numpy as np
 import structlog
 
-import uuid
+from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
+from argus.anomaly.detector import AnomalibDetector, AnomalyResult, DetectorStatus
+from argus.anomaly.drift import DriftDetector, DriftStatus
+from argus.capture.base import CaptureAdapter
+from argus.capture.camera import CameraCapture, FrameData
+from argus.config.schema import AlertConfig, CameraConfig, ClassifierConfig, SegmenterConfig, ZonePriority
+from argus.contracts.validation import validate_anomaly_result
+from argus.core.alert_ring_buffer import AlertFrameBuffer, FrameSnapshot, RecordingStatus, compress_frame
+from argus.core.degradation import LockState
+from argus.core.diagnostics import (
+    DiagnosticsBuffer,
+    FrameDiagnostics,
+    FrameScoreRecord,
+    StageResult,
+)
+from argus.core.error_channel import (
+    SEVERITY_WARNING,
+    get_error_channel,
+)
+from argus.core.event_bus import (
+    AlertRaised,
+    EventBus,
+    FrameAnalyzed,
+)
+from argus.core.frame_quality import FrameQualityAssessor
+from argus.core.inference_record import (
+    ConformalLevel,
+    FinalDecision,
+    InferenceRecord,
+    PrefilterDecision,
+)
+from argus.core.metrics import METRICS
+from argus.core.model_discovery import find_all_models, find_runtime_model, find_runtime_model_in_dir
+from argus.core.zone_mask import ZoneMaskEngine
+from argus.person.detector import ObjectDetection, ObjectDetectionResult, YOLOObjectDetector
+from argus.prefilter.fast_motion import FastMotionDetector, FastMotionResult
+from argus.prefilter.mog2 import MOG2PreFilter, PreFilterResult
+from argus.storage.models import AlertRecordingRecord
+
+logger = structlog.get_logger()
 
 # Default inference executor — used when no shared executor is injected.
 # Prefer injecting a shared executor from CameraManager for proper lifecycle management.
@@ -46,47 +86,6 @@ def _get_default_inference_executor() -> ThreadPoolExecutor:
                 )
     return _DEFAULT_INFERENCE_EXECUTOR
 
-from argus.alerts.grader import Alert, AlertGrader, CusumSnapshot, DetectionType
-from types import MappingProxyType
-
-from argus.core.error_channel import (
-    SEVERITY_WARNING,
-    get_error_channel,
-)
-from argus.core.event_bus import (
-    EventBus,
-    FrameAnalyzed,
-    AlertRaised,
-)
-from argus.core.metrics import METRICS
-from argus.core.alert_ring_buffer import AlertFrameBuffer, FrameSnapshot, RecordingStatus, compress_frame
-from argus.storage.models import AlertRecordingRecord
-from argus.anomaly.detector import AnomalibDetector, AnomalyResult, DetectorStatus
-from argus.anomaly.drift import DriftDetector, DriftStatus
-from argus.core.diagnostics import (
-    DiagnosticsBuffer,
-    FrameDiagnostics,
-    FrameScoreRecord,
-    StageResult,
-)
-from argus.core.degradation import LockState
-from argus.core.inference_record import (
-    ConformalLevel,
-    FinalDecision,
-    InferenceRecord,
-    PrefilterDecision,
-)
-from argus.contracts.validation import validate_anomaly_result
-from argus.core.frame_quality import FrameQualityAssessor, QualityScore
-from argus.core.model_discovery import find_all_models, find_runtime_model, find_runtime_model_in_dir
-from argus.capture.base import CaptureAdapter
-from argus.capture.camera import CameraCapture, FrameData
-from argus.config.schema import AlertConfig, CameraConfig, ClassifierConfig, SegmenterConfig, ZonePriority
-from argus.core.zone_mask import ZoneMaskEngine
-from argus.person.detector import ObjectDetectionResult, YOLOObjectDetector
-from argus.prefilter.mog2 import MOG2PreFilter, PreFilterResult
-
-logger = structlog.get_logger()
 
 _SEVERITY_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3}
 
@@ -252,7 +251,7 @@ class DetectionPipeline:
         # Stage metrics: pre-cache known stages, with fallback for dynamic ones
         self._m_stages: dict[str, object] = {
             name: METRICS.pipeline_stage_seconds.labels(camera_id=_cid, stage=name)
-            for name in ("zone_mask", "mog2", "yolo", "anomaly", "simplex")
+            for name in ("zone_mask", "fast_motion", "mog2", "yolo", "anomaly", "simplex")
         }
 
         # Stage 0: Zone masking
@@ -367,6 +366,22 @@ class DetectionPipeline:
             self._simplex = None
         self._simplex_reference_set = False
 
+        fast_cfg = camera_config.fast_motion
+        if fast_cfg.enabled:
+            self._fast_motion: FastMotionDetector | None = FastMotionDetector(
+                process_width=fast_cfg.process_width,
+                diff_threshold=fast_cfg.diff_threshold,
+                background_alpha=fast_cfg.background_alpha,
+                min_area_px=fast_cfg.min_area_px,
+                max_area_px=fast_cfg.max_area_px,
+                min_streak_length_px=fast_cfg.min_streak_length_px,
+                min_confidence=fast_cfg.min_confidence,
+                max_candidates_per_frame=fast_cfg.max_candidates_per_frame,
+                fps_hint=camera_config.fps_target,
+            )
+        else:
+            self._fast_motion = None
+
         # Alert grading
         self._alert_grader = AlertGrader(config=alert_config, sensor_fusion=sensor_fusion)
 
@@ -390,14 +405,24 @@ class DetectionPipeline:
                 max_reconnect_attempts=camera_config.max_reconnect_attempts,
             )
         else:
+            camera_kwargs = {
+                "camera_id": camera_config.camera_id,
+                "source": camera_config.source,
+                "protocol": camera_config.protocol,
+                "fps_target": camera_config.fps_target,
+                "resolution": camera_config.resolution,
+                "reconnect_delay": camera_config.reconnect_delay,
+                "max_reconnect_attempts": camera_config.max_reconnect_attempts,
+            }
+            if camera_config.protocol == "usb":
+                usb_cfg = camera_config.usb
+                camera_kwargs.update(
+                    usb_backend=usb_cfg.preferred_backend,
+                    usb_pixel_format=usb_cfg.pixel_format,
+                    usb_min_runtime_fps=usb_cfg.min_runtime_fps,
+                )
             self._camera = CameraCapture(
-                camera_id=camera_config.camera_id,
-                source=camera_config.source,
-                protocol=camera_config.protocol,
-                fps_target=camera_config.fps_target,
-                resolution=camera_config.resolution,
-                reconnect_delay=camera_config.reconnect_delay,
-                max_reconnect_attempts=camera_config.max_reconnect_attempts,
+                **camera_kwargs,
             )
 
         # Anti-absorption: time-based heartbeat (MED-05)
@@ -664,16 +689,9 @@ class DetectionPipeline:
         # Frame quality assessment: reduce false positives from degraded input
         self._frame_quality_assessor = FrameQualityAssessor()
 
-    def set_nir_frame(self, nir_frame: np.ndarray) -> None:
-        """Inject a NIR strobe frame for modality fusion.
-
-        Called by the camera manager when a NIR frame is available
-        (Phase 3: alternating visible/NIR capture).
-        """
-        self._latest_nir_frame = nir_frame
-
         # Cached postprocessor for physics enrichment (avoid per-frame allocation)
         from argus.core.anomaly_postprocess import AnomalyMapProcessor
+
         self._physics_postproc = AnomalyMapProcessor(
             min_contour_area=camera_config.anomaly.min_contour_area,
         )
@@ -751,6 +769,14 @@ class DetectionPipeline:
             custom_vocab_path = getattr(classifier_config, "custom_vocabulary_path", None)
             if custom_vocab_path:
                 self._classifier.load_vocabulary(custom_vocab_path)
+
+    def set_nir_frame(self, nir_frame: np.ndarray) -> None:
+        """Inject a NIR strobe frame for modality fusion.
+
+        Called by the camera manager when a NIR frame is available
+        (Phase 3: alternating visible/NIR capture).
+        """
+        self._latest_nir_frame = nir_frame
 
     @staticmethod
     def _find_model_in_dir(base: Path, camera_id: str) -> Path | None:
@@ -911,6 +937,12 @@ class DetectionPipeline:
     def _categorize_alert(self, alert, simplex_result, detection_result) -> str:
         """Auto-categorize alert based on detection characteristics."""
         _ENV_LABELS = {"insect", "bird", "shadow", "reflection", "crane", "overhead-bridge", "scaffold"}
+
+        if getattr(alert, "detection_type", None) == DetectionType.PROJECTILE:
+            return "projectile"
+        for obj in getattr(alert, "detected_objects", []) or []:
+            if (obj.get("class_name") or "").lower() == "fast_projectile":
+                return "projectile"
 
         speed_px_per_sec = getattr(alert, "speed_px_per_sec", None)
         if isinstance(speed_px_per_sec, int | float) and speed_px_per_sec > 50:
@@ -1381,6 +1413,8 @@ class DetectionPipeline:
         # thread / video wall keep working; YOLO + Anomalib + MOG2 consumption
         # are bypassed to free CPU/GPU and avoid contaminating alert history.
         if current_mode in _DETECTION_SKIPPED_MODES:
+            if self._fast_motion is not None:
+                self._fast_motion.reset()
             diag.stages.append(StageResult(
                 stage_name="mode_skip",
                 duration_ms=0.0,
@@ -1390,6 +1424,33 @@ class DetectionPipeline:
             diag.total_duration_ms = (time.monotonic() - start) * 1000
             self._diagnostics.append(diag)
             return None
+
+        if self._fast_motion is not None and current_mode in (
+            PipelineMode.ACTIVE,
+            PipelineMode.MAINTENANCE,
+        ):
+            t_fast = time.monotonic()
+            fast_result = self._fast_motion.process(frame, timestamp=time.time())
+            diag.stages.append(StageResult(
+                stage_name="fast_motion",
+                duration_ms=(time.monotonic() - t_fast) * 1000,
+                metadata={
+                    "candidates": len(fast_result.candidates),
+                    "max_confidence": round(fast_result.max_confidence, 3),
+                },
+                skipped=not fast_result.has_detection,
+            ))
+            if fast_result.has_detection:
+                # Fast fly-through objects may only survive one frame.  Once
+                # this branch fires, avoid spending that frame on heavyweight
+                # YOLO/anomaly inference and grade it immediately instead.
+                return self._handle_fast_motion_detection(
+                    frame_data=frame_data,
+                    frame=frame,
+                    start=start,
+                    diag=diag,
+                    fast_result=fast_result,
+                )
 
         # Single full-resolution BGR->GRAY conversion shared by brightness
         # detection (below) and MOG2 stabilization. Valid only for this frame.
@@ -1466,10 +1527,24 @@ class DetectionPipeline:
         if is_heartbeat:
             self._last_heartbeat_time = now
 
+        calibrating_ssim = False
+        try:
+            detector_status = self._anomaly_detector.get_status()
+            calibrating_ssim = (
+                getattr(detector_status, "mode", None) == "ssim_fallback"
+                and not bool(getattr(detector_status, "ssim_calibrated", True))
+            )
+        except Exception:
+            logger.debug(
+                "pipeline.detector_status_unavailable",
+                camera_id=frame_data.camera_id,
+                exc_info=True,
+            )
+
         # CRIT-01/02: Read lock state atomically for prefilter decision
         with self._lock_state_lock:
             is_locked = self._locked
-        skip_prefilter = is_heartbeat or is_locked or is_low_light
+        skip_prefilter = is_heartbeat or is_locked or is_low_light or calibrating_ssim
 
         # DET-006: MAINTENANCE mode freezes MOG2 learning on all frames
         # Also freeze on brightness jumps to prevent background model corruption
@@ -2383,6 +2458,177 @@ class DetectionPipeline:
 
         return alert
 
+    def _handle_fast_motion_detection(
+        self,
+        *,
+        frame_data: FrameData,
+        frame: np.ndarray,
+        start: float,
+        diag: FrameDiagnostics,
+        fast_result: FastMotionResult,
+    ) -> Alert | None:
+        """Grade a fast fly-through detection through the normal alert path."""
+        cfg = self.camera_config.fast_motion
+        score = min(1.0, max(float(cfg.instant_alert_score), fast_result.max_confidence))
+        anomaly_result = AnomalyResult(
+            anomaly_score=score,
+            anomaly_map=fast_result.anomaly_map,
+            is_anomalous=True,
+            threshold=float(cfg.min_confidence),
+            detection_failed=False,
+        )
+        detected_objects = [candidate.to_detected_object() for candidate in fast_result.candidates]
+
+        objects: list[ObjectDetection] = []
+        active_tracks_payload: list[dict] = []
+        for candidate in fast_result.candidates:
+            x1, y1, x2, y2 = candidate.bbox
+            objects.append(ObjectDetection(
+                x1=int(x1),
+                y1=int(y1),
+                x2=int(x2),
+                y2=int(y2),
+                confidence=float(candidate.confidence),
+                class_id=-1,
+                class_name="fast_projectile",
+                track_id=candidate.track_id,
+            ))
+            active_tracks_payload.append({
+                "track_id": int(candidate.track_id or 0),
+                "centroid_x": float(candidate.centroid[0]),
+                "centroid_y": float(candidate.centroid[1]),
+                "max_score": float(candidate.confidence),
+                "area_px": int(candidate.area_px),
+                "speed_px_per_sec": (
+                    float(candidate.speed_px_per_sec)
+                    if candidate.speed_px_per_sec is not None
+                    else None
+                ),
+            })
+
+        detection_result = ObjectDetectionResult(
+            persons=[],
+            has_persons=False,
+            objects=objects,
+            has_objects=bool(objects),
+            non_person_objects=objects,
+            filter_available=True,
+        )
+
+        self.stats.frames_analyzed += 1
+        self.stats.anomalies_detected += 1
+        diag.anomaly_score = anomaly_result.anomaly_score
+        diag.is_anomalous = True
+
+        with self._latest_anomaly_map_lock:
+            self._latest_anomaly_map = (
+                anomaly_result.anomaly_map.copy()
+                if anomaly_result.anomaly_map is not None
+                else None
+            )
+
+        alert = self._evaluate_zones(
+            frame_data,
+            anomaly_result,
+            frame,
+            detection_type=DetectionType.PROJECTILE,
+            detected_objects=detected_objects,
+        )
+
+        if alert is not None:
+            best = max(fast_result.candidates, key=lambda item: item.confidence)
+            alert.category = "projectile"
+            alert.trajectory_model = "projectile"
+            alert.model_version_id = self._model_version_id
+            alert.trajectory_points = best.trajectory or [(
+                time.time(),
+                float(best.centroid[0]),
+                float(best.centroid[1]),
+            )]
+            if best.speed_px_per_sec is not None:
+                alert.speed_px_per_sec = float(best.speed_px_per_sec)
+            self.stats.alerts_emitted += 1
+
+        self._update_latency(start)
+        diag.alert_emitted = alert is not None
+        diag.total_duration_ms = (time.monotonic() - start) * 1000
+        self._last_detection_failed = False
+
+        cam_id = frame_data.camera_id
+        self._m_latency.observe(diag.total_duration_ms / 1000.0)
+        self._m_frames.inc()
+        for stage in diag.stages:
+            metric = self._m_stages.get(stage.stage_name) or self._m_stages_fallback(stage.stage_name)
+            metric.observe(stage.duration_ms / 1000.0)
+        self._m_anomaly_score.set(anomaly_result.anomaly_score)
+        if alert is not None:
+            METRICS.alerts_total.labels(
+                camera_id=cam_id,
+                severity=alert.severity.value,
+            ).inc()
+
+        if self._event_bus is not None and self._event_bus.has_subscribers(FrameAnalyzed):
+            self._event_bus.publish(FrameAnalyzed(
+                camera_id=cam_id,
+                frame_number=frame_data.frame_number,
+                anomaly_score=anomaly_result.anomaly_score,
+                is_anomalous=True,
+                stage_latencies=MappingProxyType({
+                    stage.stage_name: stage.duration_ms for stage in diag.stages
+                }),
+                mog2_skipped=True,
+                person_detected=False,
+            ))
+        if self._event_bus is not None and alert is not None and self._event_bus.has_subscribers(AlertRaised):
+            self._event_bus.publish(AlertRaised(
+                alert_id=alert.alert_id,
+                camera_id=cam_id,
+                zone_id=alert.zone_id,
+                severity=alert.severity,
+                anomaly_score=alert.anomaly_score,
+                handling_policy=alert.handling_policy,
+            ))
+
+        frame_id = uuid.uuid4().hex
+        diag.frame_id = frame_id
+        self._last_inference_record = InferenceRecord(
+            frame_id=frame_id,
+            camera_id=frame_data.camera_id,
+            timestamp_ns=time.time_ns(),
+            model_version=self._model_version_id or "fast_motion",
+            prefilter_result=PrefilterDecision.PASSED,
+            anomaly_score=anomaly_result.anomaly_score,
+            cusum_evidence={},
+            conformal_level=ConformalLevel.HIGH,
+            safety_channel_result=True,
+            final_decision=FinalDecision.ALERT if alert is not None else FinalDecision.INFO,
+            stage_durations_ms={stage.stage_name: stage.duration_ms for stage in diag.stages},
+        )
+
+        self._diagnostics.append(diag)
+        self._diagnostics.append_score(FrameScoreRecord(
+            frame_number=frame_data.frame_number,
+            timestamp=time.time(),
+            anomaly_score=anomaly_result.anomaly_score,
+            was_alert=alert is not None,
+        ))
+        self._score_sparkline.append(anomaly_result.anomaly_score)
+        self._handle_ring_buffer(
+            frame_data,
+            frame,
+            anomaly_result,
+            detection_result,
+            None,
+            False,
+            alert,
+            active_tracks_payload,
+        )
+
+        if alert is not None and self._on_alert:
+            self._on_alert(alert)
+
+        return alert
+
     def _handle_ring_buffer(
         self,
         frame_data: FrameData,
@@ -2447,7 +2693,7 @@ class DetectionPipeline:
                 for o in detection_result.objects
             ]
 
-            snap_ts = time.time()
+            snap_ts = float(alert.timestamp) if alert is not None else time.time()
             snap_score = anomaly_result.anomaly_score
             snap_simplex = getattr(simplex_result, "max_score", None) if simplex_detected else None
             snap_frame_num = frame_data.frame_number
@@ -2622,6 +2868,54 @@ class DetectionPipeline:
             "score_sparkline": [round(s, 3) for s in sparkline],
         }
 
+    def get_capture_status(self) -> dict:
+        """Return capture and fast-motion runtime metadata for dashboard status."""
+        capture = (
+            self._camera.runtime_status()
+            if hasattr(self._camera, "runtime_status")
+            else {}
+        )
+        fast_cfg = self.camera_config.fast_motion
+        stats_fps = self.stats.snapshot().get("current_fps")
+        runtime_fps = stats_fps if stats_fps and stats_fps > 0 else capture.get("actual_fps")
+        actual_resolution = capture.get("actual_resolution")
+        fast_degraded = False
+        reasons: list[str] = []
+        if fast_cfg.enabled:
+            if actual_resolution:
+                actual_tuple = tuple(int(v) for v in actual_resolution)
+                required_tuple = tuple(int(v) for v in fast_cfg.required_resolution)
+                if actual_tuple != required_tuple:
+                    fast_degraded = True
+                    reasons.append(
+                        f"resolution {actual_tuple[0]}x{actual_tuple[1]} "
+                        f"below required {required_tuple[0]}x{required_tuple[1]}"
+                    )
+            if runtime_fps and runtime_fps < fast_cfg.min_runtime_fps:
+                fast_degraded = True
+                reasons.append(
+                    f"fps {runtime_fps:.1f} below required {fast_cfg.min_runtime_fps:.1f}"
+                )
+
+        return {
+            **capture,
+            "degraded": bool(capture.get("degraded")) or fast_degraded,
+            "degradation_reason": capture.get("degradation_reason") or "; ".join(reasons) or None,
+            "fast_motion": {
+                "enabled": fast_cfg.enabled,
+                "active": fast_cfg.enabled and self.mode in (
+                    PipelineMode.ACTIVE,
+                    PipelineMode.MAINTENANCE,
+                ),
+                "process_width": fast_cfg.process_width,
+                "min_runtime_fps": fast_cfg.min_runtime_fps,
+                "required_resolution": tuple(fast_cfg.required_resolution),
+                "current_fps": runtime_fps,
+                "degraded": fast_degraded,
+                "degradation_reason": "; ".join(reasons) or None,
+            },
+        }
+
     def _m_stages_fallback(self, stage_name: str) -> object:
         """Lazily create and cache a stage metric child for an unexpected stage name."""
         child = METRICS.pipeline_stage_seconds.labels(
@@ -2708,6 +3002,17 @@ class DetectionPipeline:
         with self._mode_lock:
             old = self._mode
             self._mode = mode
+            if mode == PipelineMode.LEARNING:
+                self._learning_start_time = time.monotonic()
+                if self._learning_duration <= 0:
+                    fps = max(1, self.camera_config.fps_target)
+                    history = self.camera_config.mog2.history
+                    self._learning_duration = max(history / fps * 3, 600)
+                self._auto_learning_complete = False
+            elif old == PipelineMode.LEARNING:
+                self._learning_start_time = None
+                if mode == PipelineMode.ACTIVE:
+                    self._auto_learning_complete = True
             if mode in _DETECTION_SKIPPED_MODES:
                 self._mode_session_start_time = time.monotonic()
             else:

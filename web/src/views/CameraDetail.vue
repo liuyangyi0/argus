@@ -1,26 +1,41 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Steps, Button } from 'ant-design-vue'
+import { Steps, Button, Segmented, message } from 'ant-design-vue'
 import { ArrowLeftOutlined } from '@ant-design/icons-vue'
 import { getCameraDetail } from '../api'
+import { setCameraMode } from '../api/cameras'
 import ZoneEditor from '../components/ZoneEditor.vue'
 import CalibrationWizard from '../components/calibration/CalibrationWizard.vue'
 import { useGo2RTC } from '../composables/useGo2RTC'
 import { useAuthStore } from '../stores/useAuthStore'
+import { extractErrorMessage } from '../utils/error'
+import type { PipelineMode } from '../types/api'
 
 const route = useRoute()
 const router = useRouter()
-// Hide zone-save (write op) from viewers; backend RBAC remains authoritative.
 const auth = useAuthStore()
-const cameraId = route.params.id as string
+const canOperateCamera = computed(() => auth.hasRole(['admin', 'operator', 'engineer']))
+const canEditZones = computed(() => auth.hasRole(['admin', 'engineer']))
+const cameraId = computed(() => String(route.params.id || ''))
 const camera = ref<any>(null)
 const loading = ref(true)
+const zoneEditorData = ref<any[]>([])
+const zoneEditorCameraId = ref<string | null>(null)
+const streamActive = ref(false)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 async function fetchCamera() {
+  const requestedId = cameraId.value
   try {
-    camera.value = await getCameraDetail(cameraId) || null
+    const detail = await getCameraDetail(requestedId) || null
+    if (cameraId.value !== requestedId) return
+    camera.value = detail
+    if (zoneEditorCameraId.value !== requestedId) {
+      zoneEditorData.value = detail?.zones || []
+      zoneEditorCameraId.value = requestedId
+    }
+    syncStream()
   } finally {
     loading.value = false
   }
@@ -29,7 +44,6 @@ async function fetchCamera() {
 onMounted(() => {
   fetchCamera()
   pollTimer = setInterval(fetchCamera, 5000)
-  startStream()
 })
 
 onUnmounted(() => {
@@ -37,7 +51,7 @@ onUnmounted(() => {
     clearInterval(pollTimer)
     pollTimer = null
   }
-  stopStream()
+  stopActiveStream()
 })
 
 // go2rtc WebRTC/MSE player
@@ -49,14 +63,39 @@ const mjpegRef = _go2rtc.mjpegRef
 const streamStatus = _go2rtc.status
 const startStream = _go2rtc.start
 const stopStream = _go2rtc.stop
-const mjpegUrl = computed(() => `/api/cameras/${cameraId}/stream`)
-const snapshotUrl = computed(() => `/api/cameras/${cameraId}/snapshot`)
-const zoneEditorData = ref<any[]>(camera.value?.zones || [])
+const mjpegUrl = computed(() => `/api/cameras/${cameraId.value}/stream`)
+const snapshotUrl = computed(() => `/api/cameras/${cameraId.value}/snapshot`)
+
+function stopActiveStream() {
+  if (!streamActive.value) return
+  stopStream()
+  streamActive.value = false
+}
+
+function syncStream() {
+  if (camera.value?.connected) {
+    if (!streamActive.value) {
+      streamActive.value = true
+      startStream()
+    }
+    return
+  }
+  stopActiveStream()
+}
+
+watch(cameraId, async (nextId, previousId) => {
+  if (!previousId || nextId === previousId) return
+  loading.value = true
+  camera.value = null
+  zoneEditorCameraId.value = null
+  stopActiveStream()
+  await fetchCamera()
+})
 
 async function saveZones() {
   try {
     const { updateZones } = await import('../api/zones')
-    await updateZones(cameraId, zoneEditorData.value)
+    await updateZones(cameraId.value, zoneEditorData.value)
   } catch { /* handled by global interceptor */ }
 }
 
@@ -125,6 +164,34 @@ const healthEntries = computed(() => flattenEntries(camera.value?.health))
 const detectorEntries = computed(() => flattenEntries(camera.value?.detector))
 const configEntries = computed(() => flattenEntries(camera.value?.config))
 const leftTab = ref<'live' | 'info' | 'zones'>('live')
+
+const modeOptions = [
+  { label: '主动检测', value: 'active' },
+  { label: '学习', value: 'learning' },
+  { label: '维护', value: 'maintenance' },
+]
+const currentPipelineMode = computed(() => camera.value?.runtime?.pipeline_mode || null)
+const canSwitchMode = computed(() => (
+  Boolean(camera.value?.running) && canOperateCamera.value
+))
+
+async function handleModeChange(value: string | number) {
+  const mode = String(value) as PipelineMode
+  if (!camera.value?.camera_id || mode === currentPipelineMode.value) return
+  try {
+    const result = await setCameraMode(camera.value.camera_id, mode)
+    camera.value = {
+      ...camera.value,
+      runtime: {
+        ...(camera.value.runtime || {}),
+        pipeline_mode: result.pipeline_mode,
+      },
+    }
+    message.success('运行模式已切换')
+  } catch (e) {
+    message.error(extractErrorMessage(e, '切换运行模式失败'))
+  }
+}
 </script>
 
 <template>
@@ -145,6 +212,14 @@ const leftTab = ref<'live' | 'info' | 'zones'>('live')
             <Steps.Step title="推理" />
           </Steps>
         </div>
+        <Segmented
+          v-if="canOperateCamera"
+          size="small"
+          :value="currentPipelineMode || 'learning'"
+          :options="modeOptions"
+          :disabled="!canSwitchMode"
+          @change="handleModeChange"
+        />
       </div>
     </div>
 
@@ -221,7 +296,7 @@ const leftTab = ref<'live' | 'info' | 'zones'>('live')
           <!-- ZONES TAB -->
           <div v-else-if="leftTab === 'zones'" class="zones-wrapper">
             <ZoneEditor v-model="zoneEditorData" :image-src="snapshotUrl" :width="640" :height="480" />
-            <div v-if="auth.hasRole(['admin', 'operator'])" style="margin-top: 16px; text-align:right; flex-shrink: 0;">
+            <div v-if="canEditZones" style="margin-top: 16px; text-align:right; flex-shrink: 0;">
                <Button type="primary" @click="saveZones">保存区域配置</Button>
             </div>
           </div>

@@ -2,7 +2,6 @@
 
 import time
 
-import pytest
 
 from argus.core.alert_ring_buffer import (
     AlertFrameBuffer,
@@ -139,7 +138,7 @@ class TestAlertFrameBuffer:
             buf.append(_make_snapshot(timestamp=ts + i * 0.2, frame_number=25 + i))
 
         # Not ready yet (deadline not reached) — manual check
-        expired = buf.check_expired_captures()
+        buf.check_expired_captures()
         # May or may not be expired depending on timing
 
     def test_memory_estimate(self):

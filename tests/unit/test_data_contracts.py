@@ -3,10 +3,8 @@
 from dataclasses import dataclass
 
 import numpy as np
-import pytest
 
 from argus.contracts.validation import (
-    ContractViolation,
     validate_alert,
     validate_anomaly_result,
     validate_feedback,

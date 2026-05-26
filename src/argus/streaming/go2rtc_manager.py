@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 import structlog
@@ -54,19 +55,59 @@ _HEALTH_POLL_INTERVAL = 0.5  # seconds
 _HEALTH_POLL_TIMEOUT = 10  # seconds
 
 
-def usb_to_go2rtc_source(device_index: str | int) -> str:
+def _normalise_usb_pixel_format(pixel_format: str | None) -> str | None:
+    if not pixel_format:
+        return None
+    fmt = pixel_format.strip().lower()
+    if fmt in {"auto", ""}:
+        return None
+    if fmt in {"mjpeg", "mjpg"}:
+        return "mjpeg"
+    if fmt in {"yuy2", "yuyv422"}:
+        return "yuyv422"
+    return fmt
+
+
+def usb_to_go2rtc_source(
+    device_index: str | int,
+    *,
+    device_name: str | None = None,
+    device_id: str | None = None,
+    resolution: tuple[int, int] | list[int] | None = None,
+    fps: int | float | None = None,
+    pixel_format: str | None = None,
+    video_codec: str = "h264",
+) -> str:
     """Convert a USB camera device index to a go2rtc ffmpeg source URL.
 
     go2rtc supports USB cameras via its built-in FFmpeg integration:
-      ``ffmpeg:device?video=<index>#video=h264``
+      ``ffmpeg:device?video=<index>&video_size=<WxH>&framerate=<fps>#video=h264``
 
     This avoids the legacy MJPEG fallback path (which creates long-lived
     HTTP connections that exhaust the browser's per-origin connection limit).
 
     Ref: https://github.com/AlexxIT/go2rtc/issues/159
     """
-    idx = int(device_index)
-    return f"ffmpeg:device?video={idx}#video=h264"
+    selector = device_id or device_name or device_index
+    try:
+        video_value: str | int = int(selector)
+    except (TypeError, ValueError):
+        video_value = str(selector)
+
+    query: dict[str, str | int] = {"video": video_value}
+    fmt = _normalise_usb_pixel_format(pixel_format)
+    if fmt:
+        query["input_format"] = fmt
+    if resolution is not None:
+        width, height = int(resolution[0]), int(resolution[1])
+        if width > 0 and height > 0:
+            query["video_size"] = f"{width}x{height}"
+    if fps is not None:
+        fps_value = float(fps)
+        if fps_value > 0:
+            query["framerate"] = int(fps_value) if fps_value.is_integer() else fps_value
+
+    return f"ffmpeg:device?{urlencode(query)}#video={video_codec}"
 
 
 def gige_to_go2rtc_source(script_path: str) -> str:

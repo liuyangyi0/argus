@@ -245,6 +245,8 @@ _GRADE_RANK = {"A": 4, "B": 3, "C": 2, "F": 1}
 def create_job_processing_task(
     scheduler: TaskScheduler,
     job_executor,
+    *,
+    interval_seconds: float = 60.0,
 ) -> None:
     """Register a periodic task that processes queued training jobs.
 
@@ -259,7 +261,7 @@ def create_job_processing_task(
         except Exception as e:
             logger.error("scheduler.job_processing_failed", error=str(e))
 
-    scheduler.add_interval_task("process_training_jobs", _process_jobs, minutes=1)
+    scheduler.add_interval_task("process_training_jobs", _process_jobs, seconds=interval_seconds)
     logger.info("scheduler.job_processing_registered")
 
 

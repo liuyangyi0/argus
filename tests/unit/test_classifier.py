@@ -1,9 +1,8 @@
 """Tests for open vocabulary classifier (D1)."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 
 from argus.anomaly.classifier import OpenVocabClassifier, FOE_VOCAB
 from argus.config.schema import AlertSeverity

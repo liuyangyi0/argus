@@ -2,15 +2,16 @@ import { api, u } from './client'
 import type {
   ModelRegistryResponse, ShadowReportResponse,
   ABScoresResponse, ABDistributionResponse, ABLiveCompareResponse,
-  BatchInferenceResponse,
+  BatchInferenceResponse, ModelRuntimeMutationResponse,
+  ModelReleaseMutationResponse,
 } from '../types/api'
 
 // ── Models ──
 export const getModelRegistry = (cameraId?: string): Promise<ModelRegistryResponse> =>
   api.get('/models/json', { params: cameraId ? { camera_id: cameraId } : {} }).then(u)
-export const activateModel = (versionId: string) =>
+export const activateModel = (versionId: string): Promise<ModelRuntimeMutationResponse> =>
   api.post(`/models/${versionId}/activate`).then(u)
-export const rollbackModel = (versionId: string) =>
+export const rollbackModel = (versionId: string): Promise<ModelRuntimeMutationResponse> =>
   api.post(`/models/${versionId}/rollback`).then(u)
 export const deleteModel = (versionId: string) => api.delete(`/models/${versionId}`).then(u)
 export const reexportModel = (versionId: string, data: { export_format?: string; quantization?: string }) =>
@@ -19,9 +20,9 @@ export const recalibrateModel = (versionId: string) =>
   api.post(`/models/${versionId}/recalibrate`, {}, { timeout: 120000 }).then(u)
 
 // ── Release Pipeline ──
-export const promoteModel = (versionId: string, data: { target_stage: string; triggered_by: string; reason?: string; canary_camera_id?: string }) =>
+export const promoteModel = (versionId: string, data: { target_stage: string; triggered_by?: string; reason?: string; canary_camera_id?: string }): Promise<ModelReleaseMutationResponse> =>
   api.post(`/models/${versionId}/promote`, data).then(u)
-export const retireModel = (versionId: string, data?: { triggered_by?: string; reason?: string }) =>
+export const retireModel = (versionId: string, data?: { triggered_by?: string; reason?: string }): Promise<ModelReleaseMutationResponse> =>
   api.post(`/models/${versionId}/retire`, data || {}).then(u)
 export const getStageHistory = (versionId: string) =>
   api.get(`/models/${versionId}/stage-history`).then(u)

@@ -1,6 +1,5 @@
 """Tests for the dispatch circuit breaker (DET-009)."""
 
-import json
 import time
 from pathlib import Path
 

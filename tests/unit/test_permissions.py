@@ -1,9 +1,7 @@
 """Tests for the 4-tier RBAC permission matrix (UX v2 §11.1)."""
 
-import pytest
 
 from argus.dashboard.auth import (
-    PERMISSION_MAP,
     VALID_ROLES,
     get_denied_response,
     has_permission,

@@ -28,6 +28,7 @@ def register_training_job_processing(
     baseline_manager,
     model_trainer,
     camera_manager: CameraManager | None = None,
+    interval_seconds: float = 60.0,
 ) -> None:
     """Attach queued training-job execution to ``scheduler``.
 
@@ -76,4 +77,8 @@ def register_training_job_processing(
         on_model_trained=_on_model_trained,
         camera_manager=camera_manager,
     )
-    create_job_processing_task(scheduler, job_executor)
+    create_job_processing_task(
+        scheduler,
+        job_executor,
+        interval_seconds=interval_seconds,
+    )

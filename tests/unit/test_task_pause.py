@@ -2,7 +2,6 @@
 
 import threading
 import time
-import pytest
 from argus.dashboard.tasks import TaskManager, TaskStatus, TaskAbortedError
 
 

@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
-import numpy as np
 import structlog
 import torch
 import torch.nn as nn

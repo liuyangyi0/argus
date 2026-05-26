@@ -8,12 +8,10 @@ the main detection pipeline.
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 
-from argus.alerts.grader import Alert, AlertGrader
+from argus.alerts.grader import AlertGrader
 from argus.config.schema import (
     AlertConfig,
     AlertSeverity,

@@ -56,7 +56,7 @@ def build_report(
 ) -> str:
     cm = metrics["confusion_matrix"]
     lines = [
-        f"# Regression Evaluation Report",
+        "# Regression Evaluation Report",
         "",
         f"- **Model**: `{model_path}`",
         f"- **Positive dir**: `{positive_dir}` ({metrics['n_positive']} images)",

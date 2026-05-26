@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { Statistic, Card, message } from 'ant-design-vue'
+import { Statistic, Card, message, Alert } from 'ant-design-vue'
 import { getModelRegistry } from '../../api'
 import { useWebSocket } from '../../composables/useWebSocket'
 import ModelTable from './ModelTable.vue'
@@ -9,9 +9,11 @@ import BatchInference from './BatchInference.vue'
 
 const props = defineProps<{
   cameras: any[]
+  focusVersionId?: string
 }>()
 
 const allModels = ref<any[]>([])
+const modelsLoaded = ref(false)
 
 async function loadAllModels() {
   try {
@@ -19,6 +21,8 @@ async function loadAllModels() {
     allModels.value = res.models || []
   } catch (e) {
     message.error('加载模型列表失败')
+  } finally {
+    modelsLoaded.value = true
   }
 }
 
@@ -52,6 +56,11 @@ const activeModels = computed(() => allModels.value.filter((m: any) => m.is_acti
 const pipelineModels = computed(() => allModels.value.filter((m: any) =>
   m.stage && m.stage !== 'retired' && m.stage !== 'production'
 ).length)
+const focusedModel = computed(() => {
+  const vid = props.focusVersionId
+  if (!vid) return null
+  return allModels.value.find((m: any) => m.model_version_id === vid) || null
+})
 
 function handleModelsChanged() {
   loadAllModels()
@@ -61,6 +70,17 @@ onMounted(loadAllModels)
 </script>
 
 <template>
+  <Alert
+    v-if="focusVersionId && modelsLoaded"
+    :type="focusedModel ? 'info' : 'warning'"
+    show-icon
+    style="margin-bottom: 12px"
+    :message="focusedModel ? '已定位触发模型' : '未找到模型版本'"
+    :description="focusedModel
+      ? `${focusedModel.model_version_id} · ${focusedModel.camera_id} · ${focusedModel.stage}`
+      : `当前注册表中没有 ${focusVersionId}，可能已被清理或来自旧数据。`"
+  />
+
   <!-- Summary stats -->
   <div style="display: flex; gap: 16px; margin-bottom: 16px">
     <Card size="small" style="flex: 1; text-align: center">
@@ -75,7 +95,12 @@ onMounted(loadAllModels)
   </div>
 
   <!-- Unified Model Table (pipeline steps + table) -->
-  <ModelTable :models="allModels" :cameras="cameras" @changed="handleModelsChanged" />
+  <ModelTable
+    :models="allModels"
+    :cameras="cameras"
+    :focused-version-id="focusVersionId"
+    @changed="handleModelsChanged"
+  />
 
   <!-- Event Log (collapsed) -->
   <div style="margin-bottom: 16px">

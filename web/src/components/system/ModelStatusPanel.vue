@@ -6,15 +6,21 @@ import type { ModelHealthStatus } from '../../types/api'
 const models = ref<ModelHealthStatus[]>([])
 const lastFetch = ref<number | null>(null)
 const fetchError = ref<string>('')
+const loading = ref(true)
 let timer: number | undefined
 
 async function refresh() {
+  if (lastFetch.value === null && models.value.length === 0) {
+    loading.value = true
+  }
   try {
     models.value = await getModelsStatus()
     lastFetch.value = Date.now() / 1000
     fetchError.value = ''
   } catch (e) {
     fetchError.value = String((e as Error)?.message ?? e)
+  } finally {
+    loading.value = false
   }
 }
 
@@ -66,7 +72,7 @@ function rowKey(m: ModelHealthStatus): string {
     title="模型运行状态"
     :bordered="false"
     size="small"
-    :loading="models.length === 0 && !fetchError"
+    :loading="loading && models.length === 0 && !fetchError"
   >
     <template #extra>
       <span style="color: #888; font-size: 12px">

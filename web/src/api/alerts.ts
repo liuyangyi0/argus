@@ -29,6 +29,32 @@ export const saveAnnotations = (alertId: string, annotations: any[]) =>
 export const getAlertGroup = (eventGroupId: string) =>
   api.get(`/alerts/group/${eventGroupId}`).then(u)
 
+export async function downloadEvidencePackage(alertId: string): Promise<void> {
+  const res = await api.get(`/alerts/${alertId}/evidence.zip`, {
+    responseType: 'blob',
+  })
+
+  const blob: Blob = res.data
+  if (blob.type.includes('application/json')) {
+    const text = await blob.text()
+    const body = JSON.parse(text)
+    throw new Error(body.msg || body.detail || '导出证据包失败')
+  }
+
+  const disposition = res.headers['content-disposition'] || ''
+  const match = disposition.match(/filename="?([^";\s]+)"?/)
+  const filename = match?.[1] || `${alertId}_evidence.zip`
+
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
 // C-AlertTrainingLink: resolve a model_version_id to its registry record so the
 // alert detail panel can show camera / stage / created_at next to the link.
 // Returns null when the version isn't in the registry (e.g. retired record

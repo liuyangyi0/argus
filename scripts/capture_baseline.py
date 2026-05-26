@@ -94,7 +94,7 @@ def main():
         cap.release()
 
     print(f"\nDone. {captured} baseline images saved to {output_dir}")
-    print(f"\nNext step: Train the anomaly model with:")
+    print("\nNext step: Train the anomaly model with:")
     print(f"  python scripts/train_model.py --data {output_dir}")
 
 

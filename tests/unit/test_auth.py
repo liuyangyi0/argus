@@ -1,6 +1,5 @@
 """Tests for the dashboard authentication system."""
 
-import time
 
 import pytest
 from fastapi.testclient import TestClient

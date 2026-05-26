@@ -2,11 +2,9 @@
 
 import time
 
-import cv2
 import numpy as np
-import pytest
 
-from argus.prefilter.simple_detector import SimplexDetector, SimplexResult
+from argus.prefilter.simple_detector import SimplexDetector
 
 
 class TestSimplexDetector:

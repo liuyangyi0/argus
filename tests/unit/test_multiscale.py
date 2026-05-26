@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -11,7 +11,6 @@ from argus.anomaly.detector import (
     AnomalibDetector,
     AnomalyResult,
     MultiScaleDetector,
-    _TileInfo,
 )
 
 
@@ -72,7 +71,7 @@ class TestTileGeneration:
         """Frame smaller than tile_size should fall back to single prediction."""
         ms = MultiScaleDetector(mock_base_detector, tile_size=512, tile_overlap=0.25)
         frame = np.zeros((256, 256, 3), dtype=np.uint8)
-        result = ms.predict(frame)
+        ms.predict(frame)
 
         # Should call base detector once (no tiling)
         mock_base_detector.predict.assert_called_once()

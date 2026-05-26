@@ -1,7 +1,5 @@
 """Tests for the MOG2 pre-filter module."""
 
-import numpy as np
-import pytest
 
 from argus.prefilter.mog2 import MOG2PreFilter
 

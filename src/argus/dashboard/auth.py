@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from argus.config.schema import AuthConfig

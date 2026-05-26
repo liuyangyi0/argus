@@ -1,4 +1,4 @@
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onUnmounted } from 'vue'
 import { message } from 'ant-design-vue'
 import {
   getReplayMetadata,
@@ -47,6 +47,23 @@ export function useReplayController(alertId: string) {
   const clipStart = ref<number | null>(null)
   const clipEnd = ref<number | null>(null)
   const persistedClips = ref<ReplayClip[]>([])
+  let recordingRefreshTimer: ReturnType<typeof setTimeout> | null = null
+
+  function clearRecordingRefresh() {
+    if (recordingRefreshTimer) {
+      clearTimeout(recordingRefreshTimer)
+      recordingRefreshTimer = null
+    }
+  }
+
+  function scheduleRecordingRefresh() {
+    clearRecordingRefresh()
+    if (metadata.value?.status !== 'recording') return
+    recordingRefreshTimer = setTimeout(() => {
+      recordingRefreshTimer = null
+      loadData()
+    }, 2000)
+  }
 
   // computed properties
   const fps = computed(() => metadata.value?.fps || 15)
@@ -61,6 +78,7 @@ export function useReplayController(alertId: string) {
 
   // data loading
   async function loadData() {
+    clearRecordingRefresh()
     loading.value = true
     try {
       const [metaRes, sigRes, trajRes] = await Promise.all([
@@ -107,9 +125,11 @@ export function useReplayController(alertId: string) {
       persistedClips.value = loadedClips as ReplayClip[]
 
       loadReference()
+      scheduleRecordingRefresh()
     } catch (e) {
       message.error('回放数据加载失败')
       metadata.value = null
+      clearRecordingRefresh()
     } finally {
       loading.value = false
     }
@@ -342,6 +362,11 @@ export function useReplayController(alertId: string) {
     refOffsetTimer = setTimeout(() => {
       loadReference()
     }, 150)
+  })
+
+  onUnmounted(() => {
+    clearRecordingRefresh()
+    if (refOffsetTimer) clearTimeout(refOffsetTimer)
   })
 
   // Shortcuts logic (exposed so component can addEventListener on mount)

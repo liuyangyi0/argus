@@ -7,12 +7,19 @@ import asyncio
 import structlog
 from fastapi import APIRouter, Request
 
-from argus.dashboard.api_response import api_success, api_error, api_unavailable
+from argus.dashboard.api_response import api_success, api_error, api_forbidden, api_unavailable
+from argus.dashboard.auth import require_role
 from argus.dashboard.forms import parse_request_form
 
 logger = structlog.get_logger()
 
 router = APIRouter()
+
+
+def _deny_non_admin(request: Request):
+    if require_role(request, "admin"):
+        return None
+    return api_forbidden("需要管理员权限")
 
 
 @router.get("/list/json")
@@ -29,6 +36,10 @@ async def backup_list_json(request: Request):
 @router.post("/create")
 async def create_backup(request: Request):
     """Create a new backup (submitted as background task)."""
+    denied = _deny_non_admin(request)
+    if denied:
+        return denied
+
     backup_manager = getattr(request.app.state, "backup_manager", None)
     task_manager = getattr(request.app.state, "task_manager", None)
 
@@ -69,6 +80,10 @@ async def create_backup(request: Request):
 @router.post("/restore")
 async def restore_backup(request: Request):
     """Restore database from a named backup."""
+    denied = _deny_non_admin(request)
+    if denied:
+        return denied
+
     backup_manager = getattr(request.app.state, "backup_manager", None)
     if not backup_manager:
         return api_unavailable("备份管理器不可用")
@@ -93,6 +108,10 @@ async def restore_backup(request: Request):
 @router.delete("/{backup_name}")
 def delete_backup(request: Request, backup_name: str):
     """Delete a specific backup."""
+    denied = _deny_non_admin(request)
+    if denied:
+        return denied
+
     backup_manager = getattr(request.app.state, "backup_manager", None)
     if not backup_manager:
         return api_unavailable("备份管理器不可用")
@@ -106,5 +125,4 @@ def delete_backup(request: Request, backup_name: str):
         return api_success({"backup_name": backup_name, "deleted": True})
     from argus.dashboard.api_response import api_not_found
     return api_not_found("备份不存在")
-
 

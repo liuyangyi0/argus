@@ -120,6 +120,7 @@ class DetectionType(str, Enum):
     ANOMALY = "anomaly"  # Anomalib only
     OBJECT = "object"  # YOLO object detection only
     HYBRID = "hybrid"  # Both YOLO and Anomalib agree
+    PROJECTILE = "projectile"  # Fast-motion fly-through detector
 
 
 @dataclass(frozen=True)

@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import numpy as np
-import pytest
 
 from argus.alerts.grader import Alert
 from argus.capture.manager import CameraManager

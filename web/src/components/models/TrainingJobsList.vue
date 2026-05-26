@@ -13,6 +13,7 @@ import {
 } from '../../api'
 import { TRAINING_STATUS_MAP, JOB_TYPE_LABELS, TRIGGER_LABELS } from '../../composables/useModelState'
 import { extractErrorMessage } from '../../utils/error'
+import { hasLiveTrainingJobs } from '../../utils/trainingJobPolling'
 import type { TrainingJobInfo, CameraSummary } from '../../types/api'
 
 const props = defineProps<{
@@ -31,8 +32,13 @@ const detailJob = ref<TrainingJobInfo | null>(null)
 const filterStatus = ref<string | undefined>(undefined)
 const filterJobType = ref<string | undefined>(undefined)
 
-async function loadJobs() {
-  loading.value = true
+type LoadJobsOptions = {
+  background?: boolean
+}
+
+async function loadJobs(options: LoadJobsOptions = {}) {
+  if (options.background && loading.value) return
+  if (!options.background) loading.value = true
   try {
     const params: Record<string, any> = {}
     if (filterStatus.value) params.status = filterStatus.value
@@ -41,10 +47,16 @@ async function loadJobs() {
     jobs.value = res.jobs || []
     emit('update:pendingCount', res.pending_count || 0)
   } catch (e) {
-    message.error(extractErrorMessage(e, '加载训练任务失败'))
+    if (!options.background) {
+      message.error(extractErrorMessage(e, '加载训练任务失败'))
+    }
   } finally {
-    loading.value = false
+    if (!options.background) loading.value = false
   }
+}
+
+function refreshJobs() {
+  void loadJobs()
 }
 
 async function showDetail(jobId: string) {
@@ -59,7 +71,7 @@ async function showDetail(jobId: string) {
 
 async function handleConfirm(jobId: string) {
   try {
-    await confirmTrainingJob(jobId, { confirmed_by: 'operator' })
+    await confirmTrainingJob(jobId)
     message.success('任务已确认，进入队列')
     loadJobs()
   } catch (e) {
@@ -77,7 +89,7 @@ async function handleConfirm(jobId: string) {
 
 async function handleReject(jobId: string) {
   try {
-    await rejectTrainingJob(jobId, { rejected_by: 'operator' })
+    await rejectTrainingJob(jobId)
     message.info('任务已拒绝')
     loadJobs()
   } catch (e) {
@@ -119,6 +131,8 @@ function showError(record: TrainingJobInfo) {
 // Elapsed time ticker — only runs when jobs are in "running" state
 const nowTick = ref(Date.now())
 let elapsedTimer: ReturnType<typeof setInterval> | null = null
+let refreshTimer: ReturnType<typeof setInterval> | null = null
+const JOB_REFRESH_MS = 5000
 
 function startElapsedTimer() {
   if (elapsedTimer) return
@@ -128,13 +142,27 @@ function stopElapsedTimer() {
   if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null }
 }
 
+function startRefreshTimer() {
+  if (refreshTimer) return
+  refreshTimer = setInterval(() => { void loadJobs({ background: true }) }, JOB_REFRESH_MS)
+}
+
+function stopRefreshTimer() {
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
+}
+
 watch(jobs, (list) => {
   if (list.some(j => j.status === 'running')) startElapsedTimer()
   else stopElapsedTimer()
+  if (hasLiveTrainingJobs(list)) startRefreshTimer()
+  else stopRefreshTimer()
 }, { immediate: true })
 
-onMounted(loadJobs)
-onUnmounted(stopElapsedTimer)
+onMounted(refreshJobs)
+onUnmounted(() => {
+  stopElapsedTimer()
+  stopRefreshTimer()
+})
 
 function formatElapsed(job: TrainingJobInfo): string {
   if (job.status !== 'running' || !job.started_at) return '-'
@@ -157,7 +185,7 @@ defineExpose({ loadJobs })
           placeholder="状态筛选"
           allow-clear
           style="width: 150px"
-          @change="loadJobs"
+          @change="refreshJobs"
         >
           <Select.Option value="pending_confirmation">待确认</Select.Option>
           <Select.Option value="queued">排队中</Select.Option>
@@ -171,12 +199,12 @@ defineExpose({ loadJobs })
           placeholder="类型筛选"
           allow-clear
           style="width: 150px"
-          @change="loadJobs"
+          @change="refreshJobs"
         >
           <Select.Option value="ssl_backbone">SSL 骨干</Select.Option>
           <Select.Option value="anomaly_head">异常检测头</Select.Option>
         </Select>
-        <Button @click="loadJobs">
+        <Button @click="refreshJobs">
           <template #icon><ReloadOutlined /></template>
           刷新
         </Button>

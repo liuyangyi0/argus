@@ -9,7 +9,6 @@ from sqlalchemy.orm import sessionmaker
 from argus.storage.models import (
     Base,
     ModelRecord,
-    ModelStage,
     ModelVersionEvent,
     ShadowInferenceLog,
 )

@@ -1,8 +1,7 @@
 """Tests for post-capture review (Phase 5)."""
 
 import json
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -51,7 +50,7 @@ class TestPostCaptureReview:
             "flagged_frames": [{"filename": "baseline_00009.png", "score": 0.9}],
         }
 
-        result = post_capture_review(
+        post_capture_review(
             version_dir=version_dir,
             camera_id="cam_01",
             models_dir=tmp_path / "models",

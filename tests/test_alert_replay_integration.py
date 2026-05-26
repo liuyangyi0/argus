@@ -11,7 +11,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pytest
 
 from argus.core.alert_ring_buffer import (
     AlertFrameBuffer,

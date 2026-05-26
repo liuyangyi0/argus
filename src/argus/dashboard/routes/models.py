@@ -6,6 +6,7 @@ import asyncio
 import base64
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,7 +26,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import require_permission
+from argus.dashboard.auth import current_username, require_permission
 from argus.dashboard.model_runtime import (
     activate_model_version,
     get_registry,
@@ -70,6 +71,18 @@ def _get_session_factory(request: Request):
     return getattr(db, "get_session", None)
 
 
+def _get_release_anomaly_config(config: object | None) -> object | None:
+    if config is None:
+        return None
+    anomaly_cfg = getattr(config, "anomaly", None)
+    if anomaly_cfg is not None:
+        return anomaly_cfg
+    cameras = getattr(config, "cameras", None) or []
+    if not cameras:
+        return None
+    return getattr(cameras[0], "anomaly", None)
+
+
 def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
     """Get or create ReleasePipeline singleton from app state."""
     cached = getattr(request.app.state, "_release_pipeline", None)
@@ -84,11 +97,10 @@ def _get_release_pipeline(request: Request) -> ReleasePipeline | None:
         return None
     config = getattr(request.app.state, "config", None)
     kwargs = {}
-    if config:
-        anomaly_cfg = getattr(config, "anomaly", None)
-        if anomaly_cfg:
-            kwargs["min_shadow_days"] = getattr(anomaly_cfg, "min_shadow_days", 3)
-            kwargs["min_canary_days"] = getattr(anomaly_cfg, "min_canary_days", 7)
+    anomaly_cfg = _get_release_anomaly_config(config)
+    if anomaly_cfg:
+        kwargs["min_shadow_days"] = getattr(anomaly_cfg, "min_shadow_days", 3)
+        kwargs["min_canary_days"] = getattr(anomaly_cfg, "min_canary_days", 7)
     # Wire the dashboard WS manager as broadcaster so stage transitions
     # surface in the frontend release-pipeline view in real time. We only
     # pass the bound broadcast method (publisher signature: topic, payload),
@@ -153,6 +165,17 @@ def _model_runtime_state(request: Request, model: ModelRecord) -> str | None:
     return "applied" if current_primary == model.model_version_id else "failed"
 
 
+def _runtime_state_after_sync(
+    request: Request,
+    model: ModelRecord,
+    runtime_synced: bool,
+) -> str | None:
+    """Return the row-level runtime state after a direct model hot reload."""
+    if runtime_synced:
+        return "applied"
+    return _model_runtime_state(request, model)
+
+
 @router.get("/status")
 def models_status(request: Request) -> JSONResponse:
     """Aggregate health status of every detector across all cameras.
@@ -212,11 +235,11 @@ async def activate_model(request: Request, version_id: str):
         return api_unavailable("数据库不可用")
 
     try:
-        triggered_by = "dashboard"
+        triggered_by = current_username(request)
         try:
             body = await request.json()
             if isinstance(body, dict):
-                triggered_by = body.get("triggered_by", triggered_by)
+                triggered_by = body.get("triggered_by") or triggered_by
         except Exception:
             logger.debug("models.request_body_parse_failed", exc_info=True)
 
@@ -229,6 +252,10 @@ async def activate_model(request: Request, version_id: str):
             "activated": record.model_version_id,
             "camera_id": record.camera_id,
             "runtime_synced": runtime_synced,
+            "runtime_state": _runtime_state_after_sync(
+                request, record, runtime_synced,
+            ),
+            "model": record.to_dict(),
         })
     except ValueError as e:
         # P1 fix (2026-05): registry rejects activation of candidate models.
@@ -264,7 +291,7 @@ async def rollback_model(request: Request, version_id: str):
     previous, runtime_synced = rollback_camera_model(
         request,
         camera_id,
-        triggered_by="dashboard",
+        triggered_by=current_username(request),
     )
     if previous is None:
         return api_not_found("没有可回滚的历史模型")
@@ -273,6 +300,10 @@ async def rollback_model(request: Request, version_id: str):
         "activated": previous.model_version_id,
         "camera_id": camera_id,
         "runtime_synced": runtime_synced,
+        "runtime_state": _runtime_state_after_sync(
+            request, previous, runtime_synced,
+        ),
+        "model": previous.to_dict(),
     })
 
 
@@ -393,9 +424,9 @@ async def promote_model(request: Request, version_id: str):
         return api_validation_error("无效的JSON请求")
 
     target_stage = body.get("target_stage")
-    triggered_by = body.get("triggered_by")
-    if not target_stage or not triggered_by:
-        return api_validation_error("target_stage and triggered_by are required")
+    triggered_by = body.get("triggered_by") or current_username(request)
+    if not target_stage:
+        return api_validation_error("target_stage is required")
 
     try:
         if target_stage == ModelStage.RETIRED.value:
@@ -458,7 +489,7 @@ async def retire_model(request: Request, version_id: str):
     except Exception:
         body = {}
 
-    triggered_by = body.get("triggered_by", "system")
+    triggered_by = body.get("triggered_by") or current_username(request)
 
     try:
         existing = registry.get_by_version_id(version_id)
@@ -540,6 +571,10 @@ def delete_model(request: Request, version_id: str):
 
 def _get_trainer(request: Request):
     """Construct a ModelTrainer from app state config."""
+    trainer = getattr(request.app.state, "model_trainer", None)
+    if trainer is not None:
+        return trainer
+
     from argus.anomaly.baseline import BaselineManager
     from argus.anomaly.trainer import ModelTrainer
 
@@ -834,8 +869,6 @@ async def ab_compare_distribution(
 
 
 # ── Shadow detector cache (LRU, max 3 entries) ──
-from collections import OrderedDict
-
 _shadow_detector_cache: OrderedDict[str, object] = OrderedDict()
 _shadow_cache_lock = threading.Lock()
 
@@ -1038,7 +1071,7 @@ async def backbone_upgrade(request: Request):
 
     backbone_path = body.get("backbone_path")
     version = body.get("version")
-    triggered_by = body.get("triggered_by", "system")
+    triggered_by = body.get("triggered_by") or current_username(request)
 
     if not backbone_path or not version:
         return api_validation_error("backbone_path and version are required")
@@ -1047,6 +1080,11 @@ async def backbone_upgrade(request: Request):
     success = await asyncio.to_thread(manager.upgrade, Path(backbone_path), version)
 
     if success:
+        logger.info(
+            "backbone.upgraded",
+            version=version,
+            triggered_by=triggered_by,
+        )
         return api_success({
             "version": version,
         })
@@ -1071,7 +1109,7 @@ def threshold_preview(
 
     This allows operators to tune the threshold with real data feedback.
     """
-    from sqlalchemy import select, func as sa_func
+    from sqlalchemy import select
     from argus.storage.models import InferenceRecord
 
     db = request.app.state.db

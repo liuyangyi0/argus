@@ -91,6 +91,54 @@ class SimplexConfig(BaseModel):
     match_radius_px: int = Field(default=50, ge=10, le=200)
 
 
+class USBCaptureConfig(BaseModel):
+    """USB camera capture hints for OpenCV and go2rtc."""
+
+    device_name: str | None = Field(
+        default=None,
+        description="Preferred USB camera display name for DirectShow/go2rtc source selection.",
+    )
+    device_id: str | None = Field(
+        default=None,
+        description="Preferred USB camera stable/alternative device identifier for DirectShow/go2rtc.",
+    )
+    preferred_backend: Literal["auto", "dshow", "msmf", "ffmpeg", "default"] = Field(
+        default="auto",
+        description="Preferred OpenCV backend for direct USB capture. Windows auto mode tries DirectShow first.",
+    )
+    pixel_format: Literal["auto", "mjpeg", "mjpg", "yuy2", "yuyv422"] = Field(
+        default="auto",
+        description="Preferred USB pixel format. Use mjpeg/mjpg for high-FPS 1080p webcams.",
+    )
+    min_runtime_fps: float = Field(
+        default=0.0, ge=0.0, le=120.0,
+        description="Warn/degrade when delivered FPS falls below this value. 0 disables the gate.",
+    )
+
+
+class FastMotionConfig(BaseModel):
+    """Lightweight detector for tiny, fast fly-through objects."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable fast frame-difference projectile detection before heavy ML stages.",
+    )
+    process_width: int = Field(default=960, ge=160, le=3840)
+    diff_threshold: int = Field(default=18, ge=1, le=255)
+    background_alpha: float = Field(default=0.03, ge=0.001, le=0.5)
+    min_area_px: int = Field(default=2, ge=1, le=100000)
+    max_area_px: int = Field(default=1500, ge=1, le=500000)
+    min_streak_length_px: int = Field(default=4, ge=1, le=1000)
+    min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    instant_alert_score: float = Field(default=0.96, ge=0.5, le=0.99)
+    max_candidates_per_frame: int = Field(default=5, ge=1, le=50)
+    min_runtime_fps: float = Field(default=50.0, ge=1.0, le=120.0)
+    required_resolution: tuple[int, int] = Field(
+        default=(1920, 1080),
+        description="Resolution expected for low-miss fast-motion mode.",
+    )
+
+
 class PersonFilterConfig(BaseModel):
     """YOLO object detection parameters (YOLO-001/002/003).
 
@@ -603,6 +651,14 @@ class CameraConfig(BaseModel):
     person_filter: PersonFilterConfig = Field(default_factory=PersonFilterConfig)
     anomaly: AnomalyConfig = Field(default_factory=AnomalyConfig)
     simplex: SimplexConfig = Field(default_factory=SimplexConfig)
+    usb: USBCaptureConfig = Field(
+        default_factory=USBCaptureConfig,
+        description="USB camera backend and pixel-format preferences",
+    )
+    fast_motion: FastMotionConfig = Field(
+        default_factory=FastMotionConfig,
+        description="Tiny high-speed object fly-through detection",
+    )
     drift: DriftConfig = Field(default_factory=DriftConfig)
     degradation: DegradationConfig = Field(default_factory=DegradationConfig)
     ring_buffer: RingBufferConfig = Field(default_factory=RingBufferConfig)
@@ -876,6 +932,10 @@ class DashboardConfig(BaseModel):
     go2rtc_rtsp_port: int = Field(
         default=8554, ge=1024, le=65535,
         description="go2rtc RTSP listener port",
+    )
+    go2rtc_webrtc_port: int = Field(
+        default=8555, ge=1024, le=65535,
+        description="go2rtc WebRTC ICE/UDP listener port",
     )
     go2rtc_binary: str | None = Field(
         default=None,

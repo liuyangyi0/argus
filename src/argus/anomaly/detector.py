@@ -7,6 +7,7 @@ normal appearance is flagged as anomalous with a score and heatmap.
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +94,79 @@ class AnomalibDetector:
         # Multi-channel fusion support (Plan A stores tensor, Plan B will use it)
         self._latest_fused_tensor: np.ndarray | None = None
 
+    def _infer_model_image_size(self, model_path: Path) -> tuple[int, int] | None:
+        """Infer deployed model input size as ``(width, height)``.
+
+        Training smoke and production exports can use non-default image sizes.
+        The detector must feed the loaded inferencer the model's real shape,
+        otherwise OpenVINO rejects tensors such as 256x256 for a 64x64 model.
+        """
+
+        metadata_path = model_path.parent / "metadata.json"
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                raw_size = metadata.get("image_size")
+                if isinstance(raw_size, int) and raw_size > 0:
+                    return (raw_size, raw_size)
+                if (
+                    isinstance(raw_size, (list, tuple))
+                    and len(raw_size) == 2
+                    and int(raw_size[0]) > 0
+                    and int(raw_size[1]) > 0
+                ):
+                    return (int(raw_size[0]), int(raw_size[1]))
+            except Exception as exc:
+                logger.debug(
+                    "anomaly.metadata_image_size_skip",
+                    path=str(metadata_path),
+                    error=str(exc),
+                )
+
+        if model_path.suffix.lower() != ".xml":
+            return None
+
+        try:
+            import openvino as ov
+
+            model = ov.Core().read_model(str(model_path))
+            inputs = model.inputs
+            if not inputs:
+                return None
+            shape = list(inputs[0].partial_shape)
+            dims: list[int | None] = []
+            for dim in shape:
+                dims.append(int(dim.get_length()) if dim.is_static else None)
+            if len(dims) == 4:
+                # Prefer NCHW, but tolerate NHWC for future exports.
+                if dims[2] and dims[3] and dims[1] in {1, 3, 4, 5}:
+                    return (dims[3], dims[2])
+                if dims[1] and dims[2] and dims[3] in {1, 3, 4, 5}:
+                    return (dims[2], dims[1])
+            if len(dims) == 3 and dims[0] and dims[1]:
+                return (dims[1], dims[0])
+        except Exception as exc:
+            logger.debug(
+                "anomaly.model_image_size_infer_failed",
+                path=str(model_path),
+                error=str(exc),
+            )
+        return None
+
+    def _sync_image_size_from_model(self, model_path: Path) -> None:
+        image_size = self._infer_model_image_size(model_path)
+        if image_size is None or image_size == self.image_size:
+            return
+        old_size = self.image_size
+        self.image_size = image_size
+        self.status.image_size = image_size
+        logger.info(
+            "anomaly.model_image_size_synced",
+            path=str(model_path),
+            old_size=old_size,
+            image_size=image_size,
+        )
+
     def load(self) -> bool:
         """Load the Anomalib model for inference.
 
@@ -141,6 +215,7 @@ class AnomalibDetector:
                 from anomalib.deploy import OpenVINOInferencer
                 self._engine = OpenVINOInferencer(path=self._model_path)
                 self._loaded = True
+                self._sync_image_size_from_model(self._model_path)
                 self._check_minmax_normalization()
                 logger.info("anomaly.model_loaded_openvino", path=str(self._model_path))
                 self._load_calibration()
@@ -180,6 +255,7 @@ class AnomalibDetector:
                 path=str(self._model_path),
                 device=device,
             )
+            self._sync_image_size_from_model(self._model_path)
             self._load_calibration()
             self.status.mark_loaded(
                 backend=f"torch-{device}",
@@ -397,8 +473,15 @@ class AnomalibDetector:
             return self._safe_result()
 
         try:
+            with self._reload_lock:
+                engine = self._engine
+                image_size = self.image_size
+                minmax_broken = self._minmax_broken
+            if engine is None:
+                return self._safe_result()
+
             # Resize to model's expected input size
-            resized = cv2.resize(frame, self.image_size)
+            resized = cv2.resize(frame, image_size)
 
             # Convert BGR to RGB for anomalib
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
@@ -406,9 +489,9 @@ class AnomalibDetector:
             # When PostProcessor MinMax is not fit, the normalized score is
             # always 1.0 (useless). Use the raw inner model score directly
             # to avoid running inference twice.
-            if self._minmax_broken:
+            if minmax_broken:
                 import torch
-                model = self._engine.model
+                model = engine.model
                 inner = getattr(model, "model", model)
                 inp = torch.from_numpy(rgb.transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
                 with torch.no_grad():
@@ -420,7 +503,7 @@ class AnomalibDetector:
                 # Use anomaly_map from inner output if available
                 prediction = raw_out
             else:
-                prediction = self._engine.predict(rgb)
+                prediction = engine.predict(rgb)
 
                 # Extract score — Anomalib 2.x returns Tensors, not numpy
                 raw_score = prediction.pred_score
@@ -607,8 +690,14 @@ class AnomalibDetector:
         anomaly_score = max(0.0, min(anomaly_score, 1.0))
 
         # Build anomaly map — use noise-cleaned version so heatmap highlights
-        # only real changes, not background noise/artifacts
-        anomaly_map = diff_clean
+        # only real changes, not background noise/artifacts. Downstream stages
+        # treat all anomaly maps as normalized 0-1 heatmaps (for example
+        # spatial continuity thresholds at >0.5), so scale the SSIM fallback
+        # map by its local peak instead of leaking raw diff magnitudes.
+        if raw_score > 0:
+            anomaly_map = np.clip(diff_clean / raw_score, 0.0, 1.0).astype(np.float32)
+        else:
+            anomaly_map = np.zeros_like(diff_clean, dtype=np.float32)
 
         return AnomalyResult(
             anomaly_score=anomaly_score,
@@ -693,11 +782,14 @@ class AnomalibDetector:
             except (ImportError, Exception):
                 from anomalib.deploy import TorchInferencer
                 new_engine = TorchInferencer(path=new_model_path)
+            new_image_size = self._infer_model_image_size(new_model_path) or self.image_size
 
             # Atomic swap
             with self._reload_lock:
                 self._engine = new_engine
                 self._model_path = new_model_path
+                self.image_size = new_image_size
+                self.status.image_size = new_image_size
                 self._loaded = True
 
             # Reload calibration data for the new model
@@ -884,6 +976,10 @@ class MultiScaleDetector:
     @property
     def is_calibrated(self) -> bool:
         return self._base.is_calibrated
+
+    @property
+    def status(self) -> ModelStatus:
+        return self._base.status
 
     def load(self) -> bool:
         return self._base.load()

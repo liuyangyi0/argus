@@ -1,8 +1,6 @@
 """Tests for config loader with environment variable overrides."""
 
 import os
-import tempfile
-from pathlib import Path
 
 import pytest
 import yaml

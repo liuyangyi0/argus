@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onBeforeUnmount } from 'vue'
+import { computed, ref, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
 import ContentSkeleton from '../components/ContentSkeleton.vue'
@@ -9,7 +9,7 @@ defineOptions({ name: 'ReplayPage' })
 const route = useRoute()
 const router = useRouter()
 
-const alertId = route.params.alertId as string
+const alertId = computed(() => String(route.params.alertId || ''))
 
 // ReplayPlayer owns its own "加载回放数据..." text via useReplayController, but
 // it only renders that text once the component mounts and the controller starts.
@@ -40,7 +40,7 @@ onBeforeUnmount(() => {
 
     <div class="replay-body">
       <ContentSkeleton v-if="showSkeleton" type="card" :rows="8" />
-      <ReplayPlayer v-else :alert-id="alertId" />
+      <ReplayPlayer v-else :key="alertId" :alert-id="alertId" />
     </div>
   </main>
 </template>

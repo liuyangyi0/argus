@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -41,7 +41,6 @@ if TYPE_CHECKING:
     from argus.camera.orchestrator import CameraOrchestrator
     from argus.capture.manager import CameraManager
     from argus.core.health import HealthMonitor
-    from argus.dashboard.tasks import TaskManager
     from argus.streaming.stream_registry import StreamRegistry
     from argus.storage.database import Database
 
@@ -72,7 +71,7 @@ def _mount_vue_spa(app: FastAPI, vue_dist: Path) -> None:
     async def serve_spa(request: Request, full_path: str):
         # Don't intercept API or WebSocket routes
         if full_path.startswith("api/") or full_path.startswith("ws"):
-            return
+            raise HTTPException(status_code=404)
         # Serve actual files if they exist (favicon, etc.)
         file_path = vue_dist / full_path
         if file_path.is_file():
@@ -93,6 +92,8 @@ def create_app(
     stream_registry: StreamRegistry | None = None,
     camera_orchestrator: CameraOrchestrator | None = None,
     sensor_fusion: SensorFusion | None = None,
+    baseline_manager: object | None = None,
+    model_trainer: object | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
     from argus.anomaly.baseline_lifecycle import BaselineLifecycle
@@ -110,6 +111,7 @@ def create_app(
         go2rtc = Go2RTCManager(
             api_port=dashboard_config.go2rtc_api_port,
             rtsp_port=dashboard_config.go2rtc_rtsp_port,
+            webrtc_port=dashboard_config.go2rtc_webrtc_port,
             binary_path=dashboard_config.go2rtc_binary,
         )
 
@@ -195,6 +197,8 @@ def create_app(
     app.state.stream_registry = stream_registry
     app.state.camera_orchestrator = camera_orchestrator
     app.state.baseline_lifecycle = BaselineLifecycle(database) if database else None
+    app.state.baseline_manager = baseline_manager
+    app.state.model_trainer = model_trainer
 
     if (
         camera_manager is not None
@@ -263,6 +267,14 @@ def create_app(
     from argus.core.degradation import GlobalDegradationManager
 
     app.state.degradation_manager = GlobalDegradationManager(ws_manager=ws_manager)
+    if health_monitor is not None:
+        if getattr(health_monitor, "_degradation_manager", None) is None:
+            health_monitor._degradation_manager = app.state.degradation_manager
+        if (
+            getattr(health_monitor, "_feedback_manager", None) is None
+            and app.state.feedback_manager is not None
+        ):
+            health_monitor._feedback_manager = app.state.feedback_manager
 
     # FR-033: Alert recording store for replay
     # The store is created in __main__.py and set on app.state after create_app().

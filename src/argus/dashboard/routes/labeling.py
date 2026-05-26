@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
@@ -17,7 +16,6 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from argus.dashboard.api_response import (
-    api_internal_error,
     api_not_found,
     api_success,
     api_unavailable,

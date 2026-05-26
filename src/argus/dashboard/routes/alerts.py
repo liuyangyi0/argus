@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cv2
-import numpy as np
 import structlog
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from argus.dashboard.api_response import (
     ErrorCode,
@@ -79,6 +81,40 @@ def _is_safe_path(file_path: str, alerts_dir: Path) -> bool:
         return False
 
 
+def _get_recording_state(
+    db,
+    recording_store: AlertRecordingStore | None,
+    alert_id: str,
+) -> tuple[bool, str | None]:
+    """Resolve whether an alert has replay evidence and its current status."""
+    has_recording = False
+    recording_status: str | None = None
+
+    if hasattr(db, "get_alert_recording"):
+        try:
+            record = db.get_alert_recording(alert_id)
+            if record is not None:
+                has_recording = True
+                recording_status = record.status
+        except Exception:
+            logger.debug("alerts.recording_db_lookup_failed", alert_id=alert_id, exc_info=True)
+
+    if recording_store is not None:
+        try:
+            metadata = recording_store.load_metadata(alert_id)
+            if metadata is not None:
+                has_recording = True
+                recording_status = metadata.get("status") or recording_status
+            elif recording_store.has_recording(alert_id):
+                has_recording = True
+        except Exception:
+            logger.debug("alerts.recording_store_lookup_failed", alert_id=alert_id, exc_info=True)
+
+    if has_recording and recording_status is None:
+        recording_status = "complete"
+    return has_recording, recording_status
+
+
 @router.get("/{alert_id}/detail")
 async def alert_detail(request: Request, alert_id: str):
     """Get single alert detail as JSON."""
@@ -93,10 +129,7 @@ async def alert_detail(request: Request, alert_id: str):
     recording_store: AlertRecordingStore | None = getattr(
         request.app.state, "recording_store", None,
     )
-    has_recording = False
-    if recording_store:
-        has_recording = recording_store.has_recording(alert_id)
-    rec_status = "complete" if has_recording else None
+    has_recording, rec_status = _get_recording_state(db, recording_store, alert_id)
 
     data = {
         "alert_id": alert.alert_id,
@@ -127,6 +160,90 @@ async def alert_detail(request: Request, alert_id: str):
     }
 
     return api_success(data)
+
+
+@router.get("/{alert_id}/evidence.zip")
+def export_evidence_package(request: Request, alert_id: str):
+    """Download a self-contained evidence package for one alert."""
+    db = request.app.state.db
+    if not db:
+        return api_unavailable("数据库不可用")
+
+    alert = db.get_alert(alert_id)
+    if alert is None:
+        return api_not_found("告警不存在")
+
+    alerts_dir = getattr(request.app.state, "alerts_dir", Path("data/alerts"))
+    recording_store: AlertRecordingStore | None = getattr(
+        request.app.state, "recording_store", None,
+    )
+
+    manifest = alert.to_dict()
+    manifest["exported_at"] = datetime.now(timezone.utc).isoformat()
+    manifest["files"] = []
+
+    def _safe_existing(path_str: str | None) -> Path | None:
+        if not path_str or not _is_safe_path(path_str, alerts_dir):
+            return None
+        path = Path(path_str)
+        return path if path.exists() else None
+
+    def _add_json(zf: zipfile.ZipFile, name: str, data: dict | list) -> None:
+        zf.writestr(
+            name,
+            json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        manifest["files"].append(name)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        snapshot = _safe_existing(getattr(alert, "snapshot_path", None))
+        if snapshot is not None:
+            target = f"images/snapshot{snapshot.suffix or '.jpg'}"
+            zf.write(snapshot, target)
+            manifest["files"].append(target)
+
+        heatmap = _safe_existing(getattr(alert, "heatmap_path", None))
+        if heatmap is not None:
+            target = f"images/heatmap{heatmap.suffix or '.jpg'}"
+            zf.write(heatmap, target)
+            manifest["files"].append(target)
+
+        if snapshot is not None and heatmap is not None:
+            composite = _generate_composite(str(snapshot), str(heatmap))
+            if composite is not None:
+                zf.writestr("images/composite.jpg", composite)
+                manifest["files"].append("images/composite.jpg")
+
+        if recording_store is not None:
+            metadata = recording_store.load_metadata(alert_id)
+            signals = recording_store.load_signals(alert_id)
+            video_path = recording_store.get_video_path(alert_id)
+            manifest["has_recording"] = video_path is not None and video_path.exists()
+            if metadata is not None:
+                _add_json(zf, "replay/metadata.json", metadata)
+            if signals is not None:
+                _add_json(zf, "replay/signals.json", signals)
+            if video_path is not None and video_path.exists():
+                target = f"replay/{video_path.name}"
+                zf.write(video_path, target)
+                manifest["files"].append(target)
+        else:
+            manifest["has_recording"] = False
+
+        zf.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{alert_id}_evidence.zip"',
+        },
+    )
 
 
 # ── Image serving (must be before /{alert_id} catch-all) ──

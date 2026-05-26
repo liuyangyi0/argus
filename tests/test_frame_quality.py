@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from argus.capture.quality import CaptureStats, FrameQualityFilter, FrameQualityResult
+from argus.capture.quality import CaptureStats, FrameQualityFilter
 from argus.config.schema import CaptureQualityConfig
 
 

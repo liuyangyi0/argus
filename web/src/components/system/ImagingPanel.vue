@@ -11,6 +11,7 @@ import {
   type ImagingConfigPayload,
 } from '../../api'
 import { extractErrorMessage } from '../../utils/error'
+import { notifyModuleToggleResult } from '../../utils/moduleToggleFeedback'
 
 defineOptions({ name: 'ImagingPanel' })
 
@@ -37,9 +38,9 @@ async function handleToggle(checked: string | number | boolean) {
   const next = Boolean(checked)
   toggling.value = true
   try {
-    await toggleModule('imaging.enabled', next)
+    const result = await toggleModule('imaging.enabled', next)
     cfg.value.enabled = next
-    message.success(next ? '多模态成像已启用' : '多模态成像已关闭')
+    notifyModuleToggleResult('多模态成像', next, result)
     await load()
   } catch (e) {
     message.error(extractErrorMessage(e, '切换失败'))
@@ -53,9 +54,9 @@ async function handlePolarizationToggle(checked: string | number | boolean) {
   const next = Boolean(checked)
   toggling.value = true
   try {
-    await toggleModule('imaging.polarization_processing', next)
+    const result = await toggleModule('imaging.polarization_processing', next)
     cfg.value.polarization_processing = next
-    message.success(next ? '偏振处理已启用' : '偏振处理已关闭')
+    notifyModuleToggleResult('偏振处理', next, result)
   } catch (e) {
     message.error(extractErrorMessage(e, '切换失败'))
   } finally {

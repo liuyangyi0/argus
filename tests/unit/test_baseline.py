@@ -47,8 +47,8 @@ class TestBaselineManager:
 
     def test_set_and_get_current_version(self, bm):
         """Should track current version."""
-        v1 = bm.create_new_version("cam_01")
-        v2 = bm.create_new_version("cam_01")
+        bm.create_new_version("cam_01")
+        bm.create_new_version("cam_01")
         bm.set_current_version("cam_01", "default", "v002")
 
         current = bm.get_baseline_dir("cam_01")

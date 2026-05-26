@@ -1,5 +1,8 @@
 """Tests for the alert JSON API routes (/api/alerts/*)."""
 
+import io
+import json
+import zipfile
 from datetime import datetime
 
 import pytest
@@ -9,8 +12,9 @@ from argus.config.schema import ArgusConfig, AuthConfig
 from argus.core.health import HealthMonitor
 from argus.dashboard.app import create_app
 from argus.dashboard.auth import create_session_token
+from argus.storage.alert_recording import AlertRecordingStore
 from argus.storage.database import Database
-from argus.storage.models import AlertRecord
+from argus.storage.models import AlertRecord, AlertRecordingRecord
 
 
 # ── Fixtures (mirrors test_dashboard.py pattern) ──
@@ -79,6 +83,24 @@ def _insert_alert(db: Database, alert_id: str = "test-alert-001", **overrides):
 def _set_role_cookie(client: TestClient, app, role: str) -> None:
     token = create_session_token(f"{role}_user", role, app.state.session_secret)
     client.cookies.set("argus_session", token)
+
+
+def _save_recording_record(db: Database, alert_id: str, *, status: str = "complete"):
+    db.save_alert_recording(
+        AlertRecordingRecord(
+            alert_id=alert_id,
+            camera_id="cam_01",
+            severity="high",
+            recording_path=f"/tmp/{alert_id}",
+            start_timestamp=0,
+            end_timestamp=1,
+            trigger_timestamp=0.5,
+            frame_count=1,
+            fps=10,
+            file_size_bytes=128,
+            status=status,
+        )
+    )
 
 
 # ── GET /api/alerts/json ──
@@ -154,6 +176,49 @@ class TestAlertsJsonEndpoint:
         assert body["data"]["total"] == 5
 
 
+class TestAlertDetailRecordingState:
+    def test_detail_uses_db_recording_status_when_store_is_absent(self, client, db):
+        _insert_alert(db, "detail-db-rec")
+        _save_recording_record(db, "detail-db-rec", status="recording")
+
+        resp = client.get("/api/alerts/detail-db-rec/detail")
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["has_recording"] is True
+        assert data["recording_status"] == "recording"
+
+    def test_detail_prefers_replay_metadata_status_over_db_status(
+        self, db, health, alerts_dir, tmp_path,
+    ):
+        _insert_alert(db, "detail-store-rec")
+        _save_recording_record(db, "detail-store-rec", status="recording")
+
+        store = AlertRecordingStore(archive_dir=str(tmp_path / "recordings"))
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+        app.state.recording_store = store
+        client = TestClient(app)
+
+        rec_dir = store.archive_dir / "2026-04-10" / "cam_01" / "detail-store-rec"
+        rec_dir.mkdir(parents=True)
+        (rec_dir / "recording.mp4").write_bytes(b"mp4 bytes")
+        (rec_dir / "metadata.json").write_text(
+            json.dumps({
+                "alert_id": "detail-store-rec",
+                "camera_id": "cam_01",
+                "status": "complete",
+            }),
+            encoding="utf-8",
+        )
+
+        resp = client.get("/api/alerts/detail-store-rec/detail")
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["has_recording"] is True
+        assert data["recording_status"] == "complete"
+
+
 # ── Image path safety ──
 
 
@@ -179,6 +244,67 @@ class TestAlertImageSafety:
 
         assert resp.status_code == 200
         assert resp.content == b"jpeg bytes"
+
+
+class TestEvidencePackageExport:
+    def test_export_evidence_package_contains_images_and_replay(
+        self, db, health, alerts_dir, tmp_path,
+    ):
+        store = AlertRecordingStore(archive_dir=str(tmp_path / "recordings"))
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+        app.state.recording_store = store
+        client = TestClient(app)
+
+        snapshot = alerts_dir / "snapshot.jpg"
+        heatmap = alerts_dir / "heatmap.jpg"
+        snapshot.write_bytes(b"snapshot bytes")
+        heatmap.write_bytes(b"heatmap bytes")
+        _insert_alert(
+            db,
+            "alert-zip",
+            snapshot_path=str(snapshot),
+            heatmap_path=str(heatmap),
+        )
+
+        rec_dir = store.archive_dir / "2026-04-10" / "cam_01" / "alert-zip"
+        rec_dir.mkdir(parents=True)
+        (rec_dir / "recording.mp4").write_bytes(b"mp4 bytes")
+        (rec_dir / "metadata.json").write_text(
+            json.dumps({
+                "alert_id": "alert-zip",
+                "camera_id": "cam_01",
+                "status": "complete",
+                "frame_count": 1,
+            }),
+            encoding="utf-8",
+        )
+        (rec_dir / "signals.json").write_text(
+            json.dumps({"timestamps": [0], "anomaly_scores": [0.95]}),
+            encoding="utf-8",
+        )
+
+        resp = client.get("/api/alerts/alert-zip/evidence.zip")
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            names = set(zf.namelist())
+            assert "manifest.json" in names
+            assert "images/snapshot.jpg" in names
+            assert "images/heatmap.jpg" in names
+            assert "replay/metadata.json" in names
+            assert "replay/signals.json" in names
+            assert "replay/recording.mp4" in names
+
+            manifest = json.loads(zf.read("manifest.json"))
+            assert manifest["alert_id"] == "alert-zip"
+            assert manifest["has_recording"] is True
+            assert "replay/recording.mp4" in manifest["files"]
+
+    def test_export_evidence_package_unknown_alert_returns_404(self, client):
+        resp = client.get("/api/alerts/missing/evidence.zip")
+
+        assert resp.status_code == 404
 
 
 # ── POST /api/alerts/{alert_id}/acknowledge ──

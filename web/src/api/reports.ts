@@ -1,15 +1,27 @@
-import { api, u } from './client'
+import type { ApiResponse, ReportStats } from '../types/api'
+import { api, u, unwrap } from './client'
 
 // ── Report statistics ──
-export const getReportStats = () => api.get('/reports/json').then(u)
+export const getReportStats = (days?: number) =>
+  api
+    .get<ApiResponse<ReportStats>>('/reports/json', {
+      params: days ? { days } : undefined,
+    })
+    .then(unwrap)
 
 // ── Chart data ──
 export const getDailyTrend = (days = 30) =>
   api.get('/reports/daily-trend/json', { params: { days } }).then(u)
 
-export const getSeverityDist = () => api.get('/reports/severity-dist/json').then(u)
+export const getSeverityDist = (days?: number) =>
+  api
+    .get('/reports/severity-dist/json', { params: days ? { days } : undefined })
+    .then(u)
 
-export const getCameraDist = () => api.get('/reports/camera-dist/json').then(u)
+export const getCameraDist = (days?: number) =>
+  api
+    .get('/reports/camera-dist/json', { params: days ? { days } : undefined })
+    .then(u)
 
 export const getFPTrend = (days = 30) =>
   api.get('/reports/fp-trend/json', { params: { days } }).then(u)

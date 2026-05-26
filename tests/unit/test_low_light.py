@@ -135,7 +135,7 @@ def test_dark_frame_triggers_low_light_bypass():
         diag = FrameDiagnostics(
             frame_number=1, timestamp=time.time(), camera_id="test_cam"
         )
-        result = pipeline._process_frame_inner(frame_data, dark_frame, time.monotonic(), diag)
+        pipeline._process_frame_inner(frame_data, dark_frame, time.monotonic(), diag)
 
         # Detector should have been called (frame wasn't blocked by MOG2)
         mock_det.predict.assert_called_once()

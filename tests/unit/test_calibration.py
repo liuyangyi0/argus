@@ -1,11 +1,10 @@
 """Tests for conformal prediction score calibration."""
 
-import json
 
 import numpy as np
 import pytest
 
-from argus.alerts.calibration import CalibrationResult, ConformalCalibrator
+from argus.alerts.calibration import ConformalCalibrator
 
 
 class TestConformalCalibrator:
@@ -31,7 +30,6 @@ class TestConformalCalibrator:
 
     def test_threshold_ordering_guaranteed(self):
         """任何 score 分布 → info <= low <= medium <= high。"""
-        rng = np.random.default_rng(123)
         # Pathological distribution: all same value
         scores = np.full(100, 0.5)
         calibrator = ConformalCalibrator()

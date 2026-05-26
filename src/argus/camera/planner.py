@@ -35,6 +35,7 @@ class CameraRuntimePlanner:
         protocol = str(config.protocol or "rtsp")
 
         stream = cls._go2rtc_stream(
+            config=config,
             camera_id=camera_id,
             source=source,
             protocol=protocol,
@@ -68,6 +69,7 @@ class CameraRuntimePlanner:
     def _go2rtc_stream(
         cls,
         *,
+        config: CameraConfig,
         camera_id: str,
         source: str,
         protocol: str,
@@ -86,9 +88,17 @@ class CameraRuntimePlanner:
                 registration="rest_api",
             )
         if protocol == "usb":
+            usb_cfg = config.usb
             return Go2RTCStreamSpec(
                 name=camera_id,
-                source=usb_to_go2rtc_source(source),
+                source=usb_to_go2rtc_source(
+                    source,
+                    device_name=usb_cfg.device_name,
+                    device_id=usb_cfg.device_id,
+                    resolution=config.resolution,
+                    fps=config.fps_target,
+                    pixel_format=usb_cfg.pixel_format,
+                ),
                 source_protocol=protocol,
                 runtime_rtsp_url=runtime_rtsp_url,
                 registration="rest_api",

@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 
 import structlog
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from argus.core.model_discovery import resolve_runtime_model_path
@@ -36,6 +36,28 @@ def _deny_without_permission(request: Request, permission: str):
     return api_forbidden("权限不足")
 
 
+async def _parse_form_or_json(request: Request) -> dict:
+    content_type = request.headers.get("content-type", "")
+    mime_type = content_type.split(";", 1)[0].strip().lower()
+    if mime_type == "application/json":
+        try:
+            payload = await request.json()
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+    return dict(await parse_request_form(request))
+
+
+def _has_value(data: dict, key: str) -> bool:
+    return key in data and data.get(key) not in (None, "")
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class ThresholdUpdateRequest(BaseModel):
     anomaly_threshold: float | None = None
     info_threshold: float | None = None
@@ -51,7 +73,7 @@ class ModelReloadRequest(BaseModel):
 
 @router.post("/detection-params")
 async def update_detection_params(request: Request):
-    """Update detection parameters from form."""
+    """Update detection parameters from JSON or form data."""
     denied = _deny_without_permission(request, "edit_config")
     if denied:
         return denied
@@ -61,40 +83,43 @@ async def update_detection_params(request: Request):
     if not config or not camera_manager:
         return api_unavailable("不可用")
 
-    form = await parse_request_form(request)
+    form = await _parse_form_or_json(request)
 
     # Update severity thresholds
     try:
         st = config.alerts.severity_thresholds
-        if form.get("sev_info"):
+        if _has_value(form, "sev_info"):
             st.info = float(form["sev_info"])
-        if form.get("sev_low"):
+        if _has_value(form, "sev_low"):
             st.low = float(form["sev_low"])
-        if form.get("sev_medium"):
+        if _has_value(form, "sev_medium"):
             st.medium = float(form["sev_medium"])
-        if form.get("sev_high"):
+        if _has_value(form, "sev_high"):
             st.high = float(form["sev_high"])
     except (ValueError, Exception) as e:
         return api_validation_error(f"阈值参数无效: {e}")
 
     # Update temporal
     temp = config.alerts.temporal
-    if form.get("temp_gap"):
+    if _has_value(form, "temp_gap"):
         temp.max_gap_seconds = float(form["temp_gap"])
-    if form.get("temp_overlap"):
+    if _has_value(form, "temp_overlap"):
         temp.min_spatial_overlap = float(form["temp_overlap"])
 
     # Update suppression
     supp = config.alerts.suppression
-    if form.get("supp_zone"):
+    if _has_value(form, "supp_zone"):
         supp.same_zone_window_seconds = float(form["supp_zone"])
 
     # Determine which sections changed so we can tell the pipelines to
     # refresh their derived caches AND tell the UI which knobs took effect.
-    severity_changed = any(form.get(k) for k in ("sev_info", "sev_low", "sev_medium", "sev_high"))
-    temporal_changed = any(form.get(k) for k in ("temp_gap", "temp_overlap"))
-    suppression_changed = bool(form.get("supp_zone"))
-    anomaly_threshold = float(form["anomaly_threshold"]) if form.get("anomaly_threshold") else None
+    severity_changed = any(
+        _has_value(form, k)
+        for k in ("sev_info", "sev_low", "sev_medium", "sev_high")
+    )
+    temporal_changed = any(_has_value(form, k) for k in ("temp_gap", "temp_overlap"))
+    suppression_changed = _has_value(form, "supp_zone")
+    anomaly_threshold = float(form["anomaly_threshold"]) if _has_value(form, "anomaly_threshold") else None
 
     # Apply to pipelines
     updated = 0
@@ -159,14 +184,14 @@ async def update_notifications(request: Request):
     if not config:
         return api_unavailable("不可用")
 
-    form = await parse_request_form(request)
+    form = await _parse_form_or_json(request)
 
     # Webhook settings
     webhook = config.alerts.webhook
     if "webhook_enabled" in form:
-        webhook.enabled = form["webhook_enabled"] == "true"
+        webhook.enabled = _as_bool(form["webhook_enabled"])
     if "webhook_url" in form:
-        webhook.url = form["webhook_url"]
+        webhook.url = str(form["webhook_url"])
     if "webhook_timeout" in form:
         webhook.timeout = float(form["webhook_timeout"])
 
@@ -1074,6 +1099,9 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
         return denied
 
     config = request.app.state.config
+    if not config:
+        return api_unavailable("配置不可用")
+
     parts = req.key.split(".")
     if len(parts) != 2:
         from argus.dashboard.api_response import api_validation_error
@@ -1099,6 +1127,8 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
     }
     restart_required = False
     hot_reloaded = 0
+    hot_reload_failed = 0
+    pipelines_seen = 0
 
     if req.key in _hot_reloadable_keys:
         camera_manager = getattr(request.app.state, "camera_manager", None)
@@ -1106,11 +1136,16 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
             for cam_config in getattr(config, "cameras", []):
                 pipeline = camera_manager.get_pipeline(cam_config.camera_id)
                 if pipeline is not None:
+                    pipelines_seen += 1
                     try:
-                        pipeline.reload_module(req.key, req.value)
-                        hot_reloaded += 1
+                        if pipeline.reload_module(req.key, req.value):
+                            hot_reloaded += 1
+                        else:
+                            hot_reload_failed += 1
                     except Exception as e:
+                        hot_reload_failed += 1
                         logger.warning("config.hot_reload_failed", camera_id=cam_config.camera_id, error=str(e))
+            restart_required = pipelines_seen > 0 and hot_reloaded < pipelines_seen
     else:
         # These still need restart (no hot-reload path yet)
         _restart_required_keys = {
@@ -1139,6 +1174,8 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
         value=req.value,
         restart_required=restart_required,
         hot_reloaded=hot_reloaded,
+        hot_reload_failed=hot_reload_failed,
+        pipelines_seen=pipelines_seen,
         persisted=persisted,
     )
     return api_success({
@@ -1146,4 +1183,8 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
         "value": req.value,
         "restart_required": restart_required,
         "hot_reloaded": hot_reloaded,
+        "hot_reloadable": req.key in _hot_reloadable_keys,
+        "hot_reload_failed": hot_reload_failed,
+        "pipelines_seen": pipelines_seen,
+        "persisted": persisted,
     })

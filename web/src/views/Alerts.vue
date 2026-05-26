@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 
 import { useAlertStore } from '../stores/useAlertStore'
 import { useWebSocket } from '../composables/useWebSocket'
+import { getAlert } from '../api/alerts'
 import AlertsToolbar from '../components/alerts/AlertsToolbar.vue'
 import AlertsTable from '../components/alerts/AlertsTable.vue'
 import AlertDetailPanel from '../components/alerts/AlertDetailPanel.vue'
@@ -25,11 +26,51 @@ const hasLoadedOnce = ref(false)
 const showSkeleton = computed(() => !hasLoadedOnce.value && storeLoading.value)
 
 const fetchData = () => store.fetchData()
+const selectedIndex = ref(-1)
+let routeSelectionSeq = 0
+
+function routeAlertId(): string {
+  return typeof route.query.id === 'string' ? route.query.id : ''
+}
+
+async function selectAlertById(
+  alertId: string,
+  options: { fetchMissing?: boolean } = {},
+) {
+  if (!alertId) return
+  const fetchMissing = options.fetchMissing ?? true
+  const seq = ++routeSelectionSeq
+  const existing = alerts.value.find(a => a.alert_id === alertId)
+  if (existing) {
+    showDetail(existing)
+    return
+  }
+  if (!fetchMissing) return
+  try {
+    const detail = await getAlert(alertId)
+    if (seq !== routeSelectionSeq || routeAlertId() !== alertId) return
+    selectedAlert.value = detail
+    selectedIndex.value = -1
+  } catch {
+    if (seq === routeSelectionSeq) {
+      selectedAlert.value = null
+      selectedIndex.value = -1
+    }
+  }
+}
+
+function syncRouteSelectionAfterListChange() {
+  const id = routeAlertId()
+  if (!id || selectedAlert.value?.alert_id === id) return
+  void selectAlertById(id, { fetchMissing: false })
+}
 
 useWebSocket({
   topics: ['alerts'],
   onMessage(topic, data) {
-    if (topic === 'alerts') store.updateFromWebSocket(data)
+    if (topic !== 'alerts') return
+    store.updateFromWebSocket(data)
+    syncRouteSelectionAfterListChange()
   },
   fallbackPoll: fetchData,
   fallbackInterval: 15000,
@@ -50,7 +91,6 @@ function closeDetail() {
 
 // Keyboard navigation — lives at the page level so arrow keys work from
 // anywhere in the layout, not just when the table has focus.
-const selectedIndex = ref(-1)
 
 function handleKeydown(e: KeyboardEvent) {
   if (!alerts.value.length) return
@@ -71,11 +111,18 @@ onMounted(async () => {
   await fetchData()
   hasLoadedOnce.value = true
   // Support URL query: ?id=xxx to auto-open alert detail
-  if (route.query.id) {
-    const target = alerts.value.find(a => a.alert_id === route.query.id)
-    if (target) showDetail(target)
-  }
+  await selectAlertById(routeAlertId())
   document.addEventListener('keydown', handleKeydown)
+})
+
+watch(() => route.query.id, (id) => {
+  const alertId = typeof id === 'string' ? id : ''
+  if (alertId) {
+    void selectAlertById(alertId)
+  } else if (selectedAlert.value) {
+    selectedAlert.value = null
+    selectedIndex.value = -1
+  }
 })
 
 onUnmounted(() => {

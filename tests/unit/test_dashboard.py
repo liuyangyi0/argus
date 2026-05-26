@@ -23,6 +23,7 @@ from argus.dashboard.auth import create_session_token
 from argus.dashboard.app import _mount_vue_spa, create_app
 from argus.dashboard.routes.baseline import _train_model_task
 from argus.dashboard.routes.alerts import _generate_composite, _is_safe_path
+from argus.streaming.go2rtc_manager import usb_to_go2rtc_source
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.database import Database
 from argus.storage.models import ModelVersionEvent
@@ -57,6 +58,54 @@ def client(db, health, alerts_dir):
 
 
 class TestDashboardPages:
+    def test_core_business_routes_fallback_to_vue_spa(self, tmp_path):
+        """Every dashboard route in the operator loop must serve the SPA shell."""
+        vue_dist = tmp_path / "dist"
+        assets = vue_dist / "assets"
+        assets.mkdir(parents=True)
+        (vue_dist / "index.html").write_text(
+            '<!doctype html><div id="app"></div><script src="/assets/app.js"></script>',
+            encoding="utf-8",
+        )
+        (assets / "app.js").write_text("console.log('argus')", encoding="utf-8")
+
+        app = FastAPI()
+        _mount_vue_spa(app, vue_dist)
+        client = TestClient(app)
+
+        for path in [
+            "/cameras",
+            "/alerts",
+            "/replay/ALT-smoke",
+            "/replay/ALT-smoke/storyboard",
+            "/models/baseline",
+            "/models/training",
+            "/models/registry",
+            "/system/overview",
+            "/system/config",
+            "/system/degradation",
+            "/reports",
+        ]:
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert '<div id="app">' in response.text, path
+            assert "text/html" in response.headers["content-type"], path
+
+    def test_spa_fallback_does_not_swallow_api_or_ws_misses(self, tmp_path):
+        """Unknown API/WS paths should 404 instead of returning index.html."""
+        vue_dist = tmp_path / "dist"
+        vue_dist.mkdir()
+        (vue_dist / "index.html").write_text('<div id="app"></div>', encoding="utf-8")
+
+        app = FastAPI()
+        _mount_vue_spa(app, vue_dist)
+        client = TestClient(app)
+
+        for path in ["/api/not-a-route", "/ws/not-a-route"]:
+            response = client.get(path)
+            assert response.status_code == 404, path
+            assert "<div id=\"app\">" not in response.text, path
+
     def test_vue_spa_mount_tolerates_missing_assets_dir(self, tmp_path):
         """A partial web/dist should not break backend startup."""
         vue_dist = tmp_path / "dist"
@@ -649,6 +698,73 @@ class TestCameraControlRoutes:
         assert calls[0][0] == camera_manager.stop_camera
         assert calls[0][1] == ("cam_01",)
 
+    def test_set_camera_mode_switches_running_pipeline(self, db, health, alerts_dir, monkeypatch):
+        """Camera mode route should expose ACTIVE/LEARNING/MAINTENANCE control."""
+        from argus.core.pipeline import PipelineMode
+
+        camera_manager = MagicMock()
+        camera_manager.get_pipeline_mode.return_value = "learning"
+        calls = []
+
+        async def fake_to_thread(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            return True
+
+        monkeypatch.setattr("argus.dashboard.routes.cameras.asyncio.to_thread", fake_to_thread)
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/cameras/cam_01/mode", json={"mode": "active"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["code"] == 0
+        assert body["data"] == {
+            "camera_id": "cam_01",
+            "previous_mode": "learning",
+            "pipeline_mode": "active",
+        }
+        assert calls[0][0] == camera_manager.set_pipeline_mode
+        assert calls[0][1] == ("cam_01", PipelineMode.ACTIVE)
+
+    def test_set_camera_mode_rejects_invalid_mode(self, db, health, alerts_dir):
+        camera_manager = MagicMock()
+        camera_manager.get_pipeline_mode.return_value = "learning"
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/cameras/cam_01/mode", json={"mode": "bad"})
+
+        assert response.status_code == 400
+        camera_manager.set_pipeline_mode.assert_not_called()
+
+    def test_set_camera_mode_requires_running_pipeline(self, db, health, alerts_dir):
+        camera_manager = MagicMock()
+        camera_manager.get_pipeline_mode.return_value = None
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/cameras/cam_01/mode", json={"mode": "active"})
+
+        assert response.status_code == 404
+        camera_manager.set_pipeline_mode.assert_not_called()
+
     def test_config_endpoint_keeps_original_usb_source_after_stream_registration(
         self, db, health, alerts_dir,
     ):
@@ -684,7 +800,16 @@ class TestCameraControlRoutes:
         payload = config_resp.json()["data"]
         assert payload["source"] == "0"
         assert payload["protocol"] == "usb"
-        go2rtc.register_camera.assert_called_with("usb_cam", "0", "usb")
+        go2rtc.register_camera.assert_called_with(
+            "usb_cam",
+            usb_to_go2rtc_source(
+                "0",
+                resolution=camera_config.resolution,
+                fps=camera_config.fps_target,
+                pixel_format=camera_config.usb.pixel_format,
+            ),
+            "rtsp",
+        )
 
     def test_delete_camera_removes_go2rtc_stream_from_app_state(
         self, db, health, alerts_dir,
@@ -883,6 +1008,8 @@ class TestModelPublishRoutes:
         data = payload["data"]
         assert data["activated"] == version_id
         assert data["runtime_synced"] is True
+        assert data["runtime_state"] == "applied"
+        assert data["model"]["model_version_id"] == version_id
         camera_manager.reload_model.assert_called_once_with(
             "cam_01",
             str(model_dir / "model.xml"),
@@ -1594,6 +1721,100 @@ class TestPathSafety:
         safe_root.mkdir()
         traversal = str(safe_root / ".." / "secret.txt")
         assert _is_safe_path(traversal, safe_root) is False
+
+
+class TestModuleToggleRoutes:
+    def test_toggle_reports_partial_hot_reload_and_persistence(
+        self, db, health, alerts_dir,
+    ):
+        config = ArgusConfig()
+        config.cameras = [
+            SimpleNamespace(camera_id="cam_a"),
+            SimpleNamespace(camera_id="cam_b"),
+        ]
+        config.classifier.enabled = False
+
+        pipe_a = MagicMock()
+        pipe_a.reload_module.return_value = True
+        pipe_b = MagicMock()
+        pipe_b.reload_module.return_value = False
+        camera_manager = MagicMock()
+        camera_manager.get_pipeline.side_effect = {
+            "cam_a": pipe_a,
+            "cam_b": pipe_b,
+        }.get
+
+        app = create_app(
+            database=db,
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=config,
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/config/modules",
+            json={"key": "classifier.enabled", "value": True},
+        )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["value"] is True
+        assert data["hot_reloadable"] is True
+        assert data["pipelines_seen"] == 2
+        assert data["hot_reloaded"] == 1
+        assert data["hot_reload_failed"] == 1
+        assert data["restart_required"] is True
+        assert data["persisted"] is False
+        assert config.classifier.enabled is True
+        pipe_a.reload_module.assert_called_once_with("classifier.enabled", True)
+        pipe_b.reload_module.assert_called_once_with("classifier.enabled", True)
+
+    def test_toggle_without_config_returns_unavailable(self, db, health, alerts_dir):
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+        app.state.config = None
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/config/modules",
+            json={"key": "classifier.enabled", "value": True},
+        )
+
+        assert response.status_code == 503
+        assert "配置" in response.json()["msg"]
+
+
+class TestGlobalDegradationWiring:
+    def test_create_app_wires_health_monitor_to_degradation_manager(
+        self, db, health, alerts_dir,
+    ):
+        assert getattr(health, "_degradation_manager", None) is None
+
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+        client = TestClient(app)
+
+        assert health._degradation_manager is app.state.degradation_manager
+
+        health.update_camera("cam_01", connected=True)
+        health.update_camera(
+            "cam_01",
+            connected=False,
+            reconnect_count=2,
+            error="rtsp timeout",
+        )
+
+        summary = client.get("/api/degradation/summary")
+        assert summary.status_code == 200
+        data = summary.json()["data"]
+        assert data["active_count"] == 1
+        assert data["max_level"] == "warning"
+        assert data["events"][0]["category"] == "rtsp_broken"
+        assert data["events"][0]["camera_id"] == "cam_01"
+
+        health.update_camera("cam_01", connected=True)
+        resolved = client.get("/api/degradation/summary").json()["data"]
+        assert resolved["active_count"] == 0
 
 
 class TestClassifierConfigRoutes:

@@ -155,6 +155,8 @@ class AlertDispatcher:
             payload["speed_px_per_sec"] = alert.speed_px_per_sec
         if alert.trajectory_model is not None:
             payload["trajectory_model"] = alert.trajectory_model
+        if getattr(alert, "category", None):
+            payload["category"] = alert.category
         if alert.origin_x_mm is not None:
             payload["origin_x_mm"] = alert.origin_x_mm
         if alert.origin_y_mm is not None:
@@ -174,6 +176,11 @@ class AlertDispatcher:
                 payload["trajectories"] = _json.loads(trajectories_json)
             except Exception:
                 pass
+        if alert.trajectory_points:
+            payload["trajectory_points"] = [
+                {"t": round(t, 4), "x": round(x, 1), "y": round(y, 1)}
+                for t, x, y in alert.trajectory_points
+            ]
         return payload
 
     def set_websocket_broadcaster(self, broadcaster: Callable[[str, dict], None] | None) -> None:

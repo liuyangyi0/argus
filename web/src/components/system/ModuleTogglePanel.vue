@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { message } from 'ant-design-vue'
-import axios from 'axios'
+import { getModuleStates, toggleModule as updateModuleToggle } from '../../api'
+import { extractErrorMessage } from '../../utils/error'
+import { notifyModuleToggleResult } from '../../utils/moduleToggleFeedback'
 
 interface ModuleToggle {
   key: string
@@ -65,8 +67,7 @@ const loading = ref(false)
 
 async function loadConfig() {
   try {
-    const res = await axios.get('/api/config/modules')
-    const states = res.data?.data || res.data
+    const states = await getModuleStates()
     for (const mod of modules.value) {
       if (mod.key in states && typeof states[mod.key] === 'boolean') {
         mod.enabled = states[mod.key]
@@ -80,23 +81,11 @@ async function loadConfig() {
 async function toggleModule(mod: ModuleToggle) {
   loading.value = true
   try {
-    const res = await axios.post('/api/config/modules', {
-      key: mod.key,
-      value: mod.enabled,
-    })
-    const data = res.data?.data
-    const restart = data?.restart_required
-    const reloaded = data?.hot_reloaded ?? 0
-    if (restart) {
-      message.warning(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}（已运行的摄像头管线需要重启才会生效）`)
-    } else if (reloaded > 0) {
-      message.success(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}（${reloaded} 个管线已热加载）`)
-    } else {
-      message.success(`${mod.label} ${mod.enabled ? '已启用' : '已关闭'}`)
-    }
-  } catch {
+    const result = await updateModuleToggle(mod.key, mod.enabled)
+    notifyModuleToggleResult(mod.label, mod.enabled, result)
+  } catch (e) {
     mod.enabled = !mod.enabled
-    message.error(`${mod.label} 切换失败`)
+    message.error(extractErrorMessage(e, `${mod.label} 切换失败`))
   } finally {
     loading.value = false
   }

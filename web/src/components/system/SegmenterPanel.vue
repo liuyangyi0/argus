@@ -16,6 +16,7 @@ import {
   type SegmenterConfigPayload,
 } from '../../api'
 import { extractErrorMessage } from '../../utils/error'
+import { notifyModuleToggleResult } from '../../utils/moduleToggleFeedback'
 
 defineOptions({ name: 'SegmenterPanel' })
 
@@ -118,11 +119,9 @@ async function handleToggle(checked: string | number | boolean) {
   const next = Boolean(checked)
   toggling.value = true
   try {
-    await toggleModule('segmenter.enabled', next)
+    const result = await toggleModule('segmenter.enabled', next)
     cfg.value.enabled = next
-    message.success(next
-      ? '分割器已启用（已运行的摄像头需要重启才会生效）'
-      : '分割器已关闭')
+    notifyModuleToggleResult('分割器', next, result)
     await load()
   } catch (e) {
     message.error(extractErrorMessage(e, '切换失败'))
