@@ -673,6 +673,51 @@ def _usb_device_selection_report(
     usb_devices: dict[str, Any] | None,
     dshow_devices: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    def _matches(
+        device: dict[str, Any],
+        *,
+        device_id: str | None,
+        device_name: str | None,
+        id_fields: tuple[str, ...],
+        name_fields: tuple[str, ...],
+    ) -> bool:
+        if device_id:
+            token = str(device_id).lower()
+            for field in id_fields:
+                value = str(device.get(field) or "").lower()
+                if value and (token in value or value in token):
+                    return True
+        if device_name:
+            token = str(device_name).lower()
+            for field in name_fields:
+                value = str(device.get(field) or "").lower()
+                if value and (token == value or token in value):
+                    return True
+        return False
+
+    def _select_match(
+        devices: list[dict[str, Any]],
+        *,
+        device_id: str | None,
+        device_name: str | None,
+        id_fields: tuple[str, ...],
+        name_fields: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        matches = [
+            device for device in devices
+            if _matches(
+                device,
+                device_id=device_id,
+                device_name=device_name,
+                id_fields=id_fields,
+                name_fields=name_fields,
+            )
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: str(item.get("status") or "").lower() != "ok")
+        return matches[0]
+
     report: dict[str, Any] = {
         "configured_source": source,
         "configured_device_name": getattr(usb_cfg, "device_name", None),
@@ -683,8 +728,33 @@ def _usb_device_selection_report(
         "selected_dshow_device": None,
         "warnings": [],
     }
+    pnp_devices = (usb_devices or {}).get("devices") or []
+    dshow_video_devices = [
+        device
+        for device in (dshow_devices or {}).get("devices") or []
+        if device.get("kind") == "video"
+    ]
     if report["configured_device_id"] or report["configured_device_name"]:
         report["selection_mode"] = "explicit_device_id_or_name"
+        report["selected_pnp_device"] = _select_match(
+            pnp_devices,
+            device_id=report["configured_device_id"],
+            device_name=report["configured_device_name"],
+            id_fields=("device_id",),
+            name_fields=("name",),
+        )
+        report["selected_dshow_device"] = _select_match(
+            dshow_video_devices,
+            device_id=report["configured_device_id"],
+            device_name=report["configured_device_name"],
+            id_fields=("alternative_name",),
+            name_fields=("name",),
+        )
+        if report["selected_pnp_device"] is None and report["selected_dshow_device"] is None:
+            report["warnings"].append(
+                "usb.device_name or usb.device_id was configured, but no inspected "
+                "USB camera inventory entry matched it."
+            )
         return report
 
     report["selection_mode"] = "numeric_index" if report["source_is_numeric_index"] else "source_string"
@@ -692,15 +762,9 @@ def _usb_device_selection_report(
         return report
 
     index = int(report["index"])
-    pnp_devices = (usb_devices or {}).get("devices") or []
     if 0 <= index < len(pnp_devices):
         report["selected_pnp_device"] = pnp_devices[index]
 
-    dshow_video_devices = [
-        device
-        for device in (dshow_devices or {}).get("devices") or []
-        if device.get("kind") == "video"
-    ]
     if 0 <= index < len(dshow_video_devices):
         report["selected_dshow_device"] = dshow_video_devices[index]
 

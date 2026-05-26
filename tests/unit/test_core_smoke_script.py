@@ -491,6 +491,84 @@ def test_run_preflight_reports_numeric_usb_index_mapping(monkeypatch, tmp_path):
     assert any("usb.device_name" in hint for hint in result["hints"])
 
 
+def test_run_preflight_reports_explicit_usb_device_name_match(monkeypatch, tmp_path):
+    def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
+        return {
+            "ok": True,
+            "source": source,
+            "protocol": protocol,
+            "backend": "fake",
+            "shape": [1080, 1920, 3],
+            "measured_fps": 60.0,
+            "attempts": [],
+        }
+
+    monkeypatch.setattr("scripts.smoke_core_loop._probe_capture_source", fake_probe)
+    monkeypatch.setattr(
+        "scripts.smoke_core_loop._inspect_usb_video_devices",
+        lambda timeout_s: {
+            "platform": "Windows",
+            "supported": True,
+            "source": "PnpDevice",
+            "devices": [
+                {
+                    "name": "OBSBOT Meet 2 StreamCamera",
+                    "status": "Unknown",
+                    "device_id": "USB\\VID_3564&PID_FEFB\\OLD",
+                },
+                {
+                    "name": "OBSBOT Meet 2 StreamCamera",
+                    "status": "OK",
+                    "device_id": "USB\\VID_3564&PID_FEFB\\CURRENT",
+                },
+            ],
+            "device_count": 2,
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.smoke_core_loop._inspect_windows_camera_privacy",
+        lambda timeout_s: {"platform": "Windows", "supported": True, "entries": []},
+    )
+    monkeypatch.setattr(
+        "scripts.smoke_core_loop._inspect_windows_dshow_devices",
+        lambda timeout_s: {
+            "platform": "Windows",
+            "supported": True,
+            "devices": [
+                {
+                    "name": "OBSBOT Meet 2 StreamCamera",
+                    "kind": "video",
+                    "alternative_name": "@device_pnp_usb_vid_3564_pid_fefb",
+                }
+            ],
+            "video_device_count": 1,
+        },
+    )
+    args = parse_args([
+        "--preflight",
+        "--work-dir",
+        str(tmp_path),
+        "--camera-source",
+        "0",
+        "--camera-protocol",
+        "usb",
+        "--usb-device-name",
+        "OBSBOT Meet 2 StreamCamera",
+        "--disable-go2rtc",
+    ])
+
+    result = run_preflight(args)
+
+    selection = result["camera_input"]["usb_selection"]
+    assert result["ok"] is True
+    assert selection["selection_mode"] == "explicit_device_id_or_name"
+    assert selection["selected_pnp_device"]["device_id"].endswith("CURRENT")
+    assert selection["selected_dshow_device"]["alternative_name"] == (
+        "@device_pnp_usb_vid_3564_pid_fefb"
+    )
+    assert selection["warnings"] == []
+
+
 def test_run_preflight_reports_capture_failure(monkeypatch, tmp_path):
     def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
         return {
