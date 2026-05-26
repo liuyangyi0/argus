@@ -60,7 +60,7 @@ def _should_continue_main_loop(
     return running and (manager.is_running or _dashboard_thread_alive(dashboard_thread))
 
 
-def _apply_dev_video_source(config, cameras, video_path: Path):
+def _apply_dev_video_source(config, cameras, video_path: Path, motion: str = "settle"):
     """Switch selected cameras to a deterministic local file source."""
 
     if not cameras:
@@ -78,7 +78,7 @@ def _apply_dev_video_source(config, cameras, video_path: Path):
         fps=fps,
         seconds=20,
         anomaly_start_s=6.0,
-        motion="settle",
+        motion=motion,
     )
 
     selected_ids = {camera.camera_id for camera in cameras}
@@ -106,6 +106,7 @@ def _apply_dev_video_source(config, cameras, video_path: Path):
         height=meta["height"],
         fps=meta["fps"],
         frames=meta["frames"],
+        motion=meta["motion"],
     )
     return [updated_by_id[camera.camera_id] for camera in cameras]
 
@@ -144,6 +145,15 @@ def main():
         type=Path,
         default=Path("data/dev/demo_camera.avi"),
         help="Path for --dev-video output (default: data/dev/demo_camera.avi)",
+    )
+    parser.add_argument(
+        "--dev-video-motion",
+        choices=("settle", "moving", "book"),
+        default="settle",
+        help=(
+            "Generated --dev-video anomaly pattern. Use book to simulate a book "
+            "being placed on an empty table."
+        ),
     )
     parser.add_argument(
         "--dev-fast-training",
@@ -192,6 +202,7 @@ def main():
                 config,
                 cameras,
                 args.dev_video_path,
+                args.dev_video_motion,
             )
         except Exception as exc:
             print(f"Error: Failed to prepare dev video source: {exc}", file=sys.stderr)

@@ -7,6 +7,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+DEV_VIDEO_MOTIONS = ("settle", "moving", "book")
+
 
 def _base_frame(width: int, height: int) -> np.ndarray:
     frame = np.full((height, width, 3), 118, dtype=np.uint8)
@@ -27,6 +29,57 @@ def _base_frame(width: int, height: int) -> np.ndarray:
     return frame
 
 
+def _draw_foreign_object(frame: np.ndarray, x: int, y: int) -> None:
+    cv2.rectangle(frame, (x, y), (x + 70, y + 52), (0, 0, 255), -1)
+    cv2.rectangle(frame, (x, y), (x + 70, y + 52), (255, 255, 255), 2)
+    cv2.putText(
+        frame,
+        "FOE",
+        (x + 16, y + 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_book(frame: np.ndarray, x: int, y: int, width: int, height: int) -> None:
+    cover = (82, 52, 26)
+    edge = (28, 24, 20)
+    pages = (220, 214, 190)
+    accent = (35, 85, 165)
+
+    cv2.rectangle(frame, (x, y), (x + width, y + height), cover, -1)
+    cv2.rectangle(frame, (x, y), (x + width, y + height), edge, 2)
+    cv2.rectangle(
+        frame,
+        (x + max(3, width // 16), y + max(3, height // 12)),
+        (x + width - max(5, width // 10), y + height - max(4, height // 10)),
+        pages,
+        -1,
+    )
+    spine_w = max(7, width // 7)
+    cv2.rectangle(frame, (x, y), (x + spine_w, y + height), accent, -1)
+    cv2.line(
+        frame,
+        (x + width // 2, y + max(5, height // 9)),
+        (x + width // 2, y + height - max(5, height // 9)),
+        (170, 160, 135),
+        1,
+    )
+    cv2.putText(
+        frame,
+        "BOOK",
+        (x + spine_w + max(5, width // 16), y + height // 2 + max(4, height // 12)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.35, min(0.7, width / 150.0)),
+        edge,
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def create_dev_video(
     output: Path,
     *,
@@ -43,8 +96,9 @@ def create_dev_video(
         raise ValueError("width and height must be positive")
     if fps <= 0 or seconds <= 0:
         raise ValueError("fps and seconds must be positive")
-    if motion not in {"settle", "moving"}:
-        raise ValueError("motion must be 'settle' or 'moving'")
+    if motion not in DEV_VIDEO_MOTIONS:
+        allowed = "', '".join(DEV_VIDEO_MOTIONS)
+        raise ValueError(f"motion must be one of '{allowed}'")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"MJPG")
@@ -65,6 +119,17 @@ def create_dev_video(
                     span = max(width - 170, 1)
                     x = 60 + (t * 9) % span
                     y = height // 2 - 36 + int(18 * np.sin(t / 8.0))
+                    _draw_foreign_object(frame, x, y)
+                elif motion == "book":
+                    book_w = max(42, min(128, width // 4))
+                    book_h = max(30, int(book_w * 0.68))
+                    settle_frames = max(fps, 1)
+                    target_x = max(12, min(width - book_w - 12, width // 2 - book_w // 2))
+                    target_y = max(12, min(height - book_h - 18, height // 2 - book_h // 2))
+                    start_y = max(0, target_y - max(18, height // 5))
+                    ease = min(1.0, t / settle_frames)
+                    y = int(start_y + (target_y - start_y) * ease)
+                    _draw_book(frame, target_x, y, book_w, book_h)
                 else:
                     settle_frames = max(fps, 1)
                     start_x = 60
@@ -72,18 +137,7 @@ def create_dev_video(
                     ease = min(1.0, t / settle_frames)
                     x = int(start_x + (target_x - start_x) * ease)
                     y = height // 2 - 36
-                cv2.rectangle(frame, (x, y), (x + 70, y + 52), (0, 0, 255), -1)
-                cv2.rectangle(frame, (x, y), (x + 70, y + 52), (255, 255, 255), 2)
-                cv2.putText(
-                    frame,
-                    "FOE",
-                    (x + 16, y + 34),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
+                    _draw_foreign_object(frame, x, y)
             writer.write(frame)
     finally:
         writer.release()

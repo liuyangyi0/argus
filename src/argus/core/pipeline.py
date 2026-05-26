@@ -376,6 +376,8 @@ class DetectionPipeline:
                 max_area_px=fast_cfg.max_area_px,
                 min_streak_length_px=fast_cfg.min_streak_length_px,
                 min_confidence=fast_cfg.min_confidence,
+                max_motion_fraction=fast_cfg.max_motion_fraction,
+                max_streak_frame_fraction=fast_cfg.max_streak_frame_fraction,
                 max_candidates_per_frame=fast_cfg.max_candidates_per_frame,
                 fps_hint=camera_config.fps_target,
             )
@@ -2908,6 +2910,8 @@ class DetectionPipeline:
                     PipelineMode.MAINTENANCE,
                 ),
                 "process_width": fast_cfg.process_width,
+                "max_motion_fraction": fast_cfg.max_motion_fraction,
+                "max_streak_frame_fraction": fast_cfg.max_streak_frame_fraction,
                 "min_runtime_fps": fast_cfg.min_runtime_fps,
                 "required_resolution": tuple(fast_cfg.required_resolution),
                 "current_fps": runtime_fps,

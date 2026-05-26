@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
-from sqlalchemy import create_engine, func as sa_func, select, text, update
+from sqlalchemy import create_engine, func as sa_func, inspect as sa_inspect, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from argus.storage.models import (
@@ -197,10 +197,14 @@ class Database:
         if not _DROP_TABLES:
             return
         with self._engine.connect() as conn:
+            existing_tables = set(sa_inspect(conn).get_table_names())
             for table in _DROP_TABLES:
+                if table not in existing_tables:
+                    continue
                 try:
                     conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
                     conn.commit()
+                    existing_tables.discard(table)
                     logger.info("database.dropped_deprecated_table", table=table)
                 except Exception as e:
                     logger.warning(
@@ -220,10 +224,19 @@ class Database:
         """
         migrations = list(_AUTO_MIGRATIONS)
         with self._engine.connect() as conn:
+            inspector = sa_inspect(conn)
+            existing_columns_by_table: dict[str, set[str]] = {}
             for table, column, col_type in migrations:
+                existing_columns = existing_columns_by_table.get(table)
+                if existing_columns is None:
+                    existing_columns = {item["name"] for item in inspector.get_columns(table)}
+                    existing_columns_by_table[table] = existing_columns
+                if column in existing_columns:
+                    continue
                 try:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
                     conn.commit()
+                    existing_columns.add(column)
                     logger.info("database.migration", table=table, column=column)
                 except Exception as e:
                     err_msg = str(e).lower()

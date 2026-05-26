@@ -20,7 +20,10 @@ from scripts.smoke_dashboard_business_flow import (
     _prepare_runtime_config,
     _seed_model_registry,
     _seed_training_baselines,
+    _verify_business_apis,
+    _verify_dev_video_alert_semantics,
     _verify_system_degradation_apis,
+    _wait_for,
     _wait_for_completed_alert,
     _websocket_url,
     parse_args,
@@ -50,6 +53,7 @@ def test_prepare_runtime_config_redirects_writable_paths(tmp_path):
     assert config.storage.baselines_dir == tmp_path / "baselines"
     assert config.logging.log_dir == tmp_path / "logs"
     assert "missing-yolo.pt" in config.cameras[0].person_filter.model_name
+    assert config.alerts.severity_thresholds.low == pytest.approx(0.55)
 
 
 def test_prepare_runtime_config_can_use_usb_source_with_go2rtc(monkeypatch, tmp_path):
@@ -162,23 +166,27 @@ def test_parse_args_accepts_preflight_mode():
         "--camera-source", "0",
         "--camera-protocol", "usb",
         "--preflight-timeout", "1.5",
+        "--preflight-measure-seconds", "4.5",
         "--browser", "off",
     ])
 
     assert args.preflight is True
     assert args.preflight_timeout == 1.5
+    assert args.preflight_measure_seconds == 4.5
 
 
 def test_parse_args_accepts_local_rtsp_fixture():
     args = parse_args([
         "--rtsp-fixture",
         "--rtsp-fixture-seconds", "60",
+        "--dev-video-motion", "book",
         "--require-go2rtc",
         "--browser", "off",
     ])
 
     assert args.rtsp_fixture is True
     assert args.rtsp_fixture_seconds == 60
+    assert args.dev_video_motion == "book"
     assert args.require_go2rtc is True
     assert args.recording_timeout == 90.0
 
@@ -243,6 +251,50 @@ def test_wait_for_completed_alert_timeout_reports_last_evidence_state():
     assert '"heatmap_path": null' in msg
 
 
+def test_wait_for_checks_predicate_once_at_deadline():
+    calls = {"count": 0}
+
+    def predicate():
+        calls["count"] += 1
+        return "ok"
+
+    assert _wait_for("edge condition", predicate, timeout_s=0) == "ok"
+    assert calls["count"] == 1
+
+
+def test_book_dev_video_semantics_rejects_projectile_category():
+    args = parse_args(["--dev-video-motion", "book", "--browser", "off"])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "projectile",
+            "category": "projectile",
+        },
+    }
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="reported as projectile"):
+        _verify_dev_video_alert_semantics(args, alert)
+
+
+def test_book_dev_video_semantics_accepts_scene_change():
+    args = parse_args(["--dev-video-motion", "book", "--browser", "off"])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "anomaly",
+            "category": "scene_change",
+        },
+    }
+
+    result = _verify_dev_video_alert_semantics(args, alert)
+
+    assert result == {
+        "motion": "book",
+        "detection_type": "anomaly",
+        "category": "scene_change",
+    }
+
+
 def test_run_camera_preflight_delegates_to_core_preflight(monkeypatch, tmp_path):
     captured = {}
 
@@ -266,6 +318,7 @@ def test_run_camera_preflight_delegates_to_core_preflight(monkeypatch, tmp_path)
         "--usb-device-name", "OBSBOT Meet 2 StreamCamera",
         "--usb-device-id", "@device_pnp_usb_vid_3564_pid_3022",
         "--require-go2rtc",
+        "--preflight-measure-seconds", "6.5",
         "--browser", "off",
     ])
 
@@ -279,6 +332,8 @@ def test_run_camera_preflight_delegates_to_core_preflight(monkeypatch, tmp_path)
     assert delegated.usb_device_name == "OBSBOT Meet 2 StreamCamera"
     assert delegated.usb_device_id == "@device_pnp_usb_vid_3564_pid_3022"
     assert delegated.require_go2rtc is True
+    assert delegated.preflight_measure_seconds == 6.5
+    assert delegated.dev_video_motion == "settle"
     assert delegated.work_dir == tmp_path
     assert result["ok"] is True
     assert "business_smoke_command" in result
@@ -288,11 +343,12 @@ def test_run_camera_preflight_can_delegate_local_rtsp_fixture(monkeypatch, tmp_p
     captured = {}
 
     class FakeRtspFixture:
-        def __init__(self, *, work_dir, resolution, seconds):
+        def __init__(self, *, work_dir, resolution, seconds, motion):
             captured["fixture_init"] = {
                 "work_dir": work_dir,
                 "resolution": resolution,
                 "seconds": seconds,
+                "motion": motion,
             }
 
         def start(self):
@@ -325,6 +381,7 @@ def test_run_camera_preflight_can_delegate_local_rtsp_fixture(monkeypatch, tmp_p
         "--work-dir", str(tmp_path),
         "--rtsp-fixture",
         "--rtsp-fixture-seconds", "60",
+        "--dev-video-motion", "book",
         "--require-go2rtc",
         "--browser", "off",
     ])
@@ -338,8 +395,10 @@ def test_run_camera_preflight_can_delegate_local_rtsp_fixture(monkeypatch, tmp_p
     assert captured["fixture_init"]["work_dir"] == tmp_path
     assert captured["fixture_init"]["resolution"] == (640, 480)
     assert captured["fixture_init"]["seconds"] == 60
+    assert captured["fixture_init"]["motion"] == "book"
     assert captured["fixture_started"] is True
     assert captured["fixture_closed"] is True
+    assert delegated.dev_video_motion == "book"
     assert result["rtsp_fixture"]["stream_name"] == "argus_rtsp_fixture"
 
 
@@ -519,6 +578,32 @@ def test_objective_checklist_maps_business_evidence_to_completion_items():
     assert checklist[3]["evidence"]["release_stages"] == ["shadow", "canary", "production"]
     assert checklist[4]["evidence"]["fallback_models"][0]["backend"] == "ssim-fallback"
     assert checklist[5]["evidence"]["total_alerts"] == 1
+
+
+def test_business_api_verification_rejects_single_frame_replay():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/alerts/ALT-1/evidence.zip":
+            return httpx.Response(200, content=b"x" * 2048)
+        if request.url.path == "/api/replay/ALT-1/metadata":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "status": "complete",
+                        "frame_count": 1,
+                    },
+                },
+            )
+        return httpx.Response(404, json={"code": 404, "message": "not found"})
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="http://argus.test",
+    )
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="replay metadata incomplete"):
+        _verify_business_apis(client, alert_id="ALT-1", camera_id="cam_a")
 
 
 def test_objective_checklist_does_not_pass_full_ui_objective_when_browser_is_off():
@@ -730,8 +815,10 @@ def test_clean_env_removes_argus_overrides(monkeypatch):
         ["--rtsp-fixture", "--camera-protocol", "usb"],
         ["--rtsp-fixture-seconds", "0"],
         ["--camera-resolution", "bad"],
+        ["--dev-video-motion", "unknown"],
         ["--activation-delay", "-1"],
         ["--preflight-timeout", "0"],
+        ["--preflight-measure-seconds", "0"],
         ["--min-frames", "0"],
         ["--browser-timeout", "0"],
         ["--browser-virtual-time-ms", "0"],

@@ -137,10 +137,19 @@ def test_parse_args_accepts_preflight_mode():
         "usb",
         "--preflight-timeout",
         "1.5",
+        "--preflight-measure-seconds",
+        "4.5",
     ])
 
     assert args.preflight is True
     assert args.preflight_timeout == 1.5
+    assert args.preflight_measure_seconds == 4.5
+
+
+def test_parse_args_accepts_book_dev_video_motion():
+    args = parse_args(["--dev-video-motion", "book"])
+
+    assert args.dev_video_motion == "book"
 
 
 def test_parse_args_accepts_usb_device_selector():
@@ -162,6 +171,11 @@ def test_parse_args_accepts_usb_device_selector():
 def test_parse_args_rejects_invalid_preflight_timeout():
     with pytest.raises(SystemExit):
         parse_args(["--preflight", "--preflight-timeout", "0"])
+
+
+def test_parse_args_rejects_invalid_preflight_measure_seconds():
+    with pytest.raises(SystemExit):
+        parse_args(["--preflight", "--preflight-measure-seconds", "0"])
 
 
 def test_inspect_usb_video_devices_reports_windows_inventory(monkeypatch):
@@ -314,7 +328,15 @@ def test_inspect_windows_dshow_devices_skips_conda_ffmpeg(monkeypatch):
 
 
 def test_run_preflight_reports_capture_success(monkeypatch, tmp_path):
-    def fake_probe(source, protocol, *, timeout_ms):
+    captured_probe: dict[str, float | int | str] = {}
+
+    def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
+        captured_probe.update({
+            "source": source,
+            "protocol": protocol,
+            "timeout_ms": timeout_ms,
+            "measure_seconds": measure_seconds,
+        })
         return {
             "ok": True,
             "source": source,
@@ -334,6 +356,8 @@ def test_run_preflight_reports_capture_success(monkeypatch, tmp_path):
         "--camera-protocol",
         "file",
         "--disable-go2rtc",
+        "--preflight-measure-seconds",
+        "7.5",
     ])
 
     result = run_preflight(args)
@@ -345,6 +369,7 @@ def test_run_preflight_reports_capture_success(monkeypatch, tmp_path):
     assert result["windows_camera_privacy"] is None
     assert result["dshow_devices"] is None
     assert result["capture_probe"]["backend"] == "fake"
+    assert captured_probe["measure_seconds"] == 7.5
     assert {item["component"] for item in result["expected_degradations"]} == {
         "person_filter",
         "anomaly_detector",
@@ -352,8 +377,51 @@ def test_run_preflight_reports_capture_success(monkeypatch, tmp_path):
     assert result["hints"] == []
 
 
+def test_run_preflight_generates_book_dev_video(monkeypatch, tmp_path):
+    captured_video: dict[str, object] = {}
+
+    def fake_create_dev_video(output, **kwargs):
+        captured_video.update({"output": output, **kwargs})
+        return {
+            "output": str(output),
+            "width": kwargs["width"],
+            "height": kwargs["height"],
+            "fps": kwargs["fps"],
+            "frames": kwargs["fps"] * kwargs["seconds"],
+            "anomaly_start_frame": int(kwargs["fps"] * kwargs["anomaly_start_s"]),
+            "motion": kwargs["motion"],
+        }
+
+    def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
+        return {
+            "ok": True,
+            "source": source,
+            "protocol": protocol,
+            "backend": "fake",
+            "shape": [480, 640, 3],
+            "attempts": [],
+        }
+
+    monkeypatch.setattr("scripts.smoke_core_loop.create_dev_video", fake_create_dev_video)
+    monkeypatch.setattr("scripts.smoke_core_loop._probe_capture_source", fake_probe)
+    args = parse_args([
+        "--preflight",
+        "--work-dir",
+        str(tmp_path),
+        "--disable-go2rtc",
+        "--dev-video-motion",
+        "book",
+    ])
+
+    result = run_preflight(args)
+
+    assert result["ok"] is True
+    assert captured_video["motion"] == "book"
+    assert captured_video["output"] == tmp_path / "dev_camera.avi"
+
+
 def test_run_preflight_reports_numeric_usb_index_mapping(monkeypatch, tmp_path):
-    def fake_probe(source, protocol, *, timeout_ms):
+    def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
         return {
             "ok": True,
             "source": source,
@@ -424,7 +492,7 @@ def test_run_preflight_reports_numeric_usb_index_mapping(monkeypatch, tmp_path):
 
 
 def test_run_preflight_reports_capture_failure(monkeypatch, tmp_path):
-    def fake_probe(source, protocol, *, timeout_ms):
+    def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
         return {
             "ok": False,
             "source": source,
@@ -483,7 +551,7 @@ def test_run_preflight_reports_capture_failure(monkeypatch, tmp_path):
 def test_run_preflight_fails_when_fast_motion_fps_is_below_requirement(
     monkeypatch, tmp_path,
 ):
-    def fake_probe(source, protocol, *, timeout_ms):
+    def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
         return {
             "ok": True,
             "source": source,

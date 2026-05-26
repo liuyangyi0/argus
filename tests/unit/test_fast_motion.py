@@ -113,6 +113,44 @@ def test_short_bright_streak_triggers_fast_projectile():
     assert result.candidates[0].streak_length_px >= 4
 
 
+def test_broad_scene_change_is_left_to_anomaly_path():
+    detector = FastMotionDetector(
+        process_width=960,
+        diff_threshold=18,
+        min_area_px=2,
+        min_streak_length_px=4,
+        min_confidence=0.55,
+        max_motion_fraction=0.015,
+    )
+    detector.process(_gray_frame(96), timestamp=1.0)
+
+    frame = _gray_frame(96)
+    frame[420:620, 760:1080] = 170
+    result = detector.process(frame, timestamp=1.0 + 1 / 60)
+
+    assert result.has_detection is False
+    assert result.candidates == []
+
+
+def test_long_structural_edge_is_left_to_anomaly_path():
+    detector = FastMotionDetector(
+        process_width=960,
+        diff_threshold=18,
+        min_area_px=2,
+        min_streak_length_px=4,
+        min_confidence=0.55,
+        max_streak_frame_fraction=0.25,
+    )
+    detector.process(_blank_frame(), timestamp=1.0)
+
+    frame = _blank_frame()
+    frame[420:423, 100:720] = 255
+    result = detector.process(frame, timestamp=1.0 + 1 / 60)
+
+    assert result.has_detection is False
+    assert result.candidates == []
+
+
 def test_dark_small_object_against_bright_background_triggers():
     detector = FastMotionDetector(
         process_width=960,

@@ -45,7 +45,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from argus.config.loader import load_config, save_config
-from argus.runtime.dev_video import create_dev_video
+from argus.runtime.dev_video import DEV_VIDEO_MOTIONS, create_dev_video
 from argus.runtime.dev_training import write_dev_openvino_ir
 from scripts.smoke_dashboard_routes import (
     DashboardSmokeFailure,
@@ -114,11 +114,13 @@ class _RtspFixture:
         work_dir: Path,
         resolution: tuple[int, int],
         seconds: int,
+        motion: str = "settle",
         stream_name: str = "argus_rtsp_fixture",
     ) -> None:
         self.work_dir = work_dir
         self.resolution = resolution
         self.seconds = seconds
+        self.motion = motion
         self.stream_name = stream_name
         self.video_path = work_dir / "rtsp_fixture.avi"
         self.api_port = _free_port()
@@ -138,7 +140,7 @@ class _RtspFixture:
             fps=10,
             seconds=self.seconds,
             anomaly_start_s=6.0,
-            motion="settle",
+            motion=self.motion,
         )
         manager = Go2RTCManager(
             api_port=self.api_port,
@@ -202,6 +204,16 @@ def _wait_for(
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(interval_s, remaining))
+    if process is not None and process.poll() is not None:
+        raise DashboardBusinessSmokeFailure(
+            f"argus exited early with code {process.returncode}"
+        )
+    try:
+        value = predicate()
+        if value:
+            return value
+    except Exception as exc:
+        last_error = exc
     suffix = f" Last error: {last_error}" if last_error else ""
     raise DashboardBusinessSmokeFailure(f"Timed out waiting for {label}.{suffix}")
 
@@ -386,6 +398,11 @@ def _prepare_runtime_config(
 
     camera.anomaly.min_shadow_days = 0
     camera.anomaly.min_canary_days = 0
+    # The business smoke must exercise real Replay clips, not INFO-only
+    # trigger-frame snapshots. RTSP fixture compression can lower the fallback
+    # anomaly score to ~0.6, so make that a LOW alert in the isolated config.
+    thresholds = config.alerts.severity_thresholds
+    thresholds.low = max(thresholds.info + 0.01, min(thresholds.low, 0.55))
 
     config.dashboard.host = "127.0.0.1"
     config.dashboard.port = port
@@ -578,6 +595,28 @@ def _wait_for_completed_alert(
     return alert, detail
 
 
+def _verify_dev_video_alert_semantics(
+    args: argparse.Namespace,
+    alert: dict[str, Any],
+) -> dict[str, str] | None:
+    if args.camera_source is not None or args.dev_video_motion != "book":
+        return None
+
+    realtime = alert.get("_realtime_payload") or alert.get("realtime") or {}
+    detection_type = str(realtime.get("detection_type") or alert.get("detection_type") or "")
+    category = str(realtime.get("category") or alert.get("category") or "")
+    if detection_type == "projectile" or category == "projectile":
+        raise DashboardBusinessSmokeFailure(
+            "book dev-video scenario was reported as projectile; expected a "
+            "static scene-change/foreign-object anomaly"
+        )
+    return {
+        "motion": args.dev_video_motion,
+        "detection_type": detection_type,
+        "category": category,
+    }
+
+
 def _verify_business_apis(
     client: httpx.Client,
     *,
@@ -594,7 +633,7 @@ def _verify_business_apis(
         client.get(f"/api/replay/{alert_id}/metadata", timeout=10),
         label="replay metadata",
     )
-    if replay_meta.get("status") != "complete" or replay_meta.get("frame_count", 0) <= 0:
+    if replay_meta.get("status") != "complete" or replay_meta.get("frame_count", 0) < 2:
         raise DashboardBusinessSmokeFailure(f"replay metadata incomplete: {replay_meta}")
 
     replay_signals = _api_data(
@@ -1210,7 +1249,7 @@ def _objective_checklist(
                 and alert_detail.get("recording_status") == "complete"
                 and alert_detail.get("snapshot_path")
                 and alert_detail.get("heatmap_path")
-                and replay.get("frame_count", 0) > 0
+                and replay.get("frame_count", 0) >= 2
                 and browser_checked
                 and replay_route in browser_routes
             ),
@@ -1403,6 +1442,7 @@ def run_camera_preflight(args: argparse.Namespace) -> dict[str, Any]:
                 work_dir=fixture_work_dir,
                 resolution=_parse_resolution(args.camera_resolution),
                 seconds=args.rtsp_fixture_seconds,
+                motion=args.dev_video_motion,
             )
             fixture_info = fixture.start()
             camera_source = fixture_info["source_url"]
@@ -1421,7 +1461,9 @@ def run_camera_preflight(args: argparse.Namespace) -> dict[str, Any]:
             disable_go2rtc=args.disable_go2rtc,
             require_go2rtc=args.require_go2rtc,
             preflight_timeout=args.preflight_timeout,
+            preflight_measure_seconds=args.preflight_measure_seconds,
             video_seconds=20,
+            dev_video_motion=args.dev_video_motion,
             use_yolo=args.use_yolo,
         )
         result = _run_core_preflight(core_args)
@@ -1466,6 +1508,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 work_dir=work_dir,
                 resolution=camera_resolution,
                 seconds=args.rtsp_fixture_seconds,
+                motion=args.dev_video_motion,
             )
             fixture_info = fixture.start()
             camera_source = fixture_info["source_url"]
@@ -1497,7 +1540,13 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
             str(runtime_config),
         ]
         if args.camera_source is None and fixture_info is None:
-            cmd.extend(["--dev-video", "--dev-video-path", str(video_path)])
+            cmd.extend([
+                "--dev-video",
+                "--dev-video-path",
+                str(video_path),
+                "--dev-video-motion",
+                args.dev_video_motion,
+            ])
         if args.training_mode == "dev-fast":
             cmd.append("--dev-fast-training")
 
@@ -1555,6 +1604,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         realtime_listener=realtime_listener,
                     )
                 alert_id = alert["alert_id"]
+                dev_video_semantics = _verify_dev_video_alert_semantics(args, alert)
                 api_result = _verify_business_apis(
                     client,
                     alert_id=alert_id,
@@ -1638,6 +1688,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "models_system": models_system_result,
             "training_baselines": training_baselines,
             "rtsp_fixture": fixture_info,
+            "dev_video_semantics": dev_video_semantics,
             "browser": browser_result,
             "objective_checklist": objective_checklist,
             "expected_degradations": _expected_degradations(
@@ -1753,6 +1804,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=180,
         help="Length of generated RTSP fixture video in seconds (default: 180).",
     )
+    parser.add_argument(
+        "--dev-video-motion",
+        choices=DEV_VIDEO_MOTIONS,
+        default="settle",
+        help=(
+            "Generated dev video anomaly pattern. Use book to simulate a book "
+            "being placed on an empty table."
+        ),
+    )
     parser.add_argument("--camera-id", default=None, help="Override the first config camera ID")
     parser.add_argument("--camera-name", default=None, help="Override the first config camera display name")
     parser.add_argument(
@@ -1794,6 +1854,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Seconds to wait per capture backend during --preflight.",
+    )
+    parser.add_argument(
+        "--preflight-measure-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds to sample decoded frames for preflight FPS measurement.",
     )
     parser.add_argument(
         "--browser",
@@ -1842,6 +1908,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--activation-delay must be non-negative")
     if args.preflight_timeout <= 0:
         parser.error("--preflight-timeout must be positive")
+    if args.preflight_measure_seconds <= 0:
+        parser.error("--preflight-measure-seconds must be positive")
     try:
         _parse_resolution(args.camera_resolution)
     except DashboardBusinessSmokeFailure as exc:

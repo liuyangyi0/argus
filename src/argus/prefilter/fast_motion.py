@@ -71,7 +71,9 @@ class FastMotionDetector:
         min_area_px: int = 2,
         max_area_px: int = 1500,
         min_streak_length_px: int = 4,
-        min_confidence: float = 0.55,
+        min_confidence: float = 0.6,
+        max_motion_fraction: float = 0.015,
+        max_streak_frame_fraction: float = 0.25,
         max_candidates_per_frame: int = 5,
         fps_hint: float | None = None,
         trajectory_history_length: int = 16,
@@ -83,6 +85,8 @@ class FastMotionDetector:
         self._max_area_px = max_area_px
         self._min_streak_length_px = min_streak_length_px
         self._min_confidence = min_confidence
+        self._max_motion_fraction = max_motion_fraction
+        self._max_streak_frame_fraction = max_streak_frame_fraction
         self._max_candidates = max_candidates_per_frame
         self._fps_hint = fps_hint
         self._trajectory_history_length = trajectory_history_length
@@ -125,6 +129,14 @@ class FastMotionDetector:
         # Close one-pixel gaps in motion streaks without erasing tiny objects.
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        motion_fraction = float(np.count_nonzero(mask)) / float(mask.size)
+        if self._max_motion_fraction > 0 and motion_fraction > self._max_motion_fraction:
+            cv2.accumulateWeighted(small, self._background, self._background_alpha)
+            self._prev_gray = small
+            self._prev_candidates = []
+            self._prev_timestamp = ts
+            return FastMotionResult()
 
         candidates, accepted_mask = self._extract_candidates(
             motion=motion,
@@ -186,6 +198,9 @@ class FastMotionDetector:
 
             streak = float(max(w, h) * inv_scale)
             full_area = int(round(area * inv_scale * inv_scale))
+            max_scene_streak = self._max_streak_frame_fraction * max(frame_w, frame_h)
+            if self._max_streak_frame_fraction > 0 and streak > max_scene_streak:
+                return [], np.zeros_like(mask)
             if streak < self._min_streak_length_px and full_area < self._min_area_px * 4:
                 continue
 

@@ -71,3 +71,34 @@ def test_create_dev_video_default_anomaly_settles(tmp_path):
     # default spatial-continuity gate can accumulate alert evidence.
     diff = cv2.absdiff(frames[12], frames[13])
     assert float(np.max(diff)) <= 1.0
+
+
+def test_create_dev_video_book_scene_places_static_book(tmp_path):
+    video_path = tmp_path / "book_dev_camera.avi"
+
+    meta = create_dev_video(
+        video_path,
+        width=160,
+        height=120,
+        fps=5,
+        seconds=4,
+        anomaly_start_s=1.0,
+        motion="book",
+    )
+
+    assert meta["motion"] == "book"
+
+    capture = cv2.VideoCapture(str(video_path))
+    frames = []
+    try:
+        for _ in range(16):
+            ok, frame = capture.read()
+            assert ok
+            frames.append(frame)
+    finally:
+        capture.release()
+
+    changed = cv2.absdiff(frames[4], frames[12])
+    settled = cv2.absdiff(frames[12], frames[13])
+    assert float(np.mean(changed)) > 3.0
+    assert float(np.max(settled)) <= 1.0

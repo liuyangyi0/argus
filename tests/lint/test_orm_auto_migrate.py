@@ -13,10 +13,11 @@ creating ``Base.metadata.create_all()`` produces no missing-column surprises.
 
 from __future__ import annotations
 
-import sqlalchemy as sa
 import pytest
+import sqlalchemy as sa
 
 from argus.storage import models as m
+from argus.storage import database as db_module
 from argus.storage.database import _AUTO_MIGRATIONS, Database
 
 
@@ -49,20 +50,88 @@ class TestAutoMigrationsMatchOrm:
 
 
 class TestRoundTripMigrations:
-    """End-to-end: applying _AUTO_MIGRATIONS to a fresh DB succeeds without warnings."""
+    """End-to-end: _AUTO_MIGRATIONS are idempotent and recover old schemas."""
 
     def test_auto_migrate_runs_clean_on_fresh_db(self, tmp_path) -> None:
-        """A fresh schema should ALTER each migration column without error.
+        """A fresh schema already has current ORM columns, so migration is a no-op.
 
-        On a brand-new DB, create_all() declares every column already, so each
-        ALTER raises 'duplicate column' which we treat as success. This proves
-        the migration list is at least executable end-to-end.
+        This proves the migration list is executable end-to-end without relying
+        on duplicate-column exceptions as the normal startup path.
         """
         db_path = tmp_path / "argus_test.db"
         db = Database(database_url=f"sqlite:///{db_path}")
         db.initialize()  # creates schema + runs _auto_migrate once internally
         # Re-run to confirm idempotency — duplicates must be swallowed silently.
         db._auto_migrate()
+
+    def test_auto_migrate_existing_columns_does_not_warn(self, tmp_path, monkeypatch) -> None:
+        """Normal startup should not flood logs with duplicate-column warnings."""
+
+        class CapturingLogger:
+            def __init__(self) -> None:
+                self.info_events: list[str] = []
+                self.warning_events: list[str] = []
+
+            def debug(self, *args, **kwargs) -> None:
+                pass
+
+            def info(self, *args, **kwargs) -> None:
+                if args:
+                    self.info_events.append(str(args[0]))
+
+            def warning(self, event, *args, **kwargs) -> None:
+                self.warning_events.append(str(event))
+
+            def error(self, *args, **kwargs) -> None:
+                pass
+
+        fake_logger = CapturingLogger()
+        monkeypatch.setattr(db_module, "logger", fake_logger)
+
+        db_path = tmp_path / "argus_test.db"
+        db = Database(database_url=f"sqlite:///{db_path}")
+        db.initialize()
+        db._auto_migrate()
+
+        assert "database.migration_skipped_already_exists" not in fake_logger.warning_events
+        assert "database.dropped_deprecated_table" not in fake_logger.info_events
+
+    def test_deprecated_table_drop_logs_only_when_table_existed(self, tmp_path, monkeypatch) -> None:
+        """Retired tables should be dropped, but fresh DB startup should stay quiet."""
+
+        class CapturingLogger:
+            def __init__(self) -> None:
+                self.info_events: list[str] = []
+
+            def debug(self, *args, **kwargs) -> None:
+                pass
+
+            def info(self, event, *args, **kwargs) -> None:
+                self.info_events.append(str(event))
+
+            def warning(self, *args, **kwargs) -> None:
+                pass
+
+            def error(self, *args, **kwargs) -> None:
+                pass
+
+        fake_logger = CapturingLogger()
+        monkeypatch.setattr(db_module, "logger", fake_logger)
+
+        db_path = tmp_path / "argus_test.db"
+        db = Database(database_url=f"sqlite:///{db_path}")
+        db.initialize()
+        assert "database.dropped_deprecated_table" not in fake_logger.info_events
+
+        with db._engine.connect() as conn:
+            conn.execute(sa.text("CREATE TABLE notification_templates (id INTEGER PRIMARY KEY)"))
+            conn.commit()
+
+        db._drop_deprecated_tables()
+
+        assert "database.dropped_deprecated_table" in fake_logger.info_events
+        inspector = sa.inspect(db._engine)
+        assert "notification_templates" not in inspector.get_table_names()
 
     def test_auto_migrate_recovers_old_schema(self, tmp_path) -> None:
         """If we drop a recently-added column, _auto_migrate must put it back.
