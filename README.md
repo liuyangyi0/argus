@@ -109,6 +109,7 @@ python scripts/smoke_dashboard_business_flow.py --camera-source rtsp://user:pass
 python scripts/smoke_physical_scenarios.py --scenario book
 python scripts/smoke_physical_scenarios.py --scenario projectile
 python scripts/smoke_physical_scenarios.py --scenario all
+python scripts/smoke_physical_scenarios.py --scenario all --work-dir C:\tmp\argus-physical-smoke --keep-work-dir
 
 # 真实 anomalib 训练链路（比 dev-fast 慢；会先在临时目录生成 baseline）
 python scripts/smoke_dashboard_business_flow.py --training-mode normal --training-timeout 420 --browser off
@@ -121,7 +122,7 @@ python scripts/smoke_cuda.py --business-smoke --business-training-timeout 420
 `smoke_dashboard_routes.py` 在本机找到 Chrome / Edge / Chromium 时，会额外以 headless 浏览器执行前端 JS 并检查核心页面 DOM；需要强制浏览器检查时可加 `--browser required`。
 `smoke_dashboard_business_flow.py` 会派生临时配置和数据目录，启动真实 Dashboard 服务，通过 WebSocket 验证告警实时推送，生成 Replay 证据，并默认用 `--dev-fast-training` 完成可复现的训练任务、导出、模型发布 / 回滚 API 和浏览器页面检查。需要验证真实训练时改用 `--training-mode normal`；需要验证硬件时先跑 `--preflight --camera-source ...`，USB preflight 会输出 Windows 摄像头设备清单、OpenCV 运行时包信息和排查提示，完整业务运行会同时检查 snapshot JPEG、Streaming/go2rtc 合同和业务页面 DOM。没有 RTSP 设备时可加 `--rtsp-fixture`，脚本会启动一个本地 go2rtc，把生成视频以 RTSP 发布，再让 Argus 以真实 RTSP 输入和独立 go2rtc 浏览器代理路径消费它。
 真实物理场景 smoke 可用 `--expect-alert-category` / `--expect-detection-type` / `--forbid-alert-category` / `--forbid-detection-type` 明确声明验收语义；脚本会在实际告警语义不匹配时失败。
-`smoke_physical_scenarios.py` 是上述语义断言的现场包装入口，默认使用 OBSBOT `1920x1080@60` + go2rtc + 浏览器检查，并在现场动作前先跑同配置 preflight；运行后按提示在 `activation-delay` 内放书或让小物体快速经过画面。最终 JSON 会提炼 preflight 的实测 FPS/go2rtc 状态和场景告警语义，便于现场验收留档；调试时可用 `--no-preflight` 跳过预检。
+`smoke_physical_scenarios.py` 是上述语义断言的现场包装入口，默认使用 OBSBOT `1920x1080@60` + go2rtc + 浏览器检查，并在现场动作前先跑同配置 preflight；运行后按提示在 `activation-delay` 内放书或让小物体快速经过画面。最终 JSON 会提炼 preflight 的实测 FPS/go2rtc 状态和场景告警语义，便于现场验收留档；需要保留数据库、截图、热力图和 Replay 证据时传 `--work-dir <dir> --keep-work-dir`，脚本会为 preflight/book/projectile 分配独立子目录；调试时可用 `--no-preflight` 跳过预检。
 `smoke_cuda.py` 面向 Ubuntu/GPU 测试机，默认要求 PyTorch CUDA 与 OpenCV CUDA 都可用，并实际执行矩阵乘、CLAHE 和 MOG2；CPU-only Windows 开发机只做诊断时可加 `--allow-missing-cuda`。
 
 ## 默认配置要点

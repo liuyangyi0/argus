@@ -25,6 +25,8 @@ def test_parse_args_defaults_to_obsbot_book_scenario() -> None:
     assert args.camera_protocol == "usb"
     assert args.camera_resolution == "1920,1080"
     assert args.usb_device_name == "OBSBOT Meet 2 StreamCamera"
+    assert args.work_dir is None
+    assert args.keep_work_dir is False
     assert args.require_go2rtc is True
     assert args.browser == "required"
     assert args.preflight is True
@@ -94,6 +96,29 @@ def test_build_preflight_command_includes_probe_options_without_semantics() -> N
     assert "--expect-alert-category" not in command
     assert "--expect-detection-type" not in command
     assert "--forbid-alert-category" not in command
+
+
+def test_work_dir_is_split_by_child_smoke(tmp_path) -> None:
+    args = parse_args([
+        "--scenario",
+        "all",
+        "--work-dir",
+        str(tmp_path),
+        "--keep-work-dir",
+        "--dry-run",
+    ])
+
+    preflight = build_preflight_command(args)
+    book = build_business_command(args, "book")
+    projectile = build_business_command(args, "projectile")
+
+    assert "--work-dir" in preflight
+    assert str(tmp_path / "preflight") in preflight
+    assert str(tmp_path / "book") in book
+    assert str(tmp_path / "projectile") in projectile
+    assert "--keep-work-dir" in preflight
+    assert "--keep-work-dir" in book
+    assert "--keep-work-dir" in projectile
 
 
 def test_extract_last_json_object_ignores_logs_and_trailing_noise() -> None:

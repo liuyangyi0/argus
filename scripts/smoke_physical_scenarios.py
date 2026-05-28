@@ -34,6 +34,13 @@ class PhysicalScenarioSmokeFailure(RuntimeError):
     """Raised when a physical scenario smoke fails."""
 
 
+def _child_work_dir(args: argparse.Namespace, child_name: str | None) -> Path | None:
+    if args.work_dir is None:
+        return None
+    name = child_name or "run"
+    return args.work_dir / name
+
+
 @dataclass(frozen=True)
 class _CommandRunResult:
     returncode: int | None
@@ -42,7 +49,12 @@ class _CommandRunResult:
     timed_out: bool = False
 
 
-def _base_business_command(args: argparse.Namespace, *, preflight: bool = False) -> list[str]:
+def _base_business_command(
+    args: argparse.Namespace,
+    *,
+    preflight: bool = False,
+    child_name: str | None = None,
+) -> list[str]:
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "smoke_dashboard_business_flow.py"),
@@ -61,6 +73,11 @@ def _base_business_command(args: argparse.Namespace, *, preflight: bool = False)
         "--browser",
         args.browser,
     ]
+    work_dir = _child_work_dir(args, child_name)
+    if work_dir is not None:
+        cmd.extend(["--work-dir", str(work_dir)])
+    if args.keep_work_dir:
+        cmd.append("--keep-work-dir")
     if args.require_go2rtc:
         cmd.append("--require-go2rtc")
     if args.usb_device_name:
@@ -101,11 +118,11 @@ def _scenario_expectation_args(scenario: str) -> list[str]:
 
 
 def build_business_command(args: argparse.Namespace, scenario: str) -> list[str]:
-    return _base_business_command(args) + _scenario_expectation_args(scenario)
+    return _base_business_command(args, child_name=scenario) + _scenario_expectation_args(scenario)
 
 
 def build_preflight_command(args: argparse.Namespace) -> list[str]:
-    return _base_business_command(args, preflight=True)
+    return _base_business_command(args, preflight=True, child_name="preflight")
 
 
 def _extract_last_json_object(text: str) -> dict[str, Any] | None:
@@ -406,6 +423,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--camera-resolution", default="1920,1080")
     parser.add_argument("--usb-device-name", default="OBSBOT Meet 2 StreamCamera")
     parser.add_argument("--usb-device-id", default=None)
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help="Optional root directory for child smoke evidence; uses preflight/book/projectile subdirectories.",
+    )
+    parser.add_argument(
+        "--keep-work-dir",
+        action="store_true",
+        help="Pass --keep-work-dir to child business smokes so temporary evidence directories are retained.",
+    )
     parser.add_argument("--require-go2rtc", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--activation-delay",
