@@ -22,6 +22,13 @@ def test_parse_args_defaults_to_obsbot_book_scenario() -> None:
     assert args.usb_device_name == "OBSBOT Meet 2 StreamCamera"
     assert args.require_go2rtc is True
     assert args.browser == "required"
+    assert args.stream_output is True
+
+
+def test_parse_args_can_disable_streaming_for_captured_logs() -> None:
+    args = parse_args(["--no-stream-output", "--dry-run"])
+
+    assert args.stream_output is False
 
 
 def test_build_book_command_includes_static_scene_expectations() -> None:
@@ -85,8 +92,30 @@ def test_run_all_dry_run_returns_both_scenarios() -> None:
     assert [item["scenario"] for item in result["scenarios"]] == ["book", "projectile"]
 
 
-def test_run_scenario_records_subprocess_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_scenario_streams_subprocess_output_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     args = parse_args(["--scenario", "book", "--process-timeout", "5"])
+    captured = {}
+
+    def fake_stream(command, *, timeout_s, log_tail_chars):
+        captured["command"] = command
+        captured["timeout_s"] = timeout_s
+        captured["log_tail_chars"] = log_tail_chars
+        return SimpleNamespace(returncode=0, stdout="live output", stderr="", timed_out=False)
+
+    monkeypatch.setattr("scripts.smoke_physical_scenarios._run_streaming_command", fake_stream)
+
+    result = run_scenario(args, "book")
+
+    assert result["ok"] is True
+    assert result["returncode"] == 0
+    assert result["timed_out"] is False
+    assert result["stdout_tail"] == "live output"
+    assert captured["timeout_s"] == 5
+    assert "smoke_dashboard_business_flow.py" in " ".join(captured["command"])
+
+
+def test_run_scenario_records_subprocess_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args(["--scenario", "book", "--process-timeout", "5", "--no-stream-output"])
 
     def fake_run(*_args, **_kwargs):
         return SimpleNamespace(returncode=7, stdout="x" * 20, stderr="boom")
@@ -97,4 +126,5 @@ def test_run_scenario_records_subprocess_failure(monkeypatch: pytest.MonkeyPatch
 
     assert result["ok"] is False
     assert result["returncode"] == 7
+    assert result["timed_out"] is False
     assert result["stderr_tail"] == "boom"
