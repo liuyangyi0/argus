@@ -377,6 +377,8 @@ def test_run_preflight_reports_capture_success(monkeypatch, tmp_path):
     assert result["dshow_devices"] is None
     assert result["capture_probe"]["backend"] == "fake"
     assert captured_probe["measure_seconds"] == 7.5
+    assert result["camera_input"]["requested_preflight_measure_seconds"] == 7.5
+    assert result["camera_input"]["effective_preflight_measure_seconds"] == 7.5
     assert {item["component"] for item in result["expected_degradations"]} == {
         "person_filter",
         "anomaly_detector",
@@ -676,5 +678,7 @@ def test_run_preflight_fails_when_fast_motion_fps_is_below_requirement(
     assert result["ok"] is False
     assert captured_probe["measure_seconds"] == 15.0
     assert result["camera_input"]["preflight_measure_seconds"] == 15.0
+    assert result["camera_input"]["requested_preflight_measure_seconds"] == 2.0
+    assert result["camera_input"]["effective_preflight_measure_seconds"] == 15.0
     assert "measured 35.0fps below required 50.0fps" in result["errors"][0]
     assert any("Increase lighting" in hint for hint in result["hints"])

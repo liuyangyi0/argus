@@ -1641,6 +1641,8 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
                 "probe_protocol": probe_protocol,
                 "resolution": camera.resolution,
                 "preflight_measure_seconds": measure_seconds,
+                "requested_preflight_measure_seconds": args.preflight_measure_seconds,
+                "effective_preflight_measure_seconds": measure_seconds,
                 "usb_selection": usb_selection,
             },
             "go2rtc": go2rtc_info,
