@@ -161,6 +161,8 @@ def _child_summary(child: dict[str, Any] | None) -> dict[str, Any] | None:
         return {
             "mode": child.get("mode"),
             "ok": child.get("ok"),
+            "work_dir": child.get("work_dir"),
+            "config": child.get("config"),
             "camera_input": {
                 "camera_id": camera_input.get("camera_id"),
                 "protocol": camera_input.get("protocol"),
@@ -189,21 +191,30 @@ def _child_summary(child: dict[str, Any] | None) -> dict[str, Any] | None:
 
     alert = child.get("alert") or {}
     realtime = alert.get("realtime") or {}
+    api = child.get("api") or {}
     browser = child.get("browser") or {}
     checklist = child.get("objective_checklist") or []
     return {
         "ok": child.get("ok"),
         "base_url": child.get("base_url"),
+        "work_dir": child.get("work_dir"),
+        "runtime_config": child.get("runtime_config"),
         "camera": child.get("camera"),
         "camera_streaming": (child.get("camera_media") or {}).get("streaming"),
         "alert": {
             "alert_id": alert.get("alert_id"),
             "severity": alert.get("severity"),
             "recording_status": alert.get("recording_status"),
+            "snapshot_path": alert.get("snapshot_path"),
+            "heatmap_path": alert.get("heatmap_path"),
             "detection_type": realtime.get("detection_type"),
             "category": realtime.get("category"),
             "speed_px_per_sec": realtime.get("speed_px_per_sec"),
             "trajectory_model": realtime.get("trajectory_model"),
+        },
+        "api": {
+            "evidence_zip_bytes": api.get("evidence_zip_bytes"),
+            "replay": api.get("replay"),
         },
         "alert_semantics": child.get("alert_semantics"),
         "browser": {
