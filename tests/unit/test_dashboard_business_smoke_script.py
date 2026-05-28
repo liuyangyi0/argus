@@ -19,6 +19,7 @@ from scripts.smoke_dashboard_business_flow import (
     _parse_resolution,
     _physical_action_window_message,
     _prepare_runtime_config,
+    _rtsp_fixture_anomaly_start_s,
     _seed_model_registry,
     _seed_training_baselines,
     _verify_alert_semantic_expectations,
@@ -274,6 +275,12 @@ def test_parse_args_accepts_local_rtsp_fixture():
     assert args.recording_timeout == 90.0
 
 
+def test_rtsp_fixture_delays_anomaly_until_after_baseline_window():
+    assert _rtsp_fixture_anomaly_start_s(60) == 18.0
+    assert _rtsp_fixture_anomaly_start_s(20) == 10.0
+    assert _rtsp_fixture_anomaly_start_s(5) == 1.0
+
+
 def test_parse_args_accepts_projectile_dev_video_motion():
     args = parse_args(["--dev-video-motion", "projectile", "--browser", "off"])
 
@@ -381,6 +388,25 @@ def test_book_dev_video_semantics_accepts_scene_change():
         "motion": "book",
         "detection_type": "anomaly",
         "category": "scene_change",
+    }
+
+
+def test_book_dev_video_semantics_accepts_static_foreign():
+    args = parse_args(["--dev-video-motion", "book", "--browser", "off"])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "anomaly",
+            "category": "static_foreign",
+        },
+    }
+
+    result = _verify_dev_video_alert_semantics(args, alert)
+
+    assert result == {
+        "motion": "book",
+        "detection_type": "anomaly",
+        "category": "static_foreign",
     }
 
 
