@@ -187,6 +187,8 @@ def test_child_summary_extracts_preflight_fps_and_go2rtc() -> None:
     summary = _child_summary({
         "ok": True,
         "mode": "preflight",
+        "work_dir": "C:/tmp/argus-physical/preflight",
+        "config": "configs/default.yaml",
         "camera_input": {
             "camera_id": "c",
             "protocol": "usb",
@@ -215,6 +217,8 @@ def test_child_summary_extracts_preflight_fps_and_go2rtc() -> None:
 
     assert summary is not None
     assert summary["mode"] == "preflight"
+    assert summary["work_dir"] == "C:/tmp/argus-physical/preflight"
+    assert summary["config"] == "configs/default.yaml"
     assert summary["camera_input"]["resolution"] == [1920, 1080]
     assert summary["capture_probe"]["measured_fps"] == 61.1
     assert summary["go2rtc"]["running"] is True
@@ -224,12 +228,16 @@ def test_child_summary_extracts_scenario_semantics_and_browser_routes() -> None:
     summary = _child_summary({
         "ok": True,
         "base_url": "http://127.0.0.1:18080",
+        "work_dir": "C:/tmp/argus-physical/projectile",
+        "runtime_config": "C:/tmp/argus-physical/projectile/dashboard_business_config.yaml",
         "camera": {"camera_id": "c", "pipeline_mode": "active"},
         "camera_media": {"streaming": {"go2rtc": True}},
         "alert": {
             "alert_id": "ALT-1",
             "severity": "high",
             "recording_status": "complete",
+            "snapshot_path": "C:/tmp/argus-physical/projectile/alerts/ALT-1_snapshot.jpg",
+            "heatmap_path": "C:/tmp/argus-physical/projectile/alerts/ALT-1_heatmap.jpg",
             "realtime": {
                 "detection_type": "projectile",
                 "category": "projectile",
@@ -237,14 +245,24 @@ def test_child_summary_extracts_scenario_semantics_and_browser_routes() -> None:
                 "trajectory_model": "projectile",
             },
         },
+        "api": {
+            "evidence_zip_bytes": 4096,
+            "replay": {"frame_count": 32, "signal_points": 32},
+        },
         "alert_semantics": {"detection_type": "projectile", "category": "projectile"},
         "browser": {"status": "checked", "routes_checked": [{"route": "/alerts?id=ALT-1"}]},
         "objective_checklist": [{"requirement": "Alerts realtime display", "passed": True}],
     })
 
     assert summary is not None
+    assert summary["work_dir"] == "C:/tmp/argus-physical/projectile"
+    assert summary["runtime_config"].endswith("dashboard_business_config.yaml")
     assert summary["alert"]["detection_type"] == "projectile"
     assert summary["alert"]["speed_px_per_sec"] == 1020.0
+    assert summary["alert"]["snapshot_path"].endswith("ALT-1_snapshot.jpg")
+    assert summary["alert"]["heatmap_path"].endswith("ALT-1_heatmap.jpg")
+    assert summary["api"]["evidence_zip_bytes"] == 4096
+    assert summary["api"]["replay"]["frame_count"] == 32
     assert summary["browser"]["routes_checked"] == ["/alerts?id=ALT-1"]
     assert summary["objective_checklist"] == [
         {"requirement": "Alerts realtime display", "passed": True}
