@@ -103,6 +103,41 @@ def test_extract_last_json_object_ignores_logs_and_trailing_noise() -> None:
     assert result == {"ok": True, "value": 3}
 
 
+def test_streaming_command_keeps_bounded_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args(["--scenario", "book", "--process-timeout", "5", "--log-tail-chars", "32"])
+    monkeypatch.setattr("scripts.smoke_physical_scenarios.CAPTURE_TAIL_CHARS", 256)
+    large_stdout = "x" * 384 + '{"ok": true, "value": 9}\n'
+    captured = {}
+
+    class FakePipe:
+        def __iter__(self):
+            yield large_stdout
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdout = FakePipe()
+        stderr = FakePipe()
+
+        def wait(self, timeout):
+            captured["timeout"] = timeout
+            return 0
+
+    monkeypatch.setattr(
+        "scripts.smoke_physical_scenarios.subprocess.Popen",
+        lambda *_args, **_kwargs: FakeProcess(),
+    )
+
+    result = run_scenario(args, "book")
+
+    assert result["ok"] is True
+    assert len(result["stdout_tail"]) == 32
+    assert result["evidence"]["ok"] is True
+    assert result["evidence"]["alert"]["category"] is None
+    assert captured["timeout"] == 5
+
+
 def test_child_summary_extracts_preflight_fps_and_go2rtc() -> None:
     summary = _child_summary({
         "ok": True,
