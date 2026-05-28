@@ -17,6 +17,7 @@ from scripts.smoke_dashboard_business_flow import (
     _model_operation_timeout,
     _objective_checklist,
     _parse_resolution,
+    _physical_action_window_message,
     _prepare_runtime_config,
     _seed_model_registry,
     _seed_training_baselines,
@@ -177,6 +178,26 @@ def test_parse_args_accepts_hardware_semantic_expectations():
     assert args.expect_detection_type == ["anomaly"]
     assert args.forbid_alert_category == ["projectile"]
     assert args.forbid_detection_type == ["projectile"]
+
+
+def test_physical_action_window_message_names_expected_and_forbidden_semantics():
+    args = parse_args([
+        "--activation-delay", "7.5",
+        "--expect-alert-category", "scene_change",
+        "--expect-detection-type", "anomaly",
+        "--forbid-alert-category", "projectile",
+        "--forbid-detection-type", "projectile",
+        "--browser", "off",
+    ])
+
+    message = _physical_action_window_message(args)
+
+    assert "camera active" in message
+    assert "within 7.5s" in message
+    assert "category in ['scene_change']" in message
+    assert "detection_type in ['anomaly']" in message
+    assert "category not in ['projectile']" in message
+    assert "detection_type not in ['projectile']" in message
 
 
 def test_parse_args_accepts_preflight_mode():

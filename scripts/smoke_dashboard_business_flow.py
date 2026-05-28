@@ -663,6 +663,30 @@ def _verify_dev_video_alert_semantics(
     }
 
 
+def _physical_action_window_message(args: argparse.Namespace) -> str:
+    """Build the operator prompt printed exactly when active detection starts."""
+    expected_parts = []
+    forbidden_parts = []
+    if args.expect_alert_category:
+        expected_parts.append(f"category in {sorted(args.expect_alert_category)!r}")
+    if args.expect_detection_type:
+        expected_parts.append(f"detection_type in {sorted(args.expect_detection_type)!r}")
+    if args.forbid_alert_category:
+        forbidden_parts.append(f"category not in {sorted(args.forbid_alert_category)!r}")
+    if args.forbid_detection_type:
+        forbidden_parts.append(f"detection_type not in {sorted(args.forbid_detection_type)!r}")
+
+    message = (
+        "[argus] camera active; introduce the physical test target within "
+        f"{args.activation_delay:.1f}s"
+    )
+    if expected_parts:
+        message += f". Expected: {', '.join(expected_parts)}"
+    if forbidden_parts:
+        message += f". Forbidden: {', '.join(forbidden_parts)}"
+    return f"{message}."
+
+
 def _verify_business_apis(
     client: httpx.Client,
     *,
@@ -1640,6 +1664,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 with _AlertWebSocketListener(base_url=base_url) as realtime_listener:
                     mode_result = _activate_camera(client, camera_id=camera_id)
                     if args.activation_delay > 0:
+                        print(_physical_action_window_message(args), flush=True)
                         time.sleep(args.activation_delay)
                     alert, alert_detail = _wait_for_completed_alert(
                         client,

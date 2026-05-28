@@ -15,9 +15,11 @@ Replay evidence, model/release APIs, reports, and optionally browser DOM pages.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,14 @@ SCENARIOS = ("book", "projectile")
 
 class PhysicalScenarioSmokeFailure(RuntimeError):
     """Raised when a physical scenario smoke fails."""
+
+
+@dataclass(frozen=True)
+class _CommandRunResult:
+    returncode: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool = False
 
 
 def _base_business_command(args: argparse.Namespace) -> list[str]:
@@ -85,6 +95,88 @@ def build_business_command(args: argparse.Namespace, scenario: str) -> list[str]
     return _base_business_command(args) + _scenario_expectation_args(scenario)
 
 
+def _append_tail(current: str, chunk: str, limit: int) -> str:
+    return (current + chunk)[-limit:]
+
+
+def _run_streaming_command(
+    command: list[str],
+    *,
+    timeout_s: float,
+    log_tail_chars: int,
+) -> _CommandRunResult:
+    proc = subprocess.Popen(
+        command,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    tails = {"stdout": "", "stderr": ""}
+    lock = threading.Lock()
+
+    def reader(pipe, sink, key: str) -> None:
+        if pipe is None:
+            return
+        try:
+            for chunk in pipe:
+                sink.write(chunk)
+                sink.flush()
+                with lock:
+                    tails[key] = _append_tail(tails[key], chunk, log_tail_chars)
+        finally:
+            pipe.close()
+
+    threads = [
+        threading.Thread(target=reader, args=(proc.stdout, sys.stdout, "stdout"), daemon=True),
+        threading.Thread(target=reader, args=(proc.stderr, sys.stderr, "stderr"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    timed_out = False
+    try:
+        returncode = proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        returncode = proc.wait()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    with lock:
+        stdout = tails["stdout"]
+        stderr = tails["stderr"]
+    return _CommandRunResult(
+        returncode=None if timed_out else returncode,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=timed_out,
+    )
+
+
+def _run_business_command(command: list[str], args: argparse.Namespace) -> _CommandRunResult:
+    if args.stream_output:
+        return _run_streaming_command(
+            command,
+            timeout_s=args.process_timeout,
+            log_tail_chars=args.log_tail_chars,
+        )
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=args.process_timeout,
+    )
+    return _CommandRunResult(
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
 def _operator_instruction(scenario: str, args: argparse.Namespace) -> str:
     if scenario == "book":
         return (
@@ -112,16 +204,11 @@ def run_scenario(args: argparse.Namespace, scenario: str) -> dict[str, Any]:
         return result
 
     print(f"[argus] scenario={scenario}: {result['instruction']}", flush=True)
-    completed = subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        timeout=args.process_timeout,
-    )
+    completed = _run_business_command(command, args)
     result.update({
-        "ok": completed.returncode == 0,
+        "ok": completed.returncode == 0 and not completed.timed_out,
         "returncode": completed.returncode,
+        "timed_out": completed.timed_out,
         "stdout_tail": completed.stdout[-args.log_tail_chars:],
         "stderr_tail": completed.stderr[-args.log_tail_chars:],
     })
@@ -162,6 +249,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--browser", choices=["auto", "required", "off"], default="required")
     parser.add_argument("--process-timeout", type=float, default=300.0)
     parser.add_argument("--log-tail-chars", type=int, default=12000)
+    parser.add_argument(
+        "--stream-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream the underlying business smoke output live; use --no-stream-output for captured logs.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the planned command without running it.")
     args = parser.parse_args(argv)
     if args.activation_delay < 0:
