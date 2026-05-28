@@ -12,6 +12,7 @@ from scripts.smoke_physical_scenarios import (
     _extract_last_json_object,
     parse_args,
     run_physical_smoke,
+    run_preflight,
     run_scenario,
 )
 
@@ -101,6 +102,25 @@ def test_extract_last_json_object_ignores_logs_and_trailing_noise() -> None:
     result = _extract_last_json_object(text)
 
     assert result == {"ok": True, "value": 3}
+
+
+def test_extract_last_json_object_prefers_outer_object_with_nested_ok() -> None:
+    text = (
+        "camera log\n"
+        '{"ok": true, "mode": "preflight", '
+        '"capture_probe": {"ok": true, "measured_fps": 61.1}, '
+        '"go2rtc": {"running": true}}\n'
+        "[rtsp] warning after json\n"
+    )
+
+    result = _extract_last_json_object(text)
+
+    assert result == {
+        "ok": True,
+        "mode": "preflight",
+        "capture_probe": {"ok": True, "measured_fps": 61.1},
+        "go2rtc": {"running": True},
+    }
 
 
 def test_streaming_command_keeps_bounded_capture(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,6 +281,35 @@ def test_preflight_failure_skips_physical_scenarios(monkeypatch: pytest.MonkeyPa
     assert result["ok"] is False
     assert result["preflight"]["returncode"] == 7
     assert result["scenarios"] == []
+
+
+def test_run_preflight_extracts_outer_evidence_with_nested_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args(["--scenario", "book", "--process-timeout", "5"])
+
+    def fake_stream(command, *, timeout_s, log_tail_chars):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "camera log\n"
+                '{"ok": true, "mode": "preflight", '
+                '"camera_input": {"resolution": [1920, 1080]}, '
+                '"capture_probe": {"ok": true, "measured_fps": 61.1}, '
+                '"go2rtc": {"running": true}}\n'
+                "[rtsp] warning after json\n"
+            ),
+            stderr="",
+            timed_out=False,
+        )
+
+    monkeypatch.setattr("scripts.smoke_physical_scenarios._run_streaming_command", fake_stream)
+
+    result = run_preflight(args)
+
+    assert result["ok"] is True
+    assert result["evidence"]["mode"] == "preflight"
+    assert result["evidence"]["camera_input"]["resolution"] == [1920, 1080]
+    assert result["evidence"]["capture_probe"]["measured_fps"] == 61.1
+    assert result["evidence"]["go2rtc"]["running"] is True
 
 
 def test_run_scenario_streams_subprocess_output_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
