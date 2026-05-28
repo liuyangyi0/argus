@@ -1248,13 +1248,26 @@ def _exercise_model_release_apis(
     }
 
 
-def _business_browser_pages(*, alert_id: str, camera_id: str) -> dict[str, list[str]]:
-    return {
+def _business_browser_pages(
+    *,
+    alert_id: str,
+    camera_id: str,
+    alert_semantics: dict[str, Any] | None = None,
+) -> dict[str, list[str]]:
+    pages = {
         f"/cameras/{camera_id}": [camera_id, "实时画面", "已采集帧", "告警触发"],
         f"/alerts?id={alert_id}": ["告警中心", alert_id[-8:], "告警信息", "录像"],
         f"/replay/{alert_id}": ["录像回放", alert_id, "FRAME", "热力"],
         "/reports": ["报表统计", "告警总数", "Replay录像覆盖率", "完整证据率"],
     }
+    semantics = alert_semantics or {}
+    if (
+        semantics.get("detection_type") == "projectile"
+        or semantics.get("category") == "projectile"
+        or semantics.get("projectile_evidence")
+    ):
+        pages[f"/alerts?id={alert_id}"].extend(["抛射物", "物理数据", "px/s", "projectile"])
+    return pages
 
 
 def _models_system_browser_pages(
@@ -1470,6 +1483,7 @@ def _check_business_browser_dom(
     work_dir: Path,
     alert_id: str,
     camera_id: str,
+    alert_semantics: dict[str, Any] | None = None,
     additional_pages: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     if args.browser == "off":
@@ -1484,7 +1498,11 @@ def _check_business_browser_dom(
         return {"status": "skipped", "reason": "Chrome/Edge/Chromium not found", "routes_checked": []}
 
     checked: list[dict[str, Any]] = []
-    pages = _business_browser_pages(alert_id=alert_id, camera_id=camera_id)
+    pages = _business_browser_pages(
+        alert_id=alert_id,
+        camera_id=camera_id,
+        alert_semantics=alert_semantics,
+    )
     if additional_pages:
         pages.update(additional_pages)
 
@@ -1773,6 +1791,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     work_dir=work_dir,
                     alert_id=alert_id,
                     camera_id=camera_id,
+                    alert_semantics=alert_semantics,
                     additional_pages=_models_system_browser_pages(
                         camera_id=camera_id,
                         model_ids=model_ids,
