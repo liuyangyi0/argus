@@ -169,6 +169,12 @@ def _child_summary(child: dict[str, Any] | None) -> dict[str, Any] | None:
                 "probe_protocol": camera_input.get("probe_protocol"),
                 "resolution": camera_input.get("resolution"),
                 "preflight_measure_seconds": camera_input.get("preflight_measure_seconds"),
+                "requested_preflight_measure_seconds": camera_input.get(
+                    "requested_preflight_measure_seconds"
+                ),
+                "effective_preflight_measure_seconds": camera_input.get(
+                    "effective_preflight_measure_seconds"
+                ),
                 "usb_selection": camera_input.get("usb_selection"),
             },
             "capture_probe": {

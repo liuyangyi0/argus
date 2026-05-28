@@ -195,6 +195,8 @@ def test_child_summary_extracts_preflight_fps_and_go2rtc() -> None:
             "probe_protocol": "rtsp",
             "resolution": [1920, 1080],
             "preflight_measure_seconds": 15.0,
+            "requested_preflight_measure_seconds": 8.0,
+            "effective_preflight_measure_seconds": 15.0,
             "usb_selection": {"selection_mode": "explicit_device_id_or_name"},
         },
         "capture_probe": {
@@ -220,6 +222,8 @@ def test_child_summary_extracts_preflight_fps_and_go2rtc() -> None:
     assert summary["work_dir"] == "C:/tmp/argus-physical/preflight"
     assert summary["config"] == "configs/default.yaml"
     assert summary["camera_input"]["resolution"] == [1920, 1080]
+    assert summary["camera_input"]["requested_preflight_measure_seconds"] == 8.0
+    assert summary["camera_input"]["effective_preflight_measure_seconds"] == 15.0
     assert summary["capture_probe"]["measured_fps"] == 61.1
     assert summary["go2rtc"]["running"] is True
 
