@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-DEV_VIDEO_MOTIONS = ("settle", "moving", "book")
+DEV_VIDEO_MOTIONS = ("settle", "moving", "book", "projectile")
 
 
 def _base_frame(width: int, height: int) -> np.ndarray:
@@ -80,6 +80,17 @@ def _draw_book(frame: np.ndarray, x: int, y: int, width: int, height: int) -> No
     )
 
 
+def _draw_projectile(frame: np.ndarray, x: int, y: int, length: int, thickness: int) -> None:
+    x1 = max(0, x - length)
+    x2 = min(frame.shape[1] - 1, x)
+    y1 = max(0, y - thickness // 2)
+    y2 = min(frame.shape[0] - 1, y + max(1, thickness // 2))
+    if x2 <= 0 or x1 >= frame.shape[1] or y2 <= y1:
+        return
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (245, 245, 245), -1)
+    cv2.circle(frame, (x2, y), max(2, thickness), (255, 255, 255), -1)
+
+
 def create_dev_video(
     output: Path,
     *,
@@ -130,6 +141,14 @@ def create_dev_video(
                     ease = min(1.0, t / settle_frames)
                     y = int(start_y + (target_y - start_y) * ease)
                     _draw_book(frame, target_x, y, book_w, book_h)
+                elif motion == "projectile":
+                    travel_frames = max(6, min(frame_count - anomaly_start_frame, fps))
+                    speed = max(8, int(round(width / max(travel_frames, 1))))
+                    x = -max(12, width // 28) + t * speed
+                    y = int(height * 0.42 + height * 0.08 * np.sin(t / max(fps / 7.0, 1.0)))
+                    length = max(8, width // 38)
+                    thickness = max(2, min(5, height // 120))
+                    _draw_projectile(frame, x, y, length, thickness)
                 else:
                     settle_frames = max(fps, 1)
                     start_x = 60
