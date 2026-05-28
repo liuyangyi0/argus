@@ -95,6 +95,27 @@ def test_prepare_runtime_config_can_use_usb_source_with_go2rtc(monkeypatch, tmp_
     assert config.dashboard.go2rtc_webrtc_port == 28555
 
 
+def test_prepare_runtime_config_preserves_default_usb_device_name(monkeypatch, tmp_path):
+    ports = iter([21984, 28554, 28555])
+    monkeypatch.setattr(
+        "scripts.smoke_dashboard_business_flow._free_port",
+        lambda: next(ports),
+    )
+
+    runtime_config, _camera_id = _prepare_runtime_config(
+        config_path=Path("configs/default.yaml"),
+        work_dir=tmp_path,
+        port=18181,
+        use_yolo=False,
+        camera_source="0",
+        camera_protocol="usb",
+        camera_resolution=(1920, 1080),
+    )
+
+    camera = load_config(runtime_config).cameras[0]
+    assert camera.usb.device_name == "OBSBOT Meet 2 StreamCamera"
+
+
 def test_infer_camera_protocol_from_source_shape():
     assert _infer_camera_protocol("rtsp://example.test/stream") == "rtsp"
     assert _infer_camera_protocol("0") == "usb"

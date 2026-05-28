@@ -75,6 +75,7 @@ def test_prepare_config_can_use_usb_hardware_with_go2rtc(monkeypatch, tmp_path):
     assert camera.source == "0"
     assert camera.resolution == (1280, 720)
     assert camera.fps_target == 60
+    assert camera.usb.device_name == "OBSBOT Meet 2 StreamCamera"
     assert config.dashboard.go2rtc_enabled is True
     assert config.dashboard.go2rtc_api_port == 21984
     assert config.dashboard.go2rtc_rtsp_port == 28554
@@ -421,6 +422,13 @@ def test_run_preflight_generates_book_dev_video(monkeypatch, tmp_path):
 
 
 def test_run_preflight_reports_numeric_usb_index_mapping(monkeypatch, tmp_path):
+    numeric_config = tmp_path / "numeric-usb.yaml"
+    default_config = Path("configs/default.yaml").read_text(encoding="utf-8")
+    numeric_config.write_text(
+        default_config.replace("    device_name: OBSBOT Meet 2 StreamCamera\n", ""),
+        encoding="utf-8",
+    )
+
     def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
         return {
             "ok": True,
@@ -470,6 +478,8 @@ def test_run_preflight_reports_numeric_usb_index_mapping(monkeypatch, tmp_path):
     )
     args = parse_args([
         "--preflight",
+        "--config",
+        str(numeric_config),
         "--work-dir",
         str(tmp_path),
         "--camera-source",
@@ -629,7 +639,10 @@ def test_run_preflight_reports_capture_failure(monkeypatch, tmp_path):
 def test_run_preflight_fails_when_fast_motion_fps_is_below_requirement(
     monkeypatch, tmp_path,
 ):
+    captured_probe: dict[str, float] = {}
+
     def fake_probe(source, protocol, *, timeout_ms, measure_seconds):
+        captured_probe["measure_seconds"] = measure_seconds
         return {
             "ok": True,
             "source": source,
@@ -655,5 +668,7 @@ def test_run_preflight_fails_when_fast_motion_fps_is_below_requirement(
     result = run_preflight(args)
 
     assert result["ok"] is False
+    assert captured_probe["measure_seconds"] == 15.0
+    assert result["camera_input"]["preflight_measure_seconds"] == 15.0
     assert "measured 35.0fps below required 50.0fps" in result["errors"][0]
     assert any("Increase lighting" in hint for hint in result["hints"])

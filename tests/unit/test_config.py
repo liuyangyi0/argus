@@ -111,6 +111,10 @@ class TestConfigLoader:
         assert config.node_id == "argus-edge-01"
         assert len(config.cameras) >= 1
         assert config.cameras[0].camera_id == "c"
+        assert config.cameras[0].protocol == "usb"
+        assert config.cameras[0].usb.device_name == "OBSBOT Meet 2 StreamCamera"
+        assert config.cameras[0].usb.pixel_format == "mjpeg"
+        assert config.cameras[0].usb.min_runtime_fps == pytest.approx(50.0)
 
 
 class TestDinomaly2Config:

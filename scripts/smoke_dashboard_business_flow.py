@@ -389,8 +389,10 @@ def _prepare_runtime_config(
 
     camera.ring_buffer.enabled = True
     if camera.protocol == "usb":
-        camera.usb.device_name = usb_device_name
-        camera.usb.device_id = usb_device_id
+        if usb_device_name is not None:
+            camera.usb.device_name = usb_device_name
+        if usb_device_id is not None:
+            camera.usb.device_id = usb_device_id
     camera.anomaly.ssim_baseline_frames = min(camera.anomaly.ssim_baseline_frames, 15)
     if not use_yolo:
         camera.person_filter.model_name = str(work_dir / "missing-yolo.pt")
@@ -1962,7 +1964,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--preflight-measure-seconds",
         type=float,
         default=2.0,
-        help="Seconds to sample decoded frames for preflight FPS measurement.",
+        help=(
+            "Seconds to sample decoded frames for preflight FPS measurement. "
+            "USB fast-motion checks use at least 15 seconds."
+        ),
     )
     parser.add_argument(
         "--browser",
