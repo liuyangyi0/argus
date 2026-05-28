@@ -252,6 +252,12 @@ def test_parse_args_accepts_local_rtsp_fixture():
     assert args.recording_timeout == 90.0
 
 
+def test_parse_args_accepts_projectile_dev_video_motion():
+    args = parse_args(["--dev-video-motion", "projectile", "--browser", "off"])
+
+    assert args.dev_video_motion == "projectile"
+
+
 def test_wait_for_completed_alert_timeout_reports_last_evidence_state():
     class RunningProcess:
         returncode = None

@@ -6,7 +6,8 @@ import cv2
 import numpy as np
 
 from argus.capture.camera import CameraCapture
-from argus.runtime.dev_video import create_dev_video
+from argus.prefilter.fast_motion import FastMotionDetector
+from argus.runtime.dev_video import DEV_VIDEO_MOTIONS, create_dev_video
 
 
 def test_create_dev_video_can_be_read_by_file_camera(tmp_path):
@@ -102,3 +103,44 @@ def test_create_dev_video_book_scene_places_static_book(tmp_path):
     settled = cv2.absdiff(frames[12], frames[13])
     assert float(np.mean(changed)) > 3.0
     assert float(np.max(settled)) <= 1.0
+
+
+def test_create_dev_video_projectile_triggers_fast_motion_detector(tmp_path):
+    video_path = tmp_path / "projectile_dev_camera.avi"
+
+    meta = create_dev_video(
+        video_path,
+        width=320,
+        height=180,
+        fps=60,
+        seconds=2,
+        anomaly_start_s=0.5,
+        motion="projectile",
+    )
+
+    assert "projectile" in DEV_VIDEO_MOTIONS
+    assert meta["motion"] == "projectile"
+
+    detector = FastMotionDetector(
+        process_width=960,
+        diff_threshold=18,
+        min_area_px=2,
+        max_area_px=1500,
+        min_streak_length_px=4,
+        min_confidence=0.55,
+        fps_hint=60,
+    )
+    capture = cv2.VideoCapture(str(video_path))
+    detections = []
+    try:
+        for idx in range(meta["frames"]):
+            ok, frame = capture.read()
+            assert ok
+            result = detector.process(frame, timestamp=idx / 60)
+            if result.has_detection:
+                detections.extend(result.candidates)
+    finally:
+        capture.release()
+
+    assert detections
+    assert any(candidate.to_detected_object()["class_name"] == "fast_projectile" for candidate in detections)

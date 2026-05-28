@@ -33,6 +33,7 @@ from argus.runtime.logging_setup import (
     log_gpu_environment as _log_gpu_environment,
     setup_file_logging as _setup_file_logging,
 )
+from argus.runtime.dev_video import DEV_VIDEO_MOTIONS
 from argus.runtime.training_job_wiring import (
     register_training_job_processing as _register_training_job_processing,
 )
@@ -148,11 +149,12 @@ def main():
     )
     parser.add_argument(
         "--dev-video-motion",
-        choices=("settle", "moving", "book"),
+        choices=DEV_VIDEO_MOTIONS,
         default="settle",
         help=(
             "Generated --dev-video anomaly pattern. Use book to simulate a book "
-            "being placed on an empty table."
+            "being placed on an empty table, or projectile to simulate a small "
+            "fast fly-through object."
         ),
     )
     parser.add_argument(

@@ -88,6 +88,7 @@ python scripts/smoke_dashboard_routes.py --timeout 75
 
 # 真实业务数据 + 浏览器页面：Camera detail -> Alerts -> Replay -> Models -> System -> Reports
 python scripts/smoke_dashboard_business_flow.py --timeout 90 --recording-timeout 90 --browser required
+python scripts/smoke_dashboard_business_flow.py --dev-video-motion projectile --expect-alert-category projectile --expect-detection-type projectile --timeout 120 --recording-timeout 120 --browser required
 
 # 同一条业务路径也可指向真实 USB/RTSP 源；先 preflight，确认摄像头/go2rtc 能读到帧
 # USB preflight 会在 Windows 上附带系统识别到的 Camera 设备清单，便于定位设备枚举问题

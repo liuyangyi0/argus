@@ -1885,7 +1885,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="settle",
         help=(
             "Generated dev video anomaly pattern. Use book to simulate a book "
-            "being placed on an empty table."
+            "being placed on an empty table, or projectile to simulate a small "
+            "fast fly-through object."
         ),
     )
     parser.add_argument("--camera-id", default=None, help="Override the first config camera ID")

@@ -44,7 +44,8 @@ def main() -> None:
         default="settle",
         help=(
             "Anomaly pattern: settle triggers stable foreign-object alerts, "
-            "moving is for tracking demos, book simulates a book placed on the table."
+            "moving is for tracking demos, book simulates a book placed on the table, "
+            "and projectile simulates a small fast fly-through object."
         ),
     )
     args = parser.parse_args()
