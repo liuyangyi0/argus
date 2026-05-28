@@ -141,6 +141,28 @@ def test_business_browser_pages_include_dynamic_alert_and_camera_ids():
     assert "ALERT-12345678" in pages["/replay/ALERT-12345678"]
 
 
+def test_business_browser_pages_include_projectile_detail_markers():
+    pages = _business_browser_pages(
+        alert_id="ALERT-12345678",
+        camera_id="cam_a",
+        alert_semantics={
+            "detection_type": "projectile",
+            "category": "projectile",
+            "projectile_evidence": {
+                "detected_object_class": "fast_projectile",
+                "speed_px_per_sec": 1020.0,
+                "trajectory_model": "projectile",
+            },
+        },
+    )
+
+    markers = pages["/alerts?id=ALERT-12345678"]
+    assert "抛射物" in markers
+    assert "物理数据" in markers
+    assert "px/s" in markers
+    assert "projectile" in markers
+
+
 def test_websocket_url_derives_ws_endpoint_from_http_base_url():
     assert _websocket_url("http://127.0.0.1:8080") == "ws://127.0.0.1:8080/ws"
     assert _websocket_url("https://example.test") == "wss://example.test/ws"
