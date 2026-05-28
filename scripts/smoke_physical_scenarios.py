@@ -27,6 +27,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 SCENARIOS = ("book", "projectile")
+CAPTURE_TAIL_CHARS = 2_000_000
 
 
 class PhysicalScenarioSmokeFailure(RuntimeError):
@@ -205,6 +206,10 @@ def _as_text(value: str | bytes | None) -> str:
     return value
 
 
+def _append_tail(current: str, chunk: str, limit: int) -> str:
+    return (current + chunk)[-limit:]
+
+
 def _run_streaming_command(
     command: list[str],
     *,
@@ -219,6 +224,7 @@ def _run_streaming_command(
         text=True,
         bufsize=1,
     )
+    capture_limit = max(log_tail_chars, CAPTURE_TAIL_CHARS)
     captured = {"stdout": "", "stderr": ""}
     lock = threading.Lock()
 
@@ -230,7 +236,7 @@ def _run_streaming_command(
                 sink.write(chunk)
                 sink.flush()
                 with lock:
-                    captured[key] += chunk
+                    captured[key] = _append_tail(captured[key], chunk, capture_limit)
         finally:
             pipe.close()
 
