@@ -41,7 +41,7 @@ class _CommandRunResult:
     timed_out: bool = False
 
 
-def _base_business_command(args: argparse.Namespace) -> list[str]:
+def _base_business_command(args: argparse.Namespace, *, preflight: bool = False) -> list[str]:
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "smoke_dashboard_business_flow.py"),
@@ -66,6 +66,14 @@ def _base_business_command(args: argparse.Namespace) -> list[str]:
         cmd.extend(["--usb-device-name", args.usb_device_name])
     if args.usb_device_id:
         cmd.extend(["--usb-device-id", args.usb_device_id])
+    if preflight:
+        cmd.extend([
+            "--preflight",
+            "--preflight-timeout",
+            str(args.preflight_timeout),
+            "--preflight-measure-seconds",
+            str(args.preflight_measure_seconds),
+        ])
     return cmd
 
 
@@ -93,6 +101,10 @@ def _scenario_expectation_args(scenario: str) -> list[str]:
 
 def build_business_command(args: argparse.Namespace, scenario: str) -> list[str]:
     return _base_business_command(args) + _scenario_expectation_args(scenario)
+
+
+def build_preflight_command(args: argparse.Namespace) -> list[str]:
+    return _base_business_command(args, preflight=True)
 
 
 def _append_tail(current: str, chunk: str, limit: int) -> str:
@@ -215,13 +227,45 @@ def run_scenario(args: argparse.Namespace, scenario: str) -> dict[str, Any]:
     return result
 
 
+def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    command = build_preflight_command(args)
+    result: dict[str, Any] = {
+        "instruction": "Verify camera capture, go2rtc registration, resolution, and FPS before physical actions.",
+        "command": command,
+    }
+    if args.dry_run:
+        result["ok"] = True
+        result["dry_run"] = True
+        return result
+
+    print(f"[argus] preflight: {result['instruction']}", flush=True)
+    completed = _run_business_command(command, args)
+    result.update({
+        "ok": completed.returncode == 0 and not completed.timed_out,
+        "returncode": completed.returncode,
+        "timed_out": completed.timed_out,
+        "stdout_tail": completed.stdout[-args.log_tail_chars:],
+        "stderr_tail": completed.stderr[-args.log_tail_chars:],
+    })
+    return result
+
+
 def run_physical_smoke(args: argparse.Namespace) -> dict[str, Any]:
+    preflight_result = run_preflight(args) if args.preflight else None
+    if preflight_result is not None and not preflight_result.get("ok"):
+        return {
+            "ok": False,
+            "preflight": preflight_result,
+            "scenarios": [],
+        }
+
     scenarios = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
     results = [run_scenario(args, scenario) for scenario in scenarios]
-    return {
-        "ok": all(item.get("ok") for item in results),
-        "scenarios": results,
-    }
+    output = {"ok": all(item.get("ok") for item in results)}
+    if preflight_result is not None:
+        output["preflight"] = preflight_result
+    output["scenarios"] = results
+    return output
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -248,6 +292,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recording-timeout", type=float, default=90.0)
     parser.add_argument("--browser", choices=["auto", "required", "off"], default="required")
     parser.add_argument("--process-timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--preflight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run a camera/go2rtc/FPS preflight before prompting for physical actions.",
+    )
+    parser.add_argument("--preflight-timeout", type=float, default=8.0)
+    parser.add_argument("--preflight-measure-seconds", type=float, default=15.0)
     parser.add_argument("--log-tail-chars", type=int, default=12000)
     parser.add_argument(
         "--stream-output",
@@ -265,6 +317,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--recording-timeout must be positive")
     if args.process_timeout <= 0:
         parser.error("--process-timeout must be positive")
+    if args.preflight_timeout <= 0:
+        parser.error("--preflight-timeout must be positive")
+    if args.preflight_measure_seconds <= 0:
+        parser.error("--preflight-measure-seconds must be positive")
     if args.log_tail_chars <= 0:
         parser.error("--log-tail-chars must be positive")
     return args
