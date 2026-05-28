@@ -197,6 +197,14 @@ def _child_summary(child: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _as_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def _run_streaming_command(
     command: list[str],
     *,
@@ -261,13 +269,21 @@ def _run_business_command(command: list[str], args: argparse.Namespace) -> _Comm
             timeout_s=args.process_timeout,
             log_tail_chars=args.log_tail_chars,
         )
-    completed = subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        timeout=args.process_timeout,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=args.process_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _CommandRunResult(
+            returncode=None,
+            stdout=_as_text(exc.stdout or exc.output),
+            stderr=_as_text(exc.stderr),
+            timed_out=True,
+        )
     return _CommandRunResult(
         returncode=completed.returncode,
         stdout=completed.stdout,

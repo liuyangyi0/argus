@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -269,3 +270,25 @@ def test_run_scenario_records_subprocess_failure(monkeypatch: pytest.MonkeyPatch
     assert result["returncode"] == 7
     assert result["timed_out"] is False
     assert result["stderr_tail"] == "boom"
+
+
+def test_run_scenario_records_non_streaming_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args(["--scenario", "book", "--process-timeout", "5", "--no-stream-output"])
+
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=["business"],
+            timeout=5,
+            output="partial stdout",
+            stderr=b"late stderr",
+        )
+
+    monkeypatch.setattr("scripts.smoke_physical_scenarios.subprocess.run", fake_run)
+
+    result = run_scenario(args, "book")
+
+    assert result["ok"] is False
+    assert result["returncode"] is None
+    assert result["timed_out"] is True
+    assert result["stdout_tail"] == "partial stdout"
+    assert result["stderr_tail"] == "late stderr"
