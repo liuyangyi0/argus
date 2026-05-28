@@ -111,15 +111,24 @@ def build_preflight_command(args: argparse.Namespace) -> list[str]:
 def _extract_last_json_object(text: str) -> dict[str, Any] | None:
     decoder = json.JSONDecoder()
     best: dict[str, Any] | None = None
+    best_end = -1
+    best_len = -1
     idx = text.find("{")
     while idx >= 0:
         try:
-            value, _end = decoder.raw_decode(text[idx:])
+            value, end = decoder.raw_decode(text[idx:])
         except json.JSONDecodeError:
             idx = text.find("{", idx + 1)
             continue
-        if isinstance(value, dict) and "ok" in value:
+        absolute_end = idx + end
+        if (
+            isinstance(value, dict)
+            and "ok" in value
+            and (absolute_end > best_end or (absolute_end == best_end and end > best_len))
+        ):
             best = value
+            best_end = absolute_end
+            best_len = end
         idx = text.find("{", idx + 1)
     return best
 
