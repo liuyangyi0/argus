@@ -57,6 +57,7 @@ def test_build_book_command_includes_static_scene_expectations() -> None:
 
     assert "--expect-alert-category" in command
     assert "scene_change" in command
+    assert "static_foreign" in command
     assert "--expect-detection-type" in command
     assert "anomaly" in command
     assert "--forbid-alert-category" in command
@@ -297,6 +298,7 @@ def test_dry_run_scenario_returns_command_without_subprocess() -> None:
     assert result["dry_run"] is True
     assert result["scenario"] == "book"
     assert "place a book" in result["instruction"]
+    assert "static_foreign" in result["instruction"]
     assert "smoke_dashboard_business_flow.py" in " ".join(result["command"])
 
 

@@ -105,6 +105,11 @@ def _expected_degradations(*, use_yolo: bool, protocol: str | None) -> list[dict
     return degradations
 
 
+def _rtsp_fixture_anomaly_start_s(seconds: int) -> float:
+    """Delay RTSP fixture anomalies past service startup and baseline calibration."""
+    return max(1.0, min(18.0, float(seconds) - 10.0))
+
+
 class _RtspFixture:
     """Local go2rtc RTSP source backed by a generated development video."""
 
@@ -133,13 +138,14 @@ class _RtspFixture:
         from argus.streaming.go2rtc_manager import Go2RTCManager
 
         width, height = self.resolution
+        anomaly_start_s = _rtsp_fixture_anomaly_start_s(self.seconds)
         meta = create_dev_video(
             self.video_path,
             width=width,
             height=height,
             fps=10,
             seconds=self.seconds,
-            anomaly_start_s=6.0,
+            anomaly_start_s=anomaly_start_s,
             motion=self.motion,
         )
         manager = Go2RTCManager(
@@ -159,6 +165,7 @@ class _RtspFixture:
             "rtsp_port": self.rtsp_port,
             "webrtc_port": self.webrtc_port,
             "seconds": self.seconds,
+            "anomaly_start_s": anomaly_start_s,
             "video": meta,
         }
         return self.info

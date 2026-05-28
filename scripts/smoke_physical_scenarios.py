@@ -100,6 +100,8 @@ def _scenario_expectation_args(scenario: str) -> list[str]:
         return [
             "--expect-alert-category",
             "scene_change",
+            "--expect-alert-category",
+            "static_foreign",
             "--expect-detection-type",
             "anomaly",
             "--forbid-alert-category",
@@ -344,7 +346,8 @@ def _operator_instruction(scenario: str, args: argparse.Namespace) -> str:
     if scenario == "book":
         return (
             f"After activation, place a book on the empty table within "
-            f"{args.activation_delay:.1f}s. Expected: scene_change/anomaly."
+            f"{args.activation_delay:.1f}s. Expected: scene_change or "
+            "static_foreign anomaly."
         )
     if scenario == "projectile":
         return (
