@@ -143,6 +143,11 @@ def create_dev_video(
                     _draw_book(frame, target_x, y, book_w, book_h)
                 elif motion == "projectile":
                     travel_frames = max(6, min(frame_count - anomaly_start_frame, fps))
+                    cycle_frames = max(travel_frames + max(fps // 2, 1), fps * 2)
+                    t = t % cycle_frames
+                    if t >= travel_frames:
+                        writer.write(frame)
+                        continue
                     speed = max(8, int(round(width / max(travel_frames, 1))))
                     x = -max(12, width // 28) + t * speed
                     y = int(height * 0.42 + height * 0.08 * np.sin(t / max(fps / 7.0, 1.0)))

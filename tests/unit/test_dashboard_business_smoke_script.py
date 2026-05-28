@@ -388,6 +388,60 @@ def test_alert_semantic_expectations_accept_expected_values():
     assert result["forbidden_category"] == ["projectile"]
 
 
+def test_alert_semantic_expectations_require_projectile_evidence():
+    args = parse_args([
+        "--expect-alert-category", "projectile",
+        "--expect-detection-type", "projectile",
+        "--browser", "off",
+    ])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "projectile",
+            "category": "projectile",
+            "trajectory_model": "projectile",
+            "speed_px_per_sec": 1020.0,
+            "trajectory_points": [{"t": 1.0, "x": 8.2, "y": 215.0}],
+            "detected_objects": [
+                {
+                    "class_name": "fast_projectile",
+                    "bbox": [0, 211, 17, 220],
+                    "speed_px_per_sec": 1020.0,
+                    "trajectory_points": [{"t": 1.0, "x": 8.2, "y": 215.0}],
+                }
+            ],
+        },
+    }
+
+    result = _verify_alert_semantic_expectations(args, alert)
+
+    assert result["projectile_evidence"] == {
+        "detected_object_class": "fast_projectile",
+        "bbox": [0, 211, 17, 220],
+        "speed_px_per_sec": 1020.0,
+        "trajectory_model": "projectile",
+        "trajectory_points": 1,
+    }
+
+
+def test_alert_semantic_expectations_reject_projectile_without_evidence():
+    args = parse_args([
+        "--expect-alert-category", "projectile",
+        "--expect-detection-type", "projectile",
+        "--browser", "off",
+    ])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "projectile",
+            "category": "projectile",
+        },
+    }
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="missing fast_projectile"):
+        _verify_alert_semantic_expectations(args, alert)
+
+
 def test_alert_semantic_expectations_reject_mismatch():
     args = parse_args([
         "--expect-alert-category", "projectile",
