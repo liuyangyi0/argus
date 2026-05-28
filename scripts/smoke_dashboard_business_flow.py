@@ -605,6 +605,55 @@ def _extract_alert_semantics(alert: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _verify_projectile_evidence(alert: dict[str, Any]) -> dict[str, Any]:
+    realtime = alert.get("_realtime_payload") or alert.get("realtime") or {}
+    detected_objects = realtime.get("detected_objects") or alert.get("detected_objects") or []
+    fast_objects = [
+        item
+        for item in detected_objects
+        if str(item.get("class_name") or item.get("class") or "").lower() == "fast_projectile"
+    ]
+    if not fast_objects:
+        raise DashboardBusinessSmokeFailure(
+            "projectile alert missing fast_projectile detected_object evidence"
+        )
+
+    primary = fast_objects[0]
+    bbox = primary.get("bbox")
+    if not isinstance(bbox, list | tuple) or len(bbox) != 4:
+        raise DashboardBusinessSmokeFailure("projectile alert missing bbox evidence")
+
+    speed = (
+        realtime.get("speed_px_per_sec")
+        or primary.get("speed_px_per_sec")
+        or alert.get("speed_px_per_sec")
+    )
+    if not isinstance(speed, int | float) or speed <= 0:
+        raise DashboardBusinessSmokeFailure("projectile alert missing positive speed evidence")
+
+    trajectory = (
+        realtime.get("trajectory_points")
+        or primary.get("trajectory_points")
+        or alert.get("trajectory_points")
+    )
+    if not isinstance(trajectory, list) or not trajectory:
+        raise DashboardBusinessSmokeFailure("projectile alert missing trajectory evidence")
+
+    trajectory_model = realtime.get("trajectory_model") or alert.get("trajectory_model")
+    if trajectory_model != "projectile":
+        raise DashboardBusinessSmokeFailure(
+            f"projectile alert trajectory_model={trajectory_model!r}; expected 'projectile'"
+        )
+
+    return {
+        "detected_object_class": "fast_projectile",
+        "bbox": [int(value) for value in bbox],
+        "speed_px_per_sec": float(speed),
+        "trajectory_model": trajectory_model,
+        "trajectory_points": len(trajectory),
+    }
+
+
 def _verify_alert_semantic_expectations(
     args: argparse.Namespace,
     alert: dict[str, Any],
@@ -637,13 +686,20 @@ def _verify_alert_semantic_expectations(
                 f"alert {field}={actual!r} matched forbidden values "
                 f"{sorted(forbidden)!r}"
             )
-    return {
+    result = {
         **semantics,
         "expected_detection_type": sorted(checks["detection_type"]["expected"]),
         "expected_category": sorted(checks["category"]["expected"]),
         "forbidden_detection_type": sorted(checks["detection_type"]["forbidden"]),
         "forbidden_category": sorted(checks["category"]["forbidden"]),
     }
+    expects_projectile = (
+        "projectile" in checks["detection_type"]["expected"]
+        or "projectile" in checks["category"]["expected"]
+    )
+    if expects_projectile:
+        result["projectile_evidence"] = _verify_projectile_evidence(alert)
+    return result
 
 
 def _verify_dev_video_alert_semantics(

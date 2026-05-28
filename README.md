@@ -98,6 +98,7 @@ python scripts/smoke_dashboard_business_flow.py --preflight --camera-source 0 --
 # 无 RTSP 硬件时，可用本地 go2rtc 夹具把生成视频发布成 RTSP，再验证 RTSP + go2rtc 路径
 python scripts/smoke_dashboard_business_flow.py --preflight --rtsp-fixture --require-go2rtc
 python scripts/smoke_dashboard_business_flow.py --rtsp-fixture --require-go2rtc --browser required
+python scripts/smoke_dashboard_business_flow.py --rtsp-fixture --dev-video-motion projectile --expect-alert-category projectile --expect-detection-type projectile --require-go2rtc --browser required
 
 # preflight 通过后再跑完整业务闭环；activation-delay 留给操作员放入测试目标
 python scripts/smoke_dashboard_business_flow.py --camera-source 0 --camera-protocol usb --require-go2rtc --activation-delay 10 --browser required

@@ -113,7 +113,7 @@ def test_create_dev_video_projectile_triggers_fast_motion_detector(tmp_path):
         width=320,
         height=180,
         fps=60,
-        seconds=2,
+        seconds=5,
         anomaly_start_s=0.5,
         motion="projectile",
     )
@@ -132,6 +132,7 @@ def test_create_dev_video_projectile_triggers_fast_motion_detector(tmp_path):
     )
     capture = cv2.VideoCapture(str(video_path))
     detections = []
+    detection_frames = []
     try:
         for idx in range(meta["frames"]):
             ok, frame = capture.read()
@@ -139,8 +140,10 @@ def test_create_dev_video_projectile_triggers_fast_motion_detector(tmp_path):
             result = detector.process(frame, timestamp=idx / 60)
             if result.has_detection:
                 detections.extend(result.candidates)
+                detection_frames.append(idx)
     finally:
         capture.release()
 
     assert detections
     assert any(candidate.to_detected_object()["class_name"] == "fast_projectile" for candidate in detections)
+    assert any(idx > meta["anomaly_start_frame"] + 120 for idx in detection_frames)
