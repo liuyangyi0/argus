@@ -6,6 +6,7 @@ import pytest
 
 from scripts.smoke_physical_scenarios import (
     build_business_command,
+    build_preflight_command,
     parse_args,
     run_physical_smoke,
     run_scenario,
@@ -22,6 +23,9 @@ def test_parse_args_defaults_to_obsbot_book_scenario() -> None:
     assert args.usb_device_name == "OBSBOT Meet 2 StreamCamera"
     assert args.require_go2rtc is True
     assert args.browser == "required"
+    assert args.preflight is True
+    assert args.preflight_timeout == 8.0
+    assert args.preflight_measure_seconds == 15.0
     assert args.stream_output is True
 
 
@@ -29,6 +33,15 @@ def test_parse_args_can_disable_streaming_for_captured_logs() -> None:
     args = parse_args(["--no-stream-output", "--dry-run"])
 
     assert args.stream_output is False
+
+
+def test_parse_args_can_disable_preflight_for_debugging() -> None:
+    args = parse_args(["--no-preflight", "--dry-run"])
+
+    result = run_physical_smoke(args)
+
+    assert args.preflight is False
+    assert "preflight" not in result
 
 
 def test_build_book_command_includes_static_scene_expectations() -> None:
@@ -53,6 +66,29 @@ def test_build_projectile_command_includes_projectile_expectations() -> None:
     assert "--expect-alert-category" in command
     assert "--expect-detection-type" in command
     assert command.count("projectile") == 2
+    assert "--forbid-alert-category" not in command
+
+
+def test_build_preflight_command_includes_probe_options_without_semantics() -> None:
+    args = parse_args([
+        "--scenario",
+        "book",
+        "--preflight-timeout",
+        "12",
+        "--preflight-measure-seconds",
+        "18",
+        "--dry-run",
+    ])
+
+    command = build_preflight_command(args)
+
+    assert "--preflight" in command
+    assert "--preflight-timeout" in command
+    assert "12.0" in command
+    assert "--preflight-measure-seconds" in command
+    assert "18.0" in command
+    assert "--expect-alert-category" not in command
+    assert "--expect-detection-type" not in command
     assert "--forbid-alert-category" not in command
 
 
@@ -89,7 +125,28 @@ def test_run_all_dry_run_returns_both_scenarios() -> None:
     result = run_physical_smoke(args)
 
     assert result["ok"] is True
+    assert result["preflight"]["ok"] is True
+    assert result["preflight"]["dry_run"] is True
     assert [item["scenario"] for item in result["scenarios"]] == ["book", "projectile"]
+
+
+def test_preflight_failure_skips_physical_scenarios(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_args(["--scenario", "book", "--process-timeout", "5"])
+
+    monkeypatch.setattr(
+        "scripts.smoke_physical_scenarios.run_preflight",
+        lambda _args: {"ok": False, "returncode": 7},
+    )
+    monkeypatch.setattr(
+        "scripts.smoke_physical_scenarios.run_scenario",
+        lambda *_args: pytest.fail("scenario should not run after preflight failure"),
+    )
+
+    result = run_physical_smoke(args)
+
+    assert result["ok"] is False
+    assert result["preflight"]["returncode"] == 7
+    assert result["scenarios"] == []
 
 
 def test_run_scenario_streams_subprocess_output_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
