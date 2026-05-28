@@ -61,6 +61,7 @@ from argus.storage.release_pipeline import ReleasePipeline
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+_MIN_FAST_USB_MEASURE_SECONDS = 15.0
 
 
 class SmokeFailure(RuntimeError):
@@ -810,6 +811,16 @@ def _wait_before_activation(*, seconds: float, camera_id: str) -> None:
     time.sleep(seconds)
 
 
+def _effective_preflight_measure_seconds(camera, requested_seconds: float) -> float:
+    if str(camera.protocol) != "usb":
+        return requested_seconds
+    fast_cfg = getattr(camera, "fast_motion", None)
+    min_fps = float(getattr(fast_cfg, "min_runtime_fps", 0.0) or 0.0)
+    if min_fps <= 0:
+        return requested_seconds
+    return max(requested_seconds, _MIN_FAST_USB_MEASURE_SECONDS)
+
+
 def _prepare_config(
     config_path: Path,
     work_dir: Path,
@@ -868,8 +879,10 @@ def _prepare_config(
         camera.fps_target = 10
     camera.resolution = camera_resolution
     if protocol == "usb":
-        camera.usb.device_name = usb_device_name
-        camera.usb.device_id = usb_device_id
+        if usb_device_name is not None:
+            camera.usb.device_name = usb_device_name
+        if usb_device_id is not None:
+            camera.usb.device_id = usb_device_id
     camera.zones = []
     camera.anomaly.ssim_baseline_frames = 15
     camera.ring_buffer.enabled = True
@@ -1530,11 +1543,15 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
         resolution = go2rtc_resolution.get(camera_id, {})
         probe_source = resolution.get("runtime_source") or camera.source
         probe_protocol = resolution.get("runtime_protocol") or camera.protocol
+        measure_seconds = _effective_preflight_measure_seconds(
+            camera,
+            args.preflight_measure_seconds,
+        )
         capture_probe = _probe_capture_source(
             str(probe_source),
             str(probe_protocol),
             timeout_ms=int(args.preflight_timeout * 1000),
-            measure_seconds=args.preflight_measure_seconds,
+            measure_seconds=measure_seconds,
         )
 
         errors: list[str] = []
@@ -1623,6 +1640,7 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
                 "probe_source": probe_source,
                 "probe_protocol": probe_protocol,
                 "resolution": camera.resolution,
+                "preflight_measure_seconds": measure_seconds,
                 "usb_selection": usb_selection,
             },
             "go2rtc": go2rtc_info,
@@ -1917,7 +1935,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--preflight-measure-seconds",
         type=float,
         default=2.0,
-        help="Seconds to sample decoded frames for preflight FPS measurement (default: 2).",
+        help=(
+            "Seconds to sample decoded frames for preflight FPS measurement "
+            "(default: 2; USB fast-motion checks use at least 15)."
+        ),
     )
     parser.add_argument(
         "--use-yolo",
