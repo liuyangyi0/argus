@@ -107,8 +107,94 @@ def build_preflight_command(args: argparse.Namespace) -> list[str]:
     return _base_business_command(args, preflight=True)
 
 
-def _append_tail(current: str, chunk: str, limit: int) -> str:
-    return (current + chunk)[-limit:]
+def _extract_last_json_object(text: str) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    best: dict[str, Any] | None = None
+    idx = text.find("{")
+    while idx >= 0:
+        try:
+            value, _end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            idx = text.find("{", idx + 1)
+            continue
+        if isinstance(value, dict) and "ok" in value:
+            best = value
+        idx = text.find("{", idx + 1)
+    return best
+
+
+def _child_summary(child: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not child:
+        return None
+
+    if child.get("mode") == "preflight":
+        probe = child.get("capture_probe") or {}
+        camera_input = child.get("camera_input") or {}
+        go2rtc = child.get("go2rtc") or {}
+        return {
+            "mode": child.get("mode"),
+            "ok": child.get("ok"),
+            "camera_input": {
+                "camera_id": camera_input.get("camera_id"),
+                "protocol": camera_input.get("protocol"),
+                "probe_protocol": camera_input.get("probe_protocol"),
+                "resolution": camera_input.get("resolution"),
+                "preflight_measure_seconds": camera_input.get("preflight_measure_seconds"),
+                "usb_selection": camera_input.get("usb_selection"),
+            },
+            "capture_probe": {
+                "ok": probe.get("ok"),
+                "backend": probe.get("backend"),
+                "shape": probe.get("shape"),
+                "measured_fps": probe.get("measured_fps"),
+                "measured_frames": probe.get("measured_frames"),
+                "measured_elapsed_seconds": probe.get("measured_elapsed_seconds"),
+            },
+            "go2rtc": {
+                "enabled": go2rtc.get("enabled"),
+                "required": go2rtc.get("required"),
+                "running": go2rtc.get("running"),
+                "resolutions": go2rtc.get("resolutions"),
+            },
+            "hints": child.get("hints") or [],
+            "errors": child.get("errors") or [],
+        }
+
+    alert = child.get("alert") or {}
+    realtime = alert.get("realtime") or {}
+    browser = child.get("browser") or {}
+    checklist = child.get("objective_checklist") or []
+    return {
+        "ok": child.get("ok"),
+        "base_url": child.get("base_url"),
+        "camera": child.get("camera"),
+        "camera_streaming": (child.get("camera_media") or {}).get("streaming"),
+        "alert": {
+            "alert_id": alert.get("alert_id"),
+            "severity": alert.get("severity"),
+            "recording_status": alert.get("recording_status"),
+            "detection_type": realtime.get("detection_type"),
+            "category": realtime.get("category"),
+            "speed_px_per_sec": realtime.get("speed_px_per_sec"),
+            "trajectory_model": realtime.get("trajectory_model"),
+        },
+        "alert_semantics": child.get("alert_semantics"),
+        "browser": {
+            "status": browser.get("status"),
+            "routes_checked": [
+                item.get("route")
+                for item in (browser.get("routes_checked") or [])
+                if item.get("route")
+            ],
+        },
+        "objective_checklist": [
+            {
+                "requirement": item.get("requirement"),
+                "passed": item.get("passed"),
+            }
+            for item in checklist
+        ],
+    }
 
 
 def _run_streaming_command(
@@ -125,7 +211,7 @@ def _run_streaming_command(
         text=True,
         bufsize=1,
     )
-    tails = {"stdout": "", "stderr": ""}
+    captured = {"stdout": "", "stderr": ""}
     lock = threading.Lock()
 
     def reader(pipe, sink, key: str) -> None:
@@ -136,7 +222,7 @@ def _run_streaming_command(
                 sink.write(chunk)
                 sink.flush()
                 with lock:
-                    tails[key] = _append_tail(tails[key], chunk, log_tail_chars)
+                    captured[key] += chunk
         finally:
             pipe.close()
 
@@ -158,8 +244,8 @@ def _run_streaming_command(
         thread.join(timeout=1.0)
 
     with lock:
-        stdout = tails["stdout"]
-        stderr = tails["stderr"]
+        stdout = captured["stdout"]
+        stderr = captured["stderr"]
     return _CommandRunResult(
         returncode=None if timed_out else returncode,
         stdout=stdout,
@@ -224,6 +310,10 @@ def run_scenario(args: argparse.Namespace, scenario: str) -> dict[str, Any]:
         "stdout_tail": completed.stdout[-args.log_tail_chars:],
         "stderr_tail": completed.stderr[-args.log_tail_chars:],
     })
+    child = _extract_last_json_object(completed.stdout)
+    summary = _child_summary(child)
+    if summary is not None:
+        result["evidence"] = summary
     return result
 
 
@@ -247,6 +337,10 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
         "stdout_tail": completed.stdout[-args.log_tail_chars:],
         "stderr_tail": completed.stderr[-args.log_tail_chars:],
     })
+    child = _extract_last_json_object(completed.stdout)
+    summary = _child_summary(child)
+    if summary is not None:
+        result["evidence"] = summary
     return result
 
 
