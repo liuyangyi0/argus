@@ -595,6 +595,55 @@ def _wait_for_completed_alert(
     return alert, detail
 
 
+def _extract_alert_semantics(alert: dict[str, Any]) -> dict[str, str]:
+    realtime = alert.get("_realtime_payload") or alert.get("realtime") or {}
+    return {
+        "detection_type": str(realtime.get("detection_type") or alert.get("detection_type") or ""),
+        "category": str(realtime.get("category") or alert.get("category") or ""),
+    }
+
+
+def _verify_alert_semantic_expectations(
+    args: argparse.Namespace,
+    alert: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify operator-declared semantic expectations for physical scenario smokes."""
+    semantics = _extract_alert_semantics(alert)
+    checks = {
+        "detection_type": {
+            "actual": semantics["detection_type"],
+            "expected": set(args.expect_detection_type or []),
+            "forbidden": set(args.forbid_detection_type or []),
+        },
+        "category": {
+            "actual": semantics["category"],
+            "expected": set(args.expect_alert_category or []),
+            "forbidden": set(args.forbid_alert_category or []),
+        },
+    }
+    for field, item in checks.items():
+        actual = item["actual"]
+        expected = item["expected"]
+        forbidden = item["forbidden"]
+        if expected and actual not in expected:
+            raise DashboardBusinessSmokeFailure(
+                f"alert {field}={actual!r} did not match expected values "
+                f"{sorted(expected)!r}"
+            )
+        if forbidden and actual in forbidden:
+            raise DashboardBusinessSmokeFailure(
+                f"alert {field}={actual!r} matched forbidden values "
+                f"{sorted(forbidden)!r}"
+            )
+    return {
+        **semantics,
+        "expected_detection_type": sorted(checks["detection_type"]["expected"]),
+        "expected_category": sorted(checks["category"]["expected"]),
+        "forbidden_detection_type": sorted(checks["detection_type"]["forbidden"]),
+        "forbidden_category": sorted(checks["category"]["forbidden"]),
+    }
+
+
 def _verify_dev_video_alert_semantics(
     args: argparse.Namespace,
     alert: dict[str, Any],
@@ -602,18 +651,15 @@ def _verify_dev_video_alert_semantics(
     if args.camera_source is not None or args.dev_video_motion != "book":
         return None
 
-    realtime = alert.get("_realtime_payload") or alert.get("realtime") or {}
-    detection_type = str(realtime.get("detection_type") or alert.get("detection_type") or "")
-    category = str(realtime.get("category") or alert.get("category") or "")
-    if detection_type == "projectile" or category == "projectile":
+    semantics = _extract_alert_semantics(alert)
+    if semantics["detection_type"] == "projectile" or semantics["category"] == "projectile":
         raise DashboardBusinessSmokeFailure(
             "book dev-video scenario was reported as projectile; expected a "
             "static scene-change/foreign-object anomaly"
         )
     return {
         "motion": args.dev_video_motion,
-        "detection_type": detection_type,
-        "category": category,
+        **semantics,
     }
 
 
@@ -1604,6 +1650,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         realtime_listener=realtime_listener,
                     )
                 alert_id = alert["alert_id"]
+                alert_semantics = _verify_alert_semantic_expectations(args, alert)
                 dev_video_semantics = _verify_dev_video_alert_semantics(args, alert)
                 api_result = _verify_business_apis(
                     client,
@@ -1688,6 +1735,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "models_system": models_system_result,
             "training_baselines": training_baselines,
             "rtsp_fixture": fixture_info,
+            "alert_semantics": alert_semantics,
             "dev_video_semantics": dev_video_semantics,
             "browser": browser_result,
             "objective_checklist": objective_checklist,
@@ -1848,6 +1896,36 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Seconds to wait after switching the camera to active mode. "
             "Useful for hardware runs where an operator needs time to introduce a test object."
         ),
+    )
+    parser.add_argument(
+        "--expect-alert-category",
+        action="append",
+        default=[],
+        help=(
+            "Require the alert category to match this value. Repeat to allow "
+            "multiple values, e.g. scene_change or projectile."
+        ),
+    )
+    parser.add_argument(
+        "--expect-detection-type",
+        action="append",
+        default=[],
+        help=(
+            "Require the realtime detection_type to match this value. Repeat "
+            "to allow multiple values, e.g. anomaly or projectile."
+        ),
+    )
+    parser.add_argument(
+        "--forbid-alert-category",
+        action="append",
+        default=[],
+        help="Fail if the alert category matches this value. May be repeated.",
+    )
+    parser.add_argument(
+        "--forbid-detection-type",
+        action="append",
+        default=[],
+        help="Fail if the realtime detection_type matches this value. May be repeated.",
     )
     parser.add_argument(
         "--preflight-timeout",

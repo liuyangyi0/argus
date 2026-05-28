@@ -20,6 +20,7 @@ from scripts.smoke_dashboard_business_flow import (
     _prepare_runtime_config,
     _seed_model_registry,
     _seed_training_baselines,
+    _verify_alert_semantic_expectations,
     _verify_business_apis,
     _verify_dev_video_alert_semantics,
     _verify_system_degradation_apis,
@@ -160,6 +161,24 @@ def test_parse_args_accepts_hardware_camera_source():
     assert args.activation_delay == 5.0
 
 
+def test_parse_args_accepts_hardware_semantic_expectations():
+    args = parse_args([
+        "--camera-source", "0",
+        "--camera-protocol", "usb",
+        "--expect-alert-category", "scene_change",
+        "--expect-alert-category", "static_foreign",
+        "--expect-detection-type", "anomaly",
+        "--forbid-alert-category", "projectile",
+        "--forbid-detection-type", "projectile",
+        "--browser", "off",
+    ])
+
+    assert args.expect_alert_category == ["scene_change", "static_foreign"]
+    assert args.expect_detection_type == ["anomaly"]
+    assert args.forbid_alert_category == ["projectile"]
+    assert args.forbid_detection_type == ["projectile"]
+
+
 def test_parse_args_accepts_preflight_mode():
     args = parse_args([
         "--preflight",
@@ -293,6 +312,64 @@ def test_book_dev_video_semantics_accepts_scene_change():
         "detection_type": "anomaly",
         "category": "scene_change",
     }
+
+
+def test_alert_semantic_expectations_accept_expected_values():
+    args = parse_args([
+        "--expect-alert-category", "scene_change",
+        "--expect-detection-type", "anomaly",
+        "--forbid-alert-category", "projectile",
+        "--forbid-detection-type", "projectile",
+        "--browser", "off",
+    ])
+    alert = {
+        "alert_id": "ALT-1",
+        "_realtime_payload": {
+            "detection_type": "anomaly",
+            "category": "scene_change",
+        },
+    }
+
+    result = _verify_alert_semantic_expectations(args, alert)
+
+    assert result["detection_type"] == "anomaly"
+    assert result["category"] == "scene_change"
+    assert result["expected_detection_type"] == ["anomaly"]
+    assert result["expected_category"] == ["scene_change"]
+    assert result["forbidden_detection_type"] == ["projectile"]
+    assert result["forbidden_category"] == ["projectile"]
+
+
+def test_alert_semantic_expectations_reject_mismatch():
+    args = parse_args([
+        "--expect-alert-category", "projectile",
+        "--expect-detection-type", "projectile",
+        "--browser", "off",
+    ])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "anomaly",
+            "category": "scene_change",
+        },
+    }
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="did not match expected"):
+        _verify_alert_semantic_expectations(args, alert)
+
+
+def test_alert_semantic_expectations_reject_forbidden_value():
+    args = parse_args(["--forbid-alert-category", "projectile", "--browser", "off"])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "projectile",
+            "category": "projectile",
+        },
+    }
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="matched forbidden"):
+        _verify_alert_semantic_expectations(args, alert)
 
 
 def test_run_camera_preflight_delegates_to_core_preflight(monkeypatch, tmp_path):
