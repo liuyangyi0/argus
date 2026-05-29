@@ -516,6 +516,14 @@ def _verify_camera_media_apis(
     }
 
 
+def _recent_alerts(client: httpx.Client, *, camera_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    data = _api_data(
+        client.get("/api/alerts/json", params={"camera_id": camera_id, "limit": limit}, timeout=5),
+        label="alerts json",
+    )
+    return list(data.get("alerts") or [])
+
+
 def _wait_for_completed_alert(
     client: httpx.Client,
     *,
@@ -526,11 +534,7 @@ def _wait_for_completed_alert(
     realtime_listener: _AlertWebSocketListener | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     def latest_alert():
-        data = _api_data(
-            client.get("/api/alerts/json", params={"camera_id": camera_id, "limit": 10}, timeout=5),
-            label="alerts json",
-        )
-        alerts = data.get("alerts") or []
+        alerts = _recent_alerts(client, camera_id=camera_id)
         return alerts[0] if alerts else None
 
     alert = _wait_for(
@@ -602,6 +606,42 @@ def _wait_for_completed_alert(
             f"{json.dumps(evidence_state, ensure_ascii=False, default=str)}"
         ) from exc
     return alert, detail
+
+
+def _verify_no_alert_window(
+    client: httpx.Client,
+    *,
+    camera_id: str,
+    observe_seconds: float,
+    process: subprocess.Popen,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + observe_seconds
+    polls = 0
+    while True:
+        if process.poll() is not None:
+            raise DashboardBusinessSmokeFailure(
+                f"argus exited early with code {process.returncode}"
+            )
+        alerts = _recent_alerts(client, camera_id=camera_id, limit=5)
+        polls += 1
+        if alerts:
+            alert = alerts[0]
+            realtime = alert.get("_realtime_payload") or alert.get("realtime") or {}
+            raise DashboardBusinessSmokeFailure(
+                "expected no alerts but observed "
+                f"{alert.get('alert_id')} severity={alert.get('severity')} "
+                f"category={realtime.get('category') or alert.get('category')} "
+                f"detection_type={realtime.get('detection_type') or alert.get('detection_type')}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
+    return {
+        "observed_seconds": observe_seconds,
+        "polls": polls,
+        "alerts_seen": 0,
+    }
 
 
 def _extract_alert_semantics(alert: dict[str, Any]) -> dict[str, str]:
@@ -1749,6 +1789,47 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     if args.activation_delay > 0:
                         print(_physical_action_window_message(args), flush=True)
                         time.sleep(args.activation_delay)
+                    if args.expect_no_alert:
+                        no_alert_result = _verify_no_alert_window(
+                            client,
+                            camera_id=camera_id,
+                            observe_seconds=args.no_alert_observe_seconds,
+                            process=proc,
+                        )
+                        camera_row = _wait_for_camera(
+                            client,
+                            camera_id=camera_id,
+                            timeout_s=min(args.timeout, 10.0),
+                            min_frames=args.min_frames,
+                            process=proc,
+                        )
+                        return {
+                            "ok": True,
+                            "mode": "no_alert",
+                            "base_url": base_url,
+                            "work_dir": str(work_dir),
+                            "runtime_config": str(runtime_config),
+                            "camera": {
+                                "camera_id": camera_id,
+                                "connected": camera_row.get("connected"),
+                                "running": camera_row.get("running"),
+                                "pipeline_mode": mode_result.get("pipeline_mode"),
+                                "frames_captured": (camera_row.get("stats") or {}).get("frames_captured"),
+                                "detector": (detector_detail.get("detector") or {}),
+                            },
+                            "camera_media": camera_media_result,
+                            "no_alert": no_alert_result,
+                            "rtsp_fixture": fixture_info,
+                            "browser": {
+                                "status": "not_applicable",
+                                "reason": "--expect-no-alert does not open alert or replay detail pages",
+                                "routes_checked": [],
+                            },
+                            "expected_degradations": _expected_degradations(
+                                use_yolo=args.use_yolo,
+                                protocol=camera_protocol or _infer_camera_protocol(camera_source or ""),
+                            ),
+                        }
                     alert, alert_detail = _wait_for_completed_alert(
                         client,
                         camera_id=camera_id,
@@ -1898,6 +1979,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--port", type=int, default=0, help="Dashboard port; 0 picks a free port")
     parser.add_argument("--timeout", type=float, default=90.0, help="Seconds to wait for alert generation")
+    parser.add_argument(
+        "--expect-no-alert",
+        action="store_true",
+        help="After activation, observe the camera and fail if any alert is generated.",
+    )
+    parser.add_argument(
+        "--no-alert-observe-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds to observe with --expect-no-alert (default: 30).",
+    )
     parser.add_argument(
         "--recording-timeout",
         type=float,
@@ -2085,6 +2177,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--port must be between 0 and 65535")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.no_alert_observe_seconds <= 0:
+        parser.error("--no-alert-observe-seconds must be positive")
+    if args.expect_no_alert and (args.expect_alert_category or args.expect_detection_type):
+        parser.error("--expect-no-alert cannot be combined with expected alert semantics")
     if args.recording_timeout <= 0:
         parser.error("--recording-timeout must be positive")
     if args.training_timeout <= 0:

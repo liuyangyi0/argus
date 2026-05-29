@@ -25,6 +25,7 @@ from scripts.smoke_dashboard_business_flow import (
     _verify_alert_semantic_expectations,
     _verify_business_apis,
     _verify_dev_video_alert_semantics,
+    _verify_no_alert_window,
     _verify_system_degradation_apis,
     _wait_for,
     _wait_for_completed_alert,
@@ -275,6 +276,19 @@ def test_parse_args_accepts_local_rtsp_fixture():
     assert args.recording_timeout == 90.0
 
 
+def test_parse_args_accepts_no_alert_observation():
+    args = parse_args([
+        "--camera-source", "0",
+        "--camera-protocol", "usb",
+        "--expect-no-alert",
+        "--no-alert-observe-seconds", "3.5",
+        "--browser", "off",
+    ])
+
+    assert args.expect_no_alert is True
+    assert args.no_alert_observe_seconds == 3.5
+
+
 def test_rtsp_fixture_delays_anomaly_until_after_baseline_window():
     assert _rtsp_fixture_anomaly_start_s(60) == 18.0
     assert _rtsp_fixture_anomaly_start_s(20) == 10.0
@@ -345,6 +359,73 @@ def test_wait_for_completed_alert_timeout_reports_last_evidence_state():
     assert "Last alert evidence state" in msg
     assert '"recording_status": "recording"' in msg
     assert '"heatmap_path": null' in msg
+
+
+def test_verify_no_alert_window_passes_when_alert_list_stays_empty():
+    class RunningProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/alerts/json"
+        return httpx.Response(200, json={"code": 0, "data": {"alerts": []}})
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="http://argus.test",
+    )
+
+    result = _verify_no_alert_window(
+        client,
+        camera_id="cam_a",
+        observe_seconds=0.01,
+        process=RunningProcess(),
+    )
+
+    assert result["alerts_seen"] == 0
+    assert result["polls"] >= 1
+
+
+def test_verify_no_alert_window_fails_on_any_alert():
+    class RunningProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/alerts/json"
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "alerts": [
+                        {
+                            "alert_id": "ALT-1",
+                            "severity": "medium",
+                            "category": "scene_change",
+                            "detection_type": "anomaly",
+                        }
+                    ]
+                },
+            },
+        )
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="http://argus.test",
+    )
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="expected no alerts"):
+        _verify_no_alert_window(
+            client,
+            camera_id="cam_a",
+            observe_seconds=1.0,
+            process=RunningProcess(),
+        )
 
 
 def test_wait_for_checks_predicate_once_at_deadline():
@@ -1032,6 +1113,7 @@ def test_clean_env_removes_argus_overrides(monkeypatch):
         ["--port", "65536"],
         ["--timeout", "0"],
         ["--recording-timeout", "0"],
+        ["--no-alert-observe-seconds", "0"],
         ["--training-timeout", "0"],
         ["--training-mode", "unknown"],
         ["--training-baseline-count", "29"],
@@ -1049,6 +1131,8 @@ def test_clean_env_removes_argus_overrides(monkeypatch):
         ["--min-frames", "0"],
         ["--browser-timeout", "0"],
         ["--browser-virtual-time-ms", "0"],
+        ["--expect-no-alert", "--expect-alert-category", "scene_change"],
+        ["--expect-no-alert", "--expect-detection-type", "anomaly"],
     ],
 )
 def test_parse_args_rejects_invalid_values(argv):
