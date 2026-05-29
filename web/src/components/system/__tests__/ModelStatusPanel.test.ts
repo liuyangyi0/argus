@@ -64,4 +64,40 @@ describe('ModelStatusPanel', () => {
 
     wrapper.unmount()
   })
+
+  it('surfaces low-light input limits before generic fallback degradation', async () => {
+    vi.mocked(getModelsStatus).mockResolvedValue([
+      {
+        name: 'anomaly',
+        camera_id: 'cam_01',
+        loaded: true,
+        backend: 'ssim-fallback',
+        model_path: null,
+        image_size: [256, 256],
+        last_error: null,
+        last_error_ts: null,
+        consecutive_failures: 0,
+        total_inferences: 0,
+        total_failures: 0,
+        last_success_ts: null,
+        extra: {
+          input_quality: {
+            low_light: true,
+            detection_limited: true,
+            detection_limited_reason: 'low_light',
+            ssim_calibration_blocked: true,
+          },
+        },
+      },
+    ])
+
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    const alert = wrapper.find('[data-test="status-alert"]')
+    expect(alert.text()).toContain('输入处于低光或曝光恢复')
+    expect(alert.text()).not.toContain('fallback 模式')
+
+    wrapper.unmount()
+  })
 })

@@ -573,7 +573,7 @@ class CameraManager:
         if pipeline is None:
             return None
         status = pipeline.get_detector_status()
-        return {
+        result = {
             "mode": status.mode,
             "model_path": status.model_path,
             "model_loaded": status.model_loaded,
@@ -582,6 +582,10 @@ class CameraManager:
             "ssim_calibrated": status.ssim_calibrated,
             "ssim_noise_floor": status.ssim_noise_floor,
         }
+        quality_getter = getattr(pipeline, "get_input_quality_status", None)
+        if callable(quality_getter):
+            result.update(quality_getter())
+        return result
 
     def reload_model(
         self,

@@ -3161,6 +3161,49 @@ class DetectionPipeline:
         """Get anomaly detector operational status (DET-004)."""
         return self._anomaly_detector.get_status()
 
+    def get_input_quality_status(self) -> dict:
+        """Return live image-quality gates that can limit detection."""
+        detector_status = self.get_detector_status()
+        ssim_calibrating = (
+            getattr(detector_status, "mode", None) == "ssim_fallback"
+            and not bool(getattr(detector_status, "ssim_calibrated", True))
+        )
+        now = time.monotonic()
+        low_light = bool(self._low_light_enabled and self._was_low_light)
+        exposure_recovering = bool(
+            self._low_light_enabled and now < self._fast_motion_suppress_until
+        )
+        limited_reason = None
+        if low_light:
+            limited_reason = "low_light"
+        elif exposure_recovering:
+            limited_reason = "exposure_recovery"
+
+        return {
+            "low_light_enabled": bool(self._low_light_enabled),
+            "low_light": low_light,
+            "low_light_threshold": self._low_light_threshold if self._low_light_enabled else None,
+            "last_brightness": (
+                round(self._prev_brightness, 1)
+                if self._prev_brightness is not None
+                else None
+            ),
+            "exposure_recovering": exposure_recovering,
+            "exposure_recovery_remaining_seconds": round(
+                max(0.0, self._fast_motion_suppress_until - now),
+                3,
+            ),
+            "detection_limited": limited_reason is not None,
+            "detection_limited_reason": limited_reason,
+            "fast_motion_suppressed": bool(
+                self._fast_motion is not None and limited_reason is not None
+            ),
+            "ssim_calibration_blocked": bool(ssim_calibrating and limited_reason is not None),
+            "ssim_calibration_blocked_reason": (
+                limited_reason if ssim_calibrating and limited_reason is not None else None
+            ),
+        }
+
     def reload_anomaly_model(self, model_path: str | Path) -> bool:
         """Hot-reload the anomaly detection model without stopping the pipeline."""
         return self._anomaly_detector.hot_reload(Path(model_path))

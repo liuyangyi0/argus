@@ -197,7 +197,22 @@ def models_status(request: Request) -> JSONResponse:
             continue
         anomaly = getattr(pipeline, "_anomaly_detector", None)
         if anomaly is not None and hasattr(anomaly, "status"):
-            out.append(anomaly.status.to_dict())
+            record = anomaly.status.to_dict()
+            quality_getter = getattr(pipeline, "get_input_quality_status", None)
+            if callable(quality_getter):
+                try:
+                    quality = quality_getter()
+                except Exception:
+                    logger.debug(
+                        "models.input_quality_status_failed",
+                        camera_id=_cid,
+                        exc_info=True,
+                    )
+                else:
+                    extra = dict(record.get("extra") or {})
+                    extra["input_quality"] = quality
+                    record["extra"] = extra
+            out.append(record)
         yolo = getattr(pipeline, "_object_detector", None)
         if yolo is not None and hasattr(yolo, "status"):
             out.append(yolo.status.to_dict())
