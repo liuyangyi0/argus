@@ -1306,7 +1306,7 @@ def _business_browser_pages(
     alert_semantics: dict[str, Any] | None = None,
 ) -> dict[str, list[str]]:
     pages = {
-        f"/cameras/{camera_id}": [camera_id, "实时画面", "已采集帧", "告警触发"],
+        f"/cameras/{camera_id}": [camera_id, "实时画面", "输入质量", "已采集帧", "告警触发"],
         f"/alerts?id={alert_id}": ["告警中心", alert_id[-8:], "告警信息", "录像"],
         f"/replay/{alert_id}": ["录像回放", alert_id, "FRAME", "热力"],
         "/reports": ["报表统计", "告警总数", "Replay录像覆盖率", "完整证据率"],

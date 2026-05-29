@@ -140,6 +140,7 @@ def test_business_browser_pages_include_dynamic_alert_and_camera_ids():
     assert "/alerts?id=ALERT-12345678" in pages
     assert "/replay/ALERT-12345678" in pages
     assert "cam_a" in pages["/cameras/cam_a"]
+    assert "输入质量" in pages["/cameras/cam_a"]
     assert "12345678" in pages["/alerts?id=ALERT-12345678"]
     assert "ALERT-12345678" in pages["/replay/ALERT-12345678"]
 
