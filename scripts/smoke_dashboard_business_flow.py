@@ -1343,6 +1343,8 @@ def _models_system_browser_pages(
             "模型运行状态",
             camera_id,
             "fallback 模式",
+            "输入质量",
+            "稳定",
             "降级监控",
         ],
         "/system/config": [
