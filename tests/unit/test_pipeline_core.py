@@ -289,8 +289,8 @@ class TestMOG2PreFilter:
 class TestFastMotion:
     """Fast projectile branch should bypass heavy inference in alert modes."""
 
-    def _fast_pipeline(self):
-        from argus.config.schema import FastMotionConfig
+    def _fast_pipeline(self, *, low_light: bool = False):
+        from argus.config.schema import FastMotionConfig, LowLightConfig
 
         cam, alert_cfg = _make_configs()
         cam.fast_motion = FastMotionConfig(
@@ -305,6 +305,8 @@ class TestFastMotion:
             max_candidates_per_frame=5,
             required_resolution=(640, 480),
         )
+        if low_light:
+            cam.low_light = LowLightConfig(enabled=True, brightness_threshold=30.0)
         pipeline = _build_pipeline(cam, alert_cfg)
         pipeline._prefilter.process.return_value = PreFilterResult(
             has_change=False,
@@ -361,6 +363,28 @@ class TestFastMotion:
         pipeline = self._fast_pipeline()
         pipeline._fast_motion = MagicMock()
         pipeline.set_mode(PipelineMode.COLLECTION)
+
+        result = pipeline.process_frame(_make_frame_data(np.zeros((480, 640, 3), dtype=np.uint8)))
+
+        assert result is None
+        pipeline._fast_motion.process.assert_not_called()
+        pipeline._fast_motion.reset.assert_called_once()
+
+    def test_low_light_resets_fast_motion_and_suppresses_projectile(self):
+        pipeline = self._fast_pipeline(low_light=True)
+        pipeline._fast_motion = MagicMock()
+        pipeline._last_heartbeat_time = time.monotonic()
+        pipeline._prefilter.process.return_value = PreFilterResult(
+            has_change=False,
+            change_ratio=0.0,
+        )
+        pipeline._object_detector.detect.return_value = ObjectDetectionResult()
+        pipeline._anomaly_detector.predict.return_value = AnomalyResult(
+            anomaly_score=0.0,
+            anomaly_map=None,
+            is_anomalous=False,
+            threshold=0.7,
+        )
 
         result = pipeline.process_frame(_make_frame_data(np.zeros((480, 640, 3), dtype=np.uint8)))
 

@@ -1427,35 +1427,8 @@ class DetectionPipeline:
             self._diagnostics.append(diag)
             return None
 
-        if self._fast_motion is not None and current_mode in (
-            PipelineMode.ACTIVE,
-            PipelineMode.MAINTENANCE,
-        ):
-            t_fast = time.monotonic()
-            fast_result = self._fast_motion.process(frame, timestamp=time.time())
-            diag.stages.append(StageResult(
-                stage_name="fast_motion",
-                duration_ms=(time.monotonic() - t_fast) * 1000,
-                metadata={
-                    "candidates": len(fast_result.candidates),
-                    "max_confidence": round(fast_result.max_confidence, 3),
-                },
-                skipped=not fast_result.has_detection,
-            ))
-            if fast_result.has_detection:
-                # Fast fly-through objects may only survive one frame.  Once
-                # this branch fires, avoid spending that frame on heavyweight
-                # YOLO/anomaly inference and grade it immediately instead.
-                return self._handle_fast_motion_detection(
-                    frame_data=frame_data,
-                    frame=frame,
-                    start=start,
-                    diag=diag,
-                    fast_result=fast_result,
-                )
-
         # Single full-resolution BGR->GRAY conversion shared by brightness
-        # detection (below) and MOG2 stabilization. Valid only for this frame.
+        # detection, fast-motion gating, and MOG2 stabilization. Valid only for this frame.
         frame_gray: np.ndarray | None = None
         need_gray = self._low_light_enabled or getattr(
             self._prefilter, "enable_stabilization", False,
@@ -1515,6 +1488,46 @@ class DetectionPipeline:
                 frame_gray = None
                 self._frame_gray = None
         diag.low_light = is_low_light
+
+        if self._fast_motion is not None and current_mode in (
+            PipelineMode.ACTIVE,
+            PipelineMode.MAINTENANCE,
+        ):
+            t_fast = time.monotonic()
+            if is_low_light or brightness_jump:
+                self._fast_motion.reset()
+                diag.stages.append(StageResult(
+                    stage_name="fast_motion",
+                    duration_ms=(time.monotonic() - t_fast) * 1000,
+                    metadata={
+                        "low_light": is_low_light,
+                        "brightness_jump": brightness_jump,
+                    },
+                    skipped=True,
+                    skip_reason="low_light" if is_low_light else "brightness_jump",
+                ))
+            else:
+                fast_result = self._fast_motion.process(frame, timestamp=time.time())
+                diag.stages.append(StageResult(
+                    stage_name="fast_motion",
+                    duration_ms=(time.monotonic() - t_fast) * 1000,
+                    metadata={
+                        "candidates": len(fast_result.candidates),
+                        "max_confidence": round(fast_result.max_confidence, 3),
+                    },
+                    skipped=not fast_result.has_detection,
+                ))
+                if fast_result.has_detection:
+                    # Fast fly-through objects may only survive one frame.  Once
+                    # this branch fires, avoid spending that frame on heavyweight
+                    # YOLO/anomaly inference and grade it immediately instead.
+                    return self._handle_fast_motion_detection(
+                        frame_data=frame_data,
+                        frame=frame,
+                        start=start,
+                        diag=diag,
+                        fast_result=fast_result,
+                    )
 
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
         t1 = time.monotonic()

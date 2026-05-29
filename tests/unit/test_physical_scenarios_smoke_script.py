@@ -33,6 +33,7 @@ def test_parse_args_defaults_to_obsbot_book_scenario() -> None:
     assert args.preflight is True
     assert args.preflight_timeout == 15.0
     assert args.preflight_measure_seconds == 15.0
+    assert args.no_alert_observe_seconds == 30.0
     assert args.stream_output is True
 
 
@@ -88,6 +89,24 @@ def test_build_projectile_command_includes_projectile_expectations() -> None:
     assert "--forbid-alert-category" not in command
 
 
+def test_build_stable_command_includes_no_alert_expectation() -> None:
+    args = parse_args([
+        "--scenario",
+        "stable",
+        "--no-alert-observe-seconds",
+        "12.5",
+        "--dry-run",
+    ])
+
+    command = build_business_command(args, "stable")
+
+    assert "--expect-no-alert" in command
+    assert "--no-alert-observe-seconds" in command
+    assert "12.5" in command
+    assert "--expect-alert-category" not in command
+    assert "--expect-detection-type" not in command
+
+
 def test_build_preflight_command_includes_probe_options_without_semantics() -> None:
     args = parse_args([
         "--scenario",
@@ -122,14 +141,17 @@ def test_work_dir_is_split_by_child_smoke(tmp_path) -> None:
     ])
 
     preflight = build_preflight_command(args)
+    stable = build_business_command(args, "stable")
     book = build_business_command(args, "book")
     projectile = build_business_command(args, "projectile")
 
     assert "--work-dir" in preflight
     assert str(tmp_path / "preflight") in preflight
+    assert str(tmp_path / "stable") in stable
     assert str(tmp_path / "book") in book
     assert str(tmp_path / "projectile") in projectile
     assert "--keep-work-dir" in preflight
+    assert "--keep-work-dir" in stable
     assert "--keep-work-dir" in book
     assert "--keep-work-dir" in projectile
 
@@ -319,6 +341,26 @@ def test_child_summary_extracts_scenario_semantics_and_browser_routes() -> None:
     ]
 
 
+def test_child_summary_extracts_no_alert_scenario() -> None:
+    summary = _child_summary({
+        "ok": True,
+        "mode": "no_alert",
+        "base_url": "http://127.0.0.1:18080",
+        "work_dir": "C:/tmp/argus-physical/stable",
+        "runtime_config": "C:/tmp/argus-physical/stable/dashboard_business_config.yaml",
+        "camera": {"camera_id": "c", "pipeline_mode": "active", "frames_captured": 125},
+        "camera_media": {"streaming": {"go2rtc": True}},
+        "no_alert": {"observed_seconds": 30.0, "polls": 31, "alerts_seen": 0},
+        "browser": {"status": "not_applicable"},
+    })
+
+    assert summary is not None
+    assert summary["mode"] == "no_alert"
+    assert summary["work_dir"] == "C:/tmp/argus-physical/stable"
+    assert summary["no_alert"]["alerts_seen"] == 0
+    assert summary["camera_streaming"]["go2rtc"] is True
+
+
 def test_parse_args_can_disable_go2rtc_for_debugging() -> None:
     args = parse_args(["--no-require-go2rtc", "--dry-run"])
 
@@ -333,6 +375,7 @@ def test_parse_args_can_disable_go2rtc_for_debugging() -> None:
     [
         ["--activation-delay", "-1"],
         ["--timeout", "0"],
+        ["--no-alert-observe-seconds", "0"],
         ["--process-timeout", "0"],
         ["--no-preflight", "--preflight-only"],
     ],
@@ -363,7 +406,7 @@ def test_run_all_dry_run_returns_both_scenarios() -> None:
     assert result["ok"] is True
     assert result["preflight"]["ok"] is True
     assert result["preflight"]["dry_run"] is True
-    assert [item["scenario"] for item in result["scenarios"]] == ["book", "projectile"]
+    assert [item["scenario"] for item in result["scenarios"]] == ["stable", "book", "projectile"]
 
 
 def test_preflight_failure_skips_physical_scenarios(monkeypatch: pytest.MonkeyPatch) -> None:
