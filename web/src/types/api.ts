@@ -251,6 +251,20 @@ export interface TrajectoryFit {
   landing: TrajectoryFitPoint
 }
 
+export interface ModelInputQualityStatus {
+  low_light_enabled?: boolean
+  low_light?: boolean
+  low_light_threshold?: number | null
+  last_brightness?: number | null
+  exposure_recovering?: boolean
+  exposure_recovery_remaining_seconds?: number
+  detection_limited?: boolean
+  detection_limited_reason?: string | null
+  fast_motion_suppressed?: boolean
+  ssim_calibration_blocked?: boolean
+  ssim_calibration_blocked_reason?: string | null
+}
+
 // Live health record for one detector on one camera
 // (aggregated at /api/models/status). backend values depend on the detector:
 //   anomaly: "torch-cuda" | "torch-cpu" | "openvino" | "ssim-fallback" | "disabled" | "none"
@@ -268,7 +282,9 @@ export interface ModelHealthStatus {
   total_inferences: number
   total_failures: number
   last_success_ts: number | null
-  extra: Record<string, unknown>
+  extra: Record<string, unknown> & {
+    input_quality?: ModelInputQualityStatus
+  }
 }
 
 // Persisted operator-marked clip range on the replay timeline (FR-033).

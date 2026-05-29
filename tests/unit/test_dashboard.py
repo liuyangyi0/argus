@@ -1482,6 +1482,31 @@ class TestCameraManagerModelRouting:
         runner.set_version_tag.assert_called_once_with("v2")
         pipeline.set_model_version_id.assert_called_once_with("v2")
 
+    def test_detector_status_includes_input_quality(self):
+        manager = CameraManager(cameras=[], alert_config=AlertConfig())
+        pipeline = MagicMock()
+        pipeline.get_detector_status.return_value = SimpleNamespace(
+            mode="ssim_fallback",
+            model_path=None,
+            model_loaded=False,
+            threshold=0.7,
+            ssim_calibration_progress=0.0,
+            ssim_calibrated=False,
+            ssim_noise_floor=None,
+        )
+        pipeline.get_input_quality_status.return_value = {
+            "low_light": True,
+            "detection_limited": True,
+            "ssim_calibration_blocked": True,
+        }
+        manager._pipelines["cam_01"] = pipeline
+
+        status = manager.get_detector_status("cam_01")
+
+        assert status["mode"] == "ssim_fallback"
+        assert status["low_light"] is True
+        assert status["ssim_calibration_blocked"] is True
+
     def test_reload_model_failure_broadcasts_activation_failed(self):
         """Reload failure should emit a models-topic event; detector keeps old engine."""
         events: list[tuple[str, dict]] = []

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { getModelsStatus } from '../../api/system'
-import type { ModelHealthStatus } from '../../types/api'
+import type { ModelHealthStatus, ModelInputQualityStatus } from '../../types/api'
 
 const models = ref<ModelHealthStatus[]>([])
 const lastFetch = ref<number | null>(null)
@@ -40,6 +40,33 @@ const degradedCount = computed(
     (m) => !m.loaded || m.backend === 'ssim-fallback' || m.backend === 'none',
   ).length,
 )
+const inputLimitedCount = computed(
+  () => models.value.filter((m) => inputQuality(m)?.detection_limited).length,
+)
+
+function inputQuality(m: ModelHealthStatus): ModelInputQualityStatus | null {
+  const quality = m.extra?.input_quality
+  if (quality && typeof quality === 'object') {
+    return quality
+  }
+  return null
+}
+
+function inputQualityLabel(m: ModelHealthStatus): string {
+  const quality = inputQuality(m)
+  if (!quality) return '—'
+  if (quality.ssim_calibration_blocked) return '低光校准等待'
+  if (quality.low_light) return '低光'
+  if (quality.exposure_recovering) return '曝光恢复'
+  return '稳定'
+}
+
+function inputQualityColor(m: ModelHealthStatus): BadgeColor {
+  const quality = inputQuality(m)
+  if (!quality) return 'default'
+  if (quality.detection_limited || quality.ssim_calibration_blocked) return 'orange'
+  return 'green'
+}
 
 type BadgeColor = 'green' | 'orange' | 'red' | 'default'
 function backendColor(m: ModelHealthStatus): BadgeColor {
@@ -85,6 +112,13 @@ function rowKey(m: ModelHealthStatus): string {
       type="error"
       show-icon
       :message="`⚠ ${failingCount} 个模型正在持续失败（连续 >5 次推理错误）`"
+      style="margin-bottom: 12px"
+    />
+    <a-alert
+      v-else-if="inputLimitedCount > 0"
+      type="warning"
+      show-icon
+      :message="`${inputLimitedCount} 个模型输入处于低光或曝光恢复，检测/校准能力受限`"
       style="margin-bottom: 12px"
     />
     <a-alert
@@ -147,6 +181,14 @@ function rowKey(m: ModelHealthStatus): string {
           <span style="color: #888; font-size: 12px">
             {{ relativeTime(record.last_success_ts) }}
           </span>
+        </template>
+      </a-table-column>
+
+      <a-table-column title="输入质量" :width="130">
+        <template #default="{ record }">
+          <a-tag :color="inputQualityColor(record)">
+            {{ inputQualityLabel(record) }}
+          </a-tag>
         </template>
       </a-table-column>
 

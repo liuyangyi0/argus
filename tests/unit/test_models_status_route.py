@@ -83,6 +83,36 @@ class TestModelsStatusRoute:
         assert by_key[("cam2", "anomaly")]["extra"]["reason"] == "no_model_found"
         assert by_key[("cam2", "yolo")]["loaded"] is False
 
+    def test_anomaly_status_includes_input_quality_extra(self, client):
+        anomaly = ModelStatus(name="anomaly", camera_id="cam1")
+        anomaly.mark_loaded(backend="ssim-fallback")
+        yolo = ModelStatus(name="yolo", camera_id="cam1")
+        yolo.mark_loaded(backend="cpu")
+
+        pipeline = SimpleNamespace(
+            _anomaly_detector=SimpleNamespace(status=anomaly),
+            _object_detector=SimpleNamespace(status=yolo),
+            get_input_quality_status=MagicMock(return_value={
+                "low_light": True,
+                "detection_limited": True,
+                "detection_limited_reason": "low_light",
+                "ssim_calibration_blocked": True,
+            }),
+        )
+        manager = MagicMock()
+        manager._runners = {"cam1": SimpleNamespace(_pipeline=pipeline)}
+        client.app.state.camera_manager = manager
+
+        resp = client.get("/api/models/status")
+
+        assert resp.status_code == 200
+        body = resp.json()["data"]["models"]
+        by_key = {(m["camera_id"], m["name"]): m for m in body}
+        quality = by_key[("cam1", "anomaly")]["extra"]["input_quality"]
+        assert quality["low_light"] is True
+        assert quality["detection_limited_reason"] == "low_light"
+        assert "input_quality" not in by_key[("cam1", "yolo")]["extra"]
+
     def test_skips_runners_without_pipeline(self, client):
         manager = MagicMock()
         manager._runners = {"dead": SimpleNamespace(_pipeline=None)}

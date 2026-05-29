@@ -310,6 +310,26 @@ def test_detector_status_delegation():
     assert status.threshold == 0.7
 
 
+def test_input_quality_status_reports_low_light_calibration_block():
+    """Low-light fallback startup should be visible to API/UI callers."""
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(
+        camera_config=cam_config,
+        alert_config=alert_config,
+    )
+    pipeline._was_low_light = True
+    pipeline._prev_brightness = 12.25
+
+    status = pipeline.get_input_quality_status()
+
+    assert status["low_light"] is True
+    assert status["last_brightness"] == 12.2
+    assert status["detection_limited"] is True
+    assert status["detection_limited_reason"] == "low_light"
+    assert status["ssim_calibration_blocked"] is True
+    assert status["ssim_calibration_blocked_reason"] == "low_light"
+
+
 def test_diagnostics_buffer_exists():
     """Pipeline should have a diagnostics buffer (DET-008)."""
     cam_config, alert_config = _make_config()
