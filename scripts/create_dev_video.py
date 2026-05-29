@@ -1,8 +1,8 @@
 """Create a deterministic local video source for Argus development.
 
-The generated video starts with a stable baseline scene, then introduces a
-high-contrast object that settles in place. Use it when a workstation has no
-USB/RTSP camera:
+The generated video can either stay stable for no-alert checks or start with a
+stable baseline scene, then introduce a test object. Use it when a workstation
+has no USB/RTSP camera:
 
     python scripts/create_dev_video.py --output data/dev/demo_camera.avi
 
@@ -43,9 +43,10 @@ def main() -> None:
         choices=DEV_VIDEO_MOTIONS,
         default="settle",
         help=(
-            "Anomaly pattern: settle triggers stable foreign-object alerts, "
-            "moving is for tracking demos, book simulates a book placed on the table, "
-            "and projectile simulates a small fast fly-through object."
+            "Pattern: stable never introduces an anomaly, settle triggers stable "
+            "foreign-object alerts, moving is for tracking demos, book simulates "
+            "a book placed on the table, and projectile simulates a small fast "
+            "fly-through object."
         ),
     )
     args = parser.parse_args()

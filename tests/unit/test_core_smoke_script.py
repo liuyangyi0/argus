@@ -159,6 +159,12 @@ def test_parse_args_accepts_projectile_dev_video_motion():
     assert args.dev_video_motion == "projectile"
 
 
+def test_parse_args_accepts_stable_dev_video_motion():
+    args = parse_args(["--dev-video-motion", "stable"])
+
+    assert args.dev_video_motion == "stable"
+
+
 def test_parse_args_accepts_usb_device_selector():
     args = parse_args([
         "--camera-source",

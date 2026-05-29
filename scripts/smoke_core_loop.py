@@ -1864,9 +1864,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=DEV_VIDEO_MOTIONS,
         default="settle",
         help=(
-            "Generated dev video anomaly pattern. Use book to simulate a book "
-            "being placed on an empty table, or projectile to simulate a small "
-            "fast fly-through object."
+            "Generated dev video pattern. Use stable for no-alert checks, book "
+            "to simulate a book being placed on an empty table, or projectile "
+            "to simulate a small fast fly-through object."
         ),
     )
     parser.add_argument(

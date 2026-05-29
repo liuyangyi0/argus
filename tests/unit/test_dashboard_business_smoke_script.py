@@ -345,6 +345,35 @@ def test_parse_args_accepts_projectile_dev_video_motion():
     assert args.dev_video_motion == "projectile"
 
 
+def test_parse_args_accepts_stable_dev_video_motion():
+    args = parse_args(["--dev-video-motion", "stable", "--browser", "off"])
+
+    assert args.dev_video_motion == "stable"
+
+
+def test_parse_args_rejects_active_no_alert_rtsp_fixture_with_anomaly_motion():
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--rtsp-fixture",
+            "--dev-video-motion", "settle",
+            "--expect-no-alert",
+            "--browser", "off",
+        ])
+
+
+def test_parse_args_allows_collection_no_alert_rtsp_fixture_with_anomaly_motion():
+    args = parse_args([
+        "--rtsp-fixture",
+        "--dev-video-motion", "book",
+        "--observe-mode", "collection",
+        "--expect-no-alert",
+        "--browser", "off",
+    ])
+
+    assert args.dev_video_motion == "book"
+    assert args.observe_mode == "collection"
+
+
 def test_wait_for_completed_alert_timeout_reports_last_evidence_state():
     class RunningProcess:
         returncode = None
@@ -426,6 +455,49 @@ def test_verify_no_alert_window_passes_when_alert_list_stays_empty():
         camera_id="cam_a",
         observe_seconds=0.01,
         process=RunningProcess(),
+    )
+
+    assert result["alerts_seen"] == 0
+    assert result["polls"] >= 1
+
+
+def test_verify_no_alert_window_ignores_preexisting_alert_ids():
+    class RunningProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/alerts/json"
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "alerts": [
+                        {
+                            "alert_id": "old-alert",
+                            "severity": "medium",
+                            "category": "scene_change",
+                            "detection_type": "anomaly",
+                        }
+                    ]
+                },
+            },
+        )
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="http://argus.test",
+    )
+
+    result = _verify_no_alert_window(
+        client,
+        camera_id="cam_a",
+        observe_seconds=0.01,
+        process=RunningProcess(),
+        known_alert_ids={"old-alert"},
     )
 
     assert result["alerts_seen"] == 0
