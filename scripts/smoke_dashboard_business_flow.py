@@ -1782,12 +1782,14 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     camera_id=camera_id,
                     require_go2rtc=args.require_go2rtc,
                 )
-                detector_detail = _wait_for_detector_ready(
-                    client,
-                    camera_id=camera_id,
-                    timeout_s=min(args.timeout, 45.0),
-                    process=proc,
-                )
+                detector_detail: dict[str, Any] | None = None
+                if not args.expect_no_alert:
+                    detector_detail = _wait_for_detector_ready(
+                        client,
+                        camera_id=camera_id,
+                        timeout_s=min(args.timeout, 45.0),
+                        process=proc,
+                    )
                 with _AlertWebSocketListener(base_url=base_url) as realtime_listener:
                     mode_result = _set_camera_mode(
                         client,
@@ -1810,6 +1812,10 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                             timeout_s=min(args.timeout, 10.0),
                             min_frames=args.min_frames,
                             process=proc,
+                        )
+                        detector_detail = _api_data(
+                            client.get(f"/api/cameras/{camera_id}/detail/json", timeout=5),
+                            label="camera detail",
                         )
                         return {
                             "ok": True,

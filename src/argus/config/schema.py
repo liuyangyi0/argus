@@ -540,6 +540,12 @@ class LowLightConfig(BaseModel):
         default=30.0, ge=5.0, le=100.0,
         description="Brightness change between frames to freeze MOG2 learning rate",
     )
+    fast_motion_recovery_seconds: float = Field(
+        default=2.0, ge=0.0, le=10.0,
+        description=(
+            "Seconds to suppress fast-motion detection after low-light or exposure transitions"
+        ),
+    )
 
 
 class EventCameraConfig(BaseModel):

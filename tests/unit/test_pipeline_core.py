@@ -392,6 +392,38 @@ class TestFastMotion:
         pipeline._fast_motion.process.assert_not_called()
         pipeline._fast_motion.reset.assert_called_once()
 
+    def test_low_light_exit_cooldown_suppresses_fast_motion(self):
+        pipeline = self._fast_pipeline(low_light=True)
+        pipeline._fast_motion = MagicMock()
+        pipeline._last_heartbeat_time = time.monotonic()
+        pipeline._prefilter.process.return_value = PreFilterResult(
+            has_change=False,
+            change_ratio=0.0,
+        )
+        pipeline._object_detector.detect.return_value = ObjectDetectionResult()
+        pipeline._anomaly_detector.predict.return_value = AnomalyResult(
+            anomaly_score=0.0,
+            anomaly_map=None,
+            is_anomalous=False,
+            threshold=0.7,
+        )
+        pipeline._was_low_light = True
+        pipeline._prev_brightness = 25.0
+
+        bright = np.full((480, 640, 3), 50, dtype=np.uint8)
+        result = pipeline.process_frame(_make_frame_data(bright, frame_number=10))
+
+        assert result is None
+        pipeline._fast_motion.process.assert_not_called()
+        pipeline._fast_motion.reset.assert_called_once()
+
+        pipeline._fast_motion.reset_mock()
+        result = pipeline.process_frame(_make_frame_data(bright, frame_number=11))
+
+        assert result is None
+        pipeline._fast_motion.process.assert_not_called()
+        pipeline._fast_motion.reset.assert_called_once()
+
     def test_fast_motion_uses_real_early_warning_grader(self):
         from argus.alerts.grader import AlertGrader, DetectionType
 

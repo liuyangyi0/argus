@@ -444,6 +444,8 @@ class DetectionPipeline:
         self._was_low_light = False
         self._prev_brightness: float | None = None
         self._brightness_jump_threshold = ll_cfg.brightness_jump_threshold
+        self._fast_motion_recovery_seconds = ll_cfg.fast_motion_recovery_seconds
+        self._fast_motion_suppress_until = 0.0
 
         # CLAHE preprocessing for low-light enhancement
         # Use CUDA CLAHE when available (13ms CPU → <1ms GPU)
@@ -1450,6 +1452,10 @@ class DetectionPipeline:
                 delta = abs(mean_brightness - self._prev_brightness)
                 if delta >= self._brightness_jump_threshold:
                     brightness_jump = True
+                    self._fast_motion_suppress_until = max(
+                        self._fast_motion_suppress_until,
+                        start + self._fast_motion_recovery_seconds,
+                    )
                     logger.debug(
                         "pipeline.brightness_jump",
                         camera_id=frame_data.camera_id,
@@ -1459,13 +1465,23 @@ class DetectionPipeline:
                     )
             self._prev_brightness = mean_brightness
 
-            if is_low_light and not self._was_low_light:
+            low_light_entered = is_low_light and not self._was_low_light
+            low_light_exited = not is_low_light and self._was_low_light
+            if low_light_entered:
+                self._fast_motion_suppress_until = max(
+                    self._fast_motion_suppress_until,
+                    start + self._fast_motion_recovery_seconds,
+                )
                 logger.warning(
                     "pipeline.low_light_entered",
                     camera_id=frame_data.camera_id,
                     brightness=round(mean_brightness, 1),
                 )
-            elif not is_low_light and self._was_low_light:
+            elif low_light_exited:
+                self._fast_motion_suppress_until = max(
+                    self._fast_motion_suppress_until,
+                    start + self._fast_motion_recovery_seconds,
+                )
                 logger.info(
                     "pipeline.low_light_exited",
                     camera_id=frame_data.camera_id,
@@ -1494,17 +1510,28 @@ class DetectionPipeline:
             PipelineMode.MAINTENANCE,
         ):
             t_fast = time.monotonic()
-            if is_low_light or brightness_jump:
+            exposure_recovering = start < self._fast_motion_suppress_until
+            if is_low_light or brightness_jump or exposure_recovering:
                 self._fast_motion.reset()
+                if is_low_light:
+                    skip_reason = "low_light"
+                elif brightness_jump:
+                    skip_reason = "brightness_jump"
+                else:
+                    skip_reason = "low_light_recovery"
                 diag.stages.append(StageResult(
                     stage_name="fast_motion",
                     duration_ms=(time.monotonic() - t_fast) * 1000,
                     metadata={
                         "low_light": is_low_light,
                         "brightness_jump": brightness_jump,
+                        "recovery_remaining_seconds": max(
+                            0.0,
+                            round(self._fast_motion_suppress_until - start, 3),
+                        ),
                     },
                     skipped=True,
-                    skip_reason="low_light" if is_low_light else "brightness_jump",
+                    skip_reason=skip_reason,
                 ))
             else:
                 fast_result = self._fast_motion.process(frame, timestamp=time.time())
@@ -1528,6 +1555,8 @@ class DetectionPipeline:
                         diag=diag,
                         fast_result=fast_result,
                     )
+        else:
+            exposure_recovering = start < self._fast_motion_suppress_until
 
         # Stage 1: Pre-filter (with heartbeat bypass and anomaly lock bypass)
         t1 = time.monotonic()
@@ -1593,6 +1622,22 @@ class DetectionPipeline:
                 self._prefilter.process(frame, gray_frame=frame_gray)
             if is_heartbeat:
                 self.stats.frames_heartbeat += 1
+
+        if calibrating_ssim and (is_low_light or brightness_jump or exposure_recovering):
+            diag.stages.append(StageResult(
+                stage_name="anomaly",
+                duration_ms=0.0,
+                skipped=True,
+                skip_reason="unstable_light_calibration",
+                metadata={
+                    "low_light": is_low_light,
+                    "brightness_jump": brightness_jump,
+                    "exposure_recovering": exposure_recovering,
+                },
+            ))
+            diag.total_duration_ms = (time.monotonic() - start) * 1000
+            self._diagnostics.append(diag)
+            return None
 
         # Frame quality assessment: pre-compute confidence multiplier
         # to reduce false positives from blurry, dark, or noisy frames.
