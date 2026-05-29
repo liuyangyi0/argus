@@ -3,6 +3,8 @@
 This script wraps ``smoke_dashboard_business_flow.py`` with the semantic
 assertions needed for real-world scenarios:
 
+* ``stable``: the operator leaves the camera view unchanged. No alert should
+  be produced during the observation window.
 * ``book``: an operator places a book on an initially empty table.  The alert
   must be a static scene-change anomaly and must not be a projectile.
 * ``projectile``: an operator passes a small object quickly through the frame.
@@ -26,7 +28,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-SCENARIOS = ("book", "projectile")
+SCENARIOS = ("stable", "book", "projectile")
 CAPTURE_TAIL_CHARS = 2_000_000
 
 
@@ -116,7 +118,13 @@ def _base_business_command(
     return cmd
 
 
-def _scenario_expectation_args(scenario: str) -> list[str]:
+def _scenario_expectation_args(args: argparse.Namespace, scenario: str) -> list[str]:
+    if scenario == "stable":
+        return [
+            "--expect-no-alert",
+            "--no-alert-observe-seconds",
+            str(args.no_alert_observe_seconds),
+        ]
     if scenario == "book":
         return [
             "--expect-alert-category",
@@ -141,7 +149,7 @@ def _scenario_expectation_args(scenario: str) -> list[str]:
 
 
 def build_business_command(args: argparse.Namespace, scenario: str) -> list[str]:
-    return _base_business_command(args, child_name=scenario) + _scenario_expectation_args(scenario)
+    return _base_business_command(args, child_name=scenario) + _scenario_expectation_args(args, scenario)
 
 
 def build_preflight_command(args: argparse.Namespace) -> list[str]:
@@ -216,6 +224,19 @@ def _child_summary(child: dict[str, Any] | None) -> dict[str, Any] | None:
             },
             "hints": child.get("hints") or [],
             "errors": child.get("errors") or [],
+        }
+
+    if child.get("mode") == "no_alert":
+        return {
+            "ok": child.get("ok"),
+            "mode": child.get("mode"),
+            "base_url": child.get("base_url"),
+            "work_dir": child.get("work_dir"),
+            "runtime_config": child.get("runtime_config"),
+            "camera": child.get("camera"),
+            "camera_streaming": (child.get("camera_media") or {}).get("streaming"),
+            "no_alert": child.get("no_alert"),
+            "browser": child.get("browser"),
         }
 
     alert = child.get("alert") or {}
@@ -364,6 +385,12 @@ def _run_business_command(command: list[str], args: argparse.Namespace) -> _Comm
 
 
 def _operator_instruction(scenario: str, args: argparse.Namespace) -> str:
+    if scenario == "stable":
+        return (
+            "Keep the observed scene unchanged for "
+            f"{args.no_alert_observe_seconds:.1f}s after activation. "
+            "Expected: no alert."
+        )
     if scenario == "book":
         return (
             f"After activation, place a book on the empty table within "
@@ -500,6 +527,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--recording-timeout", type=float, default=90.0)
+    parser.add_argument(
+        "--no-alert-observe-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds to observe during the stable no-alert scenario.",
+    )
     parser.add_argument("--browser", choices=["auto", "required", "off"], default="required")
     parser.add_argument("--process-timeout", type=float, default=300.0)
     parser.add_argument(
@@ -530,6 +563,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--timeout must be positive")
     if args.recording_timeout <= 0:
         parser.error("--recording-timeout must be positive")
+    if args.no_alert_observe_seconds <= 0:
+        parser.error("--no-alert-observe-seconds must be positive")
     if args.process_timeout <= 0:
         parser.error("--process-timeout must be positive")
     if args.preflight_timeout <= 0:
