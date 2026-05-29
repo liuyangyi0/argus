@@ -116,6 +116,7 @@ cameras:
   low_light:
     enabled: true
     brightness_threshold: 40.0
+    fast_motion_recovery_seconds: 2.0
 alerts:
   severity_thresholds:
     info: 0.5

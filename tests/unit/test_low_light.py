@@ -1,6 +1,7 @@
 """Tests for low-light MOG2 bypass in the detection pipeline."""
 
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -57,6 +58,7 @@ def test_low_light_config_defaults():
     cfg = LowLightConfig()
     assert cfg.enabled is True
     assert cfg.brightness_threshold == 40.0
+    assert cfg.fast_motion_recovery_seconds == 2.0
 
 
 def test_low_light_config_validation():
@@ -141,6 +143,48 @@ def test_dark_frame_triggers_low_light_bypass():
         mock_det.predict.assert_called_once()
         # Diagnostics should record low_light
         assert diag.low_light is True
+
+
+def test_dark_frame_does_not_calibrate_ssim_baseline():
+    """Startup dark frames should not become the SSIM fallback baseline."""
+    cam, alert = _make_config(brightness_threshold=40.0)
+    with patch("argus.core.pipeline.CameraCapture"), \
+         patch("argus.core.pipeline.AnomalibDetector") as mock_det_cls, \
+         patch("argus.core.pipeline.YOLOObjectDetector") as mock_yolo_cls:
+
+        mock_det = MagicMock()
+        mock_det.get_status.return_value = SimpleNamespace(
+            mode="ssim_fallback",
+            ssim_calibrated=False,
+        )
+        mock_det_cls.return_value = mock_det
+
+        mock_yolo = MagicMock()
+        mock_yolo_cls.return_value = mock_yolo
+
+        pipeline = DetectionPipeline(camera_config=cam, alert_config=alert)
+
+        dark_frame = np.full((480, 640, 3), 15, dtype=np.uint8)
+        frame_data = MagicMock()
+        frame_data.camera_id = "test_cam"
+        frame_data.frame_number = 1
+        frame_data.timestamp = time.time()
+
+        from argus.core.diagnostics import FrameDiagnostics
+        diag = FrameDiagnostics(
+            frame_number=1, timestamp=time.time(), camera_id="test_cam"
+        )
+        pipeline._process_frame_inner(frame_data, dark_frame, time.monotonic(), diag)
+
+        mock_yolo.detect.assert_not_called()
+        mock_det.predict.assert_not_called()
+        assert diag.low_light is True
+        assert any(
+            stage.stage_name == "anomaly"
+            and stage.skipped
+            and stage.skip_reason == "unstable_light_calibration"
+            for stage in diag.stages
+        )
 
 
 def test_bright_frame_does_not_trigger_low_light():
