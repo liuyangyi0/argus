@@ -618,15 +618,21 @@ def _verify_no_alert_window(
     camera_id: str,
     observe_seconds: float,
     process: subprocess.Popen,
+    known_alert_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + observe_seconds
     polls = 0
+    known_alert_ids = known_alert_ids or set()
     while True:
         if process.poll() is not None:
             raise DashboardBusinessSmokeFailure(
                 f"argus exited early with code {process.returncode}"
             )
-        alerts = _recent_alerts(client, camera_id=camera_id, limit=5)
+        alerts = [
+            alert
+            for alert in _recent_alerts(client, camera_id=camera_id, limit=20)
+            if str(alert.get("alert_id") or "") not in known_alert_ids
+        ]
         polls += 1
         if alerts:
             alert = alerts[0]
@@ -1814,6 +1820,11 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         process=proc,
                     )
                 with _AlertWebSocketListener(base_url=base_url) as realtime_listener:
+                    preexisting_alert_ids = {
+                        str(alert.get("alert_id"))
+                        for alert in _recent_alerts(client, camera_id=camera_id, limit=50)
+                        if alert.get("alert_id")
+                    }
                     mode_result = _set_camera_mode(
                         client,
                         camera_id=camera_id,
@@ -1828,6 +1839,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                             camera_id=camera_id,
                             observe_seconds=args.no_alert_observe_seconds,
                             process=proc,
+                            known_alert_ids=preexisting_alert_ids,
                         )
                         camera_row = _wait_for_camera(
                             client,
@@ -2104,9 +2116,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=DEV_VIDEO_MOTIONS,
         default="settle",
         help=(
-            "Generated dev video anomaly pattern. Use book to simulate a book "
-            "being placed on an empty table, or projectile to simulate a small "
-            "fast fly-through object."
+            "Generated dev video pattern. Use stable for no-alert checks, book "
+            "to simulate a book being placed on an empty table, or projectile "
+            "to simulate a small fast fly-through object."
         ),
     )
     parser.add_argument("--camera-id", default=None, help="Override the first config camera ID")
@@ -2227,6 +2239,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--no-alert-observe-seconds must be positive")
     if args.expect_no_alert and (args.expect_alert_category or args.expect_detection_type):
         parser.error("--expect-no-alert cannot be combined with expected alert semantics")
+    if (
+        args.expect_no_alert
+        and args.rtsp_fixture
+        and args.observe_mode in {"active", "maintenance"}
+        and args.dev_video_motion != "stable"
+    ):
+        parser.error(
+            "--expect-no-alert with active/maintenance RTSP fixture requires "
+            "--dev-video-motion stable; use collection/training to verify "
+            "suppression on anomalous inputs"
+        )
     if not args.expect_no_alert and args.observe_mode in {"collection", "training"}:
         parser.error("--observe-mode collection/training requires --expect-no-alert")
     if args.recording_timeout <= 0:

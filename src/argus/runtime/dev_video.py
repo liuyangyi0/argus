@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-DEV_VIDEO_MOTIONS = ("settle", "moving", "book", "projectile")
+DEV_VIDEO_MOTIONS = ("stable", "settle", "moving", "book", "projectile")
 
 
 def _base_frame(width: int, height: int) -> np.ndarray:
@@ -124,7 +124,7 @@ def create_dev_video(
     try:
         for idx in range(frame_count):
             frame = base.copy()
-            if idx >= anomaly_start_frame:
+            if idx >= anomaly_start_frame and motion != "stable":
                 t = idx - anomaly_start_frame
                 if motion == "moving":
                     span = max(width - 170, 1)

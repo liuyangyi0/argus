@@ -74,6 +74,38 @@ def test_create_dev_video_default_anomaly_settles(tmp_path):
     assert float(np.max(diff)) <= 1.0
 
 
+def test_create_dev_video_stable_scene_never_introduces_anomaly(tmp_path):
+    video_path = tmp_path / "stable_dev_camera.avi"
+
+    meta = create_dev_video(
+        video_path,
+        width=160,
+        height=120,
+        fps=5,
+        seconds=4,
+        anomaly_start_s=1.0,
+        motion="stable",
+    )
+
+    assert "stable" in DEV_VIDEO_MOTIONS
+    assert meta["motion"] == "stable"
+
+    capture = cv2.VideoCapture(str(video_path))
+    frames = []
+    try:
+        for _ in range(16):
+            ok, frame = capture.read()
+            assert ok
+            frames.append(frame)
+    finally:
+        capture.release()
+
+    before_to_after = cv2.absdiff(frames[4], frames[12])
+    settled = cv2.absdiff(frames[12], frames[13])
+    assert float(np.max(before_to_after)) <= 1.0
+    assert float(np.max(settled)) <= 1.0
+
+
 def test_create_dev_video_book_scene_places_static_book(tmp_path):
     video_path = tmp_path / "book_dev_camera.avi"
 
