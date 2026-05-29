@@ -41,6 +41,27 @@ def _child_work_dir(args: argparse.Namespace, child_name: str | None) -> Path | 
     return args.work_dir / name
 
 
+def _summary_path(args: argparse.Namespace) -> Path | None:
+    if args.summary_path is not None:
+        return args.summary_path
+    if args.work_dir is not None:
+        return args.work_dir / "physical_smoke_summary.json"
+    return None
+
+
+def _write_summary(args: argparse.Namespace, result: dict[str, Any]) -> Path | None:
+    path = _summary_path(args)
+    if path is None:
+        return None
+    result["summary_path"] = str(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 @dataclass(frozen=True)
 class _CommandRunResult:
     returncode: int | None
@@ -457,6 +478,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional root directory for child smoke evidence; uses preflight/book/projectile subdirectories.",
     )
     parser.add_argument(
+        "--summary-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path for the wrapper summary JSON. Defaults to "
+            "<work-dir>/physical_smoke_summary.json when --work-dir is set."
+        ),
+    )
+    parser.add_argument(
         "--keep-work-dir",
         action="store_true",
         help="Pass --keep-work-dir to child business smokes so temporary evidence directories are retained.",
@@ -516,6 +546,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     result = run_physical_smoke(args)
+    _write_summary(args, result)
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0 if result.get("ok") else 1
 
