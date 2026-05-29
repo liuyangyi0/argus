@@ -165,6 +165,53 @@ const detectorEntries = computed(() => flattenEntries(camera.value?.detector))
 const configEntries = computed(() => flattenEntries(camera.value?.config))
 const leftTab = ref<'live' | 'info' | 'zones'>('live')
 
+const inputQualityState = computed(() => {
+  const detector = camera.value?.detector
+  if (!detector) {
+    return {
+      label: '等待状态',
+      detail: '检测状态未返回',
+      tone: 'muted',
+    }
+  }
+  const brightness = typeof detector.last_brightness === 'number'
+    ? `亮度 ${detector.last_brightness.toFixed(1)}`
+    : '亮度 -'
+  if (detector.ssim_calibration_blocked) {
+    return {
+      label: '低光校准等待',
+      detail: `${brightness} · 异常检测校准暂停`,
+      tone: 'warn',
+    }
+  }
+  if (detector.low_light) {
+    return {
+      label: '低光',
+      detail: `${brightness} · 高速目标检测受限`,
+      tone: 'warn',
+    }
+  }
+  if (detector.exposure_recovering) {
+    return {
+      label: '曝光恢复',
+      detail: `${brightness} · 高速目标检测暂缓`,
+      tone: 'warn',
+    }
+  }
+  if (detector.detection_limited) {
+    return {
+      label: '检测受限',
+      detail: `${brightness} · ${detector.detection_limited_reason || '输入质量异常'}`,
+      tone: 'warn',
+    }
+  }
+  return {
+    label: '稳定',
+    detail: `${brightness} · 检测输入正常`,
+    tone: 'ok',
+  }
+})
+
 const modeOptions = [
   { label: '主动检测', value: 'active' },
   { label: '学习', value: 'learning' },
@@ -245,6 +292,11 @@ async function handleModeChange(value: string | number) {
              <div v-else class="video-container offline-state">
                 <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg>
                 <span>摄像头离线</span>
+             </div>
+             <div class="quality-strip" :class="`quality-${inputQualityState.tone}`" data-test="input-quality-strip">
+                <span class="quality-title">输入质量</span>
+                <strong>{{ inputQualityState.label }}</strong>
+                <span class="quality-detail">{{ inputQualityState.detail }}</span>
              </div>
           </div>
 
@@ -395,6 +447,43 @@ main { flex:1; display:flex; flex-direction:column; min-width:0; gap:12px; heigh
 }
 .offline-state svg { width: 32px; height: 32px; }
 .offline-state span { font-weight: 500; font-size: 13px; }
+
+.quality-strip {
+  margin-top: 10px;
+  min-height: 40px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  color: var(--ink-3);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.quality-title {
+  color: var(--ink-5);
+  font-weight: 600;
+}
+.quality-strip strong {
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.quality-detail {
+  color: var(--ink-4);
+}
+.quality-ok {
+  border-color: rgba(21,163,74,.28);
+  background: rgba(21,163,74,.06);
+}
+.quality-warn {
+  border-color: rgba(217,119,6,.32);
+  background: rgba(217,119,6,.08);
+}
+.quality-muted {
+  background: rgba(10,10,15,.03);
+}
 
 .right { width: 320px; flex-shrink: 0; padding: 16px; display: flex; flex-direction: column; gap: 16px; overflow: hidden; border-radius: var(--r-lg); }
 .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex-shrink: 0; }

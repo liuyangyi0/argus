@@ -185,6 +185,35 @@ describe('CameraDetail live stream fallback', () => {
     expect(wrapper.find('img.player-vid').exists()).toBe(false)
   })
 
+  it('shows low-light input quality on the live camera page', async () => {
+    vi.mocked(getCameraDetail).mockResolvedValue(cameraDetail({
+      detector: {
+        low_light: true,
+        last_brightness: 4.5,
+        ssim_calibration_blocked: true,
+      },
+    }))
+
+    const wrapper = mount(CameraDetail, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          ZoneEditor: true,
+          CalibrationWizard: true,
+          Message: passthrough,
+        },
+      },
+    })
+    await flushPromises()
+
+    const quality = wrapper.find('[data-test="input-quality-strip"]')
+    expect(quality.text()).toContain('输入质量')
+    expect(quality.text()).toContain('低光校准等待')
+    expect(quality.text()).toContain('亮度 4.5')
+
+    wrapper.unmount()
+  })
+
   it('stops an active stream when polling reports the camera offline', async () => {
     vi.useFakeTimers()
     vi.mocked(getCameraDetail)
