@@ -30,7 +30,7 @@ def test_parse_args_defaults_to_obsbot_book_scenario() -> None:
     assert args.require_go2rtc is True
     assert args.browser == "required"
     assert args.preflight is True
-    assert args.preflight_timeout == 8.0
+    assert args.preflight_timeout == 15.0
     assert args.preflight_measure_seconds == 15.0
     assert args.stream_output is True
 
@@ -48,6 +48,17 @@ def test_parse_args_can_disable_preflight_for_debugging() -> None:
 
     assert args.preflight is False
     assert "preflight" not in result
+
+
+def test_preflight_only_runs_no_physical_scenarios() -> None:
+    args = parse_args(["--preflight-only", "--dry-run"])
+
+    result = run_physical_smoke(args)
+
+    assert result["ok"] is True
+    assert result["preflight_only"] is True
+    assert result["preflight"]["dry_run"] is True
+    assert result["scenarios"] == []
 
 
 def test_build_book_command_includes_static_scene_expectations() -> None:
@@ -283,7 +294,15 @@ def test_parse_args_can_disable_go2rtc_for_debugging() -> None:
     assert "--require-go2rtc" not in command
 
 
-@pytest.mark.parametrize("argv", [["--activation-delay", "-1"], ["--timeout", "0"], ["--process-timeout", "0"]])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--activation-delay", "-1"],
+        ["--timeout", "0"],
+        ["--process-timeout", "0"],
+        ["--no-preflight", "--preflight-only"],
+    ],
+)
 def test_parse_args_rejects_invalid_values(argv: list[str]) -> None:
     with pytest.raises(SystemExit):
         parse_args(argv)

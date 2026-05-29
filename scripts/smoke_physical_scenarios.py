@@ -420,6 +420,13 @@ def run_physical_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "preflight": preflight_result,
             "scenarios": [],
         }
+    if args.preflight_only:
+        return {
+            "ok": bool(preflight_result and preflight_result.get("ok")),
+            "preflight_only": True,
+            "preflight": preflight_result,
+            "scenarios": [],
+        }
 
     scenarios = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
     results = [run_scenario(args, scenario) for scenario in scenarios]
@@ -471,7 +478,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Run a camera/go2rtc/FPS preflight before prompting for physical actions.",
     )
-    parser.add_argument("--preflight-timeout", type=float, default=8.0)
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Run only the camera/go2rtc/FPS preflight and skip physical action scenarios.",
+    )
+    parser.add_argument("--preflight-timeout", type=float, default=15.0)
     parser.add_argument("--preflight-measure-seconds", type=float, default=15.0)
     parser.add_argument("--log-tail-chars", type=int, default=12000)
     parser.add_argument(
@@ -496,6 +508,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--preflight-measure-seconds must be positive")
     if args.log_tail_chars <= 0:
         parser.error("--log-tail-chars must be positive")
+    if args.preflight_only and not args.preflight:
+        parser.error("--preflight-only requires --preflight")
     return args
 
 
