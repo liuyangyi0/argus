@@ -22,6 +22,7 @@ from scripts.smoke_dashboard_business_flow import (
     _rtsp_fixture_anomaly_start_s,
     _seed_model_registry,
     _seed_training_baselines,
+    _set_camera_mode,
     _verify_alert_semantic_expectations,
     _verify_business_apis,
     _verify_dev_video_alert_semantics,
@@ -280,13 +281,55 @@ def test_parse_args_accepts_no_alert_observation():
     args = parse_args([
         "--camera-source", "0",
         "--camera-protocol", "usb",
+        "--observe-mode", "collection",
         "--expect-no-alert",
         "--no-alert-observe-seconds", "3.5",
         "--browser", "off",
     ])
 
+    assert args.observe_mode == "collection"
     assert args.expect_no_alert is True
     assert args.no_alert_observe_seconds == 3.5
+
+
+def test_parse_args_accepts_training_no_alert_observation():
+    args = parse_args([
+        "--rtsp-fixture",
+        "--dev-video-motion", "book",
+        "--observe-mode", "training",
+        "--expect-no-alert",
+        "--no-alert-observe-seconds", "20",
+        "--browser", "off",
+    ])
+
+    assert args.observe_mode == "training"
+    assert args.expect_no_alert is True
+
+
+def test_set_camera_mode_posts_requested_pipeline_mode():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/cameras/cam_a/mode"
+        assert request.read() == b'{"mode":"training"}'
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "camera_id": "cam_a",
+                    "previous_mode": "active",
+                    "pipeline_mode": "training",
+                },
+            },
+        )
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="http://argus.test",
+    )
+
+    result = _set_camera_mode(client, camera_id="cam_a", mode="training")
+
+    assert result["pipeline_mode"] == "training"
 
 
 def test_rtsp_fixture_delays_anomaly_until_after_baseline_window():
@@ -1112,6 +1155,9 @@ def test_clean_env_removes_argus_overrides(monkeypatch):
         ["--port", "-1"],
         ["--port", "65536"],
         ["--timeout", "0"],
+        ["--observe-mode", "unknown"],
+        ["--observe-mode", "collection"],
+        ["--observe-mode", "training"],
         ["--recording-timeout", "0"],
         ["--no-alert-observe-seconds", "0"],
         ["--training-timeout", "0"],

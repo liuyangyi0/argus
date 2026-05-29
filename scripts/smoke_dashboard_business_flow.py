@@ -466,14 +466,18 @@ def _wait_for_detector_ready(
     )
 
 
-def _activate_camera(client: httpx.Client, *, camera_id: str) -> dict[str, Any]:
+def _set_camera_mode(client: httpx.Client, *, camera_id: str, mode: str) -> dict[str, Any]:
     data = _api_data(
-        client.post(f"/api/cameras/{camera_id}/mode", json={"mode": "active"}, timeout=10),
-        label="set camera active mode",
+        client.post(f"/api/cameras/{camera_id}/mode", json={"mode": mode}, timeout=10),
+        label=f"set camera {mode} mode",
     )
-    if data.get("pipeline_mode") != "active":
-        raise DashboardBusinessSmokeFailure(f"camera mode did not become active: {data}")
+    if data.get("pipeline_mode") != mode:
+        raise DashboardBusinessSmokeFailure(f"camera mode did not become {mode}: {data}")
     return data
+
+
+def _activate_camera(client: httpx.Client, *, camera_id: str) -> dict[str, Any]:
+    return _set_camera_mode(client, camera_id=camera_id, mode="active")
 
 
 def _verify_camera_media_apis(
@@ -782,7 +786,7 @@ def _physical_action_window_message(args: argparse.Namespace) -> str:
         forbidden_parts.append(f"detection_type not in {sorted(args.forbid_detection_type)!r}")
 
     message = (
-        "[argus] camera active; introduce the physical test target within "
+        f"[argus] camera {args.observe_mode}; introduce the physical test target within "
         f"{args.activation_delay:.1f}s"
     )
     if expected_parts:
@@ -1785,7 +1789,11 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     process=proc,
                 )
                 with _AlertWebSocketListener(base_url=base_url) as realtime_listener:
-                    mode_result = _activate_camera(client, camera_id=camera_id)
+                    mode_result = _set_camera_mode(
+                        client,
+                        camera_id=camera_id,
+                        mode=args.observe_mode,
+                    )
                     if args.activation_delay > 0:
                         print(_physical_action_window_message(args), flush=True)
                         time.sleep(args.activation_delay)
@@ -1980,9 +1988,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=0, help="Dashboard port; 0 picks a free port")
     parser.add_argument("--timeout", type=float, default=90.0, help="Seconds to wait for alert generation")
     parser.add_argument(
+        "--observe-mode",
+        choices=["active", "maintenance", "collection", "training"],
+        default="active",
+        help=(
+            "Pipeline mode to set before alert/no-alert observation. "
+            "Use collection or training with --expect-no-alert to verify detection is stopped."
+        ),
+    )
+    parser.add_argument(
         "--expect-no-alert",
         action="store_true",
-        help="After activation, observe the camera and fail if any alert is generated.",
+        help="After setting --observe-mode, observe the camera and fail if any alert is generated.",
     )
     parser.add_argument(
         "--no-alert-observe-seconds",
@@ -2181,6 +2198,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--no-alert-observe-seconds must be positive")
     if args.expect_no_alert and (args.expect_alert_category or args.expect_detection_type):
         parser.error("--expect-no-alert cannot be combined with expected alert semantics")
+    if not args.expect_no_alert and args.observe_mode in {"collection", "training"}:
+        parser.error("--observe-mode collection/training requires --expect-no-alert")
     if args.recording_timeout <= 0:
         parser.error("--recording-timeout must be positive")
     if args.training_timeout <= 0:
