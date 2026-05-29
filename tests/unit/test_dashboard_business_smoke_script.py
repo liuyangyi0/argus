@@ -513,6 +513,9 @@ def test_book_dev_video_semantics_accepts_scene_change():
         "motion": "book",
         "detection_type": "anomaly",
         "category": "scene_change",
+        "detected_object_classes": [],
+        "classification_label": None,
+        "classification_confidence": None,
     }
 
 
@@ -532,6 +535,9 @@ def test_book_dev_video_semantics_accepts_static_foreign():
         "motion": "book",
         "detection_type": "anomaly",
         "category": "static_foreign",
+        "detected_object_classes": [],
+        "classification_label": None,
+        "classification_confidence": None,
     }
 
 
@@ -548,6 +554,13 @@ def test_alert_semantic_expectations_accept_expected_values():
         "_realtime_payload": {
             "detection_type": "anomaly",
             "category": "scene_change",
+            "detected_objects": [
+                {"class_name": "book"},
+                {"class": "cup"},
+                {"class_name": "book"},
+            ],
+            "classification_label": "book",
+            "classification_confidence": 0.82,
         },
     }
 
@@ -555,6 +568,9 @@ def test_alert_semantic_expectations_accept_expected_values():
 
     assert result["detection_type"] == "anomaly"
     assert result["category"] == "scene_change"
+    assert result["detected_object_classes"] == ["book", "cup"]
+    assert result["classification_label"] == "book"
+    assert result["classification_confidence"] == 0.82
     assert result["expected_detection_type"] == ["anomaly"]
     assert result["expected_category"] == ["scene_change"]
     assert result["forbidden_detection_type"] == ["projectile"]

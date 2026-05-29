@@ -648,11 +648,32 @@ def _verify_no_alert_window(
     }
 
 
-def _extract_alert_semantics(alert: dict[str, Any]) -> dict[str, str]:
+def _extract_alert_semantics(alert: dict[str, Any]) -> dict[str, Any]:
     realtime = alert.get("_realtime_payload") or alert.get("realtime") or {}
+    detected_objects = realtime.get("detected_objects") or alert.get("detected_objects") or []
+    detected_object_classes: list[str] = []
+    if isinstance(detected_objects, list):
+        for item in detected_objects:
+            if not isinstance(item, dict):
+                continue
+            class_name = item.get("class_name") or item.get("class")
+            if class_name:
+                detected_object_classes.append(str(class_name))
+    classification_confidence = (
+        realtime.get("classification_confidence")
+        if "classification_confidence" in realtime
+        else alert.get("classification_confidence")
+    )
     return {
         "detection_type": str(realtime.get("detection_type") or alert.get("detection_type") or ""),
         "category": str(realtime.get("category") or alert.get("category") or ""),
+        "detected_object_classes": sorted(set(detected_object_classes)),
+        "classification_label": (
+            realtime.get("classification_label")
+            if realtime.get("classification_label") is not None
+            else alert.get("classification_label")
+        ),
+        "classification_confidence": classification_confidence,
     }
 
 
@@ -756,7 +777,7 @@ def _verify_alert_semantic_expectations(
 def _verify_dev_video_alert_semantics(
     args: argparse.Namespace,
     alert: dict[str, Any],
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     if args.camera_source is not None or args.dev_video_motion != "book":
         return None
 
