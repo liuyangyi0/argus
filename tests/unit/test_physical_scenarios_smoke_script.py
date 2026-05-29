@@ -10,6 +10,7 @@ from scripts.smoke_physical_scenarios import (
     build_preflight_command,
     _child_summary,
     _extract_last_json_object,
+    _write_summary,
     parse_args,
     run_physical_smoke,
     run_preflight,
@@ -131,6 +132,39 @@ def test_work_dir_is_split_by_child_smoke(tmp_path) -> None:
     assert "--keep-work-dir" in preflight
     assert "--keep-work-dir" in book
     assert "--keep-work-dir" in projectile
+
+
+def test_summary_defaults_to_work_dir(tmp_path) -> None:
+    args = parse_args([
+        "--work-dir",
+        str(tmp_path),
+        "--dry-run",
+    ])
+    result = run_physical_smoke(args)
+
+    path = _write_summary(args, result)
+
+    assert path == tmp_path / "physical_smoke_summary.json"
+    assert result["summary_path"] == str(path)
+    assert path is not None
+    data = path.read_text(encoding="utf-8")
+    assert '"summary_path"' in data
+    assert '"scenarios"' in data
+
+
+def test_summary_path_can_be_explicit(tmp_path) -> None:
+    summary_path = tmp_path / "nested" / "summary.json"
+    args = parse_args([
+        "--summary-path",
+        str(summary_path),
+        "--dry-run",
+    ])
+    result = run_physical_smoke(args)
+
+    path = _write_summary(args, result)
+
+    assert path == summary_path
+    assert summary_path.exists()
 
 
 def test_extract_last_json_object_ignores_logs_and_trailing_noise() -> None:
