@@ -152,6 +152,9 @@ class ReleasePipeline:
                     self._retire_current_production(
                         session, record.camera_id, model_version_id, triggered_by,
                     )
+                    self._retire_current_canaries(
+                        session, record.camera_id, model_version_id, triggered_by,
+                    )
                     record.is_active = True
                     record.canary_camera_id = None
                 elif target_stage == ModelStage.RETIRED.value:
@@ -420,4 +423,32 @@ class ReleasePipeline:
                 to_stage=ModelStage.RETIRED.value,
                 triggered_by=triggered_by,
                 reason=f"Replaced by {exclude_version_id}",
+            ))
+
+    @staticmethod
+    def _retire_current_canaries(
+        session: Session,
+        camera_id: str,
+        exclude_version_id: str,
+        triggered_by: str = "system",
+    ) -> None:
+        """Retire stale canaries for this camera when a model reaches production."""
+        canary_models = (
+            session.query(ModelRecord)
+            .filter_by(camera_id=camera_id, stage=ModelStage.CANARY.value)
+            .filter(ModelRecord.model_version_id != exclude_version_id)
+            .all()
+        )
+        for model in canary_models:
+            model.stage = ModelStage.RETIRED.value
+            model.is_active = False
+            model.canary_camera_id = None
+            session.add(ModelVersionEvent(
+                camera_id=camera_id,
+                from_version=model.model_version_id,
+                to_version=model.model_version_id,
+                from_stage=ModelStage.CANARY.value,
+                to_stage=ModelStage.RETIRED.value,
+                triggered_by=triggered_by,
+                reason=f"Replaced by production {exclude_version_id}",
             ))

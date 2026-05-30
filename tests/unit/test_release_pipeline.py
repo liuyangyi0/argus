@@ -264,12 +264,18 @@ class TestVersionEvents:
             model_version_id="cam-01-dinomaly2-old-0001",
             is_active=True,
         )
+        stale_canary_vid = _create_model(
+            session_factory,
+            stage="canary",
+            model_version_id="cam-01-dinomaly2-stale-canary-0002",
+            canary_camera_id="cam-01",
+        )
 
         # Create a canary model ready for production
         new_vid = _create_model(
             session_factory,
             stage="canary",
-            model_version_id="cam-01-dinomaly2-new-0002",
+            model_version_id="cam-01-dinomaly2-new-0003",
             canary_camera_id="cam-01",
         )
         now = datetime.now(timezone.utc)
@@ -290,9 +296,15 @@ class TestVersionEvents:
 
         with session_factory() as session:
             old = session.query(ModelRecord).filter_by(model_version_id=old_vid).first()
+            stale_canary = session.query(ModelRecord).filter_by(
+                model_version_id=stale_canary_vid
+            ).first()
             new = session.query(ModelRecord).filter_by(model_version_id=new_vid).first()
             assert old.stage == "retired"
             assert old.is_active is False
+            assert stale_canary.stage == "retired"
+            assert stale_canary.is_active is False
+            assert stale_canary.canary_camera_id is None
             assert new.stage == "production"
             assert new.is_active is True
 

@@ -10,6 +10,7 @@ server a user opens in the browser.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shutil
@@ -18,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -113,33 +116,154 @@ def _dump_dom_with_browser(
     timeout_s: float,
     virtual_time_ms: int,
 ) -> str:
+    try:
+        return _dump_dom_with_cdp(
+            browser_path=browser_path,
+            url=url,
+            user_data_dir=user_data_dir,
+            timeout_s=timeout_s,
+            virtual_time_ms=virtual_time_ms,
+        )
+    except Exception as exc:
+        raise DashboardSmokeFailure(
+            f"browser CDP DOM dump failed for {url}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _dump_dom_with_cdp(
+    *,
+    browser_path: str,
+    url: str,
+    user_data_dir: Path,
+    timeout_s: float,
+    virtual_time_ms: int,
+) -> str:
+    debug_port = _free_port()
     cmd = [
         browser_path,
         "--headless=new",
         "--disable-gpu",
         "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-extensions",
         "--no-first-run",
         "--no-default-browser-check",
+        "--blink-settings=imagesEnabled=false",
+        f"--remote-debugging-port={debug_port}",
+        "--remote-allow-origins=*",
         f"--user-data-dir={user_data_dir}",
-        f"--virtual-time-budget={virtual_time_ms}",
-        "--dump-dom",
-        url,
+        "about:blank",
     ]
-    result = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout_s,
     )
-    if result.returncode != 0:
-        stderr = (result.stderr or "").splitlines()[-12:]
-        raise DashboardSmokeFailure(
-            f"browser DOM dump failed for {url}: exit {result.returncode}; "
-            f"stderr tail={stderr}"
+    try:
+        page_ws_url = _wait_for_cdp_page(debug_port, timeout_s=min(timeout_s, 15.0))
+        return asyncio.run(_read_dom_via_cdp(
+            page_ws_url,
+            url=url,
+            timeout_s=timeout_s,
+            virtual_time_ms=virtual_time_ms,
+        ))
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+def _wait_for_cdp_page(debug_port: int, *, timeout_s: float) -> str:
+    deadline = time.monotonic() + timeout_s
+    last_error: str | None = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(  # noqa: S310 - local Chrome DevTools endpoint
+                f"http://127.0.0.1:{debug_port}/json",
+                timeout=1,
+            ) as response:
+                pages = json.loads(response.read().decode("utf-8", errors="replace"))
+            for page in pages:
+                if page.get("type") == "page" and page.get("webSocketDebuggerUrl"):
+                    return str(page["webSocketDebuggerUrl"])
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+        time.sleep(0.1)
+    raise TimeoutError(f"Chrome DevTools page target not ready: {last_error}")
+
+
+async def _read_dom_via_cdp(
+    page_ws_url: str,
+    *,
+    url: str,
+    timeout_s: float,
+    virtual_time_ms: int,
+) -> str:
+    import websockets
+
+    next_id = 0
+
+    async with websockets.connect(page_ws_url, max_size=16 * 1024 * 1024) as ws:
+        async def command(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            nonlocal next_id
+            next_id += 1
+            command_id = next_id
+            await ws.send(json.dumps({
+                "id": command_id,
+                "method": method,
+                "params": params or {},
+            }))
+            while True:
+                message = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout_s))
+                if message.get("id") == command_id:
+                    if "error" in message:
+                        raise RuntimeError(message["error"])
+                    return message.get("result") or {}
+
+        await command("Page.enable")
+        await command("Runtime.enable")
+        await command("Network.enable")
+        await command("Network.setBlockedURLs", {
+            "urls": [
+                "*/api/cameras/*/stream*",
+                "*/api/replay/*/stream*",
+                "*/api/streaming/*",
+            ],
+        })
+        await command("Page.navigate", {"url": url})
+
+        load_deadline = time.monotonic() + min(timeout_s, 15.0)
+        while time.monotonic() < load_deadline:
+            try:
+                message = json.loads(await asyncio.wait_for(ws.recv(), timeout=0.5))
+            except asyncio.TimeoutError:
+                break
+            if message.get("method") == "Page.loadEventFired":
+                break
+
+        await asyncio.sleep(max(0.5, min(virtual_time_ms / 1000.0, 12.0)))
+        try:
+            await command("Page.stopLoading")
+        except Exception:
+            pass
+        result = await command(
+            "Runtime.evaluate",
+            {
+                "expression": "document.documentElement.outerHTML",
+                "returnByValue": True,
+            },
         )
-    return result.stdout
+        value = (result.get("result") or {}).get("value")
+        if not isinstance(value, str) or not value:
+            raise RuntimeError("CDP returned an empty DOM")
+        return value
 
 
 def _check_browser_dom_routes(args: argparse.Namespace, base_url: str, work_dir: Path) -> dict[str, Any]:

@@ -216,15 +216,19 @@ def test_parse_args_accepts_hardware_semantic_expectations():
         "--expect-alert-category", "scene_change",
         "--expect-alert-category", "static_foreign",
         "--expect-detection-type", "anomaly",
+        "--expect-detected-object-class", "book",
         "--forbid-alert-category", "projectile",
         "--forbid-detection-type", "projectile",
+        "--forbid-detected-object-class", "fast_projectile",
         "--browser", "off",
     ])
 
     assert args.expect_alert_category == ["scene_change", "static_foreign"]
     assert args.expect_detection_type == ["anomaly"]
+    assert args.expect_detected_object_class == ["book"]
     assert args.forbid_alert_category == ["projectile"]
     assert args.forbid_detection_type == ["projectile"]
+    assert args.forbid_detected_object_class == ["fast_projectile"]
 
 
 def test_physical_action_window_message_names_expected_and_forbidden_semantics():
@@ -232,8 +236,10 @@ def test_physical_action_window_message_names_expected_and_forbidden_semantics()
         "--activation-delay", "7.5",
         "--expect-alert-category", "scene_change",
         "--expect-detection-type", "anomaly",
+        "--expect-detected-object-class", "book",
         "--forbid-alert-category", "projectile",
         "--forbid-detection-type", "projectile",
+        "--forbid-detected-object-class", "fast_projectile",
         "--browser", "off",
     ])
 
@@ -243,8 +249,10 @@ def test_physical_action_window_message_names_expected_and_forbidden_semantics()
     assert "within 7.5s" in message
     assert "category in ['scene_change']" in message
     assert "detection_type in ['anomaly']" in message
+    assert "detected object classes include ['book']" in message
     assert "category not in ['projectile']" in message
     assert "detection_type not in ['projectile']" in message
+    assert "detected object classes exclude ['fast_projectile']" in message
 
 
 def test_parse_args_accepts_preflight_mode():
@@ -434,6 +442,69 @@ def test_wait_for_completed_alert_timeout_reports_last_evidence_state():
     assert '"heatmap_path": null' in msg
 
 
+def test_wait_for_completed_alert_ignores_known_alert_ids():
+    class RunningProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/alerts/json":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "alerts": [
+                            {
+                                "alert_id": "ALT-old",
+                                "camera_id": "cam_a",
+                                "severity": "medium",
+                            },
+                            {
+                                "alert_id": "ALT-new",
+                                "camera_id": "cam_a",
+                                "severity": "high",
+                            },
+                        ]
+                    },
+                },
+            )
+        if request.url.path == "/api/alerts/ALT-new/detail":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "alert_id": "ALT-new",
+                        "has_recording": True,
+                        "recording_status": "complete",
+                        "snapshot_path": "snapshot.jpg",
+                        "heatmap_path": "heatmap.jpg",
+                    },
+                },
+            )
+        return httpx.Response(404, json={"code": 404, "message": "not found"})
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="http://argus.test",
+    )
+
+    alert, detail = _wait_for_completed_alert(
+        client,
+        camera_id="cam_a",
+        alert_timeout_s=0.05,
+        recording_timeout_s=0.05,
+        process=RunningProcess(),
+        known_alert_ids={"ALT-old"},
+    )
+
+    assert alert["alert_id"] == "ALT-new"
+    assert detail["alert_id"] == "ALT-new"
+
+
 def test_verify_no_alert_window_passes_when_alert_list_stays_empty():
     class RunningProcess:
         returncode = None
@@ -617,8 +688,10 @@ def test_alert_semantic_expectations_accept_expected_values():
     args = parse_args([
         "--expect-alert-category", "scene_change",
         "--expect-detection-type", "anomaly",
+        "--expect-detected-object-class", "book",
         "--forbid-alert-category", "projectile",
         "--forbid-detection-type", "projectile",
+        "--forbid-detected-object-class", "fast_projectile",
         "--browser", "off",
     ])
     alert = {
@@ -645,14 +718,17 @@ def test_alert_semantic_expectations_accept_expected_values():
     assert result["classification_confidence"] == 0.82
     assert result["expected_detection_type"] == ["anomaly"]
     assert result["expected_category"] == ["scene_change"]
+    assert result["expected_detected_object_classes"] == ["book"]
     assert result["forbidden_detection_type"] == ["projectile"]
     assert result["forbidden_category"] == ["projectile"]
+    assert result["forbidden_detected_object_classes"] == ["fast_projectile"]
 
 
 def test_alert_semantic_expectations_require_projectile_evidence():
     args = parse_args([
         "--expect-alert-category", "projectile",
         "--expect-detection-type", "projectile",
+        "--expect-detected-object-class", "fast_projectile",
         "--browser", "off",
     ])
     alert = {
@@ -683,6 +759,75 @@ def test_alert_semantic_expectations_require_projectile_evidence():
         "trajectory_model": "projectile",
         "trajectory_points": 1,
     }
+    assert result["expected_detected_object_classes"] == ["fast_projectile"]
+
+
+def test_alert_semantic_expectations_require_detected_object_class():
+    args = parse_args([
+        "--expect-detected-object-class", "fast_projectile",
+        "--browser", "off",
+    ])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "projectile",
+            "category": "projectile",
+            "trajectory_model": "projectile",
+            "speed_px_per_sec": 1020.0,
+            "trajectory_points": [{"t": 1.0, "x": 8.2, "y": 215.0}],
+            "detected_objects": [
+                {
+                    "class_name": "fast_projectile",
+                    "bbox": [0, 211, 17, 220],
+                    "speed_px_per_sec": 1020.0,
+                    "trajectory_points": [{"t": 1.0, "x": 8.2, "y": 215.0}],
+                }
+            ],
+        },
+    }
+
+    result = _verify_alert_semantic_expectations(args, alert)
+
+    assert result["detection_type"] == "projectile"
+    assert result["category"] == "projectile"
+    assert result["expected_detected_object_classes"] == ["fast_projectile"]
+    assert result["projectile_evidence"]["detected_object_class"] == "fast_projectile"
+
+
+def test_alert_semantic_expectations_reject_missing_detected_object_class():
+    args = parse_args([
+        "--expect-detected-object-class", "fast_projectile",
+        "--browser", "off",
+    ])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "anomaly",
+            "category": "scene_change",
+            "detected_objects": [{"class_name": "book"}],
+        },
+    }
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="missing expected values"):
+        _verify_alert_semantic_expectations(args, alert)
+
+
+def test_alert_semantic_expectations_reject_forbidden_detected_object_class():
+    args = parse_args([
+        "--forbid-detected-object-class", "fast_projectile",
+        "--browser", "off",
+    ])
+    alert = {
+        "alert_id": "ALT-1",
+        "realtime": {
+            "detection_type": "projectile",
+            "category": "projectile",
+            "detected_objects": [{"class_name": "fast_projectile"}],
+        },
+    }
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="matched forbidden"):
+        _verify_alert_semantic_expectations(args, alert)
 
 
 def test_alert_semantic_expectations_reject_projectile_without_evidence():
@@ -1167,6 +1312,27 @@ def test_seed_model_registry_creates_all_release_stages(tmp_path):
         assert rows[model_ids["canary"]].stage == "canary"
         assert rows[model_ids["production"]].stage == "production"
         assert rows[model_ids["production"]].is_active is True
+        first_production_path = Path(rows[model_ids["production"]].model_path)
+        assert first_production_path.name.endswith("-production")
+        assert first_production_path.name != "production"
+
+        second_model_ids = _seed_model_registry(
+            work_dir=tmp_path,
+            database_url=database_url,
+            camera_id="cam_a",
+        )
+        assert set(second_model_ids) == {"candidate", "shadow", "canary", "production"}
+        with db.get_session() as session:
+            rows = {
+                row.model_version_id: row
+                for row in session.query(ModelRecord).all()
+            }
+        assert rows[second_model_ids["production"]].stage == "production"
+        assert rows[second_model_ids["production"]].is_active is True
+        second_production_path = Path(rows[second_model_ids["production"]].model_path)
+        assert second_production_path.name.endswith("-production")
+        assert second_production_path.name != "production"
+        assert first_production_path != second_production_path
     finally:
         db.close()
 
@@ -1270,6 +1436,7 @@ def test_clean_env_removes_argus_overrides(monkeypatch):
         ["--browser-virtual-time-ms", "0"],
         ["--expect-no-alert", "--expect-alert-category", "scene_change"],
         ["--expect-no-alert", "--expect-detection-type", "anomaly"],
+        ["--expect-no-alert", "--expect-detected-object-class", "fast_projectile"],
     ],
 )
 def test_parse_args_rejects_invalid_values(argv):
