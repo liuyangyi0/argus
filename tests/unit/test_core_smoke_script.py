@@ -165,6 +165,24 @@ def test_parse_args_accepts_stable_dev_video_motion():
     assert args.dev_video_motion == "stable"
 
 
+def test_parse_args_accepts_stable_no_alert_observation():
+    args = parse_args([
+        "--dev-video-motion",
+        "stable",
+        "--expect-no-alert",
+        "--no-alert-observe-seconds",
+        "3.5",
+    ])
+
+    assert args.expect_no_alert is True
+    assert args.no_alert_observe_seconds == 3.5
+
+
+def test_parse_args_rejects_generated_no_alert_with_anomaly_motion():
+    with pytest.raises(SystemExit):
+        parse_args(["--dev-video-motion", "settle", "--expect-no-alert"])
+
+
 def test_parse_args_accepts_usb_device_selector():
     args = parse_args([
         "--camera-source",
@@ -189,6 +207,11 @@ def test_parse_args_rejects_invalid_preflight_timeout():
 def test_parse_args_rejects_invalid_preflight_measure_seconds():
     with pytest.raises(SystemExit):
         parse_args(["--preflight", "--preflight-measure-seconds", "0"])
+
+
+def test_parse_args_rejects_invalid_no_alert_observe_seconds():
+    with pytest.raises(SystemExit):
+        parse_args(["--no-alert-observe-seconds", "0"])
 
 
 def test_inspect_usb_video_devices_reports_windows_inventory(monkeypatch):

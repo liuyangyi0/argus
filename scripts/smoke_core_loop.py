@@ -20,6 +20,7 @@ Hardware validation examples:
     .\.venv\Scripts\python.exe scripts\smoke_core_loop.py --preflight --camera-source 0 --camera-protocol usb --require-go2rtc
     .\.venv\Scripts\python.exe scripts\smoke_core_loop.py --camera-source 0 --camera-protocol usb --require-go2rtc --activation-delay 10
     .\.venv\Scripts\python.exe scripts\smoke_core_loop.py --camera-source rtsp://user:pass@host/stream --camera-protocol rtsp --require-go2rtc --activation-delay 10
+    .\.venv\Scripts\python.exe scripts\smoke_core_loop.py --dev-video-motion stable --expect-no-alert
 """
 
 from __future__ import annotations
@@ -1212,6 +1213,113 @@ def _run_camera_alert_replay_reports(
     }
 
 
+def _run_camera_no_alert(
+    *,
+    client: TestClient,
+    manager: CameraManager,
+    dispatcher: AlertDispatcher,
+    camera_id: str,
+    observe_seconds: float,
+    timeout_s: float,
+    require_go2rtc: bool = False,
+) -> dict[str, Any]:
+    started = manager.start_all()
+    if camera_id not in started:
+        raise SmokeFailure(f"Camera {camera_id} did not start; started={started}")
+
+    def camera_online():
+        data = _api_data(client.get("/api/cameras/json"), label="cameras json")
+        rows = data.get("cameras") or []
+        row = next((item for item in rows if item["camera_id"] == camera_id), None)
+        if row and row.get("connected") and row.get("running"):
+            stats = row.get("stats") or {}
+            if stats.get("frames_captured", 0) >= 5:
+                return row
+        return None
+
+    camera_row = _wait_for(
+        "camera to connect and capture frames",
+        camera_online,
+        timeout_s=min(timeout_s, 30),
+    )
+
+    snapshot = client.get(f"/api/cameras/{camera_id}/snapshot")
+    if snapshot.status_code != 200 or "image/jpeg" not in snapshot.headers.get("content-type", ""):
+        raise SmokeFailure(
+            f"snapshot failed: HTTP {snapshot.status_code} {snapshot.headers.get('content-type')}"
+        )
+
+    streaming = _api_data(
+        client.get(f"/api/streaming/{camera_id}"),
+        label="streaming info",
+    )
+    expected_fallback = f"/api/cameras/{camera_id}/stream"
+    if streaming.get("fallback") != expected_fallback:
+        raise SmokeFailure(f"streaming fallback mismatch: {streaming}")
+    if require_go2rtc and streaming.get("go2rtc") is not True:
+        raise SmokeFailure(f"go2rtc streaming was required but unavailable: {streaming}")
+
+    first_stream_chunk = asyncio.run(_read_mjpeg_first_chunk(client.app, camera_id))
+    if b"--frame" not in first_stream_chunk or b"\xff\xd8" not in first_stream_chunk:
+        raise SmokeFailure(
+            f"mjpeg first frame invalid: bytes={len(first_stream_chunk)}"
+        )
+
+    def ssim_ready():
+        status = manager.get_detector_status(camera_id) or {}
+        return status if status.get("ssim_calibrated") else None
+
+    detector_status = _wait_for(
+        "SSIM fallback calibration",
+        ssim_ready,
+        timeout_s=min(timeout_s, 40),
+    )
+
+    mode_data = _api_data(
+        client.post(f"/api/cameras/{camera_id}/mode", json={"mode": "active"}),
+        label="set camera active mode",
+    )
+    if mode_data.get("pipeline_mode") != "active":
+        raise SmokeFailure(f"camera mode did not become active: {mode_data}")
+
+    deadline = time.monotonic() + observe_seconds
+    polls = 0
+    while True:
+        dispatcher.flush_db_queue()
+        alerts = _api_data(
+            client.get("/api/alerts/json", params={"camera_id": camera_id, "limit": 10}),
+            label="alerts json",
+        ).get("alerts") or []
+        polls += 1
+        if alerts:
+            alert = alerts[0]
+            raise SmokeFailure(
+                "expected no alerts but observed "
+                f"{alert.get('alert_id')} severity={alert.get('severity')} "
+                f"category={alert.get('category')} detection_type={alert.get('detection_type')}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
+
+    return {
+        "camera": {
+            "camera_id": camera_id,
+            "frames_captured": (camera_row.get("stats") or {}).get("frames_captured"),
+            "detector_mode": detector_status.get("mode"),
+            "ssim_noise_floor": detector_status.get("ssim_noise_floor"),
+            "streaming_go2rtc": streaming.get("go2rtc"),
+            "mjpeg_first_chunk_bytes": len(first_stream_chunk),
+        },
+        "no_alert": {
+            "observed_seconds": observe_seconds,
+            "polls": polls,
+            "alerts_seen": 0,
+        },
+    }
+
+
 def _run_models_and_system_smoke(
     *,
     client: TestClient,
@@ -1751,21 +1859,55 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         app.state.recording_store = recording_store
         client = TestClient(app)
 
-        camera_flow = _run_camera_alert_replay_reports(
-            client=client,
-            manager=manager,
-            dispatcher=dispatcher,
-            events=events,
-            camera_id=camera_id,
-            timeout_s=args.timeout,
-            recording_timeout_s=args.recording_timeout,
-            require_go2rtc=args.require_go2rtc,
-            activation_delay_s=args.activation_delay,
-        )
+        if args.expect_no_alert:
+            camera_flow = _run_camera_no_alert(
+                client=client,
+                manager=manager,
+                dispatcher=dispatcher,
+                camera_id=camera_id,
+                observe_seconds=args.no_alert_observe_seconds,
+                timeout_s=args.timeout,
+                require_go2rtc=args.require_go2rtc,
+            )
+        else:
+            camera_flow = _run_camera_alert_replay_reports(
+                client=client,
+                manager=manager,
+                dispatcher=dispatcher,
+                events=events,
+                camera_id=camera_id,
+                timeout_s=args.timeout,
+                recording_timeout_s=args.recording_timeout,
+                require_go2rtc=args.require_go2rtc,
+                activation_delay_s=args.activation_delay,
+            )
 
         manager.stop_all()
         manager = None
         dispatcher.flush_db_queue()
+
+        if args.expect_no_alert:
+            return {
+                "ok": True,
+                "mode": "no_alert",
+                "work_dir": str(work_dir),
+                "config": str(config_path),
+                "video": str(video_path) if args.camera_source is None else None,
+                "camera_input": {
+                    "camera_id": camera_id,
+                    "source": config.cameras[0].source,
+                    "protocol": config.cameras[0].protocol,
+                    "go2rtc_enabled": config.dashboard.go2rtc_enabled,
+                    "go2rtc_running": bool(getattr(go2rtc, "running", False)),
+                    "go2rtc_resolutions": go2rtc_resolution,
+                },
+                "expected_degradations": _expected_degradations(
+                    use_yolo=args.use_yolo,
+                    protocol=str(config.cameras[0].protocol),
+                ),
+                "events_seen": len(events),
+                "camera_no_alert": camera_flow,
+            }
 
         model_system_flow = _run_models_and_system_smoke(
             client=client,
@@ -1852,6 +1994,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=45.0,
         help="Seconds to wait for post-trigger recording completion (default: 45)",
+    )
+    parser.add_argument(
+        "--expect-no-alert",
+        action="store_true",
+        help="Observe the camera after activation and fail if any alert is generated.",
+    )
+    parser.add_argument(
+        "--no-alert-observe-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds to observe with --expect-no-alert (default: 30).",
     )
     parser.add_argument(
         "--video-seconds",
@@ -1959,6 +2112,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--preflight-timeout must be positive")
     if args.preflight_measure_seconds <= 0:
         parser.error("--preflight-measure-seconds must be positive")
+    if args.no_alert_observe_seconds <= 0:
+        parser.error("--no-alert-observe-seconds must be positive")
+    if (
+        args.expect_no_alert
+        and args.camera_source is None
+        and args.dev_video_motion != "stable"
+    ):
+        parser.error(
+            "--expect-no-alert with generated dev video requires --dev-video-motion stable"
+        )
     return args
 
 
