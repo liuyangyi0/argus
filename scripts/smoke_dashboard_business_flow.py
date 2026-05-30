@@ -536,9 +536,16 @@ def _wait_for_completed_alert(
     recording_timeout_s: float,
     process: subprocess.Popen,
     realtime_listener: _AlertWebSocketListener | None = None,
+    known_alert_ids: set[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    known_alert_ids = known_alert_ids or set()
+
     def latest_alert():
-        alerts = _recent_alerts(client, camera_id=camera_id)
+        alerts = [
+            alert
+            for alert in _recent_alerts(client, camera_id=camera_id)
+            if str(alert.get("alert_id") or "") not in known_alert_ids
+        ]
         return alerts[0] if alerts else None
 
     alert = _wait_for(
@@ -750,6 +757,9 @@ def _verify_alert_semantic_expectations(
             "forbidden": set(args.forbid_alert_category or []),
         },
     }
+    detected_class_set = set(semantics["detected_object_classes"])
+    expected_detected_classes = set(args.expect_detected_object_class or [])
+    forbidden_detected_classes = set(args.forbid_detected_object_class or [])
     for field, item in checks.items():
         actual = item["actual"]
         expected = item["expected"]
@@ -764,16 +774,31 @@ def _verify_alert_semantic_expectations(
                 f"alert {field}={actual!r} matched forbidden values "
                 f"{sorted(forbidden)!r}"
             )
+    missing_detected_classes = sorted(expected_detected_classes - detected_class_set)
+    if missing_detected_classes:
+        raise DashboardBusinessSmokeFailure(
+            "alert detected_object_classes missing expected values "
+            f"{missing_detected_classes!r}; actual={semantics['detected_object_classes']!r}"
+        )
+    forbidden_detected_matches = sorted(forbidden_detected_classes & detected_class_set)
+    if forbidden_detected_matches:
+        raise DashboardBusinessSmokeFailure(
+            "alert detected_object_classes matched forbidden values "
+            f"{forbidden_detected_matches!r}"
+        )
     result = {
         **semantics,
         "expected_detection_type": sorted(checks["detection_type"]["expected"]),
         "expected_category": sorted(checks["category"]["expected"]),
+        "expected_detected_object_classes": sorted(expected_detected_classes),
         "forbidden_detection_type": sorted(checks["detection_type"]["forbidden"]),
         "forbidden_category": sorted(checks["category"]["forbidden"]),
+        "forbidden_detected_object_classes": sorted(forbidden_detected_classes),
     }
     expects_projectile = (
         "projectile" in checks["detection_type"]["expected"]
         or "projectile" in checks["category"]["expected"]
+        or "fast_projectile" in expected_detected_classes
     )
     if expects_projectile:
         result["projectile_evidence"] = _verify_projectile_evidence(alert)
@@ -807,10 +832,18 @@ def _physical_action_window_message(args: argparse.Namespace) -> str:
         expected_parts.append(f"category in {sorted(args.expect_alert_category)!r}")
     if args.expect_detection_type:
         expected_parts.append(f"detection_type in {sorted(args.expect_detection_type)!r}")
+    if args.expect_detected_object_class:
+        expected_parts.append(
+            f"detected object classes include {sorted(args.expect_detected_object_class)!r}"
+        )
     if args.forbid_alert_category:
         forbidden_parts.append(f"category not in {sorted(args.forbid_alert_category)!r}")
     if args.forbid_detection_type:
         forbidden_parts.append(f"detection_type not in {sorted(args.forbid_detection_type)!r}")
+    if args.forbid_detected_object_class:
+        forbidden_parts.append(
+            f"detected object classes exclude {sorted(args.forbid_detected_object_class)!r}"
+        )
 
     message = (
         f"[argus] camera {args.observe_mode}; introduce the physical test target within "
@@ -912,16 +945,17 @@ def _seed_model_registry(*, work_dir: Path, database_url: str, camera_id: str) -
     try:
         registry = ModelRegistry(session_factory=db.get_session)
         baseline_dir = _baseline_artifact_dir(work_dir, camera_id)
+        seed_tag = f"seed-{time.time_ns()}"
 
         stage_ids: dict[str, str] = {}
 
         def register(name: str) -> str:
             return registry.register(
-                _model_artifact_dir(work_dir, camera_id, name),
+                _model_artifact_dir(work_dir, camera_id, f"{seed_tag}-{name}"),
                 baseline_dir,
                 camera_id,
                 "patchcore",
-                training_params={"smoke": True, "stage": name},
+                training_params={"smoke": True, "stage": name, "seed_tag": seed_tag},
             )
 
         stage_ids["candidate"] = register("candidate")
@@ -1886,6 +1920,7 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         recording_timeout_s=args.recording_timeout,
                         process=proc,
                         realtime_listener=realtime_listener,
+                        known_alert_ids=preexisting_alert_ids,
                     )
                 alert_id = alert["alert_id"]
                 alert_semantics = _verify_alert_semantic_expectations(args, alert)
@@ -2176,6 +2211,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--expect-detected-object-class",
+        action="append",
+        default=[],
+        help=(
+            "Require realtime detected_objects to include this class_name/class. "
+            "Repeat to require multiple classes, e.g. fast_projectile."
+        ),
+    )
+    parser.add_argument(
         "--forbid-alert-category",
         action="append",
         default=[],
@@ -2186,6 +2230,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="append",
         default=[],
         help="Fail if the realtime detection_type matches this value. May be repeated.",
+    )
+    parser.add_argument(
+        "--forbid-detected-object-class",
+        action="append",
+        default=[],
+        help="Fail if realtime detected_objects include this class_name/class. May be repeated.",
     )
     parser.add_argument(
         "--preflight-timeout",
@@ -2237,7 +2287,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--timeout must be positive")
     if args.no_alert_observe_seconds <= 0:
         parser.error("--no-alert-observe-seconds must be positive")
-    if args.expect_no_alert and (args.expect_alert_category or args.expect_detection_type):
+    if args.expect_no_alert and (
+        args.expect_alert_category
+        or args.expect_detection_type
+        or args.expect_detected_object_class
+    ):
         parser.error("--expect-no-alert cannot be combined with expected alert semantics")
     if (
         args.expect_no_alert
