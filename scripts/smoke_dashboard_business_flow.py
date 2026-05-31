@@ -661,6 +661,59 @@ def _verify_no_alert_window(
     }
 
 
+def _verify_no_alert_detector_ready(
+    *,
+    detector: dict[str, Any],
+    observe_mode: str,
+    allow_detection_limited: bool = False,
+) -> dict[str, Any]:
+    """Ensure active/maintenance no-alert observations did not pass with detection disabled."""
+    if observe_mode in {"collection", "training"}:
+        return {
+            "checked": False,
+            "reason": f"{observe_mode} mode intentionally disables alert detection",
+        }
+    if allow_detection_limited:
+        return {
+            "checked": False,
+            "reason": "--allow-detection-limited-no-alert was set",
+        }
+
+    failures: list[str] = []
+    if detector.get("low_light"):
+        failures.append(
+            f"low_light=true brightness={detector.get('last_brightness')}"
+        )
+    if detector.get("detection_limited"):
+        failures.append(
+            "detection_limited=true "
+            f"reason={detector.get('detection_limited_reason')}"
+        )
+    if detector.get("ssim_calibration_blocked"):
+        failures.append(
+            "ssim_calibration_blocked=true "
+            f"reason={detector.get('ssim_calibration_blocked_reason')}"
+        )
+
+    detector_mode = detector.get("mode")
+    if detector_mode in {None, "", "ssim_fallback"} and not detector.get("ssim_calibrated"):
+        failures.append("ssim fallback is not calibrated")
+
+    if failures:
+        raise DashboardBusinessSmokeFailure(
+            "no-alert observation is not valid because detection was limited: "
+            + "; ".join(failures)
+        )
+
+    return {
+        "checked": True,
+        "mode": detector_mode,
+        "ssim_calibrated": detector.get("ssim_calibrated"),
+        "detection_limited": detector.get("detection_limited"),
+        "low_light": detector.get("low_light"),
+    }
+
+
 def _extract_alert_semantics(alert: dict[str, Any]) -> dict[str, Any]:
     realtime = alert.get("_realtime_payload") or alert.get("realtime") or {}
     detected_objects = realtime.get("detected_objects") or alert.get("detected_objects") or []
@@ -1886,6 +1939,12 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                             client.get(f"/api/cameras/{camera_id}/detail/json", timeout=5),
                             label="camera detail",
                         )
+                        detector = detector_detail.get("detector") or {}
+                        detector_no_alert_check = _verify_no_alert_detector_ready(
+                            detector=detector,
+                            observe_mode=args.observe_mode,
+                            allow_detection_limited=args.allow_detection_limited_no_alert,
+                        )
                         return {
                             "ok": True,
                             "mode": "no_alert",
@@ -1898,10 +1957,13 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                                 "running": camera_row.get("running"),
                                 "pipeline_mode": mode_result.get("pipeline_mode"),
                                 "frames_captured": (camera_row.get("stats") or {}).get("frames_captured"),
-                                "detector": (detector_detail.get("detector") or {}),
+                                "detector": detector,
                             },
                             "camera_media": camera_media_result,
-                            "no_alert": no_alert_result,
+                            "no_alert": {
+                                **no_alert_result,
+                                "detector_ready": detector_no_alert_check,
+                            },
                             "rtsp_fixture": fixture_info,
                             "browser": {
                                 "status": "not_applicable",
@@ -2082,6 +2144,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=30.0,
         help="Seconds to observe with --expect-no-alert (default: 30).",
+    )
+    parser.add_argument(
+        "--allow-detection-limited-no-alert",
+        action="store_true",
+        help=(
+            "Allow active/maintenance --expect-no-alert to pass even when low light "
+            "or another input-quality gate has limited detection."
+        ),
     )
     parser.add_argument(
         "--recording-timeout",

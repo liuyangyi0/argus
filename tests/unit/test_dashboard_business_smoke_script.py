@@ -26,6 +26,7 @@ from scripts.smoke_dashboard_business_flow import (
     _verify_alert_semantic_expectations,
     _verify_business_apis,
     _verify_dev_video_alert_semantics,
+    _verify_no_alert_detector_ready,
     _verify_no_alert_window,
     _verify_system_degradation_apis,
     _wait_for,
@@ -293,12 +294,14 @@ def test_parse_args_accepts_no_alert_observation():
         "--observe-mode", "collection",
         "--expect-no-alert",
         "--no-alert-observe-seconds", "3.5",
+        "--allow-detection-limited-no-alert",
         "--browser", "off",
     ])
 
     assert args.observe_mode == "collection"
     assert args.expect_no_alert is True
     assert args.no_alert_observe_seconds == 3.5
+    assert args.allow_detection_limited_no_alert is True
 
 
 def test_parse_args_accepts_training_no_alert_observation():
@@ -613,6 +616,64 @@ def test_verify_no_alert_window_fails_on_any_alert():
             observe_seconds=1.0,
             process=RunningProcess(),
         )
+
+
+def test_no_alert_detector_ready_rejects_low_light_limited_active_observation():
+    detector = {
+        "mode": "ssim_fallback",
+        "ssim_calibrated": False,
+        "low_light": True,
+        "last_brightness": 3.5,
+        "detection_limited": True,
+        "detection_limited_reason": "low_light",
+        "ssim_calibration_blocked": True,
+        "ssim_calibration_blocked_reason": "low_light",
+    }
+
+    with pytest.raises(DashboardBusinessSmokeFailure, match="detection was limited"):
+        _verify_no_alert_detector_ready(
+            detector=detector,
+            observe_mode="active",
+        )
+
+
+def test_no_alert_detector_ready_accepts_calibrated_active_observation():
+    detector = {
+        "mode": "ssim_fallback",
+        "ssim_calibrated": True,
+        "low_light": False,
+        "detection_limited": False,
+        "ssim_calibration_blocked": False,
+    }
+
+    result = _verify_no_alert_detector_ready(
+        detector=detector,
+        observe_mode="active",
+    )
+
+    assert result["checked"] is True
+    assert result["ssim_calibrated"] is True
+
+
+def test_no_alert_detector_ready_skips_collection_mode():
+    result = _verify_no_alert_detector_ready(
+        detector={"detection_limited": True, "low_light": True},
+        observe_mode="collection",
+    )
+
+    assert result["checked"] is False
+    assert "collection mode" in result["reason"]
+
+
+def test_no_alert_detector_ready_allows_explicit_detection_limited_override():
+    result = _verify_no_alert_detector_ready(
+        detector={"detection_limited": True, "low_light": True},
+        observe_mode="active",
+        allow_detection_limited=True,
+    )
+
+    assert result["checked"] is False
+    assert "--allow-detection-limited-no-alert" in result["reason"]
 
 
 def test_wait_for_checks_predicate_once_at_deadline():
