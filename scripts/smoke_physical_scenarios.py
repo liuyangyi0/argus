@@ -185,6 +185,21 @@ def _child_summary(child: dict[str, Any] | None) -> dict[str, Any] | None:
     if not child:
         return None
 
+    if child.get("ok") is False:
+        partial = child.get("partial") or {}
+        camera_media = partial.get("camera_media") or {}
+        return {
+            "ok": False,
+            "error": child.get("error"),
+            "base_url": child.get("base_url"),
+            "work_dir": child.get("work_dir"),
+            "runtime_config": partial.get("runtime_config"),
+            "camera": partial.get("camera"),
+            "camera_snapshot": camera_media.get("snapshot"),
+            "camera_streaming": camera_media.get("streaming"),
+            "detector": partial.get("detector"),
+        }
+
     if child.get("mode") == "preflight":
         probe = child.get("capture_probe") or {}
         camera_input = child.get("camera_input") or {}

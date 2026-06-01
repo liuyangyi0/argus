@@ -25,6 +25,7 @@ from scripts.smoke_dashboard_business_flow import (
     _set_camera_mode,
     _verify_alert_semantic_expectations,
     _verify_business_apis,
+    _verify_camera_media_apis,
     _verify_dev_video_alert_semantics,
     _verify_no_alert_detector_ready,
     _verify_no_alert_window,
@@ -674,6 +675,55 @@ def test_no_alert_detector_ready_allows_explicit_detection_limited_override():
 
     assert result["checked"] is False
     assert "--allow-detection-limited-no-alert" in result["reason"]
+
+
+def test_camera_media_apis_save_snapshot_diagnostic(tmp_path):
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(123)
+    frame = rng.integers(20, 220, (128, 128, 3), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    assert ok
+    snapshot_bytes = encoded.tobytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/cameras/cam_a/snapshot":
+            return httpx.Response(
+                200,
+                headers={"content-type": "image/jpeg"},
+                content=snapshot_bytes,
+            )
+        if request.url.path == "/api/streaming/cam_a":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "go2rtc": True,
+                        "fallback": "/api/cameras/cam_a/stream",
+                    },
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="http://argus.test",
+    )
+
+    result = _verify_camera_media_apis(
+        client,
+        camera_id="cam_a",
+        require_go2rtc=True,
+        work_dir=tmp_path,
+    )
+
+    snapshot = result["snapshot"]
+    assert snapshot["path"] == str(tmp_path / "cam_a_camera_snapshot.jpg")
+    assert (tmp_path / "cam_a_camera_snapshot.jpg").read_bytes() == snapshot_bytes
+    assert snapshot["brightness_mean"] is not None
+    assert snapshot["brightness_mean"] > 0
 
 
 def test_wait_for_checks_predicate_once_at_deadline():

@@ -361,6 +361,37 @@ def test_child_summary_extracts_no_alert_scenario() -> None:
     assert summary["camera_streaming"]["go2rtc"] is True
 
 
+def test_child_summary_extracts_failed_partial_diagnostics() -> None:
+    summary = _child_summary({
+        "ok": False,
+        "error": "no-alert observation is not valid because detection was limited",
+        "base_url": "http://127.0.0.1:18080",
+        "work_dir": "C:/tmp/argus-physical/stable",
+        "partial": {
+            "runtime_config": "C:/tmp/argus-physical/stable/dashboard_business_config.yaml",
+            "camera": {"camera_id": "c", "frames_captured": 125},
+            "camera_media": {
+                "snapshot": {
+                    "path": "C:/tmp/argus-physical/stable/c_camera_snapshot.jpg",
+                    "brightness_mean": 5.7,
+                },
+                "streaming": {"go2rtc": True},
+            },
+            "detector": {
+                "low_light": True,
+                "detection_limited_reason": "low_light",
+            },
+        },
+    })
+
+    assert summary is not None
+    assert summary["ok"] is False
+    assert summary["camera_snapshot"]["brightness_mean"] == 5.7
+    assert summary["camera_snapshot"]["path"].endswith("c_camera_snapshot.jpg")
+    assert summary["camera_streaming"]["go2rtc"] is True
+    assert summary["detector"]["detection_limited_reason"] == "low_light"
+
+
 def test_parse_args_can_disable_go2rtc_for_debugging() -> None:
     args = parse_args(["--no-require-go2rtc", "--dry-run"])
 

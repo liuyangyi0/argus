@@ -485,6 +485,7 @@ def _verify_camera_media_apis(
     *,
     camera_id: str,
     require_go2rtc: bool,
+    work_dir: Path | None = None,
 ) -> dict[str, Any]:
     snapshot = client.get(f"/api/cameras/{camera_id}/snapshot", timeout=10)
     if snapshot.status_code != 200:
@@ -496,6 +497,22 @@ def _verify_camera_media_apis(
         raise DashboardBusinessSmokeFailure(f"camera snapshot content-type mismatch: {content_type}")
     if len(snapshot.content) < 1024:
         raise DashboardBusinessSmokeFailure(f"camera snapshot is too small: {len(snapshot.content)} bytes")
+
+    snapshot_path: Path | None = None
+    if work_dir is not None:
+        snapshot_path = work_dir / f"{camera_id}_camera_snapshot.jpg"
+        snapshot_path.write_bytes(snapshot.content)
+
+    snapshot_brightness_mean: float | None = None
+    try:
+        import cv2
+        import numpy as np
+
+        image = cv2.imdecode(np.frombuffer(snapshot.content, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if image is not None:
+            snapshot_brightness_mean = float(image.mean())
+    except Exception:
+        snapshot_brightness_mean = None
 
     streaming = _api_data(
         client.get(f"/api/streaming/{camera_id}", timeout=10),
@@ -512,6 +529,8 @@ def _verify_camera_media_apis(
             "status": snapshot.status_code,
             "content_type": content_type,
             "bytes": len(snapshot.content),
+            "path": str(snapshot_path) if snapshot_path is not None else None,
+            "brightness_mean": snapshot_brightness_mean,
         },
         "streaming": {
             "go2rtc": streaming.get("go2rtc"),
@@ -1812,6 +1831,12 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
     fixture: _RtspFixture | None = None
     fixture_info: dict[str, Any] | None = None
     go2rtc_api_port: int | None = None
+    runtime_config: Path | None = None
+    camera_id: str | None = None
+    camera_row: dict[str, Any] | None = None
+    camera_media_result: dict[str, Any] | None = None
+    detector_detail: dict[str, Any] | None = None
+    mode_result: dict[str, Any] | None = None
     try:
         camera_resolution = _parse_resolution(args.camera_resolution)
         camera_source = args.camera_source
@@ -1897,8 +1922,8 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     client,
                     camera_id=camera_id,
                     require_go2rtc=args.require_go2rtc,
+                    work_dir=work_dir,
                 )
-                detector_detail: dict[str, Any] | None = None
                 if not args.expect_no_alert:
                     detector_detail = _wait_for_detector_ready(
                         client,
@@ -2085,7 +2110,26 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
             exc,
             (DashboardBusinessSmokeFailure, DashboardSmokeFailure),
         ) else f"{type(exc).__name__}: {exc}"
-        return {
+        partial: dict[str, Any] = {}
+        if runtime_config is not None:
+            partial["runtime_config"] = str(runtime_config)
+        if camera_id is not None:
+            partial["camera_id"] = camera_id
+        if camera_row is not None:
+            partial["camera"] = {
+                "camera_id": camera_id,
+                "connected": camera_row.get("connected"),
+                "running": camera_row.get("running"),
+                "frames_captured": (camera_row.get("stats") or {}).get("frames_captured"),
+            }
+        if mode_result is not None:
+            partial["mode"] = mode_result
+        if camera_media_result is not None:
+            partial["camera_media"] = camera_media_result
+        if detector_detail is not None:
+            partial["detector"] = detector_detail.get("detector") or {}
+
+        result = {
             "ok": False,
             "error": error,
             "base_url": base_url,
@@ -2093,6 +2137,9 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "stdout_tail": _tail(stdout_path),
             "stderr_tail": _tail(stderr_path),
         }
+        if partial:
+            result["partial"] = partial
+        return result
     finally:
         if proc is not None and proc.poll() is None:
             proc.terminate()
