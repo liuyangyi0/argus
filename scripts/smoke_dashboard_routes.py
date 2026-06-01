@@ -116,18 +116,27 @@ def _dump_dom_with_browser(
     timeout_s: float,
     virtual_time_ms: int,
 ) -> str:
-    try:
-        return _dump_dom_with_cdp(
-            browser_path=browser_path,
-            url=url,
-            user_data_dir=user_data_dir,
-            timeout_s=timeout_s,
-            virtual_time_ms=virtual_time_ms,
-        )
-    except Exception as exc:
-        raise DashboardSmokeFailure(
-            f"browser CDP DOM dump failed for {url}: {type(exc).__name__}: {exc}"
-        ) from exc
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        attempt_dir = user_data_dir / f"cdp-{attempt}-{time.monotonic_ns()}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            return _dump_dom_with_cdp(
+                browser_path=browser_path,
+                url=url,
+                user_data_dir=attempt_dir,
+                timeout_s=timeout_s,
+                virtual_time_ms=virtual_time_ms,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 0:
+                time.sleep(0.5)
+
+    assert last_exc is not None
+    raise DashboardSmokeFailure(
+        f"browser CDP DOM dump failed for {url}: {type(last_exc).__name__}: {last_exc}"
+    ) from last_exc
 
 
 def _dump_dom_with_cdp(
@@ -149,6 +158,7 @@ def _dump_dom_with_cdp(
         "--no-first-run",
         "--no-default-browser-check",
         "--blink-settings=imagesEnabled=false",
+        "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={debug_port}",
         "--remote-allow-origins=*",
         f"--user-data-dir={user_data_dir}",
@@ -163,7 +173,7 @@ def _dump_dom_with_cdp(
         errors="replace",
     )
     try:
-        page_ws_url = _wait_for_cdp_page(debug_port, timeout_s=min(timeout_s, 15.0))
+        page_ws_url = _wait_for_cdp_page(debug_port, timeout_s=min(timeout_s, 30.0))
         return asyncio.run(_read_dom_via_cdp(
             page_ws_url,
             url=url,
