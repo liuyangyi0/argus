@@ -9,6 +9,7 @@ from scripts.smoke_dashboard_routes import (
     CORE_DASHBOARD_ROUTES,
     DashboardSmokeFailure,
     _check_browser_dom_routes,
+    _dump_dom_with_browser,
     _find_headless_browser,
     _wait_for_camera,
     parse_args,
@@ -115,6 +116,32 @@ def test_browser_dom_required_fails_when_missing(monkeypatch, tmp_path):
 
     with pytest.raises(DashboardSmokeFailure, match="browser required"):
         _check_browser_dom_routes(args, "http://127.0.0.1:1", tmp_path)
+
+
+def test_browser_dom_dump_retries_with_fresh_profile(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_cdp(**kwargs):
+        calls.append(kwargs["user_data_dir"])
+        if len(calls) == 1:
+            raise TimeoutError("target not ready")
+        return "<html>ARGUS</html>"
+
+    monkeypatch.setattr("scripts.smoke_dashboard_routes._dump_dom_with_cdp", fake_cdp)
+
+    result = _dump_dom_with_browser(
+        browser_path="chrome.exe",
+        url="http://127.0.0.1:1/cameras",
+        user_data_dir=tmp_path / "profile",
+        timeout_s=30,
+        virtual_time_ms=1000,
+    )
+
+    assert result == "<html>ARGUS</html>"
+    assert len(calls) == 2
+    assert calls[0] != calls[1]
+    assert calls[0].parent == tmp_path / "profile"
+    assert calls[1].parent == tmp_path / "profile"
 
 
 def test_wait_for_camera_returns_connected_running_camera():
