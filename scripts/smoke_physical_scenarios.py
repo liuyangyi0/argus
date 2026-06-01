@@ -103,6 +103,8 @@ def _base_business_command(
         cmd.append("--keep-work-dir")
     if args.require_go2rtc:
         cmd.append("--require-go2rtc")
+    if args.use_yolo:
+        cmd.append("--use-yolo")
     if args.usb_device_name:
         cmd.extend(["--usb-device-name", args.usb_device_name])
     if args.usb_device_id:
@@ -549,6 +551,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds to observe during the stable no-alert scenario.",
     )
     parser.add_argument("--browser", choices=["auto", "required", "off"], default="required")
+    parser.add_argument(
+        "--use-yolo",
+        action="store_true",
+        help=(
+            "Pass --use-yolo to the child business smoke so physical validation "
+            "runs the configured YOLO person filter instead of the offline fallback."
+        ),
+    )
     parser.add_argument("--process-timeout", type=float, default=300.0)
     parser.add_argument(
         "--preflight",

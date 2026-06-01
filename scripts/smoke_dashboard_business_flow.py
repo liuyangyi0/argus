@@ -466,6 +466,14 @@ def _wait_for_detector_ready(
     )
 
 
+def _should_wait_for_detector_before_no_alert(args: argparse.Namespace) -> bool:
+    return (
+        args.expect_no_alert
+        and args.observe_mode in {"active", "maintenance"}
+        and not args.allow_detection_limited_no_alert
+    )
+
+
 def _set_camera_mode(client: httpx.Client, *, camera_id: str, mode: str) -> dict[str, Any]:
     data = _api_data(
         client.post(f"/api/cameras/{camera_id}/mode", json={"mode": mode}, timeout=10),
@@ -1924,7 +1932,10 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     require_go2rtc=args.require_go2rtc,
                     work_dir=work_dir,
                 )
-                if not args.expect_no_alert:
+                if (
+                    not args.expect_no_alert
+                    or _should_wait_for_detector_before_no_alert(args)
+                ):
                     detector_detail = _wait_for_detector_ready(
                         client,
                         camera_id=camera_id,

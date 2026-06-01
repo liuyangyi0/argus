@@ -35,12 +35,24 @@ def test_parse_args_defaults_to_obsbot_book_scenario() -> None:
     assert args.preflight_measure_seconds == 15.0
     assert args.no_alert_observe_seconds == 30.0
     assert args.stream_output is True
+    assert args.use_yolo is False
 
 
 def test_parse_args_can_disable_streaming_for_captured_logs() -> None:
     args = parse_args(["--no-stream-output", "--dry-run"])
 
     assert args.stream_output is False
+
+
+def test_build_command_can_use_real_yolo_for_physical_validation() -> None:
+    args = parse_args(["--use-yolo", "--dry-run"])
+
+    command = build_business_command(args, "stable")
+    preflight = build_preflight_command(args)
+
+    assert args.use_yolo is True
+    assert "--use-yolo" in command
+    assert "--use-yolo" in preflight
 
 
 def test_parse_args_can_disable_preflight_for_debugging() -> None:

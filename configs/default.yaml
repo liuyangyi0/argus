@@ -57,6 +57,7 @@ cameras:
     ssim_baseline_frames: 15
     ssim_sensitivity: 50.0
     ssim_midpoint: 0.015
+    ssim_global_change_suppress_fraction: 0.04
     shadow_sample_rate: 5
     warmup_frames: 10
     warmup_max_latency_ms: 500.0
