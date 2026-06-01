@@ -1264,6 +1264,7 @@ class DetectionPipeline:
         self.stats.update_fps()
         self._frame_counter += 1
         frame = frame_data.frame
+        self._flush_expired_post_captures()
 
         # NIR strobe: if this frame was captured under NIR illumination,
         # store it for modality fusion and skip detection (NIR frames are
@@ -2791,29 +2792,7 @@ class DetectionPipeline:
                 exc_info=True,
             )
 
-        # Flush any expired post-trigger captures
-        try:
-            for expired_id in self._alert_ring_buffer.check_expired_captures():
-                post_frames = self._alert_ring_buffer.finish_post_capture(expired_id)
-                if post_frames and self._recording_store is not None:
-                    self._recording_store.append_post_frames(expired_id, post_frames)
-                    if self._database is not None:
-                        try:
-                            meta = self._recording_store.load_metadata(expired_id)
-                            self._database.update_alert_recording_status(
-                                expired_id,
-                                RecordingStatus.COMPLETE.value,
-                                frame_count=meta["frame_count"] if meta else None,
-                                end_timestamp=meta["end_timestamp"] if meta else None,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "pipeline.recording_db_update_failed",
-                                alert_id=expired_id,
-                                exc_info=True,
-                            )
-        except Exception:
-            logger.debug("pipeline.post_capture_flush_failed", exc_info=True)
+        self._flush_expired_post_captures()
 
         # Solidify ring buffer on alert
         if alert is not None:
@@ -2912,10 +2891,53 @@ class DetectionPipeline:
         """
         frame_data = self._camera.read_latest()
         if frame_data is None:
+            self._flush_expired_post_captures()
             if not self._camera.state.connected:
                 self._camera.request_reconnect()
             return None
         return self.process_frame(frame_data)
+
+    def _flush_expired_post_captures(self) -> None:
+        """Finalize expired alert recordings, including pre-only recordings."""
+        if self._alert_ring_buffer is None:
+            return
+
+        try:
+            expired_ids = self._alert_ring_buffer.check_expired_captures()
+        except Exception:
+            logger.debug("pipeline.post_capture_check_failed", exc_info=True)
+            return
+
+        for expired_id in expired_ids:
+            try:
+                post_frames = self._alert_ring_buffer.finish_post_capture(expired_id)
+                if self._recording_store is None:
+                    continue
+
+                if not self._recording_store.append_post_frames(expired_id, post_frames):
+                    continue
+
+                if self._database is not None:
+                    try:
+                        meta = self._recording_store.load_metadata(expired_id)
+                        self._database.update_alert_recording_status(
+                            expired_id,
+                            RecordingStatus.COMPLETE.value,
+                            frame_count=meta["frame_count"] if meta else None,
+                            end_timestamp=meta["end_timestamp"] if meta else None,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "pipeline.recording_db_update_failed",
+                            alert_id=expired_id,
+                            exc_info=True,
+                        )
+            except Exception:
+                logger.debug(
+                    "pipeline.post_capture_flush_failed",
+                    alert_id=expired_id,
+                    exc_info=True,
+                )
 
     def get_wall_status(self) -> dict:
         """Return video wall tile data for this camera (Phase 3)."""

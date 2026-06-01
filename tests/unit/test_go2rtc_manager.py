@@ -11,8 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from argus.config.schema import CameraConfig, USBCaptureConfig
+from argus.streaming import go2rtc_manager as go2rtc_mod
 from argus.streaming.go2rtc_manager import (
     CameraSourceResolution,
+    Go2RTCManager,
     gige_to_go2rtc_source,
     register_go2rtc_streams,
     runtime_camera_config,
@@ -263,6 +265,31 @@ class TestStartAndRegisterCameras:
         assert resolutions["gige_01"].runtime_source == "192.168.1.20"
         assert resolutions["gige_01"].runtime_protocol == "gige"
         assert resolutions["gige_01"].go2rtc_managed is True
+
+    def test_wait_for_ready_requires_rtsp_listener(self, monkeypatch):
+        mgr = object.__new__(Go2RTCManager)
+        mgr.rtsp_port = 8554
+        mgr._http = SimpleNamespace(
+            get=lambda path: SimpleNamespace(status_code=200),
+        )
+        calls: list[tuple[tuple[str, int], float]] = []
+
+        class _Socket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _connect(address, timeout):
+            calls.append((address, timeout))
+            return _Socket()
+
+        monkeypatch.setattr(go2rtc_mod.socket, "create_connection", _connect)
+
+        mgr._wait_for_ready()
+
+        assert calls == [(("127.0.0.1", 8554), 0.5)]
 
     def test_runtime_camera_config_accepts_resolution_object(self):
         cam = CameraConfig(camera_id="cam_usb", name="USB", source="0", protocol="usb")
