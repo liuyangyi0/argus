@@ -23,6 +23,7 @@ from scripts.smoke_dashboard_business_flow import (
     _seed_model_registry,
     _seed_training_baselines,
     _set_camera_mode,
+    _should_wait_for_detector_before_no_alert,
     _verify_alert_semantic_expectations,
     _verify_business_apis,
     _verify_camera_media_apis,
@@ -675,6 +676,26 @@ def test_no_alert_detector_ready_allows_explicit_detection_limited_override():
 
     assert result["checked"] is False
     assert "--allow-detection-limited-no-alert" in result["reason"]
+
+
+def test_active_no_alert_waits_for_detector_before_observation():
+    args = parse_args(["--expect-no-alert", "--observe-mode", "active"])
+    assert _should_wait_for_detector_before_no_alert(args) is True
+
+
+def test_collection_no_alert_does_not_wait_for_detector():
+    args = parse_args(["--expect-no-alert", "--observe-mode", "collection"])
+    assert _should_wait_for_detector_before_no_alert(args) is False
+
+
+def test_no_alert_limited_override_does_not_wait_for_detector():
+    args = parse_args([
+        "--expect-no-alert",
+        "--observe-mode",
+        "active",
+        "--allow-detection-limited-no-alert",
+    ])
+    assert _should_wait_for_detector_before_no_alert(args) is False
 
 
 def test_camera_media_apis_save_snapshot_diagnostic(tmp_path):

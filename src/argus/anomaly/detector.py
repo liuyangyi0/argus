@@ -66,6 +66,7 @@ class AnomalibDetector:
         ssim_baseline_frames: int = 15,
         ssim_sensitivity: float = 50.0,
         ssim_midpoint: float = 0.015,
+        ssim_global_change_suppress_fraction: float = 0.04,
         enable_calibration: bool = True,
         camera_id: str = "unknown",
     ):
@@ -86,6 +87,11 @@ class AnomalibDetector:
         self._ssim_baseline_frames = ssim_baseline_frames
         self._ssim_sensitivity = ssim_sensitivity
         self._ssim_midpoint = ssim_midpoint
+        self._ssim_global_change_suppress_fraction = (
+            float(ssim_global_change_suppress_fraction)
+            if ssim_global_change_suppress_fraction > 0
+            else 0.0
+        )
         self._ssim_baseline_count = 0
         self._ssim_noise_floor: float | None = None
         self._reload_lock = threading.Lock()
@@ -689,21 +695,91 @@ class AnomalibDetector:
             anomaly_score = 1.0 / (1.0 + math.exp(-sensitivity * (signal - midpoint)))
         anomaly_score = max(0.0, min(anomaly_score, 1.0))
 
-        # Build anomaly map — use noise-cleaned version so heatmap highlights
-        # only real changes, not background noise/artifacts. Downstream stages
-        # treat all anomaly maps as normalized 0-1 heatmaps (for example
-        # spatial continuity thresholds at >0.5), so scale the SSIM fallback
-        # map by its local peak instead of leaking raw diff magnitudes.
-        if raw_score > 0:
-            anomaly_map = np.clip(diff_clean / raw_score, 0.0, 1.0).astype(np.float32)
+        # Build anomaly map from absolute local signal, not relative peak
+        # normalization. Relative scaling made weak glass reflections and
+        # compression shimmer look as hot as a true foreign object whenever
+        # they were the largest change in that frame. Use the same pooled
+        # signal and sigmoid as the frame score so >0.5 has stable semantics.
+        local_signal = np.maximum(pooled - self._ssim_noise_floor, 0.0)
+        if np.any(local_signal > 0):
+            logits = np.clip(sensitivity * (local_signal - midpoint), -60.0, 60.0)
+            anomaly_map = (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+            anomaly_map[local_signal <= 0] = 0.0
         else:
             anomaly_map = np.zeros_like(diff_clean, dtype=np.float32)
+
+        hot_fraction = (
+            float(np.mean(anomaly_map > 0.5)) if anomaly_map.size else 0.0
+        )
+        suppress_fraction = self._ssim_global_change_suppress_fraction
+        global_change = False
+        hot_components = 0
+        largest_hot_share = 0.0
+        largest_bbox_fraction = 0.0
+        largest_edge_touches = 0
+        if suppress_fraction > 0 and hot_fraction >= suppress_fraction:
+            hot_mask = (anomaly_map > 0.5).astype(np.uint8)
+            hot_pixels = int(np.count_nonzero(hot_mask))
+            if hot_pixels > 0:
+                components, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                    hot_mask, connectivity=8,
+                )
+                if components > 1:
+                    areas = stats[1:, cv2.CC_STAT_AREA]
+                    hot_components = int(len(areas))
+                    largest_idx = int(np.argmax(areas)) + 1
+                    largest_hot_share = float(stats[largest_idx, cv2.CC_STAT_AREA] / hot_pixels)
+                    x = int(stats[largest_idx, cv2.CC_STAT_LEFT])
+                    y = int(stats[largest_idx, cv2.CC_STAT_TOP])
+                    w = int(stats[largest_idx, cv2.CC_STAT_WIDTH])
+                    h = int(stats[largest_idx, cv2.CC_STAT_HEIGHT])
+                    map_h, map_w = anomaly_map.shape[:2]
+                    largest_bbox_fraction = float((w * h) / max(1, map_w * map_h))
+                    largest_edge_touches = int(x <= 0) + int(y <= 0)
+                    largest_edge_touches += int((x + w) >= map_w) + int((y + h) >= map_h)
+            # A true inserted object can cover more than the nominal hot-pixel
+            # fraction on low-resolution fallback maps.  Suppress clearly broad
+            # changes, or scattered changes; preserve one dominant connected
+            # object near the threshold.
+            broad_fraction = max(0.50, suppress_fraction * 6.0)
+            edge_broad = (
+                hot_fraction >= max(0.08, suppress_fraction * 2.0)
+                and largest_bbox_fraction >= 0.15
+                and largest_edge_touches >= 2
+            )
+            global_change = (
+                hot_fraction >= broad_fraction
+                or hot_components == 0
+                or largest_hot_share < 0.5
+                or edge_broad
+            )
+
+        if suppress_fraction > 0 and hot_fraction >= suppress_fraction and global_change:
+            logger.info(
+                "anomaly.ssim_global_change_suppressed",
+                camera_id=self.status.camera_id,
+                score=round(anomaly_score, 3),
+                hot_fraction=round(hot_fraction, 4),
+                suppress_fraction=round(suppress_fraction, 4),
+                hot_components=hot_components,
+                largest_hot_share=round(largest_hot_share, 4),
+                largest_bbox_fraction=round(largest_bbox_fraction, 4),
+                largest_edge_touches=largest_edge_touches,
+            )
+            return AnomalyResult(
+                anomaly_score=0.0,
+                anomaly_map=anomaly_map,
+                is_anomalous=False,
+                threshold=self.threshold,
+                raw_score=raw_score,
+            )
 
         return AnomalyResult(
             anomaly_score=anomaly_score,
             anomaly_map=anomaly_map,
             is_anomalous=anomaly_score >= self.threshold,
             threshold=self.threshold,
+            raw_score=raw_score,
         )
 
     def get_status(self) -> DetectorStatus:

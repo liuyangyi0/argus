@@ -320,6 +320,9 @@ class DetectionPipeline:
                 ssim_baseline_frames=camera_config.anomaly.ssim_baseline_frames,
                 ssim_sensitivity=camera_config.anomaly.ssim_sensitivity,
                 ssim_midpoint=camera_config.anomaly.ssim_midpoint,
+                ssim_global_change_suppress_fraction=(
+                    camera_config.anomaly.ssim_global_change_suppress_fraction
+                ),
                 enable_calibration=camera_config.anomaly.enable_calibration,
                 camera_id=camera_config.camera_id,
             )

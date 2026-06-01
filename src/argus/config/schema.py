@@ -328,6 +328,15 @@ class AnomalyConfig(BaseModel):
         default=0.015, ge=0.001, le=0.5,
         description="Sigmoid midpoint for SSIM score normalization",
     )
+    ssim_global_change_suppress_fraction: float = Field(
+        default=0.04, ge=0.0, le=1.0,
+        description=(
+            "Suppress SSIM fallback alerts when the normalized anomaly map has "
+            "too many hot pixels, which usually indicates camera shift, "
+            "autofocus/exposure transitions, reflections, or other global "
+            "input changes instead of a localized foreign object."
+        ),
+    )
 
     # Release pipeline parameters
     shadow_sample_rate: int = Field(

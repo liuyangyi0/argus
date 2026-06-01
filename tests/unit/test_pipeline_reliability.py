@@ -57,7 +57,7 @@ class TestAnomalyResultDetectionFailed:
 
         assert result.is_anomalous is True
         assert result.anomaly_map is not None
-        assert float(result.anomaly_map.max()) == pytest.approx(1.0)
+        assert float(result.anomaly_map.max()) > 0.99
         assert np.count_nonzero(result.anomaly_map > 0.5) > 0
 
     def test_invalid_frame_returns_detection_failed(self):

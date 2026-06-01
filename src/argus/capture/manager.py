@@ -206,6 +206,9 @@ class CameraManager:
                 ssim_baseline_frames=anomaly_config.ssim_baseline_frames,
                 ssim_sensitivity=anomaly_config.ssim_sensitivity,
                 ssim_midpoint=anomaly_config.ssim_midpoint,
+                ssim_global_change_suppress_fraction=(
+                    anomaly_config.ssim_global_change_suppress_fraction
+                ),
                 enable_calibration=anomaly_config.enable_calibration,
             )
             logger.info(
