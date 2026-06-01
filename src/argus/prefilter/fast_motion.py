@@ -208,7 +208,7 @@ class FastMotionDetector:
             mean_motion = float(motion[label_mask].mean()) / 255.0
             streak_score = min(1.0, streak / max(self._min_streak_length_px, 1))
             area_score = min(1.0, full_area / max(self._min_area_px * 16, 1))
-            confidence = min(1.0, 0.25 + mean_motion * 0.45 + streak_score * 0.2 + area_score * 0.1)
+            confidence = min(1.0, 0.20 + mean_motion * 0.55 + streak_score * 0.20 + area_score * 0.05)
             if confidence < self._min_confidence:
                 continue
 

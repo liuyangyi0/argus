@@ -93,6 +93,24 @@ def test_jpeg_like_low_amplitude_block_noise_does_not_trigger():
     assert result.candidates == []
 
 
+def test_subtle_localized_reflection_flicker_does_not_trigger():
+    detector = FastMotionDetector(
+        process_width=960,
+        diff_threshold=18,
+        min_area_px=2,
+        min_streak_length_px=4,
+        min_confidence=0.60,
+    )
+    detector.process(_gray_frame(130), timestamp=1.0)
+
+    frame = _gray_frame(130)
+    frame[612:624, 1590:1612] = 158
+    result = detector.process(frame, timestamp=1.0 + 1 / 60)
+
+    assert result.has_detection is False
+    assert result.candidates == []
+
+
 def test_short_bright_streak_triggers_fast_projectile():
     detector = FastMotionDetector(
         process_width=960,
