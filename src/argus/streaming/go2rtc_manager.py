@@ -17,6 +17,7 @@ import atexit
 import json
 import platform
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -368,13 +369,36 @@ class Go2RTCManager:
             try:
                 resp = self._http.get("/api")
                 if resp.status_code == 200:
-                    return
+                    break
             except httpx.ConnectError:
                 pass
             time.sleep(_HEALTH_POLL_INTERVAL)
+        else:
+            raise TimeoutError(
+                f"go2rtc API did not become ready within {_HEALTH_POLL_TIMEOUT}s"
+            )
 
+        self._wait_for_tcp_listener("rtsp", self.rtsp_port, deadline)
+
+    @staticmethod
+    def _wait_for_tcp_listener(label: str, port: int, deadline: float) -> None:
+        """Wait until a local go2rtc TCP listener is accepting connections."""
+        if port <= 0:
+            return
+
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return
+            except OSError as exc:
+                last_error = exc
+                time.sleep(_HEALTH_POLL_INTERVAL)
+
+        suffix = f": {last_error}" if last_error else ""
         raise TimeoutError(
-            f"go2rtc did not become ready within {_HEALTH_POLL_TIMEOUT}s"
+            f"go2rtc {label} listener on port {port} did not become ready "
+            f"within {_HEALTH_POLL_TIMEOUT}s{suffix}"
         )
 
     # ------------------------------------------------------------------

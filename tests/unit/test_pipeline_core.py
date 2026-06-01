@@ -626,6 +626,104 @@ class TestAnomalyDetection:
         assert captured["solidified"] is not None
         assert captured["evidence_unavailable"] is False
 
+    def test_run_once_flushes_expired_pre_only_recording_without_new_frames(self, tmp_path):
+        """Post-capture should complete even if the source stops after alert."""
+        from argus.core.alert_ring_buffer import (
+            AlertFrameBuffer,
+            FrameSnapshot,
+            RecordingStatus,
+            SolidifiedRecording,
+            compress_frame,
+        )
+        from argus.storage.alert_recording import AlertRecordingStore
+
+        alert_id = "ALT-pre-only"
+        trigger_ts = time.time() - 2.0
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        frames = [
+            FrameSnapshot(
+                timestamp=trigger_ts - 0.3 + i * 0.1,
+                frame_jpeg=compress_frame(frame),
+                anomaly_score=0.9,
+                simplex_score=None,
+                cusum_evidence={},
+                yolo_persons=[],
+                frame_number=i,
+            )
+            for i in range(3)
+        ]
+        recording = SolidifiedRecording(
+            alert_id=alert_id,
+            camera_id="test_cam",
+            severity="medium",
+            trigger_timestamp=trigger_ts,
+            trigger_frame_index=2,
+            frames=frames,
+            fps=5,
+            status=RecordingStatus.RECORDING,
+        )
+
+        pipeline = _build_pipeline()
+        pipeline._alert_ring_buffer = AlertFrameBuffer(
+            fps=5,
+            pre_seconds=10,
+            post_seconds=10,
+        )
+        pipeline._recording_store = AlertRecordingStore(archive_dir=str(tmp_path))
+        pipeline._recording_store.save(recording)
+        pipeline._alert_ring_buffer.start_post_capture(
+            alert_id=alert_id,
+            severity="medium",
+            trigger_timestamp=trigger_ts,
+        )
+        pipeline._alert_ring_buffer._pending_captures[alert_id].deadline = time.time() - 0.01
+        pipeline._database = MagicMock()
+        pipeline._camera.read_latest.return_value = None
+        pipeline._camera.state.connected = True
+
+        assert pipeline.run_once() is None
+
+        metadata = pipeline._recording_store.load_metadata(alert_id)
+        assert metadata["status"] == RecordingStatus.COMPLETE.value
+        assert metadata["video_file"] == "recording.mp4"
+        assert metadata["frame_count"] == 3
+        pipeline._database.update_alert_recording_status.assert_called_once()
+
+    def test_process_frame_flushes_expired_recording_before_no_change_return(self):
+        """MOG2 no-change early returns must not leave replay recording open."""
+        from argus.core.alert_ring_buffer import AlertFrameBuffer
+
+        alert_id = "ALT-no-change-flush"
+        pipeline = _build_pipeline()
+        pipeline._alert_ring_buffer = AlertFrameBuffer(
+            fps=5,
+            pre_seconds=10,
+            post_seconds=10,
+        )
+        pipeline._alert_ring_buffer.start_post_capture(
+            alert_id=alert_id,
+            severity="medium",
+            trigger_timestamp=time.time() - 2.0,
+        )
+        pipeline._alert_ring_buffer._pending_captures[alert_id].deadline = time.time() - 0.01
+        pipeline._recording_store = MagicMock()
+        pipeline._recording_store.append_post_frames.return_value = True
+        pipeline._recording_store.load_metadata.return_value = {
+            "frame_count": 3,
+            "end_timestamp": time.time(),
+        }
+        pipeline._database = MagicMock()
+        pipeline._last_heartbeat_time = time.monotonic()
+        pipeline._prefilter.process.return_value = PreFilterResult(
+            has_change=False,
+            change_ratio=0.0,
+        )
+
+        assert pipeline.process_frame(_make_frame_data()) is None
+
+        pipeline._recording_store.append_post_frames.assert_called_once_with(alert_id, [])
+        pipeline._database.update_alert_recording_status.assert_called_once()
+
     def test_anomalous_but_grader_suppresses(self):
         """Anomaly detected but grader suppresses (temporal / cool-down) -> None."""
         pipeline = _build_pipeline()

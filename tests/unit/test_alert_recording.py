@@ -270,6 +270,24 @@ class TestAlertRecordingStore:
         assert not (rec_dir / "post.mp4").exists()
         assert (rec_dir / "recording.mp4").exists()
 
+    def test_append_empty_post_frames_completes_pre_only_recording(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording(frame_count=3)
+        rec_path, _ = store.save(recording)
+
+        result = store.append_post_frames("ALT-TEST-001", [])
+        assert result is True
+
+        metadata = store.load_metadata("ALT-TEST-001")
+        assert metadata["frame_count"] == 3
+        assert metadata["status"] == "complete"
+        assert metadata["video_file"] == "recording.mp4"
+
+        rec_dir = Path(rec_path)
+        assert not (rec_dir / "pre.mp4").exists()
+        assert not (rec_dir / "post.mp4").exists()
+        assert (rec_dir / "recording.mp4").exists()
+
     def test_get_video_path(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
         recording = _make_recording()
