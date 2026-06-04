@@ -1326,6 +1326,9 @@ class DetectionPipeline:
         ):
             with self._mode_lock:
                 self._mode = PipelineMode.ACTIVE
+            self._reset_fast_motion_after_detection_mode_entry(
+                PipelineMode.LEARNING, PipelineMode.ACTIVE,
+            )
             self._auto_learning_complete = True
             self._learning_start_time = None
             logger.info(
@@ -1345,6 +1348,9 @@ class DetectionPipeline:
                 stuck_mode = self._mode
                 self._mode = PipelineMode.ACTIVE
                 self._mode_session_start_time = None
+            self._reset_fast_motion_after_detection_mode_entry(
+                stuck_mode, PipelineMode.ACTIVE,
+            )
             logger.warning(
                 "pipeline.mode_session_timeout_recovered",
                 camera_id=frame_data.camera_id,
@@ -1584,10 +1590,15 @@ class DetectionPipeline:
             self._last_heartbeat_time = now
 
         calibrating_ssim = False
+        ssim_fallback_active = False
         try:
             detector_status = self._anomaly_detector.get_status()
-            calibrating_ssim = (
+            ssim_fallback_active = (
                 getattr(detector_status, "mode", None) == "ssim_fallback"
+                and not bool(getattr(detector_status, "model_loaded", False))
+            )
+            calibrating_ssim = (
+                ssim_fallback_active
                 and not bool(getattr(detector_status, "ssim_calibrated", True))
             )
         except Exception:
@@ -1947,7 +1958,10 @@ class DetectionPipeline:
             )
 
         # Update anomaly lock state
-        self._update_lock_state(anomaly_result)
+        self._update_lock_state(
+            anomaly_result,
+            allow_engage=not ssim_fallback_active,
+        )
 
         # YOLO-004: Determine hybrid detection type
         detection_type = DetectionType.ANOMALY
@@ -3094,11 +3108,12 @@ class DetectionPipeline:
 
     def set_mode(self, mode: PipelineMode) -> PipelineMode:
         """Set pipeline operating mode (DET-006). Returns previous mode."""
+        now = time.monotonic()
         with self._mode_lock:
             old = self._mode
             self._mode = mode
             if mode == PipelineMode.LEARNING:
-                self._learning_start_time = time.monotonic()
+                self._learning_start_time = now
                 if self._learning_duration <= 0:
                     fps = max(1, self.camera_config.fps_target)
                     history = self.camera_config.mog2.history
@@ -3109,9 +3124,10 @@ class DetectionPipeline:
                 if mode == PipelineMode.ACTIVE:
                     self._auto_learning_complete = True
             if mode in _DETECTION_SKIPPED_MODES:
-                self._mode_session_start_time = time.monotonic()
+                self._mode_session_start_time = now
             else:
                 self._mode_session_start_time = None
+        self._reset_fast_motion_after_detection_mode_entry(old, mode, now=now)
         logger.info(
             "pipeline.mode_changed",
             camera_id=self.camera_config.camera_id,
@@ -3119,6 +3135,32 @@ class DetectionPipeline:
             new=mode.value,
         )
         return old
+
+    def _reset_fast_motion_after_detection_mode_entry(
+        self,
+        old: PipelineMode,
+        new: PipelineMode,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Clear transient fast-motion state when detection resumes."""
+        if old == new or new not in (PipelineMode.ACTIVE, PipelineMode.MAINTENANCE):
+            return
+        if self._fast_motion is None:
+            return
+        ts = time.monotonic() if now is None else now
+        self._fast_motion.reset()
+        self._fast_motion_suppress_until = max(
+            self._fast_motion_suppress_until,
+            ts + self._fast_motion_recovery_seconds,
+        )
+        logger.debug(
+            "pipeline.fast_motion_mode_warmup",
+            camera_id=self.camera_config.camera_id,
+            old=old.value,
+            new=new.value,
+            seconds=round(self._fast_motion_recovery_seconds, 3),
+        )
 
     def get_learning_progress(self) -> dict:
         """Return learning mode progress for dashboard display (DET-010)."""
@@ -3482,7 +3524,12 @@ class DetectionPipeline:
             return 0.0
         return float(zone_values.max())
 
-    def _update_lock_state(self, anomaly_result: AnomalyResult) -> None:
+    def _update_lock_state(
+        self,
+        anomaly_result: AnomalyResult,
+        *,
+        allow_engage: bool = True,
+    ) -> None:
         """Update the anomaly region lock based on detection results.
 
         HIGH-05: Uses hysteresis — lock engages at lock_score_threshold,
@@ -3491,6 +3538,16 @@ class DetectionPipeline:
         """
         now = time.monotonic()
         with self._lock_state_lock:
+            if not allow_engage:
+                if self._locked:
+                    self._locked = False
+                    self._lock_last_below_time = None
+                    logger.info(
+                        "pipeline.lock_cleared",
+                        camera_id=self.camera_config.camera_id,
+                        reason="lock_disabled_for_detector",
+                    )
+                return
             if anomaly_result.anomaly_score >= self._lock_score_threshold:
                 if not self._locked:
                     logger.info(

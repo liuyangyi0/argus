@@ -94,6 +94,8 @@ class AnomalibDetector:
         )
         self._ssim_baseline_count = 0
         self._ssim_noise_floor: float | None = None
+        self._ssim_global_suppress_remaining = 0
+        self._ssim_global_suppress_cooldown_frames = 8
         self._reload_lock = threading.Lock()
         self._ssim_lock = threading.Lock()  # protects SSIM baseline calibration state
         self._minmax_broken = False  # True when PostProcessor MinMax is not fit
@@ -630,6 +632,7 @@ class AnomalibDetector:
                 self._ssim_baseline_acc = gray.copy()
                 self._ssim_baseline_count = 1
                 self._ssim_noise_floor = 0.0
+                self._ssim_global_suppress_remaining = 0
                 self._ssim_frame_diffs = []
                 logger.info("anomaly.ssim_calibrating", msg="Collecting baseline frames...")
                 return AnomalyResult(
@@ -719,7 +722,7 @@ class AnomalibDetector:
         largest_hot_share = 0.0
         largest_bbox_fraction = 0.0
         largest_edge_touches = 0
-        if suppress_fraction > 0 and hot_fraction >= suppress_fraction:
+        if anomaly_map.size:
             hot_mask = (anomaly_map > 0.5).astype(np.uint8)
             hot_pixels = int(np.count_nonzero(hot_mask))
             if hot_pixels > 0:
@@ -739,6 +742,7 @@ class AnomalibDetector:
                     largest_bbox_fraction = float((w * h) / max(1, map_w * map_h))
                     largest_edge_touches = int(x <= 0) + int(y <= 0)
                     largest_edge_touches += int((x + w) >= map_w) + int((y + h) >= map_h)
+        if suppress_fraction > 0 and hot_fraction >= suppress_fraction:
             # A true inserted object can cover more than the nominal hot-pixel
             # fraction on low-resolution fallback maps.  Suppress clearly broad
             # changes, or scattered changes; preserve one dominant connected
@@ -756,7 +760,55 @@ class AnomalibDetector:
                 or edge_broad
             )
 
+        edge_hotspot = (
+            suppress_fraction > 0
+            and 0 < hot_fraction <= suppress_fraction
+            and hot_components == 1
+            and largest_hot_share >= 0.75
+            and largest_edge_touches >= 1
+            and largest_bbox_fraction <= max(0.08, suppress_fraction * 2.0)
+        )
+        if edge_hotspot:
+            logger.info(
+                "anomaly.ssim_edge_hotspot_suppressed",
+                camera_id=self.status.camera_id,
+                score=round(anomaly_score, 3),
+                hot_fraction=round(hot_fraction, 4),
+                suppress_fraction=round(suppress_fraction, 4),
+                largest_hot_share=round(largest_hot_share, 4),
+                largest_bbox_fraction=round(largest_bbox_fraction, 4),
+                largest_edge_touches=largest_edge_touches,
+            )
+            return AnomalyResult(
+                anomaly_score=0.0,
+                anomaly_map=anomaly_map,
+                is_anomalous=False,
+                threshold=self.threshold,
+                raw_score=raw_score,
+            )
+
+        if self._ssim_global_suppress_remaining > 0:
+            self._ssim_global_suppress_remaining -= 1
+            logger.info(
+                "anomaly.ssim_global_change_cooldown",
+                camera_id=self.status.camera_id,
+                score=round(anomaly_score, 3),
+                hot_fraction=round(hot_fraction, 4),
+                remaining_frames=self._ssim_global_suppress_remaining,
+            )
+            return AnomalyResult(
+                anomaly_score=0.0,
+                anomaly_map=anomaly_map,
+                is_anomalous=False,
+                threshold=self.threshold,
+                raw_score=raw_score,
+            )
+
         if suppress_fraction > 0 and hot_fraction >= suppress_fraction and global_change:
+            self._ssim_global_suppress_remaining = max(
+                self._ssim_global_suppress_remaining,
+                self._ssim_global_suppress_cooldown_frames,
+            )
             logger.info(
                 "anomaly.ssim_global_change_suppressed",
                 camera_id=self.status.camera_id,

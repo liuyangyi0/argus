@@ -49,6 +49,38 @@ def test_ssim_fallback_suppresses_global_camera_shift() -> None:
     assert result.is_anomalous is False
 
 
+def test_ssim_fallback_cools_down_after_global_change() -> None:
+    detector = AnomalibDetector(
+        threshold=0.7,
+        image_size=(128, 128),
+        ssim_baseline_frames=5,
+        ssim_global_change_suppress_fraction=0.06,
+    )
+    base = _textured_frame()
+    _prime_ssim(detector, base)
+
+    shifted = cv2.warpAffine(
+        base,
+        np.float64([[1.0, 0.0, 6.0], [0.0, 1.0, 0.0]]),
+        (base.shape[1], base.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    first = detector.predict(shifted)
+    assert first.raw_score is not None and first.raw_score > 0
+    assert first.anomaly_score == 0.0
+    assert detector._ssim_global_suppress_remaining > 0
+
+    changed = base.copy()
+    cv2.rectangle(changed, (132, 96), (180, 128), (15, 15, 15), -1)
+    second = detector.predict(changed)
+
+    assert second.raw_score is not None and second.raw_score > 0
+    assert second.anomaly_map is not None
+    assert second.anomaly_score == 0.0
+    assert second.is_anomalous is False
+
+
 def test_ssim_fallback_keeps_local_foreign_object_signal() -> None:
     detector = AnomalibDetector(
         threshold=0.7,
@@ -68,6 +100,27 @@ def test_ssim_fallback_keeps_local_foreign_object_signal() -> None:
     assert float(np.mean(result.anomaly_map > 0.5)) < 0.12
     assert result.anomaly_score >= result.threshold
     assert result.is_anomalous is True
+
+
+def test_ssim_fallback_suppresses_small_edge_hotspot() -> None:
+    detector = AnomalibDetector(
+        threshold=0.7,
+        image_size=(128, 128),
+        ssim_baseline_frames=5,
+        ssim_global_change_suppress_fraction=0.04,
+    )
+    base = _textured_frame()
+    _prime_ssim(detector, base)
+
+    changed = base.copy()
+    cv2.rectangle(changed, (300, 110), (319, 155), (245, 245, 245), -1)
+    result = detector.predict(changed)
+
+    assert result.raw_score is not None and result.raw_score > 0
+    assert result.anomaly_map is not None
+    assert 0 < float(np.mean(result.anomaly_map > 0.5)) <= 0.04
+    assert result.anomaly_score == 0.0
+    assert result.is_anomalous is False
 
 
 def test_ssim_fallback_suppresses_edge_reflection_band() -> None:
