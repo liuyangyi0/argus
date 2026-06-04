@@ -483,84 +483,86 @@ class AnomalibDetector:
                 engine = self._engine
                 image_size = self.image_size
                 minmax_broken = self._minmax_broken
-            if engine is None:
-                return self._safe_result()
-
-            # Resize to model's expected input size
-            resized = cv2.resize(frame, image_size)
-
-            # Convert BGR to RGB for anomalib
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
-            # When PostProcessor MinMax is not fit, the normalized score is
-            # always 1.0 (useless). Use the raw inner model score directly
-            # to avoid running inference twice.
-            if minmax_broken:
-                import torch
-                model = engine.model
-                inner = getattr(model, "model", model)
-                inp = torch.from_numpy(rgb.transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
-                with torch.no_grad():
-                    raw_out = inner(inp)
-                raw_val = float(raw_out.pred_score.squeeze().item())
-                if not np.isfinite(raw_val):
-                    return self._safe_result()
-                anomaly_score = self._normalize_raw_score(raw_val)
-                # Use anomaly_map from inner output if available
-                prediction = raw_out
-            else:
-                prediction = engine.predict(rgb)
-
-                # Extract score — Anomalib 2.x returns Tensors, not numpy
-                raw_score = prediction.pred_score
-                if hasattr(raw_score, "item"):
-                    anomaly_score = float(raw_score.squeeze().item())
-                else:
-                    anomaly_score = float(raw_score)
-
-                if not np.isfinite(anomaly_score):
-                    logger.error(
-                        "anomaly.nan_score",
-                        raw_score=str(prediction.pred_score),
-                        msg="Model returned NaN/Inf score, treating as normal",
-                    )
+                if engine is None:
                     return self._safe_result()
 
-            # Clamp to valid range
-            anomaly_score = max(0.0, min(anomaly_score, 1.0))
+                # Resize to model's expected input size
+                resized = cv2.resize(frame, image_size)
 
-            # Apply conformal calibration if available
-            raw_score_out = None
-            if self._calibration_scores is not None:
-                raw_score_out = anomaly_score
-                anomaly_score = self._apply_calibration(anomaly_score)
+                # Convert BGR to RGB for anomalib
+                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
-            anomaly_map = None
-            if prediction.anomaly_map is not None:
-                amap = prediction.anomaly_map.squeeze()
-                # Convert Tensor to numpy if needed
-                if hasattr(amap, "detach"):
-                    amap = amap.detach().cpu().numpy()
-                anomaly_map = np.asarray(amap, dtype=np.float32)
-                # Replace NaN/Inf in heatmap
-                if not np.all(np.isfinite(anomaly_map)):
-                    logger.warning("anomaly.nan_heatmap", msg="Heatmap contains NaN/Inf")
-                    anomaly_map = np.nan_to_num(anomaly_map, nan=0.0, posinf=1.0, neginf=0.0)
-                # Normalize to 0-1 range
-                map_min, map_max = anomaly_map.min(), anomaly_map.max()
-                if map_max > map_min:
-                    anomaly_map = (anomaly_map - map_min) / (map_max - map_min)
+                # When PostProcessor MinMax is not fit, the normalized score is
+                # always 1.0 (useless). Use the raw inner model score directly
+                # to avoid running inference twice.
+                if minmax_broken:
+                    import torch
+                    model = engine.model
+                    inner = getattr(model, "model", model)
+                    inp = torch.from_numpy(rgb.transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
+                    with torch.no_grad():
+                        raw_out = inner(inp)
+                    raw_val = float(raw_out.pred_score.squeeze().item())
+                    if not np.isfinite(raw_val):
+                        return self._safe_result()
+                    anomaly_score = self._normalize_raw_score(raw_val)
+                    # Use anomaly_map from inner output if available
+                    prediction = raw_out
                 else:
-                    anomaly_map = np.zeros_like(anomaly_map, dtype=np.float32)
+                    prediction = engine.predict(rgb)
 
-            self.status.mark_inference_success()
-            return AnomalyResult(
-                anomaly_score=anomaly_score,
-                anomaly_map=anomaly_map,
-                is_anomalous=anomaly_score >= self.threshold,
-                threshold=self.threshold,
-                raw_score=raw_score_out,
-            )
+                    # Extract score — Anomalib 2.x returns Tensors, not numpy
+                    raw_score = prediction.pred_score
+                    if hasattr(raw_score, "item"):
+                        anomaly_score = float(raw_score.squeeze().item())
+                    else:
+                        anomaly_score = float(raw_score)
+
+                    if not np.isfinite(anomaly_score):
+                        logger.error(
+                            "anomaly.nan_score",
+                            raw_score=str(prediction.pred_score),
+                            msg="Model returned NaN/Inf score, treating as normal",
+                        )
+                        return self._safe_result()
+
+                # Clamp to valid range
+                anomaly_score = max(0.0, min(anomaly_score, 1.0))
+
+                # Apply conformal calibration if available
+                raw_score_out = None
+                if self._calibration_scores is not None:
+                    raw_score_out = anomaly_score
+                    anomaly_score = self._apply_calibration(anomaly_score)
+
+                anomaly_map = None
+                if prediction.anomaly_map is not None:
+                    amap = prediction.anomaly_map.squeeze()
+                    # Convert Tensor to numpy if needed
+                    if hasattr(amap, "detach"):
+                        amap = amap.detach().cpu().numpy()
+                    anomaly_map = np.asarray(amap, dtype=np.float32)
+                    # Replace NaN/Inf in heatmap
+                    if not np.all(np.isfinite(anomaly_map)):
+                        logger.warning("anomaly.nan_heatmap", msg="Heatmap contains NaN/Inf")
+                        anomaly_map = np.nan_to_num(
+                            anomaly_map, nan=0.0, posinf=1.0, neginf=0.0,
+                        )
+                    # Normalize to 0-1 range
+                    map_min, map_max = anomaly_map.min(), anomaly_map.max()
+                    if map_max > map_min:
+                        anomaly_map = (anomaly_map - map_min) / (map_max - map_min)
+                    else:
+                        anomaly_map = np.zeros_like(anomaly_map, dtype=np.float32)
+
+                self.status.mark_inference_success()
+                return AnomalyResult(
+                    anomaly_score=anomaly_score,
+                    anomaly_map=anomaly_map,
+                    is_anomalous=anomaly_score >= self.threshold,
+                    threshold=self.threshold,
+                    raw_score=raw_score_out,
+                )
         except Exception as e:
             # Rate-limit: a silent regression (e.g. the Dinomaly2 dynamic-shape
             # crash fixed in #19) can fire this per-frame and flood logs with
@@ -868,10 +870,11 @@ class AnomalibDetector:
                 self.status.image_size = new_image_size
                 self._loaded = True
 
-            # Reload calibration data for the new model
-            self._calibration_scores = None
-            self._calibration_n = 0
-            self._load_calibration()
+                # Reload calibration data for the new model while inference is
+                # paused so engine, image size, and calibration switch together.
+                self._calibration_scores = None
+                self._calibration_n = 0
+                self._load_calibration()
 
             logger.info("anomaly.hot_reload_success", path=str(new_model_path))
             return True
@@ -970,9 +973,9 @@ class AnomalibDetector:
                 self._model_path = new_model_path
                 self._loaded = True
 
-            self._calibration_scores = None
-            self._calibration_n = 0
-            self._load_calibration()
+                self._calibration_scores = None
+                self._calibration_n = 0
+                self._load_calibration()
 
             result["success"] = True
             logger.info("anomaly.warmup_reload_success", path=str(new_model_path))

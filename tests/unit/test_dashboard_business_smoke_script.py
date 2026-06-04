@@ -1138,7 +1138,7 @@ def test_models_system_browser_pages_include_seeded_model_and_system_markers():
     assert "/system/config" in pages
     assert "cam_a-patchcore-production" in pages["/models/registry"]
     assert "cam_a-patchcore-trained" in pages["/models/registry"]
-    assert "fallback 模式" in pages["/system/overview"]
+    assert "Backend" in pages["/system/overview"]
     assert "输入质量" in pages["/system/overview"]
     assert "稳定" in pages["/system/overview"]
     assert "保存当前配置" in pages["/system/config"]

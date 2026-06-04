@@ -1030,7 +1030,15 @@ class DetectionPipeline:
                         msg="Ensemble predict failed — falling back to single detector",
                     )
             result = self._anomaly_detector.predict(frame, fused_tensor=fused_tensor)
-            self._record_anomaly_inference_ok()
+            if result.detection_failed:
+                reason = "detector_result_failed"
+                status = getattr(self._anomaly_detector, "status", None)
+                last_error = getattr(status, "last_error", None)
+                if isinstance(last_error, str) and last_error:
+                    reason = f"{reason}: {last_error}"
+                self._record_anomaly_inference_failure(reason)
+            else:
+                self._record_anomaly_inference_ok()
             return result
         except Exception as exc:
             # Single-frame failures: tolerated by detector's own try/except;
