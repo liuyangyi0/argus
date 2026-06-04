@@ -167,6 +167,21 @@ class TestLockHysteresis:
         pipeline._update_lock_state(result)
         assert pipeline._locked is True
 
+    def test_lock_can_be_disabled_for_ssim_fallback(self):
+        from argus.config.schema import AlertConfig, CameraConfig
+        from argus.core.pipeline import DetectionPipeline
+
+        config = CameraConfig(
+            camera_id="test", name="test", source="0", protocol="file",
+        )
+        pipeline = DetectionPipeline(config, AlertConfig())
+
+        result = AnomalyResult(anomaly_score=0.95, anomaly_map=None, is_anomalous=True, threshold=0.7)
+        pipeline._update_lock_state(result, allow_engage=False)
+
+        assert pipeline._locked is False
+        assert pipeline._lock_last_below_time is None
+
     def test_lock_does_not_clear_above_hysteresis(self):
         from argus.config.schema import AlertConfig, CameraConfig
         from argus.core.pipeline import DetectionPipeline

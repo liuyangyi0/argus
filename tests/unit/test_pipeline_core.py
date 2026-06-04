@@ -370,6 +370,34 @@ class TestFastMotion:
         pipeline._fast_motion.process.assert_not_called()
         pipeline._fast_motion.reset.assert_called_once()
 
+    def test_entering_active_resets_and_warms_up_fast_motion(self):
+        pipeline = self._fast_pipeline()
+        pipeline._fast_motion = MagicMock()
+        pipeline._object_detector.detect.return_value = ObjectDetectionResult()
+        pipeline._anomaly_detector.predict.return_value = AnomalyResult(
+            anomaly_score=0.0,
+            anomaly_map=None,
+            is_anomalous=False,
+            threshold=0.7,
+        )
+
+        pipeline.set_mode(PipelineMode.LEARNING)
+        pipeline._fast_motion.reset_mock()
+        before = time.monotonic()
+        pipeline.set_mode(PipelineMode.ACTIVE)
+
+        assert pipeline._fast_motion_suppress_until > before
+        pipeline._fast_motion.reset.assert_called_once()
+
+        pipeline._fast_motion.reset_mock()
+        result = pipeline.process_frame(
+            _make_frame_data(np.zeros((480, 640, 3), dtype=np.uint8)),
+        )
+
+        assert result is None
+        pipeline._fast_motion.process.assert_not_called()
+        pipeline._fast_motion.reset.assert_called_once()
+
     def test_low_light_resets_fast_motion_and_suppresses_projectile(self):
         pipeline = self._fast_pipeline(low_light=True)
         pipeline._fast_motion = MagicMock()
