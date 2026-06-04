@@ -3,6 +3,7 @@
 import hashlib
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -143,6 +144,45 @@ class TestAtomicSwap:
         result = detector.hot_reload_with_warmup(model_dir)
         assert result["success"] is False
         assert detector._engine is old_engine
+
+
+class TestInferenceSerialization:
+
+    def test_predict_serializes_engine_access(self):
+        detector = AnomalibDetector(model_path=None, threshold=0.5, image_size=(16, 16))
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        class _Engine:
+            def predict(self, _rgb):
+                nonlocal active, max_active
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                with active_lock:
+                    active -= 1
+                return types.SimpleNamespace(
+                    pred_score=np.array([0.2], dtype=np.float32),
+                    anomaly_map=None,
+                )
+
+        detector._engine = _Engine()
+        detector._loaded = True
+        frame = np.zeros((32, 32, 3), dtype=np.uint8)
+        threads = [
+            threading.Thread(target=detector.predict, args=(frame,))
+            for _ in range(2)
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2.0)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert max_active == 1
 
 
 class TestCallback:

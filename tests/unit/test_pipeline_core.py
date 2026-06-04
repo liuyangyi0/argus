@@ -1182,6 +1182,51 @@ class TestAnomalyDegradation:
             "predict must NOT be called again after degraded mode entered"
         )
 
+    def test_runtime_detection_failed_results_trip_degraded_mode(self):
+        """Detector-level soft failures must count toward degraded mode too.
+
+        AnomalibDetector catches OpenVINO/Torch prediction errors and returns
+        detection_failed=True. The pipeline must treat that as a failed
+        inference, otherwise a bad hot-reloaded model keeps getting called.
+        """
+        from argus.anomaly.detector import AnomalyResult
+
+        pipeline = _build_pipeline()
+        pipeline._anomaly_detector.threshold = 0.7
+        pipeline._anomaly_detector.status = SimpleNamespace(
+            last_error="RuntimeError: Cannot find tensor for port Result_78"
+        )
+        pipeline._anomaly_detector.predict.return_value = AnomalyResult(
+            anomaly_score=0.0,
+            anomaly_map=None,
+            is_anomalous=False,
+            threshold=0.7,
+            detection_failed=True,
+        )
+
+        threshold = DetectionPipeline._ANOMALY_DEGRADE_THRESHOLD
+        frame = _make_frame()
+
+        for i in range(threshold - 1):
+            res = pipeline._predict_anomaly(frame)
+            assert res.detection_failed is True
+            assert pipeline.is_anomaly_degraded() is False, (
+                f"iteration {i + 1}/{threshold - 1} should not yet trip"
+            )
+
+        res = pipeline._predict_anomaly(frame)
+        assert res.detection_failed is True
+        assert pipeline.is_anomaly_degraded() is True
+        reason = pipeline.get_anomaly_degradation_reason() or ""
+        assert "detector_result_failed" in reason
+        assert "Cannot find tensor" in reason
+        assert pipeline._anomaly_detector.predict.call_count == threshold
+
+        res = pipeline._predict_anomaly(frame)
+        assert res.detection_failed is False
+        assert res.is_anomalous is False
+        assert pipeline._anomaly_detector.predict.call_count == threshold
+
     def test_successful_inference_resets_failure_counter(self):
         """A successful inference between hiccups must reset the counter so
         transient errors below threshold never trip degraded mode.
