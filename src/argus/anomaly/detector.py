@@ -96,6 +96,8 @@ class AnomalibDetector:
         self._ssim_noise_floor: float | None = None
         self._ssim_global_suppress_remaining = 0
         self._ssim_global_suppress_cooldown_frames = 8
+        self._ssim_calibration_max_noise_sample = 0.12
+        self._ssim_calibration_resets = 0
         self._reload_lock = threading.Lock()
         self._ssim_lock = threading.Lock()  # protects SSIM baseline calibration state
         self._minmax_broken = False  # True when PostProcessor MinMax is not fit
@@ -634,6 +636,7 @@ class AnomalibDetector:
                 self._ssim_noise_floor = 0.0
                 self._ssim_global_suppress_remaining = 0
                 self._ssim_frame_diffs = []
+                self._ssim_calibration_resets = 0
                 logger.info("anomaly.ssim_calibrating", msg="Collecting baseline frames...")
                 return AnomalyResult(
                     anomaly_score=0.0, anomaly_map=None, is_anomalous=False,
@@ -646,6 +649,24 @@ class AnomalibDetector:
                 diff_to_prev = cv2.absdiff(gray, prev)
                 diff_blurred = cv2.GaussianBlur(diff_to_prev, (11, 11), 0) / 255.0
                 noise_sample = float(cv2.blur(diff_blurred, (16, 16)).max())
+                if noise_sample > self._ssim_calibration_max_noise_sample:
+                    self._ssim_baseline_acc = gray.copy()
+                    self._ssim_baseline_count = 1
+                    self._ssim_noise_floor = 0.0
+                    self._ssim_global_suppress_remaining = 0
+                    self._ssim_frame_diffs = []
+                    self._ssim_calibration_resets += 1
+                    logger.info(
+                        "anomaly.ssim_calibration_unstable_reset",
+                        camera_id=self.status.camera_id,
+                        noise_sample=round(noise_sample, 4),
+                        max_noise_sample=round(self._ssim_calibration_max_noise_sample, 4),
+                        resets=self._ssim_calibration_resets,
+                    )
+                    return AnomalyResult(
+                        anomaly_score=0.0, anomaly_map=None, is_anomalous=False,
+                        threshold=self.threshold, detection_failed=False,
+                    )
                 self._ssim_frame_diffs.append(noise_sample)
 
                 # Accumulate for average baseline
@@ -659,7 +680,15 @@ class AnomalibDetector:
                     diffs = np.array(self._ssim_frame_diffs)
                     q25, q75 = float(np.percentile(diffs, 25)), float(np.percentile(diffs, 75))
                     iqr = q75 - q25
-                    self._ssim_noise_floor = q75 + 1.5 * iqr if iqr > 0 else float(np.median(diffs)) * 1.5
+                    estimated_noise = (
+                        q75 + 1.5 * iqr
+                        if iqr > 0
+                        else float(np.median(diffs)) * 1.5
+                    )
+                    self._ssim_noise_floor = min(
+                        estimated_noise,
+                        self._ssim_calibration_max_noise_sample,
+                    )
                     logger.info(
                         "anomaly.ssim_calibrated",
                         baseline_frames=self._ssim_baseline_count,

@@ -49,6 +49,35 @@ def test_ssim_fallback_suppresses_global_camera_shift() -> None:
     assert result.is_anomalous is False
 
 
+def test_ssim_fallback_restarts_calibration_on_unstable_startup_frames() -> None:
+    detector = AnomalibDetector(
+        threshold=0.7,
+        image_size=(128, 128),
+        ssim_baseline_frames=5,
+        ssim_global_change_suppress_fraction=0.06,
+    )
+    base = _textured_frame()
+    moving = base.copy()
+    cv2.rectangle(moving, (90, 20), (230, 210), (10, 10, 10), -1)
+
+    detector.predict(base)
+    detector.predict(moving)
+
+    assert detector._ssim_calibration_resets == 1
+    assert detector._ssim_baseline_count == 1
+    assert detector._ssim_frame_diffs == []
+
+    detector.predict(base)
+    assert detector._ssim_calibration_resets == 2
+
+    for _ in range(detector._ssim_baseline_frames - 1):
+        detector.predict(base)
+
+    assert detector.get_status().ssim_calibrated is True
+    assert detector._ssim_noise_floor is not None
+    assert detector._ssim_noise_floor < 0.05
+
+
 def test_ssim_fallback_cools_down_after_global_change() -> None:
     detector = AnomalibDetector(
         threshold=0.7,
