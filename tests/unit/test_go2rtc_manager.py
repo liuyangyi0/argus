@@ -84,6 +84,23 @@ class TestStartAndRegisterCameras:
         assert "video=0" not in by_name
         assert "video=0" not in by_id
 
+    def test_linux_v4l2_path_uses_device_path_not_windows_name(self, monkeypatch):
+        monkeypatch.setattr(go2rtc_mod.platform, "system", lambda: "Linux")
+
+        source = usb_to_go2rtc_source(
+            "/dev/video0",
+            device_name="OBSBOT Meet 2",
+            resolution=(1920, 1080),
+            fps=60,
+            pixel_format="mjpeg",
+        )
+
+        assert source == (
+            "ffmpeg:device?video=%2Fdev%2Fvideo0&input_format=mjpeg"
+            "&video_size=1920x1080&framerate=60#video=h264"
+        )
+        assert "OBSBOT" not in source
+
     def test_starts_when_not_running(self):
         mgr = _manager(running=False)
         cameras = [_make_cam("cam_01", "rtsp://192.168.1.10/s1", "rtsp")]

@@ -89,7 +89,9 @@ def usb_to_go2rtc_source(
 
     Ref: https://github.com/AlexxIT/go2rtc/issues/159
     """
-    selector = device_id or device_name or device_index
+    source_text = str(device_index)
+    use_v4l2_path = platform.system() != "Windows" and source_text.startswith("/dev/")
+    selector = source_text if use_v4l2_path else (device_id or device_name or device_index)
     try:
         video_value: str | int = int(selector)
     except (TypeError, ValueError):
