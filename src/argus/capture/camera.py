@@ -22,6 +22,7 @@ _BACKEND_NAMES = {
     getattr(cv2, "CAP_DSHOW", -1): "dshow",
     getattr(cv2, "CAP_MSMF", -1): "msmf",
     getattr(cv2, "CAP_FFMPEG", -1): "ffmpeg",
+    getattr(cv2, "CAP_V4L2", -1): "v4l2",
 }
 
 
@@ -113,6 +114,7 @@ class CameraCapture:
             "dshow": (getattr(cv2, "CAP_DSHOW", None), "dshow"),
             "msmf": (getattr(cv2, "CAP_MSMF", None), "msmf"),
             "ffmpeg": (getattr(cv2, "CAP_FFMPEG", None), "ffmpeg"),
+            "v4l2": (getattr(cv2, "CAP_V4L2", None), "v4l2"),
             "default": (None, "default"),
         }
         if preferred in backend_map and preferred != "auto":
@@ -128,7 +130,11 @@ class CameraCapture:
                 candidates.append((cv2.CAP_MSMF, "msmf"))
             candidates.append((None, "default"))
             return candidates
-        return [(None, "default")]
+        candidates = []
+        if hasattr(cv2, "CAP_V4L2"):
+            candidates.append((cv2.CAP_V4L2, "v4l2"))
+        candidates.append((None, "default"))
+        return candidates
 
     @staticmethod
     def _normalise_fourcc(pixel_format: str | None) -> str | None:

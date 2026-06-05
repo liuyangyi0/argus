@@ -102,7 +102,7 @@ class USBCaptureConfig(BaseModel):
         default=None,
         description="Preferred USB camera stable/alternative device identifier for DirectShow/go2rtc.",
     )
-    preferred_backend: Literal["auto", "dshow", "msmf", "ffmpeg", "default"] = Field(
+    preferred_backend: Literal["auto", "dshow", "msmf", "ffmpeg", "v4l2", "default"] = Field(
         default="auto",
         description="Preferred OpenCV backend for direct USB capture. Windows auto mode tries DirectShow first.",
     )
