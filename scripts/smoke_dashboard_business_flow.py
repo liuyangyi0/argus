@@ -330,25 +330,36 @@ class _AlertWebSocketListener:
                         raw = websocket.recv(timeout=0.5)
                     except TimeoutError:
                         continue
-                    payload = json.loads(raw)
-                    if payload.get("topic") == "alerts" and isinstance(payload.get("data"), dict):
-                        self._messages.put(payload["data"])
+                    self._handle_raw_message(raw)
         except Exception as exc:
+            if self._stop.is_set() and type(exc).__name__ == "ConnectionClosedOK":
+                self._connected.set()
+                return
             self._errors.put(f"{type(exc).__name__}: {exc}")
             self._connected.set()
+
+    def _handle_raw_message(self, raw: str) -> None:
+        payload = json.loads(raw)
+        if payload.get("topic") == "ping":
+            connection = self._connection
+            if connection is not None:
+                connection.send(json.dumps({"action": "pong"}))
+            return
+        if payload.get("topic") == "alerts" and isinstance(payload.get("data"), dict):
+            self._messages.put(payload["data"])
 
     def wait_for_alert(self, alert_id: str, *, timeout_s: float) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_s
         last_seen: list[str] = []
         while time.monotonic() < deadline:
-            if not self._errors.empty():
-                raise DashboardBusinessSmokeFailure(
-                    f"alert websocket listener failed: {self._errors.get_nowait()}"
-                )
             remaining = max(0.1, min(0.5, deadline - time.monotonic()))
             try:
                 payload = self._messages.get(timeout=remaining)
             except queue.Empty:
+                if not self._errors.empty():
+                    raise DashboardBusinessSmokeFailure(
+                        f"alert websocket listener failed: {self._errors.get_nowait()}"
+                    )
                 continue
             seen_id = str(payload.get("alert_id") or "")
             if seen_id:

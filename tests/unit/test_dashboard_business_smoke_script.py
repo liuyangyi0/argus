@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -8,6 +9,7 @@ import pytest
 from argus.config.loader import load_config
 from scripts.smoke_dashboard_business_flow import (
     DashboardBusinessSmokeFailure,
+    _AlertWebSocketListener,
     _business_browser_pages,
     _check_business_browser_dom,
     _clean_env,
@@ -173,6 +175,33 @@ def test_business_browser_pages_include_projectile_detail_markers():
 def test_websocket_url_derives_ws_endpoint_from_http_base_url():
     assert _websocket_url("http://127.0.0.1:8080") == "ws://127.0.0.1:8080/ws"
     assert _websocket_url("https://example.test") == "wss://example.test/ws"
+
+
+def test_alert_websocket_listener_replies_to_heartbeat_ping():
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def send(self, message: str) -> None:
+            self.sent.append(message)
+
+    connection = FakeConnection()
+    listener = _AlertWebSocketListener(base_url="http://127.0.0.1:8080")
+    listener._connection = connection
+
+    listener._handle_raw_message(json.dumps({"topic": "ping", "timestamp": 123.0}))
+
+    assert [json.loads(item) for item in connection.sent] == [{"action": "pong"}]
+
+
+def test_alert_websocket_listener_waits_for_message_before_error_queue():
+    listener = _AlertWebSocketListener(base_url="http://127.0.0.1:8080")
+    listener._messages.put({"alert_id": "ALT-1", "camera_id": "cam_a"})
+    listener._errors.put("ConnectionClosedOK: received 1000 (OK); then sent 1000 (OK)")
+
+    payload = listener.wait_for_alert("ALT-1", timeout_s=0.1)
+
+    assert payload["alert_id"] == "ALT-1"
 
 
 def test_parse_args_accepts_normal_training_mode():
