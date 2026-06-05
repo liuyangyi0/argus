@@ -75,7 +75,7 @@ cameras:
     match_radius_px: 50
   usb:
     device_name: OBSBOT Meet 2 StreamCamera
-    preferred_backend: dshow
+    preferred_backend: auto
     pixel_format: mjpeg
     min_runtime_fps: 50.0
   fast_motion:

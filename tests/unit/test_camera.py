@@ -115,15 +115,18 @@ class TestCameraCapture:
         assert cam.connect() is True
         assert attempts[0][1] == getattr(__import__("cv2"), "CAP_DSHOW", attempts[0][1])
 
-    def test_non_windows_usb_uses_default_backend(self, monkeypatch):
-        """Non-Windows USB capture should keep using the default backend."""
+    def test_non_windows_usb_prefers_v4l2_then_falls_back(self, monkeypatch):
+        """Non-Windows USB capture should try V4L2 before the default backend."""
         monkeypatch.setattr("argus.capture.camera.sys.platform", "linux")
 
         attempts = []
 
         class FakeCapture:
+            def __init__(self, opened):
+                self._opened = opened
+
             def isOpened(self):
-                return True
+                return self._opened
 
             def release(self):
                 pass
@@ -133,14 +136,14 @@ class TestCameraCapture:
 
         def fake_videocapture(source, backend=None):
             attempts.append((source, backend))
-            return FakeCapture()
+            return FakeCapture(opened=len(attempts) > 1)
 
         monkeypatch.setattr("argus.capture.camera.cv2.VideoCapture", fake_videocapture)
 
         cam = CameraCapture(camera_id="usb_cam", source="0", protocol="usb")
 
         assert cam.connect() is True
-        assert attempts == [(0, None)]
+        assert attempts == [(0, cv2.CAP_V4L2), (0, None)]
 
     def test_usb_mjpeg_resolution_and_fps_are_set_before_runtime_check(self, monkeypatch):
         """USB high-FPS mode should force MJPG before width/height/FPS."""

@@ -50,7 +50,9 @@ def _manager(
 
 
 class TestStartAndRegisterCameras:
-    def test_usb_source_includes_explicit_high_fps_mode(self):
+    def test_usb_source_includes_explicit_high_fps_mode(self, monkeypatch):
+        monkeypatch.setattr(go2rtc_mod.platform, "system", lambda: "Windows")
+
         source = usb_to_go2rtc_source(
             "0",
             resolution=(1920, 1080),
@@ -63,7 +65,9 @@ class TestStartAndRegisterCameras:
             "&video_size=1920x1080&framerate=60#video=h264"
         )
 
-    def test_usb_source_can_select_device_by_name_or_id(self):
+    def test_usb_source_can_select_device_by_name_or_id(self, monkeypatch):
+        monkeypatch.setattr(go2rtc_mod.platform, "system", lambda: "Windows")
+
         by_name = usb_to_go2rtc_source(
             "0",
             device_name="OBSBOT Meet 2 StreamCamera",
@@ -89,6 +93,23 @@ class TestStartAndRegisterCameras:
 
         source = usb_to_go2rtc_source(
             "/dev/video0",
+            device_name="OBSBOT Meet 2",
+            resolution=(1920, 1080),
+            fps=60,
+            pixel_format="mjpeg",
+        )
+
+        assert source == (
+            "ffmpeg:device?video=%2Fdev%2Fvideo0&input_format=mjpeg"
+            "&video_size=1920x1080&framerate=60#video=h264"
+        )
+        assert "OBSBOT" not in source
+
+    def test_linux_digit_source_uses_v4l2_device_path(self, monkeypatch):
+        monkeypatch.setattr(go2rtc_mod.platform, "system", lambda: "Linux")
+
+        source = usb_to_go2rtc_source(
+            "0",
             device_name="OBSBOT Meet 2",
             resolution=(1920, 1080),
             fps=60,
