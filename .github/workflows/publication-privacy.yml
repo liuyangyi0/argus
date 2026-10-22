@@ -1,0 +1,26 @@
+name: Publication privacy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pytest
+      - name: Check public files and reachable history without model dependencies
+        env:
+          ARGUS_PUBLICATION_HISTORY_CHECK: '1'
+        run: python -m pytest --noconftest tests/lint/test_publication_privacy.py -q

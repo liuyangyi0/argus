@@ -29,6 +29,13 @@ pre_trained/
 
 # Environment
 .env
+.env.*
+!.env.example
+.ssh/
+*.key
+*.pem
+*.p12
+*.pfx
 .venv/
 venv/
 
@@ -48,6 +55,7 @@ Thumbs.db
 .coverage
 htmlcov/
 .pytest_cache/
+.local-validation/
 /.claude/
 
 # Model weights and inference artifacts
