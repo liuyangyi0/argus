@@ -116,7 +116,7 @@ const rows = computed(() => collections.value)
 </script>
 
 <template>
-  <main class="glass" style="padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
+  <section aria-label="采集集合管理" class="glass" style="padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px">
       <Typography.Title :level="3" style="margin: 0">采集集合管理</Typography.Title>
       <Button @click="load">
@@ -198,5 +198,5 @@ const rows = computed(() => collections.value)
       :title="errorModalTitle"
       :error="errorModalText"
     />
-  </main>
+  </section>
 </template>

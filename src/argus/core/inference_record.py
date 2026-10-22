@@ -35,8 +35,19 @@ class FinalDecision(str, Enum):
 
     NORMAL = "normal"
     INFO = "info"
+    INFO_CANDIDATE = "info_candidate"
+    DEBUG_NORMAL_SAMPLE = "debug_normal_sample"
+    SKIPPED_HEARTBEAT = "skipped_heartbeat"
     ALERT = "alert"
     SUPPRESSED = "suppressed"
+
+
+PERSISTED_FINAL_DECISIONS = frozenset({
+    FinalDecision.INFO,
+    FinalDecision.INFO_CANDIDATE,
+    FinalDecision.SKIPPED_HEARTBEAT,
+    FinalDecision.ALERT,
+})
 
 
 @dataclass

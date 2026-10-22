@@ -28,6 +28,7 @@ const iconMap = {
     <component
       :is="iconMap[icon ?? 'database']"
       class="empty-state__icon"
+      aria-hidden="true"
     />
     <Typography.Title :level="5" class="empty-state__title">{{ title }}</Typography.Title>
     <Typography.Text v-if="description" type="secondary" class="empty-state__desc">{{ description }}</Typography.Text>

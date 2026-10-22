@@ -99,7 +99,7 @@ segmenter:
 
 ### 3.2 跨配置依赖
 
-- 必须先有 anomaly 检测产出 `anomaly_result.anomaly_map`（管线代码 `pipeline.py` 1720 行附近的判断），否则没有峰值可分割。换言之，至少要有一个开启了异常检测（baseline + scorer）的摄像头。
+- 必须先有 anomaly 检测产出 `anomaly_result.anomaly_map`，否则没有峰值可分割。换言之，至少要有一个开启了异常检测（baseline + scorer）的摄像头。
 - 触发分割还有两个前置条件，源自 `pipeline.py`：
   1. 该帧已生成 `Alert` 对象（即 grader 已判定为告警）。
   2. `anomaly_result.anomaly_score >= segmenter.min_anomaly_score`。
@@ -144,7 +144,7 @@ segmenter:
    ```powershell
    python -m argus --config configs/default.yaml
    ```
-   注意：现有运行中的 `Pipeline` 实例**不会**因为热切 `segmenter.enabled=true` 就回填一个 segmenter（见 `dashboard/routes/config.py::get_segmenter_config` 注释和 `pipeline.py` 2474 行附近的 `_segmenter_config is None` 判断）。**要让所有摄像头生效必须重启服务**。
+   注意：现有运行中的 `Pipeline` 实例**不会**因为热切 `segmenter.enabled=true` 就回填一个 segmenter（见 `dashboard/routes/config.py::get_segmenter_config` 注释和 pipeline 的 `_segmenter_config is None` 分支）。**要让所有摄像头生效必须重启服务**。
 
 6. **观察启动日志**  
    预期看到：
@@ -159,7 +159,7 @@ segmenter:
 
 ## 5. UI 入口
 
-- **配置面板**：前端路由 `/system`（`web/src/views/System.vue`），里面的 `分割器` Tab 由 `web/src/components/system/SegmenterPanel.vue` 渲染。可视化展示 `enabled`、`model_size`、`max_points`、`min_anomaly_score`、`min_mask_area_px`、`timeout_seconds`，并提供 toggle + 4 个运行时可调字段的编辑保存。后端 API：`GET/POST /api/config/segmenter`。
+- **配置面板**：前端路由 `/system/segmenter`（`web/src/views/System.vue`），里面的 `分割器` Tab 由 `web/src/components/system/SegmenterPanel.vue` 渲染。可视化展示 `enabled`、`model_size`、`max_points`、`min_anomaly_score`、`min_mask_area_px`、`timeout_seconds`，并提供 toggle + 运行时可调字段的编辑保存。后端 API：`GET /api/config/segmenter`、`POST /api/config/modules`、`PUT /api/config/segmenter/params`。
 - **告警详情**：前端 `web/src/components/alerts/AlertDetailPanel.vue` 在告警详情面板里读取 `selectedAlert.segmentation_count`，显示"X 个对象"。
 - **告警分级**：分割结果**不参与** severity 判定（`src/argus/alerts/grader.py` 中 severity 由分数 + classifier 决定，segmentation_* 只作为附加字段挂在 `Alert` 上）。`category`、`severity_adjusted_by_classifier` 仍由 classifier 路径写入，分割器不会改动告警等级。
 
@@ -167,7 +167,7 @@ segmenter:
 
 ## 6. 性能影响
 
-- **执行时机**：分割发生在 grader 已经生成告警之后（`pipeline.py` 1720 行的 `if alert is not None` 分支），但仍在主帧处理协程里。也就是说，**它是同步管线的一部分**，会被计入该帧的总耗时（管线对每个 stage 都记 `StageResult`，本 stage 名为 `segmenter`）。  
+- **执行时机**：分割发生在 grader 已经生成告警之后，但仍在主帧处理协程里。也就是说，**它是同步管线的一部分**，会被计入该帧的总耗时（管线对每个 stage 都记 `StageResult`，本 stage 名为 `segmenter`）。
   保护机制：超时通过专用 `ThreadPoolExecutor`（`thread_name_prefix="sam2"`）+ `future.result(timeout=timeout_seconds)` 兜底，超时返回空结果继续；任何异常都进 `except` 不阻塞下一帧。
 - **单帧分割延迟**：取决于 `model_size`、显存、prompt 点数：
   - `tiny` / `small` + 单 GPU + ≤5 个点：经验 100~400 ms 量级（**TBD，本仓库未提供基准；测量见第 7 节自检命令**）。
@@ -223,7 +223,7 @@ python -m pytest tests/unit/test_segmenter.py -v
 
 - 模型字段（`src/argus/storage/models.py`）：`segmentation_count`、`segmentation_total_area_px`、`segmentation_objects`（JSON 文本，不存 mask 像素，只有 bbox/area/centroid/conf）。
 - 写入路径：`pipeline.py` 把字段挂到 `alert` 对象 → `argus/alerts/dispatcher.py` 取出 → `argus/storage/database.py::save_alert` 把 `segmentation_objects` 用 `json.dumps` 编码后入库。
-- **只有当 `seg_result.num_objects > 0` 时才会写**（见 `pipeline.py` 1759 行）。否则仍是 `None`，前端 `AlertDetailPanel` 也会隐藏分割面板。
+- **只有当 `seg_result.num_objects > 0` 时才会写**。否则仍是 `None`，前端 `AlertDetailPanel` 也会隐藏分割面板。
 - 自动迁移：旧库启动时由 `database.py::_AUTO_MIGRATIONS` 自动 `ALTER TABLE alerts ADD COLUMN`，无需手工 SQL。
 
 校验 SQL（任意 SQLite 工具）：
@@ -251,7 +251,7 @@ LIMIT 10;
 把 `segmenter.enabled` 置 `false` 即可——fallback 路径只在 `enabled=true` 且 `_sam2_available=False` 时启用，单纯关 enabled 不会留下 fallback。如果只想要 fallback，可以保持 `enabled=true` 且**不安装 sam2**：`InstanceSegmenter.load()` 会捕获 `ImportError` 自动走 contour 路径（这是设计意图，但生产环境不推荐，因为分割质量明显差）。
 
 **Q4. `timeout_seconds` 经常触发警告，是不是 GPU 不够？**  
-先看 `segmenter.sam2_loaded` 里的 `device`：如果是 `cpu`，无解，必须上 GPU。如果已经是 `cuda`：(1) 把 `model_size` 从 `large` 换 `small`；(2) 把 `max_points` 调小到 `3`；(3) 把 `min_anomaly_score` 提到 `0.85` 以上，减少触发频率。`timeout_seconds` 和 `min_mask_area_px` 都支持热更新，可以在 `/system` → `分割器` Tab 直接调整保存。
+先看 `segmenter.sam2_loaded` 里的 `device`：如果是 `cpu`，无解，必须上 GPU。如果已经是 `cuda`：(1) 把 `model_size` 从 `large` 换 `small`；(2) 把 `max_points` 调小到 `3`；(3) 把 `min_anomaly_score` 提到 `0.85` 以上，减少触发频率。`timeout_seconds` 和 `min_mask_area_px` 都支持热更新，可以在 `/system/segmenter` 直接调整保存。
 
 **Q5. 我能不能不写数据库，只在前端展示分割？**  
-不能。当前实现里 `pipeline.py` 把字段挂在 `alert` 上，`dispatcher.py` 通过 `save_alert` 写库，前端 `AlertDetailPanel` 是从告警接口（`/api/alerts/...`）读 `segmentation_count`/`segmentation_objects` 渲染的，没有数据库就没有展示。`segmentation_objects` 只存 bbox / area / centroid / confidence，不会存 mask 像素，体积可控。
+不能。当前实现里 pipeline 把字段挂在 `alert` 上，`dispatcher.py` 通过 `save_alert` 写库，前端 `AlertDetailPanel` 是从告警接口（`/api/alerts/...`）读 `segmentation_count`/`segmentation_objects` 渲染的，没有数据库就没有展示。`segmentation_objects` 只存 bbox / area / centroid / confidence，不会存 mask 像素，体积可控。

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -19,6 +19,31 @@ import structlog
 from argus.core.model_status import ModelStatus
 
 logger = structlog.get_logger()
+
+
+def _torch_module_device(module: object) -> object | None:
+    """Return the first torch device used by a module's parameters or buffers."""
+    for attr_name in ("parameters", "buffers"):
+        values = getattr(module, attr_name, None)
+        if not callable(values):
+            continue
+        try:
+            for tensor in values():
+                device = getattr(tensor, "device", None)
+                if device is not None:
+                    return device
+        except Exception:
+            continue
+    return None
+
+
+def _move_tensor_to_module(tensor: object, module: object) -> object:
+    """Move a torch tensor to the module device when the module exposes one."""
+    device = _torch_module_device(module)
+    to = getattr(tensor, "to", None)
+    if device is not None and callable(to):
+        return to(device)
+    return tensor
 
 
 @dataclass
@@ -31,6 +56,14 @@ class AnomalyResult:
     threshold: float
     detection_failed: bool = False  # True when prediction errored out
     raw_score: float | None = None  # Pre-calibration score (None if no calibration)
+    # Stable model-output evidence for cross-frame/candidate calibration.  These
+    # fields intentionally sit beside (rather than replace) the legacy score and
+    # per-frame-normalized heatmap contract above.
+    model_score: float | None = None
+    model_anomaly_map: np.ndarray | None = None
+    model_output_space: str | None = None
+    model_output_comparable: bool = False
+    model_input_variant: str = "scene_stable:unmasked"
 
 
 @dataclass
@@ -68,6 +101,7 @@ class AnomalibDetector:
         ssim_midpoint: float = 0.015,
         ssim_global_change_suppress_fraction: float = 0.04,
         enable_calibration: bool = True,
+        inference_backend: str = "auto",
         camera_id: str = "unknown",
     ):
         self.threshold = threshold
@@ -75,12 +109,14 @@ class AnomalibDetector:
         self._model_path = Path(model_path) if model_path else None
         self._engine = None
         self._loaded = False
+        self._inference_backend = inference_backend
         self.status = ModelStatus(
             name="anomaly",
             camera_id=camera_id,
             image_size=image_size,
             model_path=str(self._model_path) if self._model_path else None,
         )
+        self.status.set_extra(expected_backend=inference_backend)
         self._enable_calibration = enable_calibration
         self._calibration_scores: np.ndarray | None = None  # sorted scores for p-value
         self._calibration_n: int = 0
@@ -101,6 +137,7 @@ class AnomalibDetector:
         self._reload_lock = threading.Lock()
         self._ssim_lock = threading.Lock()  # protects SSIM baseline calibration state
         self._minmax_broken = False  # True when PostProcessor MinMax is not fit
+        self._model_output_space_hint = "anomalib_postprocessed"
         # Multi-channel fusion support (Plan A stores tensor, Plan B will use it)
         self._latest_fused_tensor: np.ndarray | None = None
 
@@ -182,7 +219,12 @@ class AnomalibDetector:
 
         Returns True if model loaded successfully, False if no model available.
         """
+        strict_backend = self._inference_backend != "auto"
         if self._model_path is None or not self._model_path.exists():
+            if strict_backend:
+                error = f"{self._inference_backend}: no deployable model found"
+                self.status.mark_load_failed(error)
+                raise RuntimeError(error)
             logger.warning(
                 "anomaly.no_model",
                 path=str(self._model_path),
@@ -195,13 +237,38 @@ class AnomalibDetector:
 
         suffix = self._model_path.suffix.lower()
         if suffix == ".ckpt":
+            error = "unsupported_checkpoint"
             logger.error(
                 "anomaly.unsupported_checkpoint",
                 path=str(self._model_path),
                 msg="Lightning checkpoint is not deployable; use model.pt or model.xml",
             )
-            self.status.mark_load_failed("unsupported_checkpoint")
+            self.status.mark_load_failed(error)
+            if strict_backend:
+                raise RuntimeError(error)
             return False
+
+        if self._inference_backend in {"torch-cuda", "torch-cpu"} and suffix != ".pt":
+            error = f"{self._inference_backend} requires model.pt, got {suffix or '<none>'}"
+            logger.error(
+                "anomaly.backend_artifact_mismatch",
+                backend=self._inference_backend,
+                path=str(self._model_path),
+                error=error,
+            )
+            self.status.mark_load_failed(error)
+            raise RuntimeError(error)
+
+        if self._inference_backend == "openvino" and suffix != ".xml":
+            error = f"openvino requires model.xml, got {suffix or '<none>'}"
+            logger.error(
+                "anomaly.backend_artifact_mismatch",
+                backend=self._inference_backend,
+                path=str(self._model_path),
+                error=error,
+            )
+            self.status.mark_load_failed(error)
+            raise RuntimeError(error)
 
         # Detect CUDA availability once
         _cuda_available = False
@@ -210,6 +277,43 @@ class AnomalibDetector:
             _cuda_available = torch.cuda.is_available()
         except ImportError:
             pass
+
+        if self._inference_backend == "torch-cuda":
+            if not _cuda_available:
+                error = "torch-cuda requested but torch.cuda.is_available() is false"
+                self.status.mark_load_failed(error)
+                raise RuntimeError(error)
+            if self._try_load_torch(device="cuda"):
+                return True
+            error = self.status.last_error or "torch-cuda load failed"
+            raise RuntimeError(error)
+
+        if self._inference_backend == "torch-cpu":
+            if self._try_load_torch(device="cpu"):
+                return True
+            error = self.status.last_error or "torch-cpu load failed"
+            raise RuntimeError(error)
+
+        if self._inference_backend == "openvino":
+            try:
+                from anomalib.deploy import OpenVINOInferencer
+                self._engine = OpenVINOInferencer(path=self._model_path)
+                self._loaded = True
+                self._sync_image_size_from_model(self._model_path)
+                self._check_minmax_normalization()
+                logger.info("anomaly.model_loaded_openvino", path=str(self._model_path))
+                self._load_calibration()
+                self.status.mark_loaded(
+                    backend="openvino",
+                    model_path=str(self._model_path),
+                    image_size=self.image_size,
+                )
+                return True
+            except Exception as e:
+                error = f"openvino: {e}"
+                logger.warning("anomaly.openvino_failed", error=str(e))
+                self.status.mark_load_failed(error)
+                raise RuntimeError(error) from e
 
         # When CUDA is available, prefer Torch+CUDA over OpenVINO (which
         # defaults to CPU).  This avoids the 10-40x slowdown observed when
@@ -275,16 +379,62 @@ class AnomalibDetector:
             return True
         except Exception as e:
             logger.warning("anomaly.torch_load_failed", device=device, error=str(e))
+            self.status.mark_load_failed(f"torch-{device}: {e}")
             return False
+
+    def _load_inferencer_for_backend(self, model_path: Path):
+        """Load an inferencer for the configured backend policy."""
+        suffix = model_path.suffix.lower()
+        # Detectors restored from state created before backend policies were
+        # introduced may not carry this attribute.  Preserve the historical
+        # auto-selection behaviour for those instances.
+        backend_policy = getattr(self, "_inference_backend", "auto")
+        if backend_policy == "openvino":
+            if suffix != ".xml":
+                raise ValueError(f"openvino requires model.xml, got {suffix or '<none>'}")
+            from anomalib.deploy import OpenVINOInferencer
+
+            return OpenVINOInferencer(path=model_path), "openvino"
+
+        if backend_policy in {"torch-cuda", "torch-cpu"}:
+            if suffix != ".pt":
+                raise ValueError(
+                    f"{backend_policy} requires model.pt, got {suffix or '<none>'}"
+                )
+            if backend_policy == "torch-cuda":
+                import torch
+
+                if not torch.cuda.is_available():
+                    raise RuntimeError("torch-cuda requested but torch.cuda.is_available() is false")
+                device = "cuda"
+            else:
+                device = "cpu"
+            import os
+
+            os.environ.setdefault("TRUST_REMOTE_CODE", "1")
+            from anomalib.deploy import TorchInferencer
+
+            return TorchInferencer(path=model_path, device=device), f"torch-{device}"
+
+        try:
+            from anomalib.deploy import OpenVINOInferencer
+
+            return OpenVINOInferencer(path=model_path), "openvino"
+        except Exception:
+            from anomalib.deploy import TorchInferencer
+
+            return TorchInferencer(path=model_path), "torch"
 
     def _check_minmax_normalization(self) -> None:
         """Detect broken PostProcessor MinMax normalization.
 
-        When a model is exported without fitting the PostProcessor (e.g.
-        min=inf, max=-inf), all scores are normalized to 1.0 regardless
-        of input. We detect this at load time and flag it so predict()
-        can fall back to raw scores with sigmoid normalization.
+        Anomalib persists the fitted values in ``image_min/image_max`` and
+        ``pixel_min/pixel_max``.  Its metric objects are reset after validation,
+        so inspecting metric ``min/max`` (the previous implementation) falsely
+        classified correctly exported Torch models as broken.
         """
+        self._minmax_broken = False
+        self._model_output_space_hint = "anomalib_postprocessed"
         try:
             model = getattr(self._engine, "model", None)
             if model is None:
@@ -292,22 +442,37 @@ class AnomalibDetector:
             pp = getattr(model, "post_processor", None)
             if pp is None:
                 return
-            img_mm = getattr(pp, "_image_min_max_metric", None)
-            if img_mm is None:
+            if getattr(pp, "enable_normalization", True) is False:
+                self._model_output_space_hint = "anomalib_unscaled"
                 return
-            mm_min = getattr(img_mm, "min", None)
-            mm_max = getattr(img_mm, "max", None)
-            if mm_min is None or mm_max is None:
+
+            persisted: dict[str, tuple[float, float]] = {}
+            for level in ("image", "pixel"):
+                min_value = getattr(pp, f"{level}_min", None)
+                max_value = getattr(pp, f"{level}_max", None)
+                if min_value is None or max_value is None:
+                    continue
+                persisted[level] = (float(min_value), float(max_value))
+            if not persisted:
+                # OpenVINO and older exported wrappers may not expose the Python
+                # post-processor object.  Their graph output remains one stable
+                # inferencer space and will be calibrated by an exact binding ID.
                 return
-            import math
-            min_val = float(mm_min)
-            max_val = float(mm_max)
-            if math.isinf(min_val) or math.isinf(max_val) or min_val >= max_val:
+
+            invalid = {
+                level: (minimum, maximum)
+                for level, (minimum, maximum) in persisted.items()
+                if (
+                    not np.isfinite(minimum)
+                    or not np.isfinite(maximum)
+                    or minimum >= maximum
+                )
+            }
+            if invalid:
                 self._minmax_broken = True
                 logger.warning(
                     "anomaly.minmax_not_fit",
-                    min=min_val,
-                    max=max_val,
+                    invalid=invalid,
                     msg="PostProcessor MinMax not fit — using raw score with sigmoid normalization",
                 )
         except Exception:
@@ -338,6 +503,7 @@ class AnomalibDetector:
             resized = cv2.resize(frame, self.image_size)
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             inp = torch.from_numpy(rgb.transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
+            inp = _move_tensor_to_module(inp, inner)
             with torch.no_grad():
                 out = inner(inp)
             raw = float(out.pred_score.squeeze().item())
@@ -377,22 +543,36 @@ class AnomalibDetector:
     def _load_calibration(self) -> None:
         """Load conformal calibration data from calibration.json near the model.
 
-        Searches for calibration.json in the model file's directory and up to
-        3 parent directories (covers model files nested in subdirectories).
+        Versioned artifacts cannot inherit calibration from outside their own
+        export run. Legacy artifacts retain the original four-level search.
         """
-        if not self._enable_calibration or self._model_path is None:
+        self._calibration_scores = None
+        self._calibration_n = 0
+        if not getattr(self, "_enable_calibration", True) or self._model_path is None:
             return
 
+        from argus.anomaly.artifacts import runtime_calibration_scope
+
+        try:
+            scope = runtime_calibration_scope(self._model_path)
+        except Exception as exc:
+            # Invalid manifest boundaries cannot degrade to legacy ancestor
+            # lookup or a nominally loaded, uncalibrated model.
+            self._loaded = False
+            self._engine = None
+            raise RuntimeError("Runtime calibration manifest is invalid") from exc
         try:
             from argus.alerts.calibration import ConformalCalibrator
 
-            # Search model dir and parents for calibration.json
-            search_dir = self._model_path.parent
-            for _ in range(4):  # current dir + 3 parents
-                cal_path = search_dir / "calibration.json"
+            for _label, cal_path in scope.candidates:
                 if cal_path.exists():
                     scores = ConformalCalibrator.load_sorted_scores(cal_path)
-                    if scores is not None and len(scores) > 0:
+                    valid = (
+                        scores is not None and np.ndim(scores) == 1 and len(scores) > 0
+                        and bool(np.isfinite(scores).all())
+                        and bool((np.diff(scores) >= 0).all())
+                    )
+                    if valid:
                         self._calibration_scores = scores
                         self._calibration_n = len(scores)
                         logger.info(
@@ -401,17 +581,35 @@ class AnomalibDetector:
                             n_samples=self._calibration_n,
                         )
                     else:
+                        if scope.manifest is not None:
+                            raise ValueError("Manifest calibration has no valid sorted finite scores")
                         logger.info(
                             "anomaly.calibration_no_scores",
                             path=str(cal_path),
                             msg="calibration.json found but no sorted_scores, skipping p-value calibration",
                         )
                     return
-                search_dir = search_dir.parent
 
+            if scope.calibration_required:
+                raise ValueError("Manifest requires a missing calibration.json")
             logger.debug("anomaly.no_calibration", msg="No calibration.json found near model")
         except Exception as e:
             logger.warning("anomaly.calibration_load_failed", error=str(e))
+            if scope.manifest is not None:
+                self._loaded = False
+                self._engine = None
+                self._calibration_scores = None
+                self._calibration_n = 0
+                raise RuntimeError("Versioned model calibration could not be loaded") from e
+
+    def _prepare_calibration_for_path(self, model_path: Path) -> tuple[np.ndarray | None, int]:
+        """Validate candidate sidecars without changing any live runtime state."""
+        from copy import copy
+
+        candidate = copy(self)
+        candidate._model_path = model_path
+        candidate._load_calibration()
+        return candidate._calibration_scores, candidate._calibration_n
 
     def _apply_calibration(self, raw_score: float) -> float:
         """Convert a raw anomaly score to a calibrated p-value.
@@ -504,6 +702,10 @@ class AnomalibDetector:
                     model = engine.model
                     inner = getattr(model, "model", model)
                     inp = torch.from_numpy(rgb.transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
+                    pre_processor = getattr(model, "pre_processor", None)
+                    if callable(pre_processor):
+                        inp = pre_processor(inp)
+                    inp = _move_tensor_to_module(inp, inner)
                     with torch.no_grad():
                         raw_out = inner(inp)
                     raw_val = float(raw_out.pred_score.squeeze().item())
@@ -512,6 +714,11 @@ class AnomalibDetector:
                     anomaly_score = self._normalize_raw_score(raw_val)
                     # Use anomaly_map from inner output if available
                     prediction = raw_out
+                    model_score = raw_val
+                    model_output_space = "anomalib_inner_raw"
+                    # A raw inner-model output is not calibrated merely because
+                    # Argus can map its image score through a sigmoid fallback.
+                    model_output_comparable = False
                 else:
                     prediction = engine.predict(rgb)
 
@@ -529,6 +736,9 @@ class AnomalibDetector:
                             msg="Model returned NaN/Inf score, treating as normal",
                         )
                         return self._safe_result()
+                    model_score = anomaly_score
+                    model_output_space = self._model_output_space_hint
+                    model_output_comparable = True
 
                 # Clamp to valid range
                 anomaly_score = max(0.0, min(anomaly_score, 1.0))
@@ -540,15 +750,20 @@ class AnomalibDetector:
                     anomaly_score = self._apply_calibration(anomaly_score)
 
                 anomaly_map = None
+                model_anomaly_map = None
                 if prediction.anomaly_map is not None:
                     amap = prediction.anomaly_map.squeeze()
                     # Convert Tensor to numpy if needed
                     if hasattr(amap, "detach"):
                         amap = amap.detach().cpu().numpy()
                     anomaly_map = np.asarray(amap, dtype=np.float32)
+                    # Preserve the inferencer's output before Argus applies its
+                    # legacy, per-frame min/max visualization normalization.
+                    model_anomaly_map = anomaly_map.copy()
                     # Replace NaN/Inf in heatmap
                     if not np.all(np.isfinite(anomaly_map)):
                         logger.warning("anomaly.nan_heatmap", msg="Heatmap contains NaN/Inf")
+                        model_output_comparable = False
                         anomaly_map = np.nan_to_num(
                             anomaly_map, nan=0.0, posinf=1.0, neginf=0.0,
                         )
@@ -566,6 +781,10 @@ class AnomalibDetector:
                     is_anomalous=anomaly_score >= self.threshold,
                     threshold=self.threshold,
                     raw_score=raw_score_out,
+                    model_score=model_score,
+                    model_anomaly_map=model_anomaly_map,
+                    model_output_space=model_output_space,
+                    model_output_comparable=model_output_comparable,
                 )
         except Exception as e:
             # Rate-limit: a silent regression (e.g. the Dinomaly2 dynamic-shape
@@ -934,14 +1153,9 @@ class AnomalibDetector:
             if new_model_path.suffix.lower() == ".ckpt":
                 raise ValueError("Lightning checkpoint is not deployable; use model.pt or model.xml")
 
-            # Try OpenVINO first
-            try:
-                from anomalib.deploy import OpenVINOInferencer
-                new_engine = OpenVINOInferencer(path=new_model_path)
-            except (ImportError, Exception):
-                from anomalib.deploy import TorchInferencer
-                new_engine = TorchInferencer(path=new_model_path)
+            new_engine, backend = self._load_inferencer_for_backend(new_model_path)
             new_image_size = self._infer_model_image_size(new_model_path) or self.image_size
+            new_calibration, new_calibration_n = self._prepare_calibration_for_path(new_model_path)
 
             # Atomic swap
             with self._reload_lock:
@@ -950,14 +1164,19 @@ class AnomalibDetector:
                 self.image_size = new_image_size
                 self.status.image_size = new_image_size
                 self._loaded = True
+                self._check_minmax_normalization()
+                self.status.mark_loaded(
+                    backend=backend,
+                    model_path=str(new_model_path),
+                    image_size=new_image_size,
+                )
 
                 # Reload calibration data for the new model while inference is
                 # paused so engine, image size, and calibration switch together.
-                self._calibration_scores = None
-                self._calibration_n = 0
-                self._load_calibration()
+                self._calibration_scores = new_calibration
+                self._calibration_n = new_calibration_n
 
-            logger.info("anomaly.hot_reload_success", path=str(new_model_path))
+            logger.info("anomaly.hot_reload_success", path=str(new_model_path), backend=backend)
             return True
 
         except Exception as e:
@@ -994,7 +1213,12 @@ class AnomalibDetector:
 
         try:
             if expected_hash:
-                actual_hash = ModelRegistry._compute_dir_hash(new_model_path)
+                if new_model_path.is_file() and new_model_path.suffix.lower() in {".pt", ".pth", ".xml", ".bin", ".onnx"}:
+                    from argus.preprocessing.scene_profile import runtime_artifact_sha256
+
+                    actual_hash = runtime_artifact_sha256(new_model_path)[:16]
+                else:
+                    actual_hash = ModelRegistry._compute_dir_hash(new_model_path)
                 if actual_hash != expected_hash:
                     result["error"] = (
                         f"SHA256 mismatch: expected {expected_hash}, got {actual_hash}"
@@ -1006,12 +1230,8 @@ class AnomalibDetector:
                 result["sha256_verified"] = True
 
             # Step 2: Load new model
-            try:
-                from anomalib.deploy import OpenVINOInferencer
-                new_engine = OpenVINOInferencer(path=new_model_path)
-            except Exception:
-                from anomalib.deploy import TorchInferencer
-                new_engine = TorchInferencer(path=new_model_path)
+            new_engine, backend = self._load_inferencer_for_backend(new_model_path)
+            new_calibration, new_calibration_n = self._prepare_calibration_for_path(new_model_path)
 
             # Warmup with baseline frames
             if warmup_frames is None and baseline_dir and baseline_dir.is_dir():
@@ -1053,10 +1273,22 @@ class AnomalibDetector:
                 self._engine = new_engine
                 self._model_path = new_model_path
                 self._loaded = True
+                self._check_minmax_normalization()
 
-                self._calibration_scores = None
-                self._calibration_n = 0
-                self._load_calibration()
+                self._calibration_scores = new_calibration
+                self._calibration_n = new_calibration_n
+                # Legacy/restored detector instances can predate ModelStatus
+                # and image-size tracking.  Model activation must still work;
+                # only the optional status telemetry is skipped in that case.
+                image_size = getattr(self, "image_size", (256, 256))
+                self.image_size = image_size
+                status = getattr(self, "status", None)
+                if status is not None:
+                    status.mark_loaded(
+                        backend=backend,
+                        model_path=str(new_model_path),
+                        image_size=image_size,
+                    )
 
             result["success"] = True
             logger.info("anomaly.warmup_reload_success", path=str(new_model_path))
@@ -1247,11 +1479,34 @@ class MultiScaleDetector:
             pyramid=self._pyramid_mode,
         )
 
-        return AnomalyResult(
+        # Model-scale evidence must never be assembled from incompatible
+        # output domains.  Anchor it to the result that supplied the winning
+        # legacy score and ignore tiles from any other/non-comparable space.
+        merged_model_map = None
+        model_output_comparable = False
+        if best_result.model_output_comparable and best_result.model_output_space:
+            merged_model_map = self._merge_model_heatmaps(
+                h,
+                w,
+                all_tile_results,
+                global_result,
+                output_space=best_result.model_output_space,
+            )
+            model_output_comparable = merged_model_map is not None
+
+        any_detection_failed = global_result.detection_failed or any(
+            result.detection_failed for _tile, result in all_tile_results
+        )
+
+        return replace(
+            best_result,
             anomaly_score=best_score,
             anomaly_map=merged_map,
             is_anomalous=best_score >= self.threshold,
             threshold=self.threshold,
+            detection_failed=any_detection_failed,
+            model_anomaly_map=merged_model_map,
+            model_output_comparable=model_output_comparable,
         )
 
     def _generate_tiles(
@@ -1347,6 +1602,67 @@ class MultiScaleDetector:
             merged = self._nms_suppress(merged)
 
         return merged
+
+    def _merge_model_heatmaps(
+        self,
+        frame_h: int,
+        frame_w: int,
+        tile_results: list[tuple[_TileInfo, AnomalyResult]],
+        global_result: AnomalyResult,
+        *,
+        output_space: str,
+    ) -> np.ndarray | None:
+        """Merge only comparable model maps from one stable output space.
+
+        Unlike the legacy visualization heatmap, this map deliberately skips
+        score-threshold NMS: its numeric values must remain in the inferencer's
+        calibration domain for downstream cross-frame evidence.
+        """
+        merged = np.zeros((frame_h, frame_w), dtype=np.float32)
+        has_valid_map = False
+
+        def _accepted(result: AnomalyResult) -> bool:
+            return (
+                not result.detection_failed
+                and result.model_output_comparable
+                and result.model_output_space == output_space
+                and result.model_anomaly_map is not None
+                and np.all(np.isfinite(result.model_anomaly_map))
+            )
+
+        # A zero-filled hole is not a low model score.  Requiring complete
+        # coverage prevents failed/incompatible tiles from manufacturing a high
+        # ROI-vs-context delta in downstream candidate evidence.
+        all_results = [result for _tile, result in tile_results]
+        all_results.append(global_result)
+        if not all(_accepted(result) for result in all_results):
+            return None
+
+        for tile_info, result in tile_results:
+            if not _accepted(result):
+                continue
+            has_valid_map = True
+            tile_map = cv2.resize(
+                result.model_anomaly_map.astype(np.float32),
+                (tile_info.w, tile_info.h),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            region = merged[
+                tile_info.y : tile_info.y + tile_info.h,
+                tile_info.x : tile_info.x + tile_info.w,
+            ]
+            np.maximum(region, tile_map, out=region)
+
+        if _accepted(global_result):
+            has_valid_map = True
+            global_map = cv2.resize(
+                global_result.model_anomaly_map.astype(np.float32),
+                (frame_w, frame_h),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            np.maximum(merged, global_map, out=merged)
+
+        return merged if has_valid_map else None
 
     def _nms_suppress(
         self, heatmap: np.ndarray, iou_threshold: float = 0.5

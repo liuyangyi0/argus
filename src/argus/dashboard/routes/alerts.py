@@ -15,18 +15,26 @@ import structlog
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
+from argus.dashboard.api_contracts import (
+    AlertBulkMutationResponse,
+    AlertIdListRequest,
+    AlertMutationResponse,
+    AlertWorkflowTransitionRequest,
+    AlertWorkflowTransitionResponse,
+)
 from argus.dashboard.api_response import (
+    ApiEnvelope,
     ErrorCode,
     api_error,
     api_forbidden,
     api_internal_error,
     api_not_found,
     api_success,
+    api_typed_success,
     api_unavailable,
     api_validation_error,
 )
 from argus.dashboard.auth import current_username, require_permission, require_role
-from argus.dashboard.forms import parse_request_form
 
 if TYPE_CHECKING:
     from argus.storage.alert_recording import AlertRecordingStore
@@ -37,6 +45,8 @@ router = APIRouter()
 
 # Database/CSV-friendly timestamp format used in exports and audit fields.
 _TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S"
+_CANDIDATE_EVIDENCE_LIMIT = 6
+_CANDIDATE_TRIGGER_WINDOW = 2
 
 
 def _cleanup_alert_images(
@@ -85,34 +95,244 @@ def _get_recording_state(
     db,
     recording_store: AlertRecordingStore | None,
     alert_id: str,
-) -> tuple[bool, str | None]:
+) -> dict:
     """Resolve whether an alert has replay evidence and its current status."""
-    has_recording = False
+    has_db_record = False
     recording_status: str | None = None
+    replay_ready = False
+    unavailable_reason: str | None = None
 
     if hasattr(db, "get_alert_recording"):
         try:
             record = db.get_alert_recording(alert_id)
             if record is not None:
-                has_recording = True
+                has_db_record = True
                 recording_status = record.status
         except Exception:
             logger.debug("alerts.recording_db_lookup_failed", alert_id=alert_id, exc_info=True)
 
     if recording_store is not None:
         try:
-            metadata = recording_store.load_metadata(alert_id)
-            if metadata is not None:
-                has_recording = True
-                recording_status = metadata.get("status") or recording_status
-            elif recording_store.has_recording(alert_id):
-                has_recording = True
+            availability = recording_store.get_availability(alert_id)
+            if availability.replay_ready:
+                replay_ready = True
+                recording_status = availability.status or recording_status or "complete"
+            elif availability.unavailable_reason != "missing_directory":
+                recording_status = availability.status or recording_status or "incomplete"
+                unavailable_reason = availability.unavailable_reason
+            elif has_db_record:
+                unavailable_reason = "missing_directory"
         except Exception:
             logger.debug("alerts.recording_store_lookup_failed", alert_id=alert_id, exc_info=True)
+            if has_db_record:
+                unavailable_reason = "recording_store_error"
+    elif has_db_record:
+        # Unit-test and legacy deployments can expose recording DB rows without
+        # wiring a disk store. Preserve that old contract, but new runtime paths
+        # should always validate artifacts through AlertRecordingStore.
+        replay_ready = True
 
-    if has_recording and recording_status is None:
+    has_recording = replay_ready
+    if replay_ready and recording_status is None:
         recording_status = "complete"
-    return has_recording, recording_status
+    if not replay_ready and recording_status is None and has_db_record:
+        recording_status = "incomplete"
+    return {
+        "has_recording": has_recording,
+        "replay_ready": replay_ready,
+        "recording_status": recording_status,
+        "recording_unavailable_reason": unavailable_reason,
+    }
+
+
+def _safe_int(value) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _candidate_events_from_signals(signals: dict) -> list[dict]:
+    """Return flattened candidate events from current or older replay signals."""
+    raw_events = signals.get("candidate_events")
+    if isinstance(raw_events, list):
+        events = [item for item in raw_events if isinstance(item, dict)]
+        if events or "candidate_records" not in signals:
+            return events
+
+    events: list[dict] = []
+    frame_records = signals.get("candidate_records")
+    if not isinstance(frame_records, list):
+        return events
+
+    timestamps = signals.get("timestamps")
+    frame_numbers = signals.get("frame_numbers")
+    for frame_index, records in enumerate(frame_records):
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            event = dict(record)
+            event.setdefault("frame_index", frame_index)
+            if isinstance(frame_numbers, list) and frame_index < len(frame_numbers):
+                event.setdefault("frame_number", frame_numbers[frame_index])
+            else:
+                event.setdefault("frame_number", frame_index)
+            if isinstance(timestamps, list) and frame_index < len(timestamps):
+                event.setdefault("timestamp", timestamps[frame_index])
+            events.append(event)
+    return events
+
+
+def _event_score(event: dict) -> float | None:
+    evidence = event.get("evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    for key in ("score", "anomaly_score", "max_score", "confidence"):
+        score = _safe_float(evidence.get(key))
+        if score is not None:
+            return score
+
+    persistent = evidence.get("persistent_change")
+    if isinstance(persistent, dict):
+        score = _safe_float(persistent.get("score"))
+        if score is not None:
+            return score
+    return None
+
+
+def _compact_candidate_event(event: dict) -> dict:
+    """Keep alert-detail candidate evidence small and operator-readable."""
+    evidence = event.get("evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    frame_index = _safe_int(event.get("frame_index"))
+    frame_number = _safe_int(event.get("frame_number"))
+    compact = {
+        "candidate_id": event.get("candidate_id"),
+        "candidate_type": event.get("candidate_type"),
+        "decision": event.get("decision"),
+        "stage": event.get("stage"),
+        "suppression_reason": event.get("suppression_reason"),
+        "frame_index": frame_index,
+        "frame_number": frame_number,
+        "timestamp": _safe_float(event.get("timestamp")),
+        "score": _event_score(event),
+    }
+
+    compact_evidence = {}
+    for key in (
+        "ready",
+        "has_detection",
+        "changed_fraction",
+        "candidate_count",
+        "active_track_count",
+        "warmup_remaining",
+        "suppression_reason",
+        "low_light",
+        "brightness_jump",
+        "exposure_recovering",
+    ):
+        if key in evidence:
+            compact_evidence[key] = evidence[key]
+
+    persistent = evidence.get("persistent_change")
+    if isinstance(persistent, dict):
+        compact_evidence["persistent_change"] = {
+            key: persistent[key]
+            for key in (
+                "score",
+                "changed_fraction",
+                "candidate_count",
+                "active_track_count",
+                "suppression_reason",
+            )
+            if key in persistent
+        }
+        candidates = persistent.get("candidates")
+    else:
+        candidates = evidence.get("candidates")
+
+    if isinstance(candidates, list) and candidates:
+        compact_evidence["candidates"] = candidates[:3]
+
+    if compact_evidence:
+        compact["evidence"] = compact_evidence
+    return compact
+
+
+def _candidate_event_distance(event: dict, trigger_frame_index: int) -> int:
+    frame_index = _safe_int(event.get("frame_index"))
+    if frame_index is None:
+        frame_index = _safe_int(event.get("frame_number"))
+    if frame_index is None:
+        return 1_000_000
+    return abs(frame_index - trigger_frame_index)
+
+
+def _get_candidate_evidence_summary(
+    recording_store: AlertRecordingStore | None,
+    alert_id: str,
+) -> dict | None:
+    """Load a bounded candidate-evidence summary for the alert detail drawer."""
+    if recording_store is None:
+        return None
+    try:
+        metadata = recording_store.load_metadata(alert_id) or {}
+        signals = recording_store.load_signals(alert_id)
+    except Exception:
+        logger.debug(
+            "alerts.candidate_evidence_lookup_failed",
+            alert_id=alert_id,
+            exc_info=True,
+        )
+        return None
+
+    if not isinstance(signals, dict):
+        return None
+
+    events = _candidate_events_from_signals(signals)
+    if not events:
+        return {
+            "event_count": 0,
+            "events": [],
+            "trigger_frame_index": _safe_int(metadata.get("trigger_frame_index")),
+            "trigger_window": _CANDIDATE_TRIGGER_WINDOW,
+        }
+
+    trigger_frame_index = _safe_int(metadata.get("trigger_frame_index"))
+    if trigger_frame_index is not None:
+        near_trigger = [
+            event
+            for event in events
+            if _candidate_event_distance(event, trigger_frame_index)
+            <= _CANDIDATE_TRIGGER_WINDOW
+        ]
+        selected = near_trigger or sorted(
+            events,
+            key=lambda event: _candidate_event_distance(event, trigger_frame_index),
+        )
+    else:
+        selected = events
+
+    selected = selected[:_CANDIDATE_EVIDENCE_LIMIT]
+    return {
+        "event_count": len(events),
+        "events": [_compact_candidate_event(event) for event in selected],
+        "trigger_frame_index": trigger_frame_index,
+        "trigger_window": _CANDIDATE_TRIGGER_WINDOW,
+        "truncated": len(events) > len(selected),
+    }
 
 
 @router.get("/{alert_id}/detail")
@@ -129,7 +349,7 @@ async def alert_detail(request: Request, alert_id: str):
     recording_store: AlertRecordingStore | None = getattr(
         request.app.state, "recording_store", None,
     )
-    has_recording, rec_status = _get_recording_state(db, recording_store, alert_id)
+    recording_state = _get_recording_state(db, recording_store, alert_id)
 
     data = {
         "alert_id": alert.alert_id,
@@ -138,14 +358,25 @@ async def alert_detail(request: Request, alert_id: str):
         "zone_id": getattr(alert, "zone_id", ""),
         "severity": alert.severity,
         "anomaly_score": alert.anomaly_score,
+        "detection_type": getattr(alert, "detection_type", None),
+        "evidence_summary": getattr(alert, "evidence_summary", None),
+        "evidence_json": getattr(alert, "to_dict", lambda: {})().get("evidence_json"),
+        "suppression_reason": getattr(alert, "suppression_reason", None),
         "acknowledged": alert.acknowledged,
         "false_positive": alert.false_positive,
-        "has_recording": has_recording,
-        "recording_status": rec_status,
+        "has_recording": recording_state["has_recording"],
+        "replay_ready": recording_state["replay_ready"],
+        "recording_status": recording_state["recording_status"],
+        "recording_unavailable_reason": recording_state["recording_unavailable_reason"],
         "workflow_status": getattr(alert, "workflow_status", "new"),
         "notes": getattr(alert, "notes", ""),
         "classification_label": getattr(alert, "classification_label", None),
         "classification_confidence": getattr(alert, "classification_confidence", None),
+        "model_version_id": getattr(alert, "model_version_id", None),
+        "category": getattr(alert, "category", None),
+        "severity_adjusted_by_classifier": getattr(
+            alert, "severity_adjusted_by_classifier", None,
+        ),
         "corroborated": getattr(alert, "corroborated", None),
         "correlation_partner": getattr(alert, "correlation_partner", None),
         "segmentation_count": getattr(alert, "segmentation_count", None),
@@ -157,6 +388,10 @@ async def alert_detail(request: Request, alert_id: str):
         "speed_ms": getattr(alert, "speed_ms", None),
         "assigned_to": getattr(alert, "assigned_to", None),
         "resolved_at": getattr(alert, "resolved_at", None),
+        "candidate_evidence": _get_candidate_evidence_summary(
+            recording_store,
+            alert_id,
+        ),
     }
 
     return api_success(data)
@@ -216,20 +451,26 @@ def export_evidence_package(request: Request, alert_id: str):
                 manifest["files"].append("images/composite.jpg")
 
         if recording_store is not None:
-            metadata = recording_store.load_metadata(alert_id)
-            signals = recording_store.load_signals(alert_id)
-            video_path = recording_store.get_video_path(alert_id)
-            manifest["has_recording"] = video_path is not None and video_path.exists()
-            if metadata is not None:
-                _add_json(zf, "replay/metadata.json", metadata)
-            if signals is not None:
-                _add_json(zf, "replay/signals.json", signals)
-            if video_path is not None and video_path.exists():
-                target = f"replay/{video_path.name}"
-                zf.write(video_path, target)
-                manifest["files"].append(target)
+            availability = recording_store.get_availability(alert_id)
+            manifest["has_recording"] = availability.has_recording
+            manifest["replay_ready"] = availability.replay_ready
+            manifest["recording_status"] = availability.status
+            manifest["recording_unavailable_reason"] = availability.unavailable_reason
+            if availability.replay_ready:
+                metadata = recording_store.load_metadata(alert_id)
+                signals = recording_store.load_signals(alert_id)
+                video_path = availability.video_path
+                if metadata is not None:
+                    _add_json(zf, "replay/metadata.json", metadata)
+                if signals is not None:
+                    _add_json(zf, "replay/signals.json", signals)
+                if video_path is not None and video_path.exists():
+                    target = f"replay/{video_path.name}"
+                    zf.write(video_path, target)
+                    manifest["files"].append(target)
         else:
             manifest["has_recording"] = False
+            manifest["replay_ready"] = False
 
         zf.writestr(
             "manifest.json",
@@ -252,15 +493,15 @@ def export_evidence_package(request: Request, alert_id: str):
 def alert_image(request: Request, alert_id: str, image_type: str):
     """Serve alert snapshot, heatmap, or composite overlay image."""
     if image_type not in ("snapshot", "heatmap", "composite"):
-        return Response(status_code=400)
+        return api_validation_error("不支持的图片类型")
 
     db = request.app.state.db
     if not db:
-        return Response(status_code=503)
+        return api_unavailable("数据库不可用")
 
     alert = db.get_alert(alert_id)
     if alert is None:
-        return Response(status_code=404)
+        return api_not_found("告警不存在")
 
     alerts_dir = getattr(request.app.state, "alerts_dir", Path("data/alerts"))
 
@@ -270,22 +511,25 @@ def alert_image(request: Request, alert_id: str, image_type: str):
                 path = Path(alert.snapshot_path)
                 if path.exists():
                     return Response(content=path.read_bytes(), media_type="image/jpeg")
-            return Response(status_code=404)
-        if not _is_safe_path(alert.snapshot_path, alerts_dir) or not _is_safe_path(alert.heatmap_path, alerts_dir):
-            return Response(status_code=403)
+            return api_not_found("告警快照不存在")
+        if not _is_safe_path(alert.snapshot_path, alerts_dir) or not _is_safe_path(
+            alert.heatmap_path,
+            alerts_dir,
+        ):
+            return api_forbidden("证据文件路径无权访问")
         data = _generate_composite(alert.snapshot_path, alert.heatmap_path)
         if data is None:
-            return Response(status_code=404)
+            return api_not_found("合成证据图不存在")
         return Response(content=data, media_type="image/jpeg")
 
     path_str = alert.snapshot_path if image_type == "snapshot" else alert.heatmap_path
     if not path_str:
-        return Response(status_code=404)
+        return api_not_found("证据图片不存在")
     if not _is_safe_path(path_str, alerts_dir):
-        return Response(status_code=403)
+        return api_forbidden("证据文件路径无权访问")
     path = Path(path_str)
     if not path.exists():
-        return Response(status_code=404)
+        return api_not_found("证据图片不存在")
     return Response(content=path.read_bytes(), media_type="image/jpeg")
 
 
@@ -310,8 +554,15 @@ _FEEDBACK_CATEGORIES = [
 ]
 
 
-@router.post("/{alert_id}/workflow")
-async def alert_workflow_transition(request: Request, alert_id: str):
+@router.post(
+    "/{alert_id}/workflow",
+    response_model=ApiEnvelope[AlertWorkflowTransitionResponse],
+)
+async def alert_workflow_transition(
+    request: Request,
+    alert_id: str,
+    body: AlertWorkflowTransitionRequest,
+):
     """Transition alert workflow status with severity-based handling (UX v2 §5.1).
 
     Handling policy by severity:
@@ -331,32 +582,17 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     if not db:
         return api_unavailable("数据库不可用")
 
-    # Accept both JSON and form data
-    content_type = request.headers.get("content-type", "")
-    if "json" in content_type:
-        data = await request.json()
-    else:
-        form = await parse_request_form(request)
-        data = dict(form)
-
-    new_status = data.get("status", "")
-    notes = data.get("notes", "")
-    category = data.get("category", "")
-    assigned_to = data.get("assigned_to", "")
-    confirmed = data.get("confirmed", False)
-    from_detail_view = data.get("from_detail_view", False)
+    new_status = body.status
+    notes = body.notes
+    category = body.category
+    assigned_to = body.assigned_to
+    confirmed = body.confirmed
+    from_detail_view = body.from_detail_view
 
     if category and notes:
         notes = f"[{category}] {notes}"
     elif category:
         notes = f"[{category}]"
-
-    valid_statuses = {
-        "acknowledged", "confirmed_anomaly", "investigating", "resolved", "closed",
-        "false_positive", "uncertain",
-    }
-    if new_status not in valid_statuses:
-        return api_validation_error(f"无效状态: {new_status}")
 
     # Fetch alert to check severity
     alert = db.get_alert(alert_id)
@@ -406,24 +642,25 @@ async def alert_workflow_transition(request: Request, alert_id: str):
     }
     next_actions = _next_actions_map.get(new_status, [])
 
-    # Return JSON response for API consumers
-    if "json" in content_type:
-        return api_success({
+    return api_typed_success(
+        {
             "severity": severity,
             "handling_policy": handling_policy,
             "require_confirmation": severity == "medium",
             "require_detail_view": severity == "high",
             "next_actions": next_actions,
-        })
-
-    # Re-render the detail view for HTMX consumers
-    return await alert_detail(request, alert_id)
+        },
+        AlertWorkflowTransitionResponse,
+    )
 
 
 # ── Bulk operations ──
 
-@router.post("/bulk-acknowledge")
-async def bulk_acknowledge(request: Request):
+@router.post(
+    "/bulk-acknowledge",
+    response_model=ApiEnvelope[AlertBulkMutationResponse],
+)
+async def bulk_acknowledge(request: Request, body: AlertIdListRequest):
     """Bulk acknowledge alerts."""
     if not require_permission(request, "handle_alerts"):
         return api_forbidden("权限不足")
@@ -432,8 +669,7 @@ async def bulk_acknowledge(request: Request):
     if not db:
         return api_unavailable("数据库不可用")
 
-    data = await request.json()
-    alert_ids = data.get("alert_ids", [])
+    alert_ids = body.alert_ids
 
     acknowledged_by = current_username(request)
     count = 0
@@ -453,11 +689,17 @@ async def bulk_acknowledge(request: Request):
             ip_address=client_ip,
         )
 
-    return api_success({"count": count, "message": f"已确认 {count} 条告警"})
+    return api_typed_success(
+        {"count": count, "message": f"已确认 {count} 条告警"},
+        AlertBulkMutationResponse,
+    )
 
 
-@router.post("/bulk-false-positive")
-async def bulk_false_positive(request: Request):
+@router.post(
+    "/bulk-false-positive",
+    response_model=ApiEnvelope[AlertBulkMutationResponse],
+)
+async def bulk_false_positive(request: Request, body: AlertIdListRequest):
     """Bulk mark alerts as false positive."""
     if not require_permission(request, "handle_alerts"):
         return api_forbidden("权限不足")
@@ -466,8 +708,7 @@ async def bulk_false_positive(request: Request):
     if not db:
         return api_unavailable("数据库不可用")
 
-    data = await request.json()
-    alert_ids = data.get("alert_ids", [])
+    alert_ids = body.alert_ids
 
     count = 0
     for aid in alert_ids:
@@ -486,11 +727,17 @@ async def bulk_false_positive(request: Request):
             ip_address=client_ip,
         )
 
-    return api_success({"count": count, "message": f"已标记 {count} 条为误报"})
+    return api_typed_success(
+        {"count": count, "message": f"已标记 {count} 条为误报"},
+        AlertBulkMutationResponse,
+    )
 
 
-@router.post("/bulk-delete")
-async def bulk_delete(request: Request):
+@router.post(
+    "/bulk-delete",
+    response_model=ApiEnvelope[AlertBulkMutationResponse],
+)
+async def bulk_delete(request: Request, body: AlertIdListRequest):
     """Bulk delete alerts."""
     if not require_permission(request, "handle_alerts"):
         return api_forbidden("权限不足")
@@ -499,8 +746,7 @@ async def bulk_delete(request: Request):
     if not db:
         return api_unavailable("数据库不可用")
 
-    data = await request.json()
-    alert_ids = data.get("alert_ids", [])
+    alert_ids = body.alert_ids
 
     recording_store = getattr(request.app.state, "recording_store", None)
     count = 0
@@ -522,7 +768,10 @@ async def bulk_delete(request: Request):
             ip_address=client_ip,
         )
 
-    return api_success({"count": count, "message": f"已删除 {count} 条告警"})
+    return api_typed_success(
+        {"count": count, "message": f"已删除 {count} 条告警"},
+        AlertBulkMutationResponse,
+    )
 
 
 # ── Event Group ──
@@ -655,7 +904,10 @@ def export_pdf_report(
 
 # ── Single alert operations ──
 
-@router.post("/{alert_id}/acknowledge")
+@router.post(
+    "/{alert_id}/acknowledge",
+    response_model=ApiEnvelope[AlertMutationResponse],
+)
 def acknowledge_alert(request: Request, alert_id: str):
     """Acknowledge an alert."""
     if not require_permission(request, "handle_alerts"):
@@ -675,11 +927,17 @@ def acknowledge_alert(request: Request, alert_id: str):
                 target_id=alert_id,
                 ip_address=client_ip,
             )
-        return api_success({"alert_id": alert_id, "message": "已确认"})
+        return api_typed_success(
+            {"alert_id": alert_id, "message": "已确认"},
+            AlertMutationResponse,
+        )
     return api_not_found("告警不存在或操作失败")
 
 
-@router.post("/{alert_id}/confirm-anomaly")
+@router.post(
+    "/{alert_id}/confirm-anomaly",
+    response_model=ApiEnvelope[AlertMutationResponse],
+)
 def confirm_real_anomaly(request: Request, alert_id: str):
     """痛点 10: explicitly mark an alert as a real anomaly (FN feedback).
 
@@ -710,7 +968,10 @@ def confirm_real_anomaly(request: Request, alert_id: str):
         )
 
     _submit_workflow_feedback(request, alert_id, "confirmed_anomaly")
-    return api_success({"alert_id": alert_id, "message": "已确认真异常"})
+    return api_typed_success(
+        {"alert_id": alert_id, "message": "已确认真异常"},
+        AlertMutationResponse,
+    )
 
 
 @router.get("/feedback-stats")
@@ -736,7 +997,10 @@ def feedback_stats(request: Request, camera_id: str | None = None):
     })
 
 
-@router.post("/{alert_id}/false-positive")
+@router.post(
+    "/{alert_id}/false-positive",
+    response_model=ApiEnvelope[AlertMutationResponse],
+)
 def mark_false_positive(request: Request, alert_id: str):
     """Mark an alert as a false positive and submit to feedback queue.
 
@@ -765,11 +1029,17 @@ def mark_false_positive(request: Request, alert_id: str):
         # Submit to feedback queue (handles baseline copy + queue entry)
         _submit_workflow_feedback(request, alert_id, "false_positive")
 
-        return api_success({"alert_id": alert_id, "message": "已标记误报"})
+        return api_typed_success(
+            {"alert_id": alert_id, "message": "已标记误报"},
+            AlertMutationResponse,
+        )
     return api_not_found("告警不存在或操作失败")
 
 
-@router.delete("/{alert_id}")
+@router.delete(
+    "/{alert_id}",
+    response_model=ApiEnvelope[AlertMutationResponse],
+)
 def delete_alert(request: Request, alert_id: str):
     """Delete a single alert by ID."""
     if not require_permission(request, "handle_alerts"):
@@ -797,7 +1067,10 @@ def delete_alert(request: Request, alert_id: str):
             ip_address=client_ip,
         )
 
-    return api_success({"alert_id": alert_id, "message": "已删除"})
+    return api_typed_success(
+        {"alert_id": alert_id, "message": "已删除"},
+        AlertMutationResponse,
+    )
 
 
 def _submit_workflow_feedback(
@@ -982,18 +1255,15 @@ def alerts_json(
         offset=offset,
     )
 
-    # Batch-fetch recording status to avoid N+1 queries
-    recording_map: dict = {}
-    if hasattr(db, "get_alert_recordings_batch"):
-        alert_ids = [a.alert_id for a in alerts]
-        recording_map = db.get_alert_recordings_batch(alert_ids)
+    recording_store: AlertRecordingStore | None = getattr(
+        request.app.state, "recording_store", None,
+    )
 
     result = []
     for a in alerts:
         d = a.to_dict()
-        rec = recording_map.get(a.alert_id)
-        d["has_recording"] = rec is not None
-        d["recording_status"] = rec.status if rec else None
+        recording_state = _get_recording_state(db, recording_store, a.alert_id)
+        d.update(recording_state)
         result.append(d)
 
     total = db.get_alert_count(camera_id=camera_id, severity=severity)

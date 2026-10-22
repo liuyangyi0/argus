@@ -14,6 +14,7 @@ import {
   testCameraConnection,
   testCameraConnectionDraft,
 } from '../../api/cameras'
+import { ApiError } from '../../types/api'
 
 const routerPush = vi.hoisted(() => vi.fn())
 const antStubs = vi.hoisted(() => ({
@@ -64,7 +65,12 @@ const antStubs = vi.hoisted(() => ({
     template: `
       <table>
         <tbody>
-          <tr v-for="record in dataSource" :key="record.camera_id" class="camera-row">
+          <tr
+            v-for="record in dataSource"
+            :key="record.camera_id"
+            class="camera-row"
+            v-bind="customRow ? customRow(record) : {}"
+          >
             <td v-for="column in columns" :key="column.key" :data-col="column.key">
               <slot name="bodyCell" :column="column" :record="record" />
               <template v-if="column.dataIndex">{{ record[column.dataIndex] }}</template>
@@ -88,6 +94,16 @@ const antStubs = vi.hoisted(() => ({
     props: ['status'],
     template: '<span class="ant-badge" :data-status="status" />',
   },
+  result: {
+    props: ['status', 'title', 'subTitle'],
+    template: '<section :data-status="status"><h2>{{ title }}</h2><p>{{ subTitle }}</p><slot name="extra" /></section>',
+  },
+  popconfirm: {
+    emits: ['confirm'],
+    template: '<span><slot /></span>',
+  },
+  card: { template: '<div><slot /></div>' },
+  skeleton: { template: '<div data-test="skeleton" />' },
 }))
 let pinia: ReturnType<typeof createPinia>
 
@@ -120,11 +136,15 @@ vi.mock('../../api/cameras', () => ({
 vi.mock('ant-design-vue', () => ({
   Badge: antStubs.badge,
   Button: antStubs.button,
+  Card: antStubs.card,
   Form: antStubs.form,
   Input: antStubs.input,
   InputNumber: antStubs.inputNumber,
   Modal: antStubs.modal,
+  Popconfirm: antStubs.popconfirm,
+  Result: antStubs.result,
   Select: antStubs.select,
+  Skeleton: antStubs.skeleton,
   Space: antStubs.space,
   Table: antStubs.table,
   Typography: antStubs.typography,
@@ -139,6 +159,13 @@ vi.mock('@ant-design/icons-vue', () => ({
   DeleteOutlined: { template: '<span />' },
   EditOutlined: { template: '<span />' },
   PlusOutlined: { template: '<span />' },
+  CheckCircleOutlined: { template: '<span />' },
+  CloseCircleOutlined: { template: '<span />' },
+  ExclamationCircleOutlined: { template: '<span />' },
+  InfoCircleOutlined: { template: '<span />' },
+  LoadingOutlined: { template: '<span />' },
+  DatabaseOutlined: { template: '<span />' },
+  VideoCameraOutlined: { template: '<span />' },
 }))
 
 function formEntries(form: FormData): Record<string, string> {
@@ -386,5 +413,55 @@ describe('Cameras page add camera flow', () => {
     expect(wrapper.text()).not.toContain('新增摄像头')
     expect(wrapper.text()).toContain('启动')
     expect(wrapper.text()).toContain('详情')
+    const row = wrapper.get('tr.camera-row')
+    expect(row.attributes('role')).toBe('link')
+    expect(row.attributes('tabindex')).toBe('0')
+    await row.trigger('keydown', { key: 'Enter' })
+    expect(routerPush).toHaveBeenCalledWith('/cameras/cam_01')
+  })
+
+  it('renders a request failure instead of the camera empty state', async () => {
+    vi.mocked(getCameras).mockRejectedValue(new Error('camera registry unavailable'))
+
+    const wrapper = mount(Cameras, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          ConnectionTestResult: true,
+          HealthBadge: true,
+          ModeBadge: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('数据加载失败')
+    expect(wrapper.text()).toContain('camera registry unavailable')
+    expect(wrapper.text()).not.toContain('尚未配置摄像头')
+  })
+
+  it('renders camera access denial as a permission state', async () => {
+    vi.mocked(getCameras).mockRejectedValue(new ApiError({
+      httpStatus: 403,
+      businessCode: 40300,
+      message: 'camera access denied',
+    }))
+
+    const wrapper = mount(Cameras, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          ConnectionTestResult: true,
+          HealthBadge: true,
+          ModeBadge: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('无权访问')
+    expect(wrapper.text()).not.toContain('数据加载失败')
+    expect(wrapper.text()).not.toContain('刷新失败，当前显示上次成功获取的数据')
+    expect(wrapper.text()).not.toContain('尚未配置摄像头')
   })
 })

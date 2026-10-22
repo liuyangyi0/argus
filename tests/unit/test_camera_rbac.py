@@ -21,6 +21,12 @@ class _CameraManager:
         self.added.append(camera.camera_id)
         self._cameras.append(camera)
 
+    def get_camera_config(self, camera_id: str) -> CameraConfig | None:
+        return next(
+            (camera for camera in self._cameras if camera.camera_id == camera_id),
+            None,
+        )
+
     def remove_camera_config(self, camera_id: str) -> None:
         self.removed.append(camera_id)
         self._cameras = [camera for camera in self._cameras if camera.camera_id != camera_id]

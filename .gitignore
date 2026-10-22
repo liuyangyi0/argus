@@ -20,9 +20,25 @@ data/recordings/
 data/backups/
 data/backbones/
 data/model_packages/
+data/review/
 data/argus.db*
 
 data/.watchdog
+data/*.png
+data/*.jpg
+data/*.jpeg
+data/*.bmp
+data/*.avi
+data/*.mp4
+data/*.patch
+data/regression/clips/
+data/regression/generated_annotations/
+data/regression/reports/
+data/regression/review/
+data/regression/**/*.avi
+data/regression/**/*.mp4
+data/regression/**/*.mov
+data/regression/**/*.mkv
 
 # Local model assets
 pre_trained/
@@ -37,6 +53,7 @@ pre_trained/
 *.p12
 *.pfx
 .venv/
+.venv-review/
 venv/
 
 web/package-lock.json
@@ -66,3 +83,4 @@ openvino_cache/
 
 # Debug residue
 *.errors.txt
+ssh-tunnel-*.log

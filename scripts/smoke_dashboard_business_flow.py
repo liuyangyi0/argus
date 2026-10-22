@@ -187,6 +187,74 @@ def _api_data(response: httpx.Response, *, label: str) -> Any:
     return payload.get("data")
 
 
+def _wait_release_applied(client, submitted: dict, *, timeout_s: float) -> dict:
+    """Wait for the durable operation, not the HTTP 202 acceptance snapshot."""
+    operation_id = submitted.get("operation_id") or (
+        submitted.get("operation") or {}
+    ).get("operation_id")
+    if not operation_id:
+        raise DashboardBusinessSmokeFailure("release acceptance has no operation_id")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        operation = _api_data(
+            client.get(f"/api/models/release-operations/{operation_id}", timeout=10),
+            label="release operation",
+        ).get("operation") or {}
+        if operation.get("status") == "failed":
+            raise DashboardBusinessSmokeFailure(
+                f"release operation {operation_id} failed: {operation.get('error')}"
+            )
+        if operation.get("status") == "applied":
+            models = _api_data(
+                client.get("/api/models/json", timeout=10), label="applied models",
+            ).get("models") or []
+            model = next((row for row in models if row.get("model_version_id") ==
+                          operation.get("model_version_id")), None)
+            if model is None:
+                raise DashboardBusinessSmokeFailure("applied release model is missing")
+            return {
+                **submitted,
+                "operation": operation,
+                "model": model,
+                "runtime_synced": True,
+                "runtime_state": operation.get("runtime_state"),
+            }
+        time.sleep(0.1)
+    raise DashboardBusinessSmokeFailure(f"release operation {operation_id} timed out")
+
+
+def _expect_legacy_model_command_closed(
+    response: httpx.Response,
+    *,
+    label: str,
+    message_fragment: str,
+) -> dict[str, Any]:
+    """Require a legacy model mutation endpoint to fail closed with 409."""
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise DashboardBusinessSmokeFailure(
+            f"{label} did not return the JSON error envelope: {response.text[:500]}"
+        ) from exc
+    message = str(payload.get("msg") or payload.get("message") or "")
+    if response.status_code != 409 or payload.get("code") == 0:
+        raise DashboardBusinessSmokeFailure(
+            f"{label} did not fail closed with HTTP 409: "
+            f"status={response.status_code}, body={payload}"
+        )
+    if message_fragment not in message:
+        raise DashboardBusinessSmokeFailure(
+            f"{label} returned an unexpected fail-closed reason: {payload}"
+        )
+    return {
+        "status": "fail_closed",
+        "http_status": response.status_code,
+        "message": message,
+        "data": payload.get("data"),
+    }
+
+
 def _wait_for(
     label: str,
     predicate,
@@ -417,6 +485,10 @@ def _prepare_runtime_config(
     config.cameras = [camera]
 
     camera.anomaly.min_shadow_days = 0
+    camera.anomaly.min_shadow_samples = 0
+    camera.anomaly.max_shadow_alert_rate_delta = 1.0
+    camera.anomaly.max_shadow_score_divergence = 1.0
+    camera.anomaly.max_shadow_latency_ms = 0.0
     camera.anomaly.min_canary_days = 0
     # The business smoke must exercise real Replay clips, not INFO-only
     # trigger-frame snapshots. RTSP fixture compression can lower the fallback
@@ -1030,11 +1102,17 @@ def _seed_model_registry(*, work_dir: Path, database_url: str, camera_id: str) -
     from argus.storage.database import Database
     from argus.storage.model_registry import ModelRegistry
     from argus.storage.models import ModelStage
+    from argus.storage.release_pipeline import ReleasePipeline
 
     db = Database(database_url=database_url)
     db.initialize()
     try:
         registry = ModelRegistry(session_factory=db.get_session)
+        release_pipeline = ReleasePipeline(
+            db.get_session,
+            min_shadow_days=0,
+            min_canary_days=0,
+        )
         baseline_dir = _baseline_artifact_dir(work_dir, camera_id)
         seed_tag = f"seed-{time.time_ns()}"
 
@@ -1052,29 +1130,26 @@ def _seed_model_registry(*, work_dir: Path, database_url: str, camera_id: str) -
         stage_ids["candidate"] = register("candidate")
 
         shadow_id = register("shadow")
-        registry.promote(shadow_id, ModelStage.SHADOW.value, triggered_by="smoke")
+        release_pipeline.transition(
+            model_version_id=shadow_id,
+            target_stage=ModelStage.SHADOW.value,
+            triggered_by="smoke-fixture",
+        )
         stage_ids["shadow"] = shadow_id
 
         canary_id = register("canary")
-        registry.promote(canary_id, ModelStage.SHADOW.value, triggered_by="smoke")
-        registry.promote(
-            canary_id,
-            ModelStage.CANARY.value,
-            triggered_by="smoke",
+        release_pipeline.transition(
+            model_version_id=canary_id,
+            target_stage=ModelStage.SHADOW.value,
+            triggered_by="smoke-fixture",
+        )
+        release_pipeline.transition(
+            model_version_id=canary_id,
+            target_stage=ModelStage.CANARY.value,
+            triggered_by="smoke-fixture",
             canary_camera_id=camera_id,
         )
         stage_ids["canary"] = canary_id
-
-        production_id = register("production")
-        registry.promote(production_id, ModelStage.SHADOW.value, triggered_by="smoke")
-        registry.promote(
-            production_id,
-            ModelStage.CANARY.value,
-            triggered_by="smoke",
-            canary_camera_id=camera_id,
-        )
-        registry.promote(production_id, ModelStage.PRODUCTION.value, triggered_by="smoke")
-        stage_ids["production"] = production_id
 
         return stage_ids
     finally:
@@ -1185,7 +1260,6 @@ def _verify_models_system_apis(
         model_ids["candidate"]: "candidate",
         model_ids["shadow"]: "shadow",
         model_ids["canary"]: "canary",
-        model_ids["production"]: "production",
     }
     for version_id, expected_stage in expected_stages.items():
         row = by_id[version_id]
@@ -1193,8 +1267,10 @@ def _verify_models_system_apis(
             raise DashboardBusinessSmokeFailure(
                 f"model {version_id} stage mismatch: {row.get('stage')} != {expected_stage}"
             )
-    if by_id[model_ids["production"]].get("is_active") is not True:
-        raise DashboardBusinessSmokeFailure("seeded production model is not active")
+    if any(by_id[version_id].get("is_active") is True for version_id in model_ids.values()):
+        raise DashboardBusinessSmokeFailure(
+            "unapproved smoke fixture unexpectedly contains an active model"
+        )
 
     config_result = _api_data(
         client.post(
@@ -1227,7 +1303,8 @@ def _verify_models_system_apis(
     return {
         "registry_total": models_data.get("total"),
         "seeded_versions": model_ids,
-        "production_active": model_ids["production"],
+        "production_active": None,
+        "release_fixture_status": "no_approved_production_fixture",
         "config_update": config_result,
         "fallback_models": fallback_rows,
         "degradation": degradation,
@@ -1337,6 +1414,9 @@ def _exercise_model_release_apis(
         ),
         label="retire seeded canary",
     )
+    retired_canary = _wait_release_applied(
+        client, retired_canary, timeout_s=operation_timeout,
+    )
     if (retired_canary.get("model") or {}).get("stage") != "retired":
         raise DashboardBusinessSmokeFailure(f"seeded canary did not retire: {retired_canary}")
 
@@ -1358,14 +1438,6 @@ def _exercise_model_release_apis(
                 "canary_camera_id": camera_id,
             },
         ),
-        (
-            "production",
-            {
-                "target_stage": "production",
-                "triggered_by": "smoke",
-                "reason": "business smoke production promotion",
-            },
-        ),
     ]
 
     transition_results: list[dict[str, Any]] = []
@@ -1378,6 +1450,7 @@ def _exercise_model_release_apis(
             ),
             label=f"model promote {expected_stage}",
         )
+        data = _wait_release_applied(client, data, timeout_s=operation_timeout)
         model = data.get("model") or {}
         if model.get("stage") != expected_stage:
             raise DashboardBusinessSmokeFailure(
@@ -1392,7 +1465,7 @@ def _exercise_model_release_apis(
             raise DashboardBusinessSmokeFailure(
                 f"model promote {expected_stage} had runtime errors: {runtime_state}"
             )
-        if expected_stage in {"canary", "production"} and isinstance(runtime_state, dict):
+        if expected_stage == "canary" and isinstance(runtime_state, dict):
             if runtime_state.get("primary_model_version") != candidate_id:
                 raise DashboardBusinessSmokeFailure(
                     f"model promote {expected_stage} did not route trained model: {runtime_state}"
@@ -1407,47 +1480,117 @@ def _exercise_model_release_apis(
             "runtime_state": data.get("runtime_state"),
         })
 
-    rollback_data = _api_data(
-        client.post(f"/api/models/{candidate_id}/rollback", timeout=operation_timeout),
-        label="model rollback",
+    production_response = client.post(
+        f"/api/models/{candidate_id}/promote",
+        json={
+            "target_stage": "production",
+            "triggered_by": "smoke",
+            "reason": "verify production release evidence gate",
+        },
+        timeout=operation_timeout,
     )
-    if rollback_data.get("activated") != model_ids["production"]:
+    if not 400 <= production_response.status_code < 500:
         raise DashboardBusinessSmokeFailure(
-            f"model rollback activated wrong version: {rollback_data}"
+            "production promotion without release evidence did not fail closed: "
+            f"status={production_response.status_code}, "
+            f"body={production_response.text[:1000]}"
         )
-    if rollback_data.get("runtime_synced") is not True:
-        raise DashboardBusinessSmokeFailure(f"model rollback did not sync runtime: {rollback_data}")
+    try:
+        production_error = production_response.json()
+    except ValueError:
+        production_error = {"message": production_response.text[:1000]}
+    production_message = str(
+        production_error.get("msg")
+        or production_error.get("message")
+        or production_error
+    )
+    if "release_evidence_sources" not in production_message:
+        raise DashboardBusinessSmokeFailure(
+            "production NO-GO did not identify missing release evidence: "
+            f"{production_error}"
+        )
+
+    legacy_commands = {
+        "activate": _expect_legacy_model_command_closed(
+            client.post(
+                f"/api/models/{candidate_id}/activate",
+                timeout=operation_timeout,
+            ),
+            label="legacy direct model activation",
+            message_fragment="直接激活入口已关闭",
+        ),
+        "rollback": _expect_legacy_model_command_closed(
+            client.post(
+                f"/api/models/{candidate_id}/rollback",
+                timeout=operation_timeout,
+            ),
+            label="legacy model rollback",
+            message_fragment="回滚入口已安全关闭",
+        ),
+        "reload": _expect_legacy_model_command_closed(
+            client.post(
+                "/api/config/reload-model",
+                json={
+                    "camera_id": camera_id,
+                    "model_path": f"registry://{candidate_id}",
+                },
+                timeout=operation_timeout,
+            ),
+            label="legacy path model reload",
+            message_fragment="按路径直接热加载模型的入口已关闭",
+        ),
+    }
+    if (legacy_commands["reload"].get("data") or {}).get("runtime_changed") is not False:
+        raise DashboardBusinessSmokeFailure(
+            "legacy path model reload did not explicitly prove runtime_changed=false"
+        )
 
     models_data = _api_data(
         client.get("/api/models/json", params={"camera_id": camera_id}, timeout=10),
-        label="models json after rollback",
+        label="models json after blocked production promotion",
     )
     rows = {
         item.get("model_version_id"): item
         for item in models_data.get("models") or []
     }
-    production = rows.get(model_ids["production"])
     api_candidate = rows.get(candidate_id)
-    if not production or production.get("stage") != "production" or production.get("is_active") is not True:
+    if (
+        not api_candidate
+        or api_candidate.get("stage") != "canary"
+        or api_candidate.get("is_active") is True
+    ):
         raise DashboardBusinessSmokeFailure(
-            f"rollback did not restore previous production model: {production}"
+            "blocked production changed the candidate registry state: "
+            f"{api_candidate}"
         )
-    if not api_candidate or api_candidate.get("stage") != "production" or api_candidate.get("is_active") is True:
+    if any(
+        row.get("stage") == "production" and row.get("is_active") is True
+        for row in rows.values()
+    ):
         raise DashboardBusinessSmokeFailure(
-            f"rolled-back candidate state is unexpected: {api_candidate}"
+            "blocked production unexpectedly activated a registry model"
         )
 
     return {
         "promoted_version": candidate_id,
         "retired_seeded_canary": model_ids["canary"],
         "transitions": transition_results,
-        "rollback": {
-            "requested_from": candidate_id,
-            "activated": rollback_data.get("activated"),
-            "runtime_synced": rollback_data.get("runtime_synced"),
-            "runtime_state": rollback_data.get("runtime_state"),
+        "production": {
+            "status": "blocked_by_release_evidence",
+            "production_ready": False,
+            "http_status": production_response.status_code,
+            "message": production_message,
+            "candidate_stage_after_rejection": api_candidate.get("stage"),
         },
-        "active_after_rollback": model_ids["production"],
+        "legacy_commands": legacy_commands,
+        "rollback": {
+            "status": "not_exercised_no_approved_fixture",
+            "requested_from": candidate_id,
+            "activated": None,
+            "runtime_synced": None,
+            "runtime_state": None,
+        },
+        "active_after_rollback": None,
     }
 
 
@@ -1487,8 +1630,7 @@ def _models_system_browser_pages(
             "影子",
             "金丝雀",
             "生产",
-            "已激活",
-            model_ids["production"],
+            model_ids["canary"],
             trained_version_id,
         ],
         "/system/overview": [
@@ -1542,6 +1684,18 @@ def _objective_checklist(
     alerts_route = f"/alerts?id={alert.get('alert_id')}"
     replay_route = f"/replay/{alert.get('alert_id')}"
     release_transitions = release.get("transitions") or []
+    legacy_commands = release.get("legacy_commands") or {}
+    legacy_commands_closed = bool(
+        {"activate", "rollback", "reload"}.issubset(legacy_commands)
+        and all(
+            item.get("status") == "fail_closed"
+            and item.get("http_status") == 409
+            for item in legacy_commands.values()
+        )
+        and (legacy_commands.get("reload", {}).get("data") or {}).get(
+            "runtime_changed"
+        ) is False
+    )
     fallback_or_degraded = bool(
         fallback_models
         or anomaly_degradation.get("degraded")
@@ -1617,6 +1771,8 @@ def _objective_checklist(
                 and (training.get("reexport") or {}).get("status") == "ok"
                 and release_transitions
                 and all(item.get("runtime_synced") is True for item in release_transitions)
+                and legacy_commands_closed
+                and (release.get("production") or {}).get("status") == "released"
                 and (release.get("rollback") or {}).get("runtime_synced") is True
                 and browser_checked
                 and "/models/registry" in browser_routes
@@ -1628,7 +1784,17 @@ def _objective_checklist(
                 "trained_model_version": training.get("model_version_id"),
                 "reexport_status": (training.get("reexport") or {}).get("status"),
                 "release_stages": [item.get("stage") for item in release_transitions],
+                "production_status": (release.get("production") or {}).get("status"),
+                "production_http_status": (
+                    release.get("production") or {}
+                ).get("http_status"),
+                "rollback_status": (release.get("rollback") or {}).get("status"),
                 "rollback_activated": (release.get("rollback") or {}).get("activated"),
+                "legacy_commands_closed": legacy_commands_closed,
+                "legacy_command_statuses": {
+                    name: item.get("http_status")
+                    for name, item in legacy_commands.items()
+                },
                 "browser_route": "/models/registry" if "/models/registry" in browser_routes else None,
             },
         },
@@ -2092,7 +2258,15 @@ def run_dashboard_business_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
         return {
-            "ok": True,
+            "ok": bool(
+                objective_checklist
+                and all(item.get("passed") is True for item in objective_checklist)
+            ),
+            "release_gate_status": (
+                ((models_system_result or {}).get("release_api") or {})
+                .get("production", {})
+                .get("status")
+            ),
             "base_url": base_url,
             "work_dir": str(work_dir),
             "runtime_config": str(runtime_config),

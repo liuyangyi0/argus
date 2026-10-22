@@ -16,6 +16,8 @@ import cv2
 import numpy as np
 import structlog
 
+from argus.core.frame_identity import FrameIdentity, build_frame_identity
+
 logger = structlog.get_logger()
 
 _BACKEND_NAMES = {
@@ -36,6 +38,7 @@ class FrameData:
     frame_number: int
     resolution: tuple[int, int]  # (width, height)
     is_nir: bool = False  # True when frame was captured under NIR strobe
+    identity: FrameIdentity | None = None
 
 
 @dataclass
@@ -78,6 +81,9 @@ class CameraCapture:
         usb_backend: str = "auto",
         usb_pixel_format: str = "auto",
         usb_min_runtime_fps: float = 0.0,
+        source_declared: str | None = None,
+        source_runtime: str | None = None,
+        stream_id: str | None = None,
     ):
         self.camera_id = camera_id
         self.source = source
@@ -89,6 +95,9 @@ class CameraCapture:
         self.usb_backend = usb_backend
         self.usb_pixel_format = usb_pixel_format
         self.usb_min_runtime_fps = usb_min_runtime_fps
+        self._source_declared = source_declared or source
+        self._source_runtime = source_runtime or source
+        self._stream_id = stream_id
 
         self._cap: cv2.VideoCapture | None = None
         self._state = CameraState()
@@ -106,6 +115,20 @@ class CameraCapture:
     @property
     def state(self) -> CameraState:
         return self._state
+
+    def configure_frame_identity(
+        self,
+        *,
+        source_declared: str | None = None,
+        source_runtime: str | None = None,
+        stream_id: str | None = None,
+    ) -> None:
+        """Update frame identity source context for injected captures."""
+        if source_declared is not None:
+            self._source_declared = source_declared
+        if source_runtime is not None:
+            self._source_runtime = source_runtime
+        self._stream_id = stream_id
 
     def _usb_backend_candidates(self) -> list[tuple[int | None, str]]:
         """Return preferred OpenCV backends for USB cameras."""
@@ -400,18 +423,30 @@ class CameraCapture:
                 self._state.error = "Read failed"
                 return None
 
+        capture_monotonic_ts = time.monotonic()
+        capture_wall_ts = time.time()
         self._frame_count += 1
 
-        self._state.last_frame_time = time.monotonic()
+        self._state.last_frame_time = capture_monotonic_ts
         self._state.total_frames += 1
 
         h, w = frame.shape[:2]
+        frame_number = self._state.total_frames
         return FrameData(
             frame=frame,
             camera_id=self.camera_id,
-            timestamp=now,
-            frame_number=self._state.total_frames,
+            timestamp=capture_monotonic_ts,
+            frame_number=frame_number,
             resolution=(w, h),
+            identity=build_frame_identity(
+                camera_id=self.camera_id,
+                source_declared=str(self._source_declared),
+                source_runtime=str(self._source_runtime),
+                stream_id=self._stream_id,
+                frame_index=frame_number,
+                capture_wall_ts=capture_wall_ts,
+                capture_monotonic_ts=capture_monotonic_ts,
+            ),
         )
 
     # ------------------------------------------------------------------

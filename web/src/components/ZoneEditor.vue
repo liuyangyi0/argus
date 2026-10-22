@@ -125,14 +125,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-
-interface Vertex { x: number; y: number }
-interface Zone {
-  zone_id: string
-  zone_type: 'include' | 'exclude'
-  vertices: Vertex[]
-  priority?: string
-}
+import type { CameraZone as Zone, ZoneVertex as Vertex } from '../types/api'
 
 const props = withDefaults(defineProps<{
   modelValue: Zone[]

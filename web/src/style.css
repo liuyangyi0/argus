@@ -11,6 +11,23 @@
   }
   
   :root {
+    color-scheme: light;
+
+    /* Canonical semantic surface/text tokens. */
+    --surface-canvas: #f6f6f8;
+    --surface-panel: #ffffff;
+    --surface-panel-translucent: rgba(255, 255, 255, .66);
+    --surface-panel-strong: rgba(255, 255, 255, .82);
+    --text-primary: #18181c;
+    --text-secondary: #3a3a42;
+    --text-muted: #65656e;
+    --border-subtle: rgba(10, 10, 15, .055);
+    --border-default: rgba(10, 10, 15, .09);
+    --status-info: #2563eb;
+    --status-danger: #e5484d;
+    --status-warning: #d97706;
+    --status-success: #15a34a;
+
     --bg: #f6f6f8;
     --ink: #0a0a0c;
     --ink-2: #18181c;
@@ -38,6 +55,24 @@
     --sh-1: 0 1px 2px rgba(10, 10, 15, .04);
     --sh-2: 0 1px 2px rgba(10, 10, 15, .04), 0 6px 16px -6px rgba(10, 10, 15, .08), 0 16px 36px -12px rgba(10, 10, 15, .08);
     --sh-3: 0 1px 2px rgba(10, 10, 15, .04), 0 10px 24px -8px rgba(10, 10, 15, .10), 0 24px 56px -16px rgba(10, 10, 15, .12);
+
+    /* Compatibility aliases for components migrated before the global token
+       system. Remove these only after every --argus-* consumer is converted. */
+    --argus-border: var(--border-default);
+    --argus-card-bg-solid: var(--surface-panel);
+    --argus-code-bg: #f0f0f3;
+    --argus-footer-bg: rgba(255, 255, 255, .74);
+    --argus-header-bg: rgba(255, 255, 255, .82);
+    --argus-icon-muted: var(--text-muted);
+    --argus-mono: 'JetBrains Mono', ui-monospace, monospace;
+    --argus-sidebar-border: var(--border-subtle);
+    --argus-surface: var(--surface-panel);
+    --argus-text: var(--text-primary);
+    --argus-text-muted: var(--text-muted);
+  }
+
+  html.dark-theme {
+    color-scheme: light;
   }
 
   html, body {

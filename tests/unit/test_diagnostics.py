@@ -3,6 +3,7 @@
 import threading
 
 from argus.core.diagnostics import (
+    CandidateRecord,
     DiagnosticsBuffer,
     FrameDiagnostics,
     FrameScoreRecord,
@@ -135,6 +136,26 @@ def test_stage_result_defaults():
     assert sr.metadata == {}
 
 
+def test_candidate_record_to_dict():
+    record = CandidateRecord(
+        candidate_id="cam1:1:1",
+        candidate_type="frame_anomaly",
+        decision="suppressed",
+        stage="decision",
+        evidence={"score": 0.8},
+        suppression_reason="grader_no_alert",
+    )
+
+    assert record.to_dict() == {
+        "candidate_id": "cam1:1:1",
+        "candidate_type": "frame_anomaly",
+        "decision": "suppressed",
+        "stage": "decision",
+        "evidence": {"score": 0.8},
+        "suppression_reason": "grader_no_alert",
+    }
+
+
 def test_frame_diagnostics_defaults():
     fd = FrameDiagnostics(frame_number=1, timestamp=1.0, camera_id="cam1")
     assert fd.total_duration_ms == 0.0
@@ -143,3 +164,28 @@ def test_frame_diagnostics_defaults():
     assert fd.is_anomalous is False
     assert fd.alert_emitted is False
     assert fd.pipeline_mode == "active"
+    assert fd.final_decision == "normal"
+    assert fd.suppression_reason is None
+    assert fd.candidate_records == []
+
+
+def test_frame_diagnostics_add_candidate_and_to_dict():
+    fd = FrameDiagnostics(frame_number=7, timestamp=1.0, camera_id="cam1")
+    fd.stages.append(StageResult(stage_name="mog2", duration_ms=2.0))
+    record = fd.add_candidate(
+        candidate_type="frame_change",
+        decision="skipped",
+        stage="mog2",
+        evidence={"change_ratio": 0.001},
+        suppression_reason="no_change",
+    )
+
+    assert record.candidate_id == "cam1:7:1"
+    assert fd.suppression_reason == "no_change"
+
+    payload = fd.to_dict()
+    assert payload["final_decision"] == "normal"
+    assert payload["suppression_reason"] == "no_change"
+    assert payload["stages"][0]["stage_name"] == "mog2"
+    assert payload["candidate_records"][0]["candidate_type"] == "frame_change"
+    assert payload["candidate_records"][0]["evidence"]["change_ratio"] == 0.001

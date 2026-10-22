@@ -33,6 +33,7 @@ class ShadowRunner:
         session_factory,
         sample_rate: int = 5,
         threshold: float = 0.5,
+        inference_backend: str = "auto",
     ):
         self._shadow_model_path = shadow_model_path
         self._shadow_version_id = shadow_version_id
@@ -41,6 +42,7 @@ class ShadowRunner:
         self._session_factory = session_factory
         self._sample_rate = max(1, sample_rate)
         self._threshold = threshold
+        self._inference_backend = inference_backend
 
         self._frame_counter = 0
         self._lock = threading.Lock()
@@ -71,7 +73,11 @@ class ShadowRunner:
             self._detector = AnomalibDetector(
                 model_path=self._shadow_model_path,
                 threshold=self._threshold,
+                inference_backend=self._inference_backend,
+                camera_id=self._camera_id,
             )
+            if self._detector.load() is not True:
+                raise RuntimeError("shadow detector did not load requested artifact")
             logger.info(
                 "shadow_runner.loaded",
                 camera_id=self._camera_id,
@@ -88,6 +94,11 @@ class ShadowRunner:
                 max_retries=self._max_load_retries,
             )
             return False
+
+    def prepare(self) -> bool:
+        """Eagerly load the exact shadow artifact for release preparation."""
+
+        return self._ensure_loaded() is True
 
     def run_shadow(
         self,

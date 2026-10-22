@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
@@ -11,10 +12,15 @@ from fastapi.testclient import TestClient
 from argus.anomaly.job_executor import TrainingJobExecutor
 from argus.anomaly.trainer import TrainingResult, TrainingStatus
 from argus.capture.manager import CameraManager
-from argus.config.schema import AlertConfig, CameraConfig
+from argus.config.schema import AlertConfig, CameraConfig, DashboardConfig
 from argus.dashboard.app import create_app
 from argus.storage.database import Database
 from argus.storage.model_registry import ModelRegistry
+from argus.storage.model_release_service import (
+    RuntimeReleaseCommit,
+    RuntimeReleaseIdentity,
+    RuntimeReleasePreparation,
+)
 from argus.storage.models import ModelStage
 from argus.storage.release_pipeline import ReleasePipeline
 
@@ -46,6 +52,7 @@ def _model_dir(root: Path, name: str) -> Path:
     model_dir = root / name
     model_dir.mkdir(parents=True)
     (model_dir / "model.xml").write_text("model", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"weights")
     return model_dir
 
 
@@ -67,16 +74,69 @@ def _camera_manager(db: Database, current_version: str | None) -> CameraManager:
     manager._pipelines["cam_01"] = _PipelineDouble(cam_config, current_version)
     manager._runners["cam_01"] = MagicMock()
     manager._notify_camera_status = MagicMock()
+
+    def prepare_model_release(plan) -> RuntimeReleasePreparation:
+        class Transaction:
+            def commit(self) -> RuntimeReleaseCommit:
+                return RuntimeReleaseCommit(
+                    True,
+                    state={
+                        "camera_id": plan.camera_id,
+                        "primary_model_version": (
+                            plan.model_version_id
+                            if plan.target_stage in {"canary", "production"}
+                            else current_version
+                        ),
+                        "shadow_model_version": (
+                            plan.model_version_id
+                            if plan.target_stage == "shadow"
+                            else None
+                        ),
+                        "errors": [],
+                    },
+                )
+
+            def abort(self) -> RuntimeReleaseCommit:
+                return RuntimeReleaseCommit(True, state={"restored": True})
+
+            def finalize(self) -> RuntimeReleaseCommit:
+                return RuntimeReleaseCommit(True, state={"released": True})
+
+        return RuntimeReleasePreparation(
+            True,
+            identity=RuntimeReleaseIdentity(
+                camera_id=plan.camera_id,
+                model_version_id=plan.model_version_id,
+                target_stage=plan.target_stage,
+                runtime_artifact_sha256=plan.runtime_artifact_sha256,
+            ),
+            transaction=Transaction(),
+        )
+
+    manager.prepare_model_release = prepare_model_release
     return manager
 
 
-def test_training_candidate_release_and_rollback_flow(tmp_path):
+def test_training_candidate_release_and_rollback_flow(
+    tmp_path,
+    release_evidence_factory,
+    release_baseline_factory,
+    release_evidence_sources_factory,
+    running_release_client,
+    await_release_operation,
+):
     database = Database(database_url=f"sqlite:///{tmp_path / 'argus.db'}")
     database.initialize()
     registry = ModelRegistry(session_factory=database.get_session)
+    fixture_pipeline = ReleasePipeline(
+        database.get_session,
+        min_shadow_days=0,
+        min_canary_days=0,
+    )
 
     baselines_root = tmp_path / "baselines"
     baseline_dir = _baseline_dir(baselines_root)
+    baseline_dir = release_baseline_factory(root=baseline_dir)
 
     previous_model_dir = _model_dir(tmp_path / "models", "previous")
     previous_id = registry.register(
@@ -85,14 +145,29 @@ def test_training_candidate_release_and_rollback_flow(tmp_path):
         "cam_01",
         "patchcore",
     )
-    registry.promote(previous_id, ModelStage.SHADOW.value, triggered_by="test")
-    registry.promote(
-        previous_id,
-        ModelStage.CANARY.value,
-        triggered_by="test",
+    fixture_pipeline.transition(
+        model_version_id=previous_id,
+        target_stage=ModelStage.SHADOW.value,
+        triggered_by="test-fixture",
+    )
+    fixture_pipeline.transition(
+        model_version_id=previous_id,
+        target_stage=ModelStage.CANARY.value,
+        triggered_by="test-fixture",
         canary_camera_id="cam_01",
     )
-    registry.promote(previous_id, ModelStage.PRODUCTION.value, triggered_by="test")
+    fixture_pipeline.transition(
+        model_version_id=previous_id,
+        target_stage=ModelStage.PRODUCTION.value,
+        triggered_by="test-fixture",
+        release_evidence=release_evidence_factory(
+            model_path=previous_model_dir,
+            model_version_id=previous_id,
+            registry_model_hash=registry.get_by_version_id(
+                previous_id
+            ).model_hash,
+        ),
+    )
 
     camera_manager = _camera_manager(database, current_version=previous_id)
     alerts_dir = tmp_path / "alerts"
@@ -101,13 +176,16 @@ def test_training_candidate_release_and_rollback_flow(tmp_path):
         database=database,
         camera_manager=camera_manager,
         alerts_dir=str(alerts_dir),
+        config=SimpleNamespace(
+            dashboard=DashboardConfig(go2rtc_enabled=False), cameras=camera_manager._cameras,
+        ),
     )
     app.state._release_pipeline = ReleasePipeline(
         database.get_session,
         min_shadow_days=0,
         min_canary_days=0,
     )
-    client = TestClient(app)
+    client = running_release_client(app)
 
     create_response = client.post(
         "/api/training-jobs/",
@@ -158,6 +236,14 @@ def test_training_candidate_release_and_rollback_flow(tmp_path):
     assert candidate["stage"] == "candidate"
     assert candidate["is_active"] is False
 
+    registered_candidate = registry.get_by_version_id(candidate_id)
+    release_evidence_sources = release_evidence_sources_factory(
+        root=tmp_path / "candidate-release-sources",
+        model_path=trained_model_dir,
+        model_version_id=candidate_id,
+        registry_model_hash=registered_candidate.model_hash,
+        baseline_path=baseline_dir,
+    )
     for body in (
         {"target_stage": "shadow", "triggered_by": "tester"},
         {
@@ -165,25 +251,28 @@ def test_training_candidate_release_and_rollback_flow(tmp_path):
             "triggered_by": "tester",
             "canary_camera_id": "cam_01",
         },
-        {"target_stage": "production", "triggered_by": "tester"},
     ):
         response = client.post(f"/api/models/{candidate_id}/promote", json=body)
-        assert response.status_code == 200
-        data = response.json()["data"]
+        assert response.status_code == 202
+        data = await_release_operation(client, response)
         assert data["runtime_synced"] is True
         assert data["runtime_state"]["camera_id"] == "cam_01"
 
-    production = registry.get_by_version_id(candidate_id)
-    assert production is not None
-    assert production.stage == ModelStage.PRODUCTION.value
-    assert production.is_active is True
+    production_response = client.post(
+        f"/api/models/{candidate_id}/promote",
+        json={
+            "target_stage": "production",
+            "release_evidence_sources": release_evidence_sources,
+        },
+    )
+    failed = await_release_operation(client, production_response, status="failed")
+    assert "decoder evidence is insufficient" in failed["operation"]["error"]
 
-    rollback_response = client.post(f"/api/models/{candidate_id}/rollback")
-    assert rollback_response.status_code == 200
-    rollback_data = rollback_response.json()["data"]
-    assert rollback_data["activated"] == previous_id
-    assert rollback_data["runtime_synced"] is True
-    assert rollback_data["runtime_state"] == "applied"
+    blocked = registry.get_by_version_id(candidate_id)
+    assert blocked is not None
+    assert blocked.stage == ModelStage.CANARY.value
+    assert blocked.is_active is False
+    assert registry.get_active("cam_01").model_version_id == previous_id
 
     detail = client.get(f"/api/training-jobs/{job_id}").json()["data"]
     params = detail["hyperparameters"]
@@ -272,6 +361,9 @@ def test_reexport_api_invokes_trainer_with_requested_format(tmp_path, monkeypatc
         export_format="openvino",
         quantization="fp16",
         model_type="patchcore",
+        camera_id="cam_01",
+        zone_id="reexport-source",
+        image_size=256,
     )
 
 
@@ -316,4 +408,7 @@ def test_reexport_api_prefers_shared_app_state_trainer(tmp_path):
         export_format="openvino",
         quantization="fp16",
         model_type="patchcore",
+        camera_id="cam_01",
+        zone_id="shared-trainer-source",
+        image_size=256,
     )

@@ -5,7 +5,7 @@ import {
   InputNumber, Slider,
 } from 'ant-design-vue'
 import {
-  ReloadOutlined, WarningOutlined,
+  ReloadOutlined,
   EditOutlined, SaveOutlined, CloseOutlined,
 } from '@ant-design/icons-vue'
 
@@ -16,7 +16,8 @@ import {
   type SegmenterConfigPayload,
 } from '../../api'
 import { extractErrorMessage } from '../../utils/error'
-import { notifyModuleToggleResult } from '../../utils/moduleToggleFeedback'
+import { notifyModuleToggleResult, type ModuleToggleFeedback } from '../../utils/moduleToggleFeedback'
+import AuxiliaryRuntimeStatus from './AuxiliaryRuntimeStatus.vue'
 
 defineOptions({ name: 'SegmenterPanel' })
 
@@ -32,6 +33,7 @@ const loading = ref(false)
 const toggling = ref(false)
 const saving = ref(false)
 const error = ref<string | null>(null)
+const toggleFeedback = ref<ModuleToggleFeedback | null>(null)
 
 // Edit-mode state: copy of the 4 tunable params operators can tweak.
 const editing = ref(false)
@@ -115,34 +117,22 @@ async function saveDraft() {
 }
 
 async function handleToggle(checked: string | number | boolean) {
-  if (!cfg.value) return
+  if (!cfg.value || toggling.value || loading.value) return
   const next = Boolean(checked)
   toggling.value = true
   try {
     const result = await toggleModule('segmenter.enabled', next)
     cfg.value.enabled = next
-    notifyModuleToggleResult('分割器', next, result)
+    toggleFeedback.value = notifyModuleToggleResult('分割器', next, result)
     await load()
   } catch (e) {
     message.error(extractErrorMessage(e, '切换失败'))
+    toggleFeedback.value = { type: 'warning', message: '切换请求失败，运行时状态尚未确认；请刷新后核验，不要将当前开关视为实际加载状态。' }
+    await load()
   } finally {
     toggling.value = false
   }
 }
-
-const runtimeSummary = computed(() => {
-  const r = cfg.value?.runtime
-  if (!r) return null
-  if (!cfg.value?.enabled) return '分割器已关闭'
-  if (r.total_pipelines === 0) return '无运行中的摄像头管线'
-  if (r.pipelines_attached === 0) {
-    return `${r.total_pipelines} 路管线运行中，但都没有挂载分割器（配置是后启用的 — 需重启摄像头）`
-  }
-  if (r.pipelines_loaded === r.pipelines_attached) {
-    return `已在 ${r.pipelines_loaded} / ${r.total_pipelines} 路管线就绪`
-  }
-  return `${r.pipelines_loaded} / ${r.pipelines_attached} 路已挂载分割器已加载 SAM2 模型（首次推理后懒加载）`
-})
 
 // A nice human label for the model_size enum
 const modelSizeLabel = computed(() => {
@@ -165,18 +155,19 @@ onMounted(load)
       <Space>
         <span>SAM2 实例分割器</span>
         <Tag v-if="cfg" :color="cfg.enabled ? 'green' : 'default'">
-          {{ cfg.enabled ? '已启用' : '已关闭' }}
+          {{ cfg.enabled ? '配置已启用' : '配置已关闭' }}
         </Tag>
       </Space>
     </template>
     <template #extra>
-      <Button size="small" :loading="loading" @click="load">
+      <Button size="small" :loading="loading" :disabled="toggling" @click="load">
         <template #icon><ReloadOutlined /></template>
         刷新
       </Button>
     </template>
 
     <Alert v-if="error" type="error" :message="error" show-icon style="margin-bottom: 16px" />
+    <Alert v-if="toggleFeedback" :type="toggleFeedback.type" :message="toggleFeedback.message" show-icon style="margin-bottom: 16px" />
 
     <div v-if="cfg" class="segmenter-panel">
       <!-- Master toggle + runtime status -->
@@ -191,21 +182,11 @@ onMounted(load)
           <Switch
             :checked="cfg.enabled"
             :loading="toggling"
+            :disabled="loading || saving"
             @update:checked="handleToggle"
           />
         </div>
-        <Typography.Text v-if="runtimeSummary" type="secondary" style="font-size: 12px">
-          {{ runtimeSummary }}
-        </Typography.Text>
-        <Alert
-          v-if="cfg.enabled && cfg.runtime.pipelines_attached === 0 && cfg.runtime.total_pipelines > 0"
-          type="warning"
-          show-icon
-          style="margin-top: 8px"
-          message="切换后的 enabled 状态只会影响新启动的摄像头管线，已运行的管线需要在 /cameras 页面手动重启。"
-        >
-          <template #icon><WarningOutlined /></template>
-        </Alert>
+        <AuxiliaryRuntimeStatus label="分割器" :enabled="cfg.enabled" :runtime="cfg.runtime" />
       </div>
 
       <!-- Model + threshold summary -->
@@ -286,7 +267,7 @@ onMounted(load)
             <Slider
               v-model:value="draft.max_points"
               :min="1"
-              :max="16"
+              :max="20"
               :step="1"
               :marks="{ 1: '1', 5: '5', 10: '10', 16: '16' }"
               class="edit-slider"
@@ -294,7 +275,7 @@ onMounted(load)
             <InputNumber
               v-model:value="draft.max_points"
               :min="1"
-              :max="32"
+              :max="20"
               size="small"
               class="edit-number"
             />
@@ -308,16 +289,16 @@ onMounted(load)
             </div>
             <Slider
               v-model:value="draft.min_anomaly_score"
-              :min="0"
-              :max="1"
+              :min="0.1"
+              :max="0.99"
               :step="0.05"
               :marks="{ 0: '0', 0.5: '0.5', 0.7: '0.7', 1: '1' }"
               class="edit-slider"
             />
             <InputNumber
               v-model:value="draft.min_anomaly_score"
-              :min="0"
-              :max="1"
+              :min="0.1"
+              :max="0.99"
               :step="0.05"
               size="small"
               class="edit-number"
@@ -332,7 +313,7 @@ onMounted(load)
             </div>
             <Slider
               v-model:value="draft.min_mask_area_px"
-              :min="0"
+              :min="10"
               :max="2000"
               :step="10"
               :marks="{ 0: '0', 100: '100', 500: '500', 2000: '2K' }"
@@ -340,8 +321,8 @@ onMounted(load)
             />
             <InputNumber
               v-model:value="draft.min_mask_area_px"
-              :min="0"
-              :max="1000000"
+              :min="10"
+              :max="100000"
               size="small"
               class="edit-number"
             />
@@ -363,8 +344,8 @@ onMounted(load)
             />
             <InputNumber
               v-model:value="draft.timeout_seconds"
-              :min="0.1"
-              :max="120"
+              :min="1"
+              :max="60"
               :step="0.5"
               size="small"
               class="edit-number"

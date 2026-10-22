@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import router from '../index'
+import router, { roleFallbackPath } from '../index'
 import type { NavigationGuard, RouteRecordNormalized } from 'vue-router'
 import { createPinia, setActivePinia } from 'pinia'
 import { useAuthStore } from '../../stores/useAuthStore'
@@ -76,6 +76,12 @@ describe('router RBAC metadata', () => {
 
   it('allows config management for admin and engineer roles', () => {
     expect(routeMeta('system-config').requiresRole).toEqual(['admin', 'engineer'])
+  })
+
+  it('redirects forbidden hard navigations to a role-accessible section', () => {
+    expect(roleFallbackPath('/models/registry')).toBe('/models/collections')
+    expect(roleFallbackPath('/system/users')).toBe('/system/overview')
+    expect(roleFallbackPath('/cameras/cam-01')).toBe('/overview')
   })
 })
 

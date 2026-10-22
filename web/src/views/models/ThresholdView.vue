@@ -2,8 +2,9 @@
 import { onMounted } from 'vue'
 import { useModelState } from '../../composables/useModelState'
 import ThresholdPreview from '../../components/models/ThresholdPreview.vue'
+import ModelCameraState from '../../components/models/ModelCameraState.vue'
 
-const { cameras, loadCameras } = useModelState()
+const { cameras, loadCameras, camerasLoading, camerasLoaded, camerasError } = useModelState()
 
 onMounted(async () => {
   await loadCameras()
@@ -11,5 +12,13 @@ onMounted(async () => {
 </script>
 
 <template>
-  <ThresholdPreview :cameras="cameras" />
+  <ModelCameraState
+    :loading="camerasLoading"
+    :loaded="camerasLoaded"
+    :error="camerasError"
+    :camera-count="cameras.length"
+    @retry="loadCameras"
+  >
+    <ThresholdPreview :cameras="cameras" />
+  </ModelCameraState>
 </template>

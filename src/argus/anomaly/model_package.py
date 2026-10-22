@@ -6,7 +6,8 @@ needed to deploy, audit, and reproduce a trained model:
     model.openvino/          # OpenVINO IR files (.xml + .bin)
     model.pytorch            # PyTorch checkpoint backup
     config.yaml              # Training hyperparameters snapshot
-    conformal_quantiles.json # Calibration data
+    conformal_quantiles.json # Calibration data for audit/compatibility
+    model.openvino/calibration.json # Calibration discoverable by detector
     calibration_set.txt      # Frame IDs used for calibration
     validation_report.json   # Three-step validation results
     training_job.json        # Full job metadata
@@ -15,6 +16,10 @@ needed to deploy, audit, and reproduce a trained model:
     model_card.md            # Auto-generated human-readable summary
     SHA256SUMS               # Checksums of all files
     signature.sig            # HMAC-SHA256 signature (optional)
+
+The ``runtime/`` bundle uses relative v2 manifests and survives relocation.
+Its identity differs from the source run: importing it requires new registry,
+scene-profile and release evidence rather than reusing the source approval.
 """
 
 from __future__ import annotations
@@ -23,12 +28,19 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import structlog
+
+from argus.anomaly.artifacts import (
+    MANIFEST_NAME,
+    artifact_metadata,
+    write_portable_artifact_manifest,
+)
 
 logger = structlog.get_logger()
 
@@ -121,13 +133,14 @@ class ModelPackager:
         model_type: str | None = None,
         training_params: dict | None = None,
         calibration_image_ids: list[str] | None = None,
+        runtime_artifact: Path | None = None,
     ) -> Path:
         """Assemble a complete model package.
 
         Args:
             output_dir: Where to create the package directory.
             model_dir: Training output directory (contains .ckpt files).
-            export_dir: Export directory (contains .xml/.bin or .onnx files).
+            export_dir: Export directory (contains .pt, .xml/.bin or .onnx files).
             training_job: Full TrainingJob dict for training_job.json.
             validation_report: ValidationReport dict for validation_report.json.
             calibration_path: Path to existing calibration.json.
@@ -137,6 +150,7 @@ class ModelPackager:
             model_type: Model type (patchcore, dinomaly2, etc.).
             training_params: Hyperparameters dict for config.yaml.
             calibration_image_ids: List of image paths used for calibration.
+            runtime_artifact: Exact deployment file, required for ambiguous exports.
 
         Returns:
             Path to the created package directory.
@@ -168,6 +182,7 @@ class ModelPackager:
                 model_type=model_type,
                 training_params=training_params,
                 calibration_image_ids=calibration_image_ids,
+                runtime_artifact=runtime_artifact,
             )
             if final_dir.exists():
                 shutil.rmtree(final_dir)
@@ -194,12 +209,43 @@ class ModelPackager:
         model_type: str | None,
         training_params: dict | None,
         calibration_image_ids: list[str] | None,
+        runtime_artifact: Path | None = None,
     ) -> None:
         """Write all package files into *pkg_dir*."""
         created_at = datetime.now(timezone.utc).isoformat()
 
-        # 1. Copy OpenVINO model files
+        # Select exactly one deployment artifact before copying. Source v1
+        # manifests contain absolute paths and are audit provenance only in a
+        # portable package; runtime receives new, bounded relative v2 markers.
+        source_metadata = {}
+        selected_artifact = None
         if export_dir and export_dir.exists():
+            if export_dir.is_symlink() or any(path.is_symlink() for path in export_dir.rglob("*")):
+                raise ValueError("Model packages cannot contain symlinked runtime files")
+            source_metadata = artifact_metadata(export_dir)
+            if runtime_artifact is not None:
+                selected_artifact = runtime_artifact.resolve()
+            elif source_metadata:
+                selected_artifact = Path(source_metadata["artifact_path"])
+            else:
+                candidates = [
+                    path for path in export_dir.rglob("*")
+                    if path.is_file() and path.suffix in {".pt", ".xml", ".onnx"}
+                    and not path.stem.endswith("_fp32")
+                ]
+                if len(candidates) != 1:
+                    raise ValueError("Model package requires one exact deployment artifact")
+                selected_artifact = candidates[0].resolve()
+            if not selected_artifact.is_relative_to(export_dir.resolve()):
+                raise ValueError("Packaged runtime artifact escapes its export directory")
+            # Preserve the complete run-local runtime bundle, including CUDA
+            # model.pt, calibration and artifact metadata. The legacy
+            # model.openvino directory below remains for existing consumers.
+            shutil.copytree(export_dir, pkg_dir / "runtime")
+            for marker in (pkg_dir / "runtime").rglob(MANIFEST_NAME):
+                audit_copy = pkg_dir / "provenance" / marker.relative_to(pkg_dir)
+                audit_copy.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(marker), str(audit_copy))
             ov_dir = pkg_dir / "model.openvino"
             ov_dir.mkdir(exist_ok=True)
             for ext in ("*.xml", "*.bin", "*.onnx"):
@@ -207,10 +253,15 @@ class ModelPackager:
                     shutil.copy2(str(f), str(ov_dir / f.name))
 
         # 2. Copy PyTorch checkpoint
-        for pattern in ("**/*.ckpt", "**/*.pt"):
-            for ckpt in model_dir.glob(pattern):
-                shutil.copy2(str(ckpt), str(pkg_dir / "model.pytorch"))
-                break  # Only copy the first/best one
+        checkpoints = sorted(model_dir.rglob("*.ckpt")) or sorted(model_dir.rglob("*.pt"))
+        if checkpoints:
+            if model_dir.is_symlink() or checkpoints[0].is_symlink():
+                raise ValueError("Model packages cannot contain symlinked checkpoints")
+            shutil.copy2(str(checkpoints[0]), str(pkg_dir / "model.pytorch"))
+            if selected_artifact is not None:
+                training_bundle = pkg_dir / "runtime" / "_training"
+                training_bundle.mkdir(exist_ok=True)
+                shutil.copy2(str(checkpoints[0]), str(training_bundle / "source.ckpt"))
 
         # 3. config.yaml (training hyperparameters)
         if training_params:
@@ -238,9 +289,43 @@ class ModelPackager:
                     encoding="utf-8",
                 )
 
-        # 4. conformal_quantiles.json
+        # 4. Calibration data. Keep the legacy root filename for audit
+        # consumers, and also place calibration.json next to the exported model
+        # so AnomalibDetector can discover it when loading model.openvino/model.xml.
         if calibration_path and calibration_path.exists():
+            if calibration_path.is_symlink():
+                raise ValueError("Model packages cannot contain symlinked calibration")
             shutil.copy2(str(calibration_path), str(pkg_dir / "conformal_quantiles.json"))
+            ov_dir = pkg_dir / "model.openvino"
+            if ov_dir.exists():
+                shutil.copy2(str(calibration_path), str(ov_dir / "calibration.json"))
+
+        if selected_artifact is not None:
+            runtime_root = pkg_dir / "runtime"
+            packaged_artifact = runtime_root / selected_artifact.relative_to(export_dir.resolve())
+            runtime_calibration = packaged_artifact.parent / "calibration.json"
+            if calibration_path and calibration_path.is_file():
+                if runtime_calibration.is_file() and _sha256(runtime_calibration) != _sha256(calibration_path):
+                    raise ValueError("Training and runtime calibration files disagree")
+                if not runtime_calibration.exists():
+                    shutil.copy2(calibration_path, runtime_calibration)
+            write_portable_artifact_manifest(
+                runtime_root, packaged_artifact, source_metadata=source_metadata,
+                camera_id=camera_id or source_metadata.get("camera_id", "backbone"),
+                model_type=model_type,
+            )
+            # Keep the historical flat OpenVINO path usable, but give it the
+            # same explicit calibration boundary instead of an ancestor search.
+            legacy_artifact = pkg_dir / "model.openvino" / selected_artifact.name
+            if legacy_artifact.is_file():
+                source_calibration = packaged_artifact.parent / "calibration.json"
+                if source_calibration.is_file():
+                    shutil.copy2(source_calibration, legacy_artifact.parent / "calibration.json")
+                write_portable_artifact_manifest(
+                    legacy_artifact.parent, legacy_artifact, source_metadata=source_metadata,
+                    camera_id=camera_id or source_metadata.get("camera_id", "backbone"),
+                    model_type=model_type,
+                )
 
         # 5. calibration_set.txt
         if calibration_image_ids:
@@ -284,8 +369,10 @@ class ModelPackager:
         # 11. SHA256SUMS
         checksums = []
         for f in sorted(pkg_dir.rglob("*")):
-            if f.is_file() and f.name not in ("SHA256SUMS", "signature.sig"):
-                rel = f.relative_to(pkg_dir)
+            if f.is_file() and f not in {pkg_dir / "SHA256SUMS", pkg_dir / "signature.sig"}:
+                rel = f.relative_to(pkg_dir).as_posix()
+                if "\n" in rel or "\r" in rel or "\\" in rel:
+                    raise ValueError("Unsupported model package filename")
                 checksums.append(f"{_sha256(f)}  {rel}")
 
         sums_content = "\n".join(checksums)
@@ -307,25 +394,45 @@ class ModelPackager:
 
     def verify(self, package_dir: Path) -> bool:
         """Verify package integrity using SHA256SUMS and optional signature."""
+        try:
+            return self._verify_contents(package_dir)
+        except (OSError, UnicodeError, ValueError):
+            logger.exception("model_package.verify_failed", reason="Invalid package contents")
+            return False
+
+    def _verify_contents(self, package_dir: Path) -> bool:
+        """Fail closed on missing signatures, incomplete lists, or path escapes."""
+        if package_dir.is_symlink():
+            return False
+        package_dir = package_dir.resolve()
         sums_file = package_dir / "SHA256SUMS"
-        if not sums_file.exists():
+        if not sums_file.is_file() or sums_file.is_symlink():
             logger.error("model_package.verify_failed", reason="SHA256SUMS missing")
             return False
 
         sums_content = sums_file.read_text(encoding="utf-8")
 
-        # Verify signature if present
+        # A configured trust key requires a signature. Deleting signature.sig
+        # must not downgrade a signed artifact to unchecked hash-only mode.
         sig_file = package_dir / "signature.sig"
-        if sig_file.exists() and self._signing_key:
+        if self._signing_key:
+            if not sig_file.is_file() or sig_file.is_symlink():
+                return False
             expected_sig = sig_file.read_text(encoding="utf-8").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sig):
+                return False
             actual_sig = hmac.new(
                 self._signing_key.encode(), sums_content.encode(), hashlib.sha256,
             ).hexdigest()
-            if not hmac.compare_digest(expected_sig, actual_sig):
+            if not hmac.compare_digest(expected_sig.lower(), actual_sig):
                 logger.error("model_package.verify_failed", reason="Signature mismatch")
                 return False
+        elif sig_file.exists():
+            logger.error("model_package.verify_failed", reason="Signature requires a verification key")
+            return False
 
         # Verify each file hash
+        listed_paths: set[str] = set()
         for line in sums_content.strip().split("\n"):
             if not line.strip():
                 continue
@@ -336,19 +443,42 @@ class ModelPackager:
             if len(parts) != 2:
                 parts = line.split(" ", 1)
             if len(parts) != 2:
-                continue
+                return False
             expected_hash, rel_path = parts[0].strip(), parts[1].strip()
+            if (
+                not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash)
+                or not rel_path or "\\" in rel_path
+                or PurePosixPath(rel_path).is_absolute() or PureWindowsPath(rel_path).drive
+                or ".." in PurePosixPath(rel_path).parts
+                or rel_path in listed_paths or rel_path in {"SHA256SUMS", "signature.sig"}
+            ):
+                return False
+            listed_paths.add(rel_path)
             file_path = package_dir / rel_path
-            if not file_path.exists():
+            if (
+                not file_path.is_file() or file_path.is_symlink()
+                or not file_path.resolve().is_relative_to(package_dir)
+            ):
                 logger.error("model_package.verify_failed", reason=f"Missing: {rel_path}")
                 return False
             actual_hash = _sha256(file_path)
-            if actual_hash != expected_hash:
+            if not hmac.compare_digest(actual_hash, expected_hash.lower()):
                 logger.error(
                     "model_package.verify_failed",
                     reason=f"Hash mismatch: {rel_path}",
                 )
                 return False
+
+        if not listed_paths:
+            return False
+        actual_paths: set[str] = set()
+        for path in package_dir.rglob("*"):
+            if path.is_symlink():
+                return False
+            if path.is_file() and path not in {sums_file, sig_file}:
+                actual_paths.add(path.relative_to(package_dir).as_posix())
+        if actual_paths != listed_paths:
+            return False
 
         logger.info("model_package.verified", path=str(package_dir))
         return True

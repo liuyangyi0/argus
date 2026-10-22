@@ -177,7 +177,10 @@ class TestBaselineCaptureJob:
         assert calls[0].args == ("test_cam", PipelineMode.COLLECTION)
         assert calls[-1].args == ("test_cam", PipelineMode.ACTIVE)
 
-    def test_active_sampler_respects_duration_based_interval(self, basic_job_config):
+    def test_active_sampler_respects_duration_based_interval(self, basic_job_config, monkeypatch):
+        # Only interval configuration is under test; do not probe/import a
+        # real encoder SDK or make the result depend on local model packages.
+        monkeypatch.setattr("argus.capture.baseline_job.get_active_sampler_unavailable_reason", lambda: None)
         basic_job_config.sampling_strategy = "active"
         basic_job_config.target_frames = 10
         basic_job_config.duration_hours = 1.0

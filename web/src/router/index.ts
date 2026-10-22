@@ -44,6 +44,12 @@ function defaultModelsChild(): string {
   return auth.hasRole(['admin', 'engineer']) ? 'baseline' : 'collections'
 }
 
+export function roleFallbackPath(path: string): string {
+  if (path === '/models' || path.startsWith('/models/')) return '/models/collections'
+  if (path === '/system' || path.startsWith('/system/')) return '/system/overview'
+  return '/overview'
+}
+
 const router = createRouter({
   history: createWebHistory(),
   routes: [
@@ -244,7 +250,7 @@ const router = createRouter({
           path: 'warehouse3D',
           name: 'warehouse3D',
           component: () => import('../views/Warehouse3D.vue'),
-          meta: { title: '3D', requiresAuth: true },
+          meta: { title: '3D 演示', requiresAuth: true, demo: true },
         },
       ]
     }
@@ -261,10 +267,10 @@ router.beforeEach(async (to) => {
   const auth = useAuthStore()
   // Cache (60s) and in-flight de-dup are handled inside the store, so
   // rapid back-to-back navigations don't fan out to N concurrent requests.
-  let user = auth.currentUser
-  if (!user) {
-    user = await auth.fetchCurrentUser()
-  }
+  // Always enter the store so its 60-second TTL can expire. Reading
+  // currentUser directly here would keep the first role forever and bypass
+  // server-side disable/downgrade checks on subsequent navigations.
+  const user = await auth.fetchCurrentUser()
 
   // Not authenticated: client.ts's 401 interceptor already kicked off a
   // full-page redirect to /login. Just cancel the in-app navigation here.
@@ -277,7 +283,10 @@ router.beforeEach(async (to) => {
       // (which also imports `message` from ant-design-vue).
       const { message } = await import('ant-design-vue')
       message.error('权限不足:你的角色无法访问此页面')
-      return false
+      // Cancelling an initial hard navigation leaves the forbidden URL in the
+      // address bar. Redirect to a role-accessible page so direct links and
+      // refreshes are denied consistently as well as in-app navigation.
+      return { path: roleFallbackPath(to.path), replace: true }
     }
   }
 

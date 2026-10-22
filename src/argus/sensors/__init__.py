@@ -6,6 +6,6 @@ for a given camera/zone. The fusion layer is deliberately sensor-agnostic —
 it stores tuples and does not care what they represent.
 """
 
-from argus.sensors.fusion import SensorFusion
+from argus.sensors.fusion import SensorFusion, SensorFusionDecision, SensorFusionHead
 
-__all__ = ["SensorFusion"]
+__all__ = ["SensorFusion", "SensorFusionDecision", "SensorFusionHead"]

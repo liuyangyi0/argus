@@ -21,6 +21,7 @@ from argus.config.schema import (
     CameraConfig,
     MOG2Config,
     PersonFilterConfig,
+    SceneGuardConfig,
     SeverityThresholds,
     SimplexConfig,
     SuppressionConfig,
@@ -41,6 +42,7 @@ def _cam_config(camera_id: str, name: str = "Test") -> CameraConfig:
         protocol="file",
         fps_target=5,
         resolution=(640, 480),
+        scene_guard=SceneGuardConfig(enabled=False),
         mog2=MOG2Config(
             history=50,
             heartbeat_frames=10,
@@ -78,6 +80,7 @@ class TestCameraManagerIntegration:
         # Setup mock pipeline that simulates running
         mock_instance = MagicMock()
         mock_instance.initialize.return_value = True
+        mock_instance.reconcile_auxiliary_desired.return_value = True
         mock_instance.stats = MagicMock(frames_captured=0)
         mock_instance._camera.state.connected = True
         mock_instance.run_once.return_value = None
@@ -115,6 +118,7 @@ class TestCameraManagerIntegration:
         """Start all cameras, stop one, verify the other continues."""
         mock_instance = MagicMock()
         mock_instance.initialize.return_value = True
+        mock_instance.reconcile_auxiliary_desired.return_value = True
         mock_instance.stats = MagicMock(frames_captured=0)
         mock_instance._camera.state.connected = True
         mock_instance.run_once.return_value = None
@@ -143,6 +147,131 @@ class TestCameraManagerIntegration:
 
     @patch("argus.capture.manager.DetectionPipeline")
     @patch("argus.person.detector.get_shared_yolo", return_value=MagicMock())
+    def test_start_stop_broadcasts_matching_camera_and_wall_state(
+        self, mock_yolo, MockPipeline,
+    ):
+        """Every lifecycle transition refreshes both camera subscribers."""
+        stats = SimpleNamespace(
+            frames_captured=0,
+            frames_analyzed=0,
+            anomalies_detected=0,
+            alerts_emitted=0,
+            avg_latency_ms=0.0,
+            current_fps=0.0,
+            frames_dropped_backpressure=0,
+        )
+        pipeline = MagicMock()
+        pipeline.initialize.return_value = True
+        pipeline.reconcile_auxiliary_desired.return_value = True
+        pipeline.get_detector_status.return_value = SimpleNamespace(mode="loaded")
+        pipeline.stats = stats
+        pipeline._camera.state.connected = True
+        pipeline.run_once.return_value = None
+        pipeline.last_detection_failed = False
+        pipeline.segmenter_consecutive_failures = 0
+        pipeline.last_inference_record = None
+        pipeline.get_latest_anomaly_map.return_value = None
+        pipeline.get_capture_status.return_value = {"degraded": False}
+        pipeline.get_wall_status.return_value = {
+            "current_score": 0.0,
+            "score_sparkline": [],
+        }
+        MockPipeline.return_value = pipeline
+
+        events: list[tuple[str, dict]] = []
+        manager = CameraManager(
+            [_cam_config("cam_a", "Camera A")],
+            _alert_config(),
+            on_status_change=lambda topic, payload: events.append((topic, payload)),
+        )
+
+        assert manager.start_camera("cam_a") is True
+        assert [topic for topic, _ in events[-2:]] == ["cameras", "wall"]
+        start_camera_payload = events[-2][1]
+        start_wall_payload = events[-1][1]["cameras"][0]
+        assert start_camera_payload == manager.get_camera_status_payload("cam_a")
+        assert start_camera_payload["running"] is True
+        assert start_camera_payload["connected"] is True
+        assert start_wall_payload["status"] == "online"
+        camera_thread = manager._threads["cam_a"]
+
+        manager.stop_camera("cam_a")
+
+        assert [topic for topic, _ in events[-2:]] == ["cameras", "wall"]
+        stop_camera_payload = events[-2][1]
+        stop_wall_payload = events[-1][1]["cameras"][0]
+        assert stop_camera_payload == manager.get_camera_status_payload("cam_a")
+        assert stop_camera_payload["running"] is False
+        assert stop_camera_payload["connected"] is False
+        assert stop_wall_payload["status"] == "offline"
+        assert camera_thread.is_alive() is False
+
+        manager.stop_all()
+
+    def test_disconnect_and_reconnect_publish_camera_and_wall_refreshes(self):
+        """Capture connection transitions are visible without waiting for polling."""
+        events: list[tuple[str, dict]] = []
+        manager = CameraManager(
+            [_cam_config("cam_a", "Camera A")],
+            _alert_config(),
+            on_status_change=lambda topic, payload: events.append((topic, payload)),
+        )
+
+        stats = SimpleNamespace(
+            frames_captured=0,
+            frames_analyzed=0,
+            anomalies_detected=0,
+            alerts_emitted=0,
+            avg_latency_ms=0.0,
+            current_fps=0.0,
+            frames_dropped_backpressure=0,
+        )
+        camera = SimpleNamespace(
+            state=SimpleNamespace(connected=True),
+            reconnect=MagicMock(return_value=True),
+        )
+        pipeline = SimpleNamespace(
+            _camera=camera,
+            stats=stats,
+            mode=PipelineMode.ACTIVE,
+            get_capture_status=lambda: {"degraded": False},
+            get_wall_status=lambda: {
+                "current_score": 0.0,
+                "score_sparkline": [],
+            },
+            shutdown=lambda: None,
+        )
+        runner = SimpleNamespace(pipeline=pipeline)
+        iterations = 0
+
+        def run_once():
+            nonlocal iterations
+            iterations += 1
+            if iterations == 1:
+                camera.state.connected = False
+            elif iterations == 2:
+                camera.state.connected = True
+            else:
+                manager._runners.pop("cam_a", None)
+            return None
+
+        runner.run_once = run_once
+        manager._pipelines["cam_a"] = pipeline
+        manager._runners["cam_a"] = runner
+        manager._threads["cam_a"] = threading.current_thread()
+
+        manager._camera_loop("cam_a", runner)
+
+        camera_events = [payload for topic, payload in events if topic == "cameras"]
+        wall_events = [payload for topic, payload in events if topic == "wall"]
+        assert [payload["connected"] for payload in camera_events] == [False, True]
+        assert len(wall_events) == 2
+        assert iterations == 3
+
+        manager.stop_all()
+
+    @patch("argus.capture.manager.DetectionPipeline")
+    @patch("argus.person.detector.get_shared_yolo", return_value=MagicMock())
     def test_concurrent_start_same_camera_is_idempotent(self, mock_yolo, MockPipeline):
         """Startup and manual start must not create duplicate pipelines."""
         init_entered = threading.Event()
@@ -160,6 +289,7 @@ class TestCameraManagerIntegration:
             return True
 
         mock_instance.initialize.side_effect = _initialize
+        mock_instance.reconcile_auxiliary_desired.return_value = True
         MockPipeline.return_value = mock_instance
 
         manager = CameraManager([_cam_config("cam_a")], _alert_config())
@@ -184,6 +314,7 @@ class TestCameraManagerIntegration:
         """Mode switching through CameraManager reaches the pipeline."""
         mock_instance = MagicMock()
         mock_instance.initialize.return_value = True
+        mock_instance.reconcile_auxiliary_desired.return_value = True
         mock_instance.stats = MagicMock(frames_captured=0)
         mock_instance._camera.state.connected = True
         mock_instance.run_once.return_value = None
@@ -210,12 +341,65 @@ class TestCameraManagerIntegration:
 
     @patch("argus.capture.manager.DetectionPipeline")
     @patch("argus.person.detector.get_shared_yolo", return_value=MagicMock())
+    def test_runtime_source_identity_is_passed_to_pipeline(self, mock_yolo, MockPipeline):
+        """Runtime source rewrites keep declared and runtime source visible."""
+        cam = CameraConfig(
+            camera_id="usb_cam",
+            name="USB",
+            source="0",
+            protocol="usb",
+            fps_target=5,
+            resolution=(640, 480),
+            scene_guard=SceneGuardConfig(enabled=False),
+            mog2=MOG2Config(history=50, heartbeat_frames=10, enable_stabilization=False),
+            person_filter=PersonFilterConfig(model_name="yolo11n.pt"),
+            anomaly=AnomalyConfig(threshold=0.5),
+            simplex=SimplexConfig(enabled=False),
+            watchdog_timeout=5.0,
+        )
+        mock_instance = MagicMock()
+        mock_instance.camera_config = cam.model_copy(
+            update={
+                "source": "rtsp://127.0.0.1:8554/usb_cam",
+                "protocol": "rtsp",
+            },
+        )
+        mock_instance.initialize.return_value = True
+        mock_instance.reconcile_auxiliary_desired.return_value = True
+        mock_instance.stats = MagicMock(frames_captured=0)
+        mock_instance._camera.state.connected = True
+        mock_instance.run_once.return_value = None
+        mock_instance.get_latest_anomaly_map.return_value = None
+        MockPipeline.return_value = mock_instance
+
+        def resolver(config):
+            return config.model_copy(
+                update={
+                    "source": "rtsp://127.0.0.1:8554/usb_cam",
+                    "protocol": "rtsp",
+                },
+            )
+
+        manager = CameraManager([cam], _alert_config(), source_resolver=resolver)
+        assert manager.start_camera("usb_cam") is True
+
+        _, kwargs = MockPipeline.call_args
+        assert kwargs["camera_config"].source == "rtsp://127.0.0.1:8554/usb_cam"
+        assert kwargs["frame_identity_declared_source"] == "0"
+        assert kwargs["frame_identity_runtime_source"] == "rtsp://127.0.0.1:8554/usb_cam"
+        assert kwargs["frame_identity_stream_id"] == "usb_cam"
+
+        manager.stop_all()
+
+    @patch("argus.capture.manager.DetectionPipeline")
+    @patch("argus.person.detector.get_shared_yolo", return_value=MagicMock())
     def test_alert_callback_routing(self, mock_yolo, MockPipeline):
         """Alerts from pipelines are routed through the manager's callback."""
         alerts_received = []
 
         mock_instance = MagicMock()
         mock_instance.initialize.return_value = True
+        mock_instance.reconcile_auxiliary_desired.return_value = True
         mock_instance.stats = MagicMock(frames_captured=0)
         mock_instance._camera.state.connected = True
         mock_instance.run_once.return_value = None
@@ -283,6 +467,7 @@ class TestCameraManagerIntegration:
             instance = MagicMock()
             instance.camera_config = kwargs["camera_config"]
             instance.initialize.return_value = True
+            instance.reconcile_auxiliary_desired.return_value = True
             instance.get_detector_status.return_value = MagicMock(mode="loaded")
             instance.stats = MagicMock(frames_captured=0)
             instance._camera.state.connected = True

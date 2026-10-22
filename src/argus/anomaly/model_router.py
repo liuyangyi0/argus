@@ -10,6 +10,7 @@ from pathlib import Path
 
 import structlog
 
+from argus.storage.model_registry import validate_persisted_release_evidence
 from argus.storage.models import ModelRecord, ModelStage
 
 logger = structlog.get_logger()
@@ -31,16 +32,24 @@ class ModelRouter:
         """
         with self._session_factory() as session:
             # Check for canary model targeting this camera
-            canary = (
+            canaries = (
                 session.query(ModelRecord)
                 .filter_by(
                     camera_id=camera_id,
                     stage=ModelStage.CANARY.value,
                     canary_camera_id=camera_id,
                 )
-                .order_by(ModelRecord.created_at.desc())
-                .first()
+                .limit(2)
+                .all()
             )
+            if len(canaries) > 1:
+                logger.error(
+                    "model_router.ambiguous_canary_assignment",
+                    camera_id=camera_id,
+                    versions=[model.model_version_id for model in canaries],
+                )
+                return None
+            canary = canaries[0] if canaries else None
             if canary is not None:
                 logger.debug(
                     "model_router.canary",
@@ -60,20 +69,39 @@ class ModelRouter:
                 .order_by(ModelRecord.created_at.desc())
                 .first()
             )
+            if production is None:
+                return None
+            validation = validate_persisted_release_evidence(production)
+            if not validation.valid:
+                logger.error(
+                    "model_router.production_rejected",
+                    camera_id=camera_id,
+                    version=production.model_version_id,
+                    reasons=list(validation.reasons),
+                )
+                return None
             return production
 
     def get_shadow_model_for_camera(self, camera_id: str) -> ModelRecord | None:
-        """Get the newest shadow-stage model for a camera, if any."""
+        """Return the unique applied shadow assignment, or fail closed."""
         with self._session_factory() as session:
-            return (
+            models = (
                 session.query(ModelRecord)
                 .filter_by(
                     camera_id=camera_id,
                     stage=ModelStage.SHADOW.value,
                 )
-                .order_by(ModelRecord.created_at.desc())
-                .first()
+                .limit(2)
+                .all()
             )
+            if len(models) > 1:
+                logger.error(
+                    "model_router.ambiguous_shadow_assignment",
+                    camera_id=camera_id,
+                    versions=[model.model_version_id for model in models],
+                )
+                return None
+            return models[0] if models else None
 
     def get_model_path(self, camera_id: str) -> Path | None:
         """Get the model file path for a camera, considering canary routing."""
@@ -94,12 +122,14 @@ class ModelRouter:
     def is_canary(self, camera_id: str) -> bool:
         """Check if a camera is currently running a canary model."""
         with self._session_factory() as session:
-            return (
-                session.query(ModelRecord)
+            assignments = (
+                session.query(ModelRecord.id)
                 .filter_by(
                     camera_id=camera_id,
                     stage=ModelStage.CANARY.value,
                     canary_camera_id=camera_id,
                 )
-                .first()
-            ) is not None
+                .limit(2)
+                .all()
+            )
+            return len(assignments) == 1

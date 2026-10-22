@@ -1,6 +1,14 @@
 import type { ApiResponse, ReportStats } from '../types/api'
 import { api, u, unwrap } from './client'
 
+export interface DailyTrendResponse {
+  labels: string[]
+  high: number[]
+  medium: number[]
+  low: number[]
+  info: number[]
+}
+
 // ── Report statistics ──
 export const getReportStats = (days?: number) =>
   api
@@ -11,7 +19,9 @@ export const getReportStats = (days?: number) =>
 
 // ── Chart data ──
 export const getDailyTrend = (days = 30) =>
-  api.get('/reports/daily-trend/json', { params: { days } }).then(u)
+  api
+    .get<ApiResponse<DailyTrendResponse>>('/reports/daily-trend/json', { params: { days } })
+    .then(unwrap)
 
 export const getSeverityDist = (days?: number) =>
   api

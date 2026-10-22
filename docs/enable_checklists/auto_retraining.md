@@ -91,7 +91,7 @@
 | `enabled` | `false` | bool | 总开关。**只有这一项控制 scheduled 入口；queued 任务消费始终启用**。|
 | `interval_hours` | `24` | 1–168 | 计划重训练扫描周期。生产环境建议 24h；开发联调可降到 1h 加快验证。|
 | `min_new_baselines` | `20` | 5–500 | 触发阈值；建议 ≥ 30 与训练硬下限对齐。摄像机组共用此值。|
-| `auto_deploy` | `false` | bool | 训练成功且达到质量门槛后是否自动 `ModelRegistry.activate(..., allow_bypass=True)`。生产慎开。|
+| `auto_deploy` | `false` | bool | 训练成功且达到质量门槛后是否尝试 `ModelRegistry.activate(...)`；只有已完成 production 发布、持久化证据仍为 canonical 且当前 runtime artifact/sidecar 摘要未漂移时才会成功。生产慎开。|
 | `auto_deploy_min_grade` | `B` | A/B/C/F | 自动激活的最低质量等级。等级排序：A=4 > B=3 > C=2 > F=1（见 `src/argus/core/scheduler.py` 中 `_GRADE_RANK`）。|
 | `backbone_retrain_interval_days` | `30` | 7–180 | Backbone 任务到期判定（仅入队待确认）。|
 | `backbone_type` | `dinov2_vitb14` | `dinov2_vits14/vitb14/vitl14` | Backbone 变体。`vitl14` 显存占用最高。|

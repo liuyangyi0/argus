@@ -7,7 +7,7 @@ import {
   CheckCircleOutlined,
 } from '@ant-design/icons-vue'
 import Sparkline from './Sparkline.vue'
-import { useGo2RTC } from '../composables/useGo2RTC'
+import { streamFallbackReasonLabel, useGo2RTC } from '../composables/useGo2RTC'
 
 export interface CameraTileData {
   camera_id: string
@@ -27,6 +27,8 @@ export interface CameraTileData {
     description?: string;
   } | null
   degradation: string | null
+  model_backend?: string | null
+  expected_model_backend?: string | null
   capture_status?: {
     degradation_reason?: string | null
     fast_motion?: {
@@ -62,7 +64,23 @@ const degradationTitle = computed(() => {
   const reason = props.camera.capture_status?.degradation_reason
     || props.camera.capture_status?.fast_motion?.degradation_reason
     || props.camera.degradation
+  if (reason === 'model_backend_mismatch') {
+    return `降级: 模型后端不符合要求（当前 ${props.camera.model_backend || '未知'}，期望 ${props.camera.expected_model_backend || 'auto'}）`
+  }
+  if (reason === 'model_fallback') return '降级: 主模型未加载或已回退'
   return reason ? `降级: ${reason}` : '降级'
+})
+
+const modelBackendWarning = computed(() => {
+  const actual = props.camera.model_backend
+  const expected = props.camera.expected_model_backend
+  if (expected && expected !== 'auto' && actual !== expected) {
+    return '模型后端不符合要求'
+  }
+  if (actual && ['ssim-fallback', 'none', 'disabled'].includes(actual)) {
+    return '主模型未加载或已回退'
+  }
+  return ''
 })
 
 // go2rtc WebRTC/MSE player
@@ -72,6 +90,8 @@ const _go2rtc = useGo2RTC(cameraIdRef)
 const videoRef = _go2rtc.videoRef
 const mjpegRef = _go2rtc.mjpegRef
 const streamStatus = _go2rtc.status
+const streamFallbackReason = _go2rtc.fallbackReason
+const streamFallbackDetail = computed(() => streamFallbackReasonLabel(streamFallbackReason.value))
 const { start, stop } = _go2rtc
 
 // Legacy MJPEG fallback URL
@@ -234,6 +254,22 @@ function handleAlertBadgeClick(e: MouseEvent) {
           {{ camera.frames_dropped }}
         </div>
       </Tooltip>
+      <div class="absolute bottom-1 left-1 flex flex-col gap-1 pointer-events-none">
+        <div
+          v-if="camera.status === 'online' && streamStatus === 'fallback'"
+          class="px-1.5 py-px rounded-[3px] bg-amber-500/90 text-[10px] font-semibold text-white shadow"
+          role="status"
+          :title="streamFallbackDetail"
+        >
+          MJPEG fallback · 非实时预览 · {{ streamFallbackDetail }}
+        </div>
+        <div
+          v-if="modelBackendWarning"
+          class="px-1.5 py-px rounded-[3px] bg-red-500/90 text-[10px] font-semibold text-white shadow"
+        >
+          {{ modelBackendWarning }}
+        </div>
+      </div>
     </div>
 
     <!-- Footer: 28px status bar -->

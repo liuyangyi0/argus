@@ -1,9 +1,11 @@
-import { mount, flushPromises } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { enableAutoUnmount, mount, flushPromises } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { message } from 'ant-design-vue'
 
 import ModuleTogglePanel from '../ModuleTogglePanel.vue'
 import { getModuleStates, toggleModule } from '../../../api'
+
+enableAutoUnmount(afterEach)
 
 vi.mock('../../../api', () => ({
   getModuleStates: vi.fn(),
@@ -24,14 +26,14 @@ const cardStub = {
 }
 
 const switchStub = {
-  props: ['checked', 'loading'],
+  props: ['checked', 'loading', 'disabled'],
   emits: ['update:checked', 'change'],
   template: `
     <button
       type="button"
       class="module-switch"
       :aria-pressed="checked ? 'true' : 'false'"
-      :disabled="loading"
+      :disabled="loading || disabled"
       @click="$emit('update:checked', !checked); $emit('change', !checked)"
     >
       {{ checked ? 'on' : 'off' }}
@@ -46,6 +48,36 @@ describe('ModuleTogglePanel', () => {
     vi.mocked(message.success).mockReset()
     vi.mocked(message.warning).mockReset()
     vi.mocked(message.error).mockReset()
+  })
+
+  it('keeps unavailable switches disabled and surfaces configuration loading failures', async () => {
+    vi.mocked(getModuleStates).mockRejectedValue(new Error('configuration unavailable'))
+    const wrapper = mount(ModuleTogglePanel, {
+      global: { stubs: { 'a-card': cardStub, 'a-switch': switchStub } },
+    })
+    await flushPromises()
+    expect(wrapper.find('[role="alert"]').text()).toContain('configuration unavailable')
+    expect(wrapper.findAll('.module-switch').every(button => button.attributes('disabled') !== undefined)).toBe(true)
+    expect(toggleModule).not.toHaveBeenCalled()
+  })
+
+  it('keeps partial runtime application warnings visible after a successful HTTP response', async () => {
+    vi.mocked(getModuleStates).mockResolvedValue({ 'segmenter.enabled': false })
+    vi.mocked(toggleModule).mockResolvedValue({
+      key: 'segmenter.enabled', value: true, restart_required: false,
+      hot_reloaded: 0, hot_reloadable: true, hot_reload_failed: 1,
+      pipelines_seen: 1, persisted: true, all_applied: false,
+    })
+    const wrapper = mount(ModuleTogglePanel, {
+      global: { stubs: { 'a-card': cardStub, 'a-switch': switchStub } },
+    })
+    await flushPromises()
+    const row = wrapper.findAll('.module-item').find(item => item.text().includes('SAM2 实例分割'))!
+    await row.find('.module-switch').trigger('click')
+    await flushPromises()
+    expect(row.text()).toContain('运行时未全部生效')
+    expect(row.find('.module-switch').attributes('aria-pressed')).toBe('true')
+    expect(message.success).not.toHaveBeenCalled()
   })
 
   it('loads module state and reports hot-reload feedback after toggling classifier', async () => {
@@ -85,8 +117,8 @@ describe('ModuleTogglePanel', () => {
     await flushPromises()
 
     expect(toggleModule).toHaveBeenCalledWith('classifier.enabled', true)
-    expect(message.success).toHaveBeenCalledWith(
-      'AI 异物分类 已启用（1 个管线已热加载；未写入 YAML，重启后可能丢失）',
+    expect(message.warning).toHaveBeenCalledWith(
+      'AI 异物分类 已在 1 个管线应用，但未写入 YAML，重启后可能丢失',
     )
   })
 

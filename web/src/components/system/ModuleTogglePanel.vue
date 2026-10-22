@@ -3,13 +3,15 @@ import { ref, onMounted } from 'vue'
 import { message } from 'ant-design-vue'
 import { getModuleStates, toggleModule as updateModuleToggle } from '../../api'
 import { extractErrorMessage } from '../../utils/error'
-import { notifyModuleToggleResult } from '../../utils/moduleToggleFeedback'
+import { notifyModuleToggleResult, type ModuleToggleFeedback } from '../../utils/moduleToggleFeedback'
 
 interface ModuleToggle {
   key: string
   label: string
   description: string
   enabled: boolean
+  available?: boolean
+  feedback?: ModuleToggleFeedback
 }
 
 const modules = ref<ModuleToggle[]>([
@@ -64,28 +66,40 @@ const modules = ref<ModuleToggle[]>([
 ])
 
 const loading = ref(false)
+const loadingConfig = ref(false)
+const configError = ref<string | null>(null)
 
 async function loadConfig() {
+  if (loadingConfig.value) return
+  loadingConfig.value = true
+  configError.value = null
   try {
     const states = await getModuleStates()
     for (const mod of modules.value) {
-      if (mod.key in states && typeof states[mod.key] === 'boolean') {
+      mod.available = mod.key in states && typeof states[mod.key] === 'boolean'
+      if (mod.available) {
         mod.enabled = states[mod.key]
       }
     }
-  } catch {
-    // Config endpoint may not expose all fields yet
+  } catch (e) {
+    configError.value = extractErrorMessage(e, '加载功能模块状态失败')
+    for (const mod of modules.value) mod.available = false
+  } finally {
+    loadingConfig.value = false
   }
 }
 
-async function toggleModule(mod: ModuleToggle) {
+async function toggleModule(mod: ModuleToggle, checked: boolean) {
+  if (loading.value || loadingConfig.value || !mod.available) return
   loading.value = true
   try {
-    const result = await updateModuleToggle(mod.key, mod.enabled)
-    notifyModuleToggleResult(mod.label, mod.enabled, result)
+    const result = await updateModuleToggle(mod.key, checked)
+    mod.enabled = result.value
+    mod.feedback = notifyModuleToggleResult(mod.label, checked, result)
   } catch (e) {
-    mod.enabled = !mod.enabled
     message.error(extractErrorMessage(e, `${mod.label} 切换失败`))
+    mod.feedback = { type: 'warning', message: '切换请求失败，运行时状态尚未确认；已重新读取配置，请核验后再操作。' }
+    await loadConfig()
   } finally {
     loading.value = false
   }
@@ -96,16 +110,25 @@ onMounted(loadConfig)
 
 <template>
   <a-card title="功能模块" :bordered="false">
+    <p class="module-notice">开关表示配置目标，不代表模型已经加载或识别效果已验收；分类器与分割器的逐相机状态请查看对应面板。</p>
+    <div v-if="configError" class="module-error" role="alert">
+      {{ configError }}
+      <button type="button" :disabled="loadingConfig" @click="loadConfig">重新加载状态</button>
+    </div>
     <div class="module-list">
       <div v-for="mod in modules" :key="mod.key" class="module-item">
         <div class="module-info">
           <span class="module-label">{{ mod.label }}</span>
           <span class="module-desc">{{ mod.description }}</span>
+          <span v-if="!mod.available" class="module-status" role="status">{{ loadingConfig ? '状态加载中' : '配置状态不可用，禁止切换' }}</span>
+          <span v-if="mod.feedback" class="module-status" role="status">{{ mod.feedback.message }}</span>
         </div>
         <a-switch
-          v-model:checked="mod.enabled"
+          :checked="mod.enabled"
           :loading="loading"
-          @change="toggleModule(mod)"
+          :disabled="loadingConfig || !mod.available"
+          :aria-label="`${mod.label}配置开关`"
+          @change="(checked: boolean) => toggleModule(mod, checked)"
         />
       </div>
     </div>
@@ -118,6 +141,9 @@ onMounted(loadConfig)
   flex-direction: column;
   gap: 16px;
 }
+.module-notice, .module-status { font-size: 12px; color: var(--argus-text-muted); }
+.module-error { color: var(--argus-danger, #b42318); margin-bottom: 12px; }
+.module-status { overflow-wrap: anywhere; }
 .module-item {
   display: flex;
   justify-content: space-between;

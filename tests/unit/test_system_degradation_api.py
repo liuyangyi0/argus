@@ -33,14 +33,24 @@ def test_anomaly_degradation_endpoint_aggregates_pipeline_fallback(tmp_path):
     alerts_dir = tmp_path / "alerts"
     alerts_dir.mkdir()
     camera_manager = SimpleNamespace(
-        _pipelines={
-            "cam_01": _Pipeline(degraded=False),
-            "cam_02": _Pipeline(
-                degraded=True,
-                reason="anomaly_head_failures",
-                since=1234.5,
-            ),
-        }
+        get_system_status_snapshots=lambda: [
+            {
+                "camera_id": "cam_01",
+                "anomaly_degradation": {
+                    "degraded": False,
+                    "reason": None,
+                    "since": None,
+                },
+            },
+            {
+                "camera_id": "cam_02",
+                "anomaly_degradation": {
+                    "degraded": True,
+                    "reason": "anomaly_head_failures",
+                    "since": 1234.5,
+                },
+            },
+        ],
     )
     client = TestClient(
         create_app(camera_manager=camera_manager, alerts_dir=str(alerts_dir))

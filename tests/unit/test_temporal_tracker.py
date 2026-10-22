@@ -43,6 +43,25 @@ class TestTemporalAnomalyTracker:
         assert result.active_tracks[0].consecutive_frames == 2
         assert result.active_tracks[0].max_score == 0.85
 
+    def test_active_tracks_snapshot_is_detached_and_api_safe(self):
+        tracker = TemporalAnomalyTracker(match_distance=50.0)
+        tracker.update([FakeRegion(100.04, 200.06, 0.81234)], frame_number=1)
+        tracker.update([FakeRegion(101.04, 201.06, 0.91234)], frame_number=2)
+
+        snapshot = tracker.get_active_tracks_snapshot()
+
+        assert snapshot == [{
+            "track_id": 1,
+            "centroid_x": 101.0,
+            "centroid_y": 201.1,
+            "consecutive_frames": 2,
+            "max_score": 0.912,
+            "area_px": 0,
+            "trajectory_length": 2,
+        }]
+        snapshot[0]["centroid_x"] = -1
+        assert tracker.get_active_tracks_snapshot()[0]["centroid_x"] == 101.0
+
     def test_far_away_region_creates_separate_track(self):
         """A region far from existing tracks should create a new track."""
         tracker = TemporalAnomalyTracker(match_distance=50.0)

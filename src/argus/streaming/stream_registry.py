@@ -88,6 +88,9 @@ def _usb_go2rtc_source(camera: Any, source: str, protocol: str) -> str | None:
         return str(explicit)
 
     usb_cfg = _attr(camera, "usb")
+    configured_source = _attr(usb_cfg, "go2rtc_source", None)
+    if configured_source:
+        return str(configured_source)
     pixel_format = _attr(usb_cfg, "pixel_format", None)
     device_name = _attr(usb_cfg, "device_name", None)
     device_id = _attr(usb_cfg, "device_id", None)
@@ -261,6 +264,7 @@ class StreamRegistry:
         self._desired: dict[str, StreamDeclaration] = {}
         self._registered: dict[str, tuple[str, str, str | None]] = {}
         self._resolutions: dict[str, CameraSourceResolution] = {}
+        self._initial_config_streams: dict[str, str] = {}
 
     @property
     def desired_streams(self) -> dict[str, StreamDeclaration]:
@@ -337,8 +341,11 @@ class StreamRegistry:
         )
         if declaration is None:
             return None
+        restored = False
         if start_if_needed:
-            self._ensure_started()
+            restored = self._ensure_started()
+        if restored:
+            return self._resolutions.get(declaration.camera_id)
         return self._ensure_registered(declaration)
 
     def undeclare_camera(self, camera_or_id: Any, *, remove_runtime: bool = True) -> bool:
@@ -357,7 +364,15 @@ class StreamRegistry:
         self._drop_resolution_for_stream(stream_name)
 
         was_registered = self._registered.pop(stream_name, None) is not None
-        if remove_runtime and was_registered:
+        initial_config_stream = (
+            declaration is not None and self._requires_initial_config(declaration)
+        )
+        if initial_config_stream and self._is_running():
+            # Initial-config exec sources cannot be deleted/re-added safely via
+            # REST. Restart only the manager-owned process with the remaining
+            # desired map, then replay all dynamic streams.
+            self._ensure_started()
+        elif remove_runtime and was_registered:
             self._remove_stream(stream_name)
         return declaration is not None or was_registered
 
@@ -373,8 +388,7 @@ class StreamRegistry:
         if plan is not None:
             self.declare_plan(plan)
 
-        if start_if_needed:
-            self._ensure_started()
+        restored = self._ensure_started() if start_if_needed else False
 
         desired_names = set(self._desired)
         if remove_stale:
@@ -387,8 +401,9 @@ class StreamRegistry:
                     self._drop_resolution_for_stream(stale_name)
                     self._remove_stream(stale_name)
 
-        for declaration in self._desired.values():
-            self._ensure_registered(declaration)
+        if not restored:
+            for declaration in self._desired.values():
+                self._ensure_registered(declaration)
 
         desired_camera_ids = {
             declaration.camera_id for declaration in self._desired.values()
@@ -419,12 +434,41 @@ class StreamRegistry:
         )
         return runtime_camera_config(camera, _resolution_for(declaration, None))
 
-    def _ensure_started(self) -> None:
-        if self._is_running():
-            return
+    def _ensure_started(self) -> bool:
+        """Ensure the owned manager is running.
+
+        Returns ``True`` when this call started/restarted the process and
+        already replayed every desired registration.  Callers use that signal
+        to avoid an immediate duplicate registration attempt after a failure.
+        """
         initial_streams = self._initial_streams()
+        if self._is_running():
+            if self._initial_config_streams == initial_streams:
+                return False
+            if self._initial_config_streams or initial_streams:
+                logger.warning(
+                    "go2rtc.initial_config_changed",
+                    previous=sorted(self._initial_config_streams),
+                    desired=sorted(initial_streams),
+                )
+                self.manager.stop()
+                self.manager.start(initial_streams=initial_streams or None)
+                self._initial_config_streams = dict(initial_streams)
+                self._registered.clear()
+                self._restore_desired_registrations()
+                return True
+            return False
         self.manager.start(initial_streams=initial_streams or None)
+        self._initial_config_streams = dict(initial_streams)
         self._registered.clear()
+        self._restore_desired_registrations()
+        return True
+
+    def _restore_desired_registrations(self) -> None:
+        """Replay every desired stream after this manager instance restarts."""
+        self._resolutions.clear()
+        for declaration in self._desired.values():
+            self._ensure_registered(declaration)
 
     def _ensure_registered(
         self,
@@ -444,17 +488,29 @@ class StreamRegistry:
 
         rtsp_url: str | None = None
         if declaration.supported_by_go2rtc:
+            if self._requires_initial_config(declaration):
+                expected_source = self._initial_source(declaration)
+                if self._initial_config_streams.get(stream_name) != expected_source:
+                    raise RuntimeError(
+                        "exec-backed camera source is not active in the owned "
+                        "go2rtc initial configuration"
+                    )
             try:
-                register_source = declaration.source
-                register_protocol = declaration.protocol
-                if declaration.protocol == "usb" and declaration.go2rtc_source:
-                    register_source = declaration.go2rtc_source
-                    register_protocol = "rtsp"
-                rtsp_url = self.manager.register_camera(
-                    stream_name,
-                    register_source,
-                    register_protocol,
-                )
+                if self._requires_initial_config(declaration):
+                    rtsp_url = (
+                        f"rtsp://127.0.0.1:{self.manager.rtsp_port}/{stream_name}"
+                    )
+                else:
+                    register_source = declaration.source
+                    register_protocol = declaration.protocol
+                    if declaration.protocol == "usb" and declaration.go2rtc_source:
+                        register_source = declaration.go2rtc_source
+                        register_protocol = "rtsp"
+                    rtsp_url = self.manager.register_camera(
+                        stream_name,
+                        register_source,
+                        register_protocol,
+                    )
             except Exception:
                 logger.warning(
                     "go2rtc.register_failed",
@@ -487,7 +543,7 @@ class StreamRegistry:
     def _initial_streams(self) -> dict[str, str]:
         initial_streams: dict[str, str] = {}
         for declaration in self._desired.values():
-            if declaration.protocol != "gige":
+            if not self._requires_initial_config(declaration):
                 continue
             if declaration.go2rtc_source:
                 initial_streams[str(declaration.stream_name)] = declaration.go2rtc_source
@@ -496,6 +552,24 @@ class StreamRegistry:
                     declaration.capture_script,
                 )
         return initial_streams
+
+    @staticmethod
+    def _initial_source(declaration: StreamDeclaration) -> str:
+        if declaration.go2rtc_source:
+            return declaration.go2rtc_source
+        if declaration.capture_script:
+            return gige_to_go2rtc_source(declaration.capture_script)
+        raise RuntimeError("initial-config stream has no source")
+
+    @staticmethod
+    def _requires_initial_config(declaration: StreamDeclaration) -> bool:
+        if declaration.protocol == "gige":
+            return True
+        return (
+            declaration.protocol == "usb"
+            and isinstance(declaration.go2rtc_source, str)
+            and declaration.go2rtc_source.lstrip().startswith("exec:")
+        )
 
     def _stream_name_for(self, camera_or_id: Any) -> str | None:
         if _looks_like_camera(camera_or_id):

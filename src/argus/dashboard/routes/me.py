@@ -14,22 +14,26 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from argus.dashboard.api_response import ErrorCode, api_error, api_success
+
 router = APIRouter()
 
 
 @router.get("")
 async def get_me(request: Request) -> JSONResponse:
-    """Return the current session user's identity (flat shape).
+    """Return the current session user's identity in the API envelope.
 
     Response (200):
-        {"username": str, "role": str, "display_name": str?}
+        {"code": 0, "msg": "ok", "data": {
+            "username": str, "role": str, "display_name": str?
+        }}
 
     ``display_name`` is omitted when the user record has no display name
     (or when the principal is not backed by a DB row, e.g. the
     auth-disabled "system" user or the legacy X-API-Token "api" user).
 
     Unauthenticated callers never reach this handler — the AuthMiddleware
-    short-circuits with ``{"error": "Authentication required"}`` (401).
+    short-circuits with the canonical ``{code,msg,data}`` error (401).
     """
     user = getattr(request.state, "user", None) or {}
     username = user.get("username") if isinstance(user, dict) else None
@@ -40,8 +44,9 @@ async def get_me(request: Request) -> JSONResponse:
     # same as unauthenticated so the frontend doesn't render with a stale
     # identity.
     if not username or not role:
-        return JSONResponse(
-            {"error": "Authentication required"},
+        return api_error(
+            ErrorCode.AUTH_REQUIRED,
+            "Authentication required",
             status_code=401,
             headers={"WWW-Authenticate": 'Bearer realm="Argus"'},
         )
@@ -63,4 +68,4 @@ async def get_me(request: Request) -> JSONResponse:
             if display_name:
                 body["display_name"] = display_name
 
-    return JSONResponse(body, status_code=200)
+    return api_success(body)

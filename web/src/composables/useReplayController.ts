@@ -10,17 +10,115 @@ import {
   deleteReplayClip,
   getAlertTrajectory,
 } from '../api'
-import type { ReplayClip, TrajectoryFit } from '../types/api'
+import type { ReplayMetadataPayload, ReplaySignalsPayload } from '../api/replay'
+import type { TrajectoryFit } from '../types/api'
+import { toApiError } from '../utils/error'
+
+export type ReplayResourceState = 'idle' | 'loading' | 'ready' | 'error' | 'unavailable'
+
+type ReferenceOption = 'yesterday' | 'last_week' | 'prev_week' | 'custom'
+
+interface ReplayClipState {
+  start_index: number
+  end_index: number
+  label: string
+  created_at?: string
+}
+
+export interface ReplayYoloBox {
+  bbox: [number, number, number, number]
+  class: string
+  confidence?: number
+}
+
+export interface ReplayCanvasPoint {
+  x: number
+  y: number
+}
+
+export type ReplayTrackPoints = Array<ReplayCanvasPoint | null>
+
+export type ReplaySignalsState = Omit<
+  ReplaySignalsPayload,
+  'trajectory_points' | 'yolo_boxes'
+> & {
+  // The API stores trajectory samples grouped by track. The compositor needs
+  // fixed-length, frame-indexed arrays, so expose the normalized shape here.
+  trajectory_points?: ReplayTrackPoints
+  trajectory_points_by_track?: Record<string, ReplayTrackPoints>
+  yolo_boxes?: ReplayYoloBox[][]
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function isNumberTuple4(value: unknown): value is [number, number, number, number] {
+  return Array.isArray(value)
+    && value.length === 4
+    && value.every(isFiniteNumber)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function normalizeYoloBoxes(
+  frames: ReplaySignalsPayload['yolo_boxes'],
+): ReplayYoloBox[][] | undefined {
+  if (!frames) return undefined
+  return frames.map((frame) => frame.flatMap((rawBox) => {
+    if (!isRecord(rawBox) || !isNumberTuple4(rawBox.bbox) || typeof rawBox.class !== 'string') {
+      return []
+    }
+    const box: ReplayYoloBox = {
+      bbox: rawBox.bbox,
+      class: rawBox.class,
+    }
+    if (isFiniteNumber(rawBox.confidence)) box.confidence = rawBox.confidence
+    return [box]
+  }))
+}
+
+function isReferenceOption(value: unknown): value is ReferenceOption {
+  return value === 'yesterday'
+    || value === 'last_week'
+    || value === 'prev_week'
+    || value === 'custom'
+}
 
 export function useReplayController(alertId: string) {
   // core state
-  const metadata = ref<any>(null)
-  const signals = ref<any>(null)
+  const metadata = ref<ReplayMetadataPayload | null>(null)
+  const signals = ref<ReplaySignalsState | null>(null)
   const trajectoryFits = ref<TrajectoryFit[]>([])
   const currentIndex = ref(0)
   const playing = ref(false)
   const speed = ref(1)
-  const loading = ref(true)
+  // Start in loading so the first render cannot flash an empty-state before
+  // ReplayPlayer's mounted hook starts the initial requests.
+  const metadataState = ref<ReplayResourceState>('loading')
+  const signalsState = ref<ReplayResourceState>('loading')
+  const trajectoryState = ref<ReplayResourceState>('loading')
+  const videoState = ref<ReplayResourceState>('idle')
+  const metadataError = ref('')
+  const metadataErrorStatus = ref<number | null>(null)
+  const signalsError = ref('')
+  const signalsErrorStatus = ref<number | null>(null)
+  const trajectoryError = ref('')
+  const trajectoryErrorStatus = ref<number | null>(null)
+
+  const metadataLoading = computed(() => metadataState.value === 'loading')
+  const signalsLoading = computed(() => signalsState.value === 'loading')
+  const trajectoryLoading = computed(() => trajectoryState.value === 'loading')
+  const videoLoading = computed(() => videoState.value === 'loading')
+  // Compatibility aliases for existing callers. The page shell is gated only
+  // by metadata; signals, trajectory and video expose their own states below.
+  const loading = computed(() => (
+    metadataLoading.value || signalsLoading.value || trajectoryLoading.value
+  ))
+  const loadError = computed(() => metadataError.value)
+  const loadErrorStatus = computed(() => metadataErrorStatus.value)
 
   // video/canvas dom refs
   const videoEl = ref<HTMLVideoElement | null>(null)
@@ -39,15 +137,19 @@ export function useReplayController(alertId: string) {
   const referenceFrame = ref<string | null>(null)
   const referenceDate = ref('')
   const loadingRef = ref(false)
-  const selectedRefOption = ref('yesterday')
+  const selectedRefOption = ref<ReferenceOption>('yesterday')
   const referenceOffsetSeconds = ref(0)
   const lastRefDate = ref<string | undefined>(undefined)
 
   // clips
   const clipStart = ref<number | null>(null)
   const clipEnd = ref<number | null>(null)
-  const persistedClips = ref<ReplayClip[]>([])
+  const persistedClips = ref<ReplayClipState[]>([])
   let recordingRefreshTimer: ReturnType<typeof setTimeout> | null = null
+  let loadDataRevision = 0
+  let metadataLoadRevision = 0
+  let signalsLoadRevision = 0
+  let trajectoryLoadRevision = 0
 
   function clearRecordingRefresh() {
     if (recordingRefreshTimer) {
@@ -67,7 +169,21 @@ export function useReplayController(alertId: string) {
 
   // computed properties
   const fps = computed(() => metadata.value?.fps || 15)
-  const videoUrl = computed(() => getReplayVideoUrl(alertId))
+  const videoUrl = computed(() => {
+    const base = metadata.value?.video_url || getReplayVideoUrl(alertId)
+    if (!metadata.value) return base
+    // In-progress media is served no-store and keeps a stable source so each
+    // 2-second metadata refresh does not reset playback. Once finalized, move
+    // to an immutable metadata-derived URL and remount exactly once.
+    if (metadata.value.status !== 'complete') return base
+    const artifactRevision = [
+      'complete',
+      metadata.value.frame_count ?? 0,
+      metadata.value.created_at || '',
+    ].join(':')
+    const separator = base.includes('?') ? '&' : '?'
+    return `${base}${separator}v=${encodeURIComponent(artifactRevision)}`
+  })
   const hasHeatmaps = computed(() => signals.value?.has_heatmaps || false)
 
   const currentTimestamp = computed(() => {
@@ -76,63 +192,128 @@ export function useReplayController(alertId: string) {
     return new Date(ts * 1000).toLocaleTimeString('zh-CN')
   })
 
-  // data loading
-  async function loadData() {
-    clearRecordingRefresh()
-    loading.value = true
+  // data loading. Each resource commits independently so a missing signal or
+  // trajectory document never discards usable metadata/video state.
+  async function loadMetadata(): Promise<void> {
+    const revision = ++metadataLoadRevision
+    metadataState.value = 'loading'
+    metadataError.value = ''
+    metadataErrorStatus.value = null
     try {
-      const [metaRes, sigRes, trajRes] = await Promise.all([
-        getReplayMetadata(alertId),
-        getReplaySignals(alertId),
-        // Older alerts have no trajectory record — swallow 404 but log real errors
-        getAlertTrajectory(alertId).catch((err) => {
-          if (!/404|not found/i.test(String(err?.message ?? err))) {
-            console.warn('[replay] trajectory fetch failed:', err)
-          }
-          return null
-        }),
-      ])
+      const metaRes = await getReplayMetadata(alertId)
+      if (revision !== metadataLoadRevision) return
       metadata.value = metaRes
-      signals.value = sigRes
-      trajectoryFits.value = trajRes?.trajectories ?? []
+      metadataState.value = 'ready'
+      const triggerFrameIndex = metadata.value?.trigger_frame_index
+      if (triggerFrameIndex !== undefined) {
+        pendingSeekIndex.value = triggerFrameIndex
+        currentIndex.value = triggerFrameIndex
+      }
+      void loadReference()
+    } catch (err) {
+      if (revision !== metadataLoadRevision) return
+      const apiError = toApiError(err, '回放元数据加载失败')
+      metadataError.value = apiError.message
+      metadataErrorStatus.value = apiError.httpStatus
+      metadataState.value = 'error'
+    }
+  }
+
+  async function loadSignals(): Promise<void> {
+    const revision = ++signalsLoadRevision
+    signalsState.value = 'loading'
+    signalsError.value = ''
+    signalsErrorStatus.value = null
+    try {
+      const sigRes = await getReplaySignals(alertId)
+      if (revision !== signalsLoadRevision) return
 
       // Transform backend's {track_id: [{frame_index, x, y, t}]} into a
       // frame-indexed array per track for the canvas compositor.
-      const tracksMap = (sigRes as any)?.trajectory_points ?? {}
+      const {
+        trajectory_points: tracksMap = {},
+        yolo_boxes: rawYoloBoxes,
+        ...signalFields
+      } = sigRes
       const frameCount = Array.isArray(sigRes?.timestamps) ? sigRes.timestamps.length : 0
+      const enrichedSignals: ReplaySignalsState = {
+        ...signalFields,
+        ...(rawYoloBoxes ? { yolo_boxes: normalizeYoloBoxes(rawYoloBoxes) } : {}),
+      }
       if (frameCount > 0 && tracksMap && typeof tracksMap === 'object') {
-        const byTrack: Record<string, Array<{ x: number; y: number } | null>> = {}
-        for (const [tid, pts] of Object.entries<any>(tracksMap)) {
-          const arr: Array<{ x: number; y: number } | null> = new Array(frameCount).fill(null)
-          for (const p of (pts as any[])) {
+        const byTrack: Record<string, ReplayTrackPoints> = {}
+        for (const [tid, pts] of Object.entries(tracksMap)) {
+          const arr: ReplayTrackPoints = new Array(frameCount).fill(null)
+          for (const p of pts) {
             const idx = p?.frame_index
-            if (Number.isInteger(idx) && idx >= 0 && idx < frameCount) {
+            if (
+              Number.isInteger(idx)
+              && idx >= 0
+              && idx < frameCount
+              && isFiniteNumber(p.x)
+              && isFiniteNumber(p.y)
+            ) {
               arr[idx] = { x: p.x, y: p.y }
             }
           }
           byTrack[tid] = arr
         }
-        ;(signals.value as any).trajectory_points_by_track = byTrack
+        enrichedSignals.trajectory_points_by_track = byTrack
+        enrichedSignals.trajectory_points = Object.values(byTrack)[0]
       }
-
-      if (metadata.value?.trigger_frame_index !== undefined) {
-        pendingSeekIndex.value = metadata.value.trigger_frame_index
-        currentIndex.value = metadata.value.trigger_frame_index
-      }
-
+      signals.value = enrichedSignals
+      signalsState.value = 'ready'
       // Rehydrate operator-persisted clip ranges so they survive reload.
-      const loadedClips = Array.isArray((sigRes as any)?.clips) ? (sigRes as any).clips : []
-      persistedClips.value = loadedClips as ReplayClip[]
-
-      loadReference()
-      scheduleRecordingRefresh()
-    } catch (e) {
-      message.error('回放数据加载失败')
-      metadata.value = null
-      clearRecordingRefresh()
-    } finally {
-      loading.value = false
+      persistedClips.value = Array.isArray(sigRes.clips) ? sigRes.clips : []
+    } catch (err) {
+      if (revision !== signalsLoadRevision) return
+      const apiError = toApiError(err, '回放信号加载失败')
+      signalsError.value = apiError.message
+      signalsErrorStatus.value = apiError.httpStatus
+      signalsState.value = 'error'
     }
+  }
+
+  async function loadTrajectory(): Promise<void> {
+    const revision = ++trajectoryLoadRevision
+    trajectoryState.value = 'loading'
+    trajectoryError.value = ''
+    trajectoryErrorStatus.value = null
+    try {
+      const response = await getAlertTrajectory(alertId)
+      if (revision !== trajectoryLoadRevision) return
+      trajectoryFits.value = response?.trajectories ?? []
+      trajectoryState.value = response ? 'ready' : 'unavailable'
+    } catch (err) {
+      if (revision !== trajectoryLoadRevision) return
+      const apiError = toApiError(err, '轨迹数据加载失败')
+      if (apiError.httpStatus === 404 || /404|not found|不存在/i.test(apiError.message)) {
+        trajectoryFits.value = []
+        trajectoryState.value = 'unavailable'
+        return
+      }
+      trajectoryError.value = apiError.message
+      trajectoryErrorStatus.value = apiError.httpStatus
+      trajectoryState.value = 'error'
+    }
+  }
+
+  async function loadData(): Promise<void> {
+    const revision = ++loadDataRevision
+    clearRecordingRefresh()
+    await Promise.allSettled([
+      loadMetadata(),
+      loadSignals(),
+      loadTrajectory(),
+    ])
+    if (revision !== loadDataRevision) return
+    scheduleRecordingRefresh()
+  }
+
+  async function retryMetadata(): Promise<void> {
+    clearRecordingRefresh()
+    await loadMetadata()
+    scheduleRecordingRefresh()
   }
 
   async function loadReference(date?: string) {
@@ -168,7 +349,7 @@ export function useReplayController(alertId: string) {
         label: label || '',
       })
       if (Array.isArray(res?.clips)) {
-        persistedClips.value = res.clips as ReplayClip[]
+        persistedClips.value = res.clips
       }
       message.success(`片段已保存 #${startIdx}–${endIdx}`)
     } catch {
@@ -181,7 +362,7 @@ export function useReplayController(alertId: string) {
     try {
       const res = await deleteReplayClip(alertId, index)
       if (Array.isArray(res?.clips)) {
-        persistedClips.value = res.clips as ReplayClip[]
+        persistedClips.value = res.clips
       } else {
         persistedClips.value = persistedClips.value.filter((_, i) => i !== index)
       }
@@ -191,7 +372,8 @@ export function useReplayController(alertId: string) {
   }
 
   // reference option change
-  function onRefOptionChange(value: any) {
+  function onRefOptionChange(value: unknown) {
+    if (!isReferenceOption(value)) return
     selectedRefOption.value = value
     if (value === 'custom') {
       const dateStr = prompt('输入日期 (YYYY-MM-DD):')
@@ -218,6 +400,32 @@ export function useReplayController(alertId: string) {
   }
 
   // playback controls
+  function markVideoLoading() {
+    videoState.value = 'loading'
+    videoError.value = ''
+  }
+
+  function markVideoReady() {
+    videoState.value = 'ready'
+    videoError.value = ''
+  }
+
+  function markVideoError(error: string) {
+    videoState.value = 'error'
+    videoError.value = error
+    playing.value = false
+  }
+
+  function reloadVideo() {
+    const el = videoEl.value
+    if (!el) {
+      videoState.value = 'idle'
+      return
+    }
+    markVideoLoading()
+    el.load()
+  }
+
   function safePlay() {
     if (!videoEl.value) return
     // Bail out early when the <video> has no usable source — otherwise the
@@ -229,17 +437,15 @@ export function useReplayController(alertId: string) {
       const msg = el.error
         ? videoErrorMessage(el.error)
         : '录像文件无法加载，请切换到"触发帧"查看'
-      videoError.value = msg
+      markVideoError(msg)
       message.warning(msg)
-      playing.value = false
       return
     }
     el.play().catch((err: DOMException) => {
       if (err.name === 'AbortError') return
       const msg = videoErrorMessage(err)
-      videoError.value = msg
+      markVideoError(msg)
       message.error(msg)
-      playing.value = false
     })
   }
 
@@ -323,11 +529,12 @@ export function useReplayController(alertId: string) {
     if (!label) return
     try {
       await pinReplayFrame(alertId, { index: currentIndex.value, label })
-      if (signals.value) {
-        if (!signals.value.key_frames) signals.value.key_frames = []
+      const currentSignals = signals.value
+      if (currentSignals) {
+        if (!currentSignals.key_frames) currentSignals.key_frames = []
         const idx = currentIndex.value
-        if (!signals.value.key_frames.some((kf: any) => kf.index === idx)) {
-          signals.value.key_frames.push({ index: idx, label, type: 'user' })
+        if (!currentSignals.key_frames.some((kf) => kf.index === idx)) {
+          currentSignals.key_frames.push({ index: idx, label, type: 'user' })
         }
       }
       message.success('已标记帧')
@@ -400,14 +607,21 @@ export function useReplayController(alertId: string) {
   }
 
   return {
-    metadata, signals, trajectoryFits, currentIndex, playing, speed, loading,
+    metadata, signals, trajectoryFits, currentIndex, playing, speed,
+    metadataState, signalsState, trajectoryState, videoState,
+    metadataLoading, signalsLoading, trajectoryLoading, videoLoading,
+    metadataError, metadataErrorStatus, signalsError, signalsErrorStatus,
+    trajectoryError, trajectoryErrorStatus,
+    loading, loadError, loadErrorStatus,
     videoEl, canvasEl, videoError, pendingSeekIndex,
     showHeatmap, showBoxes, showTrajectory, showHud, heatmapOpacity,
     referenceFrame, referenceDate, loadingRef, selectedRefOption,
     referenceOffsetSeconds,
     clipStart, clipEnd, persistedClips,
     fps, videoUrl, hasHeatmaps, currentTimestamp,
-    loadData, loadReference, togglePlay, stepFrame, seekTo, goToStart, goToEnd,
+    loadData, loadMetadata, retryMetadata, loadSignals, loadTrajectory, loadReference,
+    markVideoLoading, markVideoReady, markVideoError, reloadVideo,
+    togglePlay, stepFrame, seekTo, goToStart, goToEnd,
     captureCurrentFrame, handlePinFrame, handleKeydown, onRefOptionChange,
     commitClip, removeClip,
   }

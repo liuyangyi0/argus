@@ -21,7 +21,8 @@ class CameraOrchestrator:
         """Register the runtime stream before starting the camera pipeline."""
         cam_config = self._camera_config(camera_id)
         if cam_config is not None:
-            self._ensure_registered(cam_config)
+            resolution = self._ensure_registered(cam_config)
+            self._require_usb_redirect(cam_config, resolution)
         return bool(self.camera_manager.start_camera(camera_id))
 
     def stop(self, camera_id: str) -> None:
@@ -58,6 +59,7 @@ class CameraOrchestrator:
             return camera_config
 
         resolution = self._ensure_registered(camera_config)
+        self._require_usb_redirect(camera_config, resolution)
         if resolution is not None:
             return self.stream_registry.runtime_camera_config(
                 camera_config,
@@ -79,7 +81,20 @@ class CameraOrchestrator:
                 camera_id=getattr(camera_config, "camera_id", None),
                 error=str(exc),
             )
+            if getattr(camera_config, "protocol", None) == "usb":
+                raise RuntimeError(
+                    "USB camera registration failed; direct capture is forbidden"
+                ) from exc
             return None
+
+    @staticmethod
+    def _require_usb_redirect(camera_config: Any, resolution: Any | None) -> None:
+        if getattr(camera_config, "protocol", None) != "usb":
+            return
+        if resolution is None or getattr(resolution, "go2rtc_managed", False) is not True:
+            raise RuntimeError(
+                "USB camera is not backed by an owned go2rtc runtime stream"
+            )
 
     def _camera_config(self, camera_id: str) -> Any | None:
         get_config: Callable[[str], Any] | None = getattr(

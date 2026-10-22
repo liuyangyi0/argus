@@ -1,8 +1,15 @@
 # Argus 系统架构文档
 
-> 最后更新：2026-05-25
+> 最后更新：2026-06-11
 
 本文档描述当前仓库已经落地的系统结构、运行时关系和主要边界，内容以实际代码路径为准，而不是历史规划中的理想版本。
+
+相关入口：
+
+- `docs/index.md`：文档结构和维护顺序。
+- `docs/source-index.md`：自动提取的目录树、类/函数签名、API 路由和前端入口。
+- `docs/modules/README.md`：各后端/前端模块说明入口。
+- `docs/api-reference.md`：Dashboard API 与 WebSocket 参考。
 
 ## 1. 系统定位
 
@@ -217,19 +224,24 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 - alerts
 - zones
 - config
-- detection
 - system
 - tasks
 - audit
 - backup
 - users
+- me
+- regions
 - reports
+- sensors
 - models
 - replay
 - degradation
 - training-jobs
 - streaming
 - labeling
+- recordings
+- calibration
+- physics
 - baseline
 
 ### 7.3 WebSocket
@@ -249,13 +261,14 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 
 前端位于 `web/`，使用 Vue 3、TypeScript、Vite、Pinia、Ant Design Vue。
 
-当前主路由为：
+当前工作台主入口和参数化页面为：
 
 - `/overview`
 - `/cameras`
 - `/cameras/:id`
 - `/alerts`
 - `/reports`
+- `/warehouse3D`
 - `/models`
 - `/system`
 
@@ -270,6 +283,7 @@ FastAPI 应用位于 `src/argus/dashboard/app.py`，当前承担三类职责：
 - Cameras / CameraDetail：摄像头清单、播放、诊断和控制。
 - Alerts：告警列表、筛选、工作流操作和回放详情。
 - Reports：报表与统计分析。
+- Warehouse3D：3D 仓库视图。
 - Models：基线、训练与评估、模型发布、A/B 对比、标注队列、阈值预览。
 - System：系统概览、配置管理、备份、审计、降级历史、异常检测 fallback、模块开关、音频告警、用户管理、存储清理。
 - ReplayView / StoryboardReplay：从告警进入的录像回放视图，分别是单机位回放和多机位故事板回放。
@@ -355,7 +369,7 @@ Cameras -> Alerts -> Replay -> Models -> System -> Reports
 - 自动备份
 - 条件启用的自动重训练
 
-此外，代码中已经定义了 backbone 重训练检查任务工厂，但当前启动链尚未注册它。
+当 `retraining.enabled=true` 时，启动链还会同时注册 backbone 重训练检查任务；默认配置仍关闭自动重训练，因此该任务默认不运行。
 
 ### 10.3 训练作业模型
 

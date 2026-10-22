@@ -1,36 +1,36 @@
 import { ref, type Ref, watch, onBeforeUnmount } from 'vue'
 import type { useHeatmapCache } from './useHeatmapCache'
+import type { ReplayMetadataPayload } from '../api/replay'
 import type { TrajectoryFit } from '../types/api'
+import type {
+  ReplaySignalsState,
+  ReplayTrackPoints,
+  ReplayYoloBox,
+} from './useReplayController'
 
 /* ── Types ── */
 
-interface YoloBox {
-  bbox: [number, number, number, number]
-  class: string
-  confidence?: number
+type YoloBox = ReplayYoloBox
+type TrackPoints = ReplayTrackPoints
+
+type ReplayVideoFrameCallback = (
+  now: DOMHighResTimeStamp,
+  metadata: { mediaTime: number },
+) => void
+
+interface VideoFrameCallbackMethods {
+  requestVideoFrameCallback(callback: ReplayVideoFrameCallback): number
+  cancelVideoFrameCallback(handle: number): void
 }
 
-type TrackPoints = ({ x: number; y: number } | null)[]
+type VideoElementWithFrameCallbacks = HTMLVideoElement & VideoFrameCallbackMethods
 
-interface SignalsData {
-  yolo_boxes?: YoloBox[][]
-  trajectory_points?: TrackPoints
-  trajectory_points_by_track?: Record<string, TrackPoints>
-  speed_px_per_sec?: (number | null)[]
-  origin?: { x: number; y: number }
-  landing?: { x: number; y: number }
-  timestamps?: number[]
-  [key: string]: unknown
-}
-
-interface ReplayMeta {
-  camera_id?: string
-  width?: number
-  height?: number
-  fps?: number
-  frame_count?: number
-  status?: string
-  [key: string]: unknown
+function supportsVideoFrameCallbacks(
+  video: HTMLVideoElement,
+): video is VideoElementWithFrameCallbacks {
+  const candidate = video as HTMLVideoElement & Partial<VideoFrameCallbackMethods>
+  return typeof candidate.requestVideoFrameCallback === 'function'
+    && typeof candidate.cancelVideoFrameCallback === 'function'
 }
 
 interface CompositorOptions {
@@ -39,13 +39,13 @@ interface CompositorOptions {
   fps: Ref<number>
   frameCount: Ref<number>
   heatmapCache: ReturnType<typeof useHeatmapCache>
-  signals: Ref<SignalsData | null>
+  signals: Ref<ReplaySignalsState | null>
   showHeatmap: Ref<boolean>
   showBoxes: Ref<boolean>
   showTrajectory: Ref<boolean>
   showHud: Ref<boolean>
   heatmapOpacity: Ref<number>
-  metadata: Ref<ReplayMeta | null>
+  metadata: Ref<ReplayMetadataPayload | null>
   // Optional: per-track origin/landing + speed fits fetched from
   // /physics/{alert_id}/trajectory. When absent the compositor still works
   // using only the per-frame trajectory_points_by_track signal.
@@ -371,7 +371,7 @@ export function useCanvasCompositor(options: CompositorOptions) {
 
   function drawHud(
     ctx: CanvasRenderingContext2D,
-    meta: ReplayMeta,
+    meta: ReplayMetadataPayload,
     frameIndex: number,
     timestamp: string,
   ): void {
@@ -520,7 +520,7 @@ export function useCanvasCompositor(options: CompositorOptions) {
 
   function startRVFC(): void {
     const vid = videoEl.value
-    if (!vid || !hasRVFC) return
+    if (!vid || !hasRVFC || !supportsVideoFrameCallbacks(vid)) return
 
     function onVideoFrame(
       _now: DOMHighResTimeStamp,
@@ -532,14 +532,13 @@ export function useCanvasCompositor(options: CompositorOptions) {
         Math.max(frameCount.value - 1, 0),
       )
       renderFrame(frameIndex)
-      if (playing.value && videoEl.value) {
-        vfcId = (videoEl.value as any).requestVideoFrameCallback(
-          onVideoFrame,
-        )
+      const currentVideo = videoEl.value
+      if (playing.value && currentVideo && supportsVideoFrameCallbacks(currentVideo)) {
+        vfcId = currentVideo.requestVideoFrameCallback(onVideoFrame)
       }
     }
 
-    vfcId = (vid as any).requestVideoFrameCallback(onVideoFrame)
+    vfcId = vid.requestVideoFrameCallback(onVideoFrame)
   }
 
   function startRAF(): void {
@@ -565,7 +564,8 @@ export function useCanvasCompositor(options: CompositorOptions) {
   function start(): void {
     if (running) return
     running = true
-    if (hasRVFC) {
+    const currentVideo = videoEl.value
+    if (hasRVFC && currentVideo && supportsVideoFrameCallbacks(currentVideo)) {
       startRVFC()
     } else {
       startRAF()
@@ -578,8 +578,9 @@ export function useCanvasCompositor(options: CompositorOptions) {
       cancelAnimationFrame(rafId)
       rafId = 0
     }
-    if (vfcId && videoEl.value && hasRVFC) {
-      ;(videoEl.value as any).cancelVideoFrameCallback(vfcId)
+    const currentVideo = videoEl.value
+    if (vfcId && currentVideo && supportsVideoFrameCallbacks(currentVideo)) {
+      currentVideo.cancelVideoFrameCallback(vfcId)
       vfcId = 0
     }
   }

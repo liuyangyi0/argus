@@ -16,7 +16,7 @@ from argus.config.schema import (
     TemporalConfirmation,
     ZonePriority,
 )
-from argus.sensors.fusion import SensorFusion
+from argus.sensors.fusion import SensorFusion, SensorFusionHead
 
 
 # ── Basic behaviour ──
@@ -145,6 +145,65 @@ def test_active_signals_lists_only_valid() -> None:
     assert ("cam2", "z9") not in keys
 
 
+def test_gas_reading_sets_danger_signal_with_evidence() -> None:
+    fusion = SensorFusion(
+        enabled=True,
+        head=SensorFusionHead(
+            gas_warning_ppm=10.0,
+            gas_danger_ppm=50.0,
+            warning_multiplier=1.4,
+            danger_multiplier=2.6,
+        ),
+    )
+
+    decision = fusion.set_reading(
+        "cam1",
+        "z1",
+        "gas_ppm",
+        55.0,
+        source="gas-01",
+        valid_for_s=30,
+    )
+
+    assert decision.active is True
+    assert decision.severity == "danger"
+    assert decision.multiplier == pytest.approx(2.6)
+    assert fusion.get_multiplier("cam1", "z1") == pytest.approx(2.6)
+    signals = fusion.active_signals()
+    assert signals[0]["sensor_type"] == "gas_ppm"
+    assert signals[0]["source"] == "gas-01"
+    assert signals[0]["evidence"]["metric"] == "gas_ppm"
+
+
+def test_pressure_delta_reading_uses_absolute_drop() -> None:
+    fusion = SensorFusion(enabled=True)
+
+    decision = fusion.set_reading("cam1", "*", "pressure_delta_kpa", -20.0)
+
+    assert decision.active is True
+    assert decision.reason == "pressure_drop_kpa_danger"
+    assert fusion.get_multiplier("cam1", "any-zone") == pytest.approx(2.5)
+
+
+def test_neutral_reading_removes_existing_signal() -> None:
+    fusion = SensorFusion(enabled=True)
+    fusion.set_reading("cam1", "z1", "humidity", 96.0)
+    assert fusion.get_multiplier("cam1", "z1") > 1.0
+
+    decision = fusion.set_reading("cam1", "z1", "humidity", 50.0)
+
+    assert decision.active is False
+    assert decision.reason == "relative_humidity_neutral"
+    assert fusion.get_multiplier("cam1", "z1") == 1.0
+
+
+def test_unsupported_reading_is_neutral() -> None:
+    decision = SensorFusionHead().evaluate("unknown_sensor", 123.0)
+
+    assert decision.active is False
+    assert decision.reason == "unsupported_sensor_type"
+
+
 # ── Thread safety ──
 
 
@@ -211,6 +270,23 @@ def test_grader_applies_fusion_multiplier() -> None:
     )
     assert alert is not None
     assert alert.severity == AlertSeverity.MEDIUM
+
+
+def test_grader_applies_typed_gas_sensor_multiplier() -> None:
+    """Gas sensor evidence can escalate a visual anomaly, not replace RGB evidence."""
+    fusion = SensorFusion(enabled=True)
+    fusion.set_reading("cam1", "z1", "gas_ppm", 60.0)
+
+    grader = AlertGrader(_grader_config(), sensor_fusion=fusion)
+    alert = grader.evaluate(
+        camera_id="cam1",
+        zone_id="z1",
+        zone_priority=ZonePriority.STANDARD,
+        anomaly_score=0.4,
+        frame_number=1,
+    )
+    assert alert is not None
+    assert alert.severity == AlertSeverity.HIGH
 
 
 def test_grader_without_fusion_baseline_behaviour() -> None:

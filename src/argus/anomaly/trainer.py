@@ -8,14 +8,17 @@ report, recommend threshold, and record results.
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import os
 import random
 import shutil
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Sequence
 
 import cv2
@@ -23,7 +26,18 @@ import numpy as np
 import structlog
 
 from argus.anomaly import _trainer_export as _te
+from argus.anomaly.artifacts import (
+    artifact_metadata,
+    exported_artifact,
+    new_artifact_run,
+    training_directory,
+    write_artifact_manifest,
+)
 from argus.anomaly.baseline import BaselineManager
+from argus.anomaly.scene_training import (
+    SceneTrainingInput,
+    revalidate_scene_training_input,
+)
 from argus.core.error_channel import (
     SEVERITY_ERROR,
     get_error_channel,
@@ -35,6 +49,30 @@ if TYPE_CHECKING:
 
 
 _IMAGE_EXTS = ("*.png", "*.jpg", "*.jpeg")
+_SCENE_PROFILE_BASELINE_SCHEMAS = frozenset(
+    {
+        "argus.scene-profile-baseline.v2",
+        "argus.scene-profile-baseline.v3",
+    }
+)
+_SCENE_PROFILE_SPLIT_POLICY = (
+    "complete_operator_declared_source_session_grouping"
+)
+_SCENE_PROFILE_SPLIT_ASSIGNMENT = (
+    "lexicographically_greatest_declared_session_id_is_calibration; "
+    "all_other_declared_sessions_are_train"
+)
+_SCENE_PROFILE_SPLIT_ROLES = ("train", "calibration", "diagnostic_only")
+
+
+@dataclass(frozen=True)
+class _ManifestSample:
+    path: Path
+    sha256: str
+
+
+def _adjacent_baseline_manifest(directory: Path) -> Path:
+    return directory.parent / "manifest.json"
 
 
 class _DatasetMerger:
@@ -59,6 +97,24 @@ class _DatasetMerger:
         self._copied = 0
 
     def __enter__(self) -> Path:
+        manifest_backed = [
+            (label, _adjacent_baseline_manifest(src_dir))
+            for label, src_dir in self._items
+            if (
+                _adjacent_baseline_manifest(src_dir).exists()
+                or _adjacent_baseline_manifest(src_dir).is_symlink()
+            )
+        ]
+        if manifest_backed:
+            sources = ", ".join(
+                f"{label}:{manifest_path}"
+                for label, manifest_path in manifest_backed
+            )
+            raise ValueError(
+                "manifest-backed scene-profile baselines cannot be flattened "
+                "by _DatasetMerger because that would discard the authoritative "
+                f"whole-session split; train them directly instead ({sources})"
+            )
         self._tmp = Path(tempfile.mkdtemp(prefix="argus_train_"))
         symlink_supported = True
         for label, src_dir in self._items:
@@ -220,11 +276,262 @@ class TrainingResult:
     validation_report: object | None = None  # ValidationReport from training_validator
     calibration_status: str | None = None  # "ok", "skipped", "failed"
     baseline_validation_skipped: bool = False
+    training_dir: str | None = None
+    export_dir: str | None = None
+    run_id: str | None = None
+    actual_export_format: str | None = None
+    actual_quantization: str | None = None
 
 
 def _list_images(directory: Path) -> list[Path]:
     """Return sorted list of .png and .jpg files in directory."""
     return sorted(list(directory.glob("*.png")) + list(directory.glob("*.jpg")))
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _role_counts(value: object, *, field: str) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set(_SCENE_PROFILE_SPLIT_ROLES):
+        raise ValueError(f"scene-profile manifest {field} must contain exact split roles")
+    counts: dict[str, int] = {}
+    for role in _SCENE_PROFILE_SPLIT_ROLES:
+        count = value[role]
+        if type(count) is not int or count < 0:
+            raise ValueError(f"scene-profile manifest {field}.{role} must be non-negative int")
+        counts[role] = count
+    return counts
+
+
+def _scene_profile_manifest_samples(
+    baseline_dir: Path,
+    *,
+    expected_camera_id: str | None,
+) -> tuple[list[_ManifestSample], list[_ManifestSample]] | None:
+    """Validate a v2/v3 scene-profile manifest and return its exact split.
+
+    Absence preserves the legacy random split. Once an adjacent manifest is
+    present, every contract or artifact mismatch is fatal; silently falling
+    back to a random split would reintroduce temporal/session leakage.
+    """
+
+    manifest_path = _adjacent_baseline_manifest(baseline_dir)
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        return None
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("scene-profile manifest must be a regular file")
+    if not baseline_dir.is_dir():
+        raise ValueError("scene-profile baseline image directory does not exist")
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read scene-profile manifest: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("scene-profile manifest root must be an object")
+    if manifest.get("schema_version") not in _SCENE_PROFILE_BASELINE_SCHEMAS:
+        raise ValueError("unsupported adjacent scene-profile manifest schema")
+    if manifest.get("training_ready") is not True:
+        raise ValueError("scene-profile manifest is not ready for offline training")
+    if manifest.get("release_eligible") is not False:
+        raise ValueError("scene-profile manifest release_eligible must be literal false")
+    if manifest.get("corpus_evidence_complete") is not True:
+        raise ValueError("scene-profile manifest corpus evidence is incomplete")
+    camera_id = manifest.get("camera_id")
+    if type(camera_id) is not str or not camera_id.strip():
+        raise ValueError("scene-profile manifest camera_id is missing")
+    if expected_camera_id is not None and camera_id != expected_camera_id:
+        raise ValueError("scene-profile manifest camera_id does not match training camera")
+    scene_profile_id = manifest.get("scene_profile_id")
+    if type(scene_profile_id) is not str or not scene_profile_id.strip():
+        raise ValueError("scene-profile manifest scene_profile_id is missing")
+
+    split = manifest.get("split_contract")
+    if not isinstance(split, dict):
+        raise ValueError("scene-profile manifest split_contract must be an object")
+    if split.get("policy") != _SCENE_PROFILE_SPLIT_POLICY:
+        raise ValueError("scene-profile manifest split policy is unsupported")
+    if split.get("assignment") != _SCENE_PROFILE_SPLIT_ASSIGNMENT:
+        raise ValueError("scene-profile manifest split assignment is unsupported")
+    if split.get("random_frame_split_allowed") is not False:
+        raise ValueError("scene-profile manifest must forbid random frame splitting")
+    if split.get("single_session_policy") != "diagnostic_only":
+        raise ValueError("scene-profile manifest single-session policy is unsafe")
+    source_counts = _role_counts(
+        split.get("source_counts"),
+        field="split_contract.source_counts",
+    )
+    sample_counts = _role_counts(
+        split.get("sample_counts"),
+        field="split_contract.sample_counts",
+    )
+    if source_counts["diagnostic_only"] != 0 or sample_counts["diagnostic_only"] != 0:
+        raise ValueError("scene-profile manifest contains diagnostic-only data")
+
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError("scene-profile manifest sources must be a non-empty list")
+    sources: dict[int, dict[str, object]] = {}
+    source_paths: set[str] = set()
+    source_hashes: set[str] = set()
+    session_roles: dict[str, str] = {}
+    actual_source_counts = {role: 0 for role in _SCENE_PROFILE_SPLIT_ROLES}
+    for position, source in enumerate(raw_sources):
+        if not isinstance(source, dict):
+            raise ValueError(f"scene-profile manifest sources[{position}] must be an object")
+        source_index = source.get("source_index")
+        if type(source_index) is not int or source_index in sources:
+            raise ValueError("scene-profile manifest source_index must be a unique integer")
+        source_path = source.get("path")
+        source_hash = source.get("sha256")
+        source_role = source.get("split_role")
+        if type(source_path) is not str or not source_path.strip():
+            raise ValueError("scene-profile manifest source path is missing")
+        if source_path in source_paths:
+            raise ValueError("scene-profile manifest contains duplicate source paths")
+        if not _is_sha256(source_hash) or source_hash in source_hashes:
+            raise ValueError("scene-profile manifest source sha256 is invalid or duplicated")
+        if source_role not in {"train", "calibration"}:
+            raise ValueError("scene-profile manifest source has an unsafe split role")
+        review = source.get("annotation_review_evidence")
+        if not isinstance(review, dict) or review.get("complete") is not True:
+            raise ValueError("scene-profile manifest source review evidence is incomplete")
+        if review.get("source_video_sha256") != source_hash:
+            raise ValueError("scene-profile manifest source/review sha256 mismatch")
+        if review.get("source_video_sha256_matches") is not True:
+            raise ValueError("scene-profile manifest source video identity is unverified")
+        if review.get("camera_id") != camera_id or review.get("camera_id_matches") is not True:
+            raise ValueError("scene-profile manifest source camera identity is unverified")
+        session_id = review.get("source_session_id")
+        if (
+            type(session_id) is not str
+            or not session_id.strip()
+            or session_id != session_id.strip()
+        ):
+            raise ValueError("scene-profile manifest source_session_id is invalid")
+        prior_role = session_roles.setdefault(session_id, source_role)
+        if prior_role != source_role:
+            raise ValueError("scene-profile manifest splits one source session across roles")
+        sources[source_index] = {
+            "path": source_path,
+            "sha256": source_hash,
+            "split_role": source_role,
+            "source_session_id": session_id,
+        }
+        source_paths.add(source_path)
+        source_hashes.add(source_hash)
+        actual_source_counts[source_role] += 1
+    if set(sources) != set(range(len(raw_sources))):
+        raise ValueError("scene-profile manifest source indexes must be contiguous from zero")
+    if actual_source_counts != source_counts:
+        raise ValueError("scene-profile manifest source split counts do not match sources")
+
+    declared_sessions = split.get("declared_session_ids")
+    expected_sessions = sorted(session_roles)
+    if declared_sessions != expected_sessions or len(expected_sessions) < 2:
+        raise ValueError("scene-profile manifest requires at least two exact reviewed sessions")
+    if split.get("declared_independent_session_count") != len(expected_sessions):
+        raise ValueError("scene-profile manifest declared session count is inconsistent")
+    calibration_session = expected_sessions[-1]
+    for session_id, role in session_roles.items():
+        expected_role = "calibration" if session_id == calibration_session else "train"
+        if role != expected_role:
+            raise ValueError("scene-profile manifest session role assignment is inconsistent")
+
+    raw_samples = manifest.get("samples")
+    if not isinstance(raw_samples, list) or not raw_samples:
+        raise ValueError("scene-profile manifest samples must be a non-empty list")
+    manifest_root = manifest_path.parent.resolve(strict=True)
+    baseline_root = baseline_dir.resolve(strict=True)
+    train_samples: list[_ManifestSample] = []
+    calibration_samples: list[_ManifestSample] = []
+    seen_paths: set[Path] = set()
+    seen_names: set[str] = set()
+    actual_sample_counts = {role: 0 for role in _SCENE_PROFILE_SPLIT_ROLES}
+    for position, sample in enumerate(raw_samples):
+        if not isinstance(sample, dict):
+            raise ValueError(f"scene-profile manifest samples[{position}] must be an object")
+        if sample.get("sample_index") != position or type(sample.get("sample_index")) is not int:
+            raise ValueError("scene-profile manifest sample indexes must be contiguous from zero")
+        role = sample.get("split_role")
+        if role not in {"train", "calibration"}:
+            raise ValueError("scene-profile manifest sample has an unsafe split role")
+        source_index = sample.get("source_index")
+        if type(source_index) is not int or source_index not in sources:
+            raise ValueError("scene-profile manifest sample references an unknown source")
+        source = sources[source_index]
+        if role != source["split_role"]:
+            raise ValueError("scene-profile manifest sample/source split role mismatch")
+        if sample.get("source_path") != source["path"]:
+            raise ValueError("scene-profile manifest sample/source path mismatch")
+        if sample.get("source_sha256") != source["sha256"]:
+            raise ValueError("scene-profile manifest sample/source sha256 mismatch")
+
+        relative_value = sample.get("path")
+        if type(relative_value) is not str or not relative_value or "\\" in relative_value:
+            raise ValueError(
+                "scene-profile manifest sample path must be canonical POSIX relative path"
+            )
+        relative = PurePosixPath(relative_value)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != relative_value
+            or len(relative.parts) != 2
+            or relative.parts[0] != baseline_dir.name
+            or relative.parts[1] in {".", ".."}
+        ):
+            raise ValueError("scene-profile manifest sample path escapes the image directory")
+        candidate = manifest_root.joinpath(*relative.parts)
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError("scene-profile manifest sample must be a regular existing file")
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != baseline_root:
+            raise ValueError("scene-profile manifest sample path escapes the image directory")
+        if resolved.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+            raise ValueError("scene-profile manifest sample has unsupported image extension")
+        if resolved in seen_paths or resolved.name in seen_names:
+            raise ValueError("scene-profile manifest sample path or target name is duplicated")
+        expected_hash = sample.get("sha256")
+        if not _is_sha256(expected_hash) or _sha256_file(resolved) != expected_hash:
+            raise ValueError("scene-profile manifest sample sha256 mismatch")
+        manifest_sample = _ManifestSample(path=resolved, sha256=expected_hash)
+        if role == "train":
+            train_samples.append(manifest_sample)
+        else:
+            calibration_samples.append(manifest_sample)
+        seen_paths.add(resolved)
+        seen_names.add(resolved.name)
+        actual_sample_counts[role] += 1
+
+    actual_images: set[Path] = set()
+    for pattern in _IMAGE_EXTS:
+        for image in baseline_dir.glob(pattern):
+            if image.is_symlink() or not image.is_file():
+                raise ValueError("scene-profile baseline contains a non-regular image")
+            actual_images.add(image.resolve(strict=True))
+    if actual_images != seen_paths:
+        raise ValueError("scene-profile manifest samples do not exactly cover baseline images")
+    if not train_samples or not calibration_samples:
+        raise ValueError("scene-profile manifest train and calibration roles must be non-empty")
+    if actual_sample_counts != sample_counts:
+        raise ValueError("scene-profile manifest sample split counts do not match samples")
+    selection = manifest.get("selection")
+    if not isinstance(selection, dict) or selection.get("accepted_images") != len(raw_samples):
+        raise ValueError("scene-profile manifest accepted image count is inconsistent")
+    return train_samples, calibration_samples
 
 
 class ModelTrainer:
@@ -247,6 +554,7 @@ class ModelTrainer:
         self._models_dir = Path(models_dir)
         self._exports_dir = Path(exports_dir)
         self._model_registry = model_registry
+        self._registry_binding_lock = threading.Lock()
         self._training_validator = training_validator
         self._validation_config = validation_config or {}
         self._status = TrainingStatus.IDLE
@@ -255,6 +563,18 @@ class ModelTrainer:
     @property
     def exports_dir(self) -> Path:
         return self._exports_dir
+
+    def bind_model_registry(self, registry) -> None:
+        """Attach the authoritative registry before running derived operations."""
+        if registry is None:
+            raise ValueError("model registry is required")
+        with self._registry_binding_lock:
+            if self._model_registry is not None and self._model_registry is not registry:
+                same_sessions = getattr(type(self._model_registry), "uses_same_sessions_as", None)
+                if callable(same_sessions) and same_sessions(self._model_registry, registry):
+                    return
+                raise ValueError("model registry is already bound to a different database")
+            self._model_registry = registry
 
     @property
     def status(self) -> TrainingStatus:
@@ -344,6 +664,8 @@ class ModelTrainer:
         baseline_dir_override: Path | None = None,
         image_count_override: int | None = None,
         baseline_versions_label: str | None = None,
+        require_calibration: bool = False,
+        scene_training_input: SceneTrainingInput | None = None,
     ) -> TrainingResult:
         """Train an anomaly detection model for a specific camera/zone.
 
@@ -361,12 +683,34 @@ class ModelTrainer:
             image_count_override: Image count for the override directory.
             baseline_versions_label: Human/JSON label describing the version
                 set (e.g. ``v001+v003``); persisted to TrainingRecord.
+            require_calibration: Fail before candidate registration unless a
+                deployable runtime artifact has successful conformal calibration.
+            scene_training_input: Shared, immutable V3 workflow input. It is
+                revalidated before training and again before registration; it
+                cannot be combined with a group or legacy/random dataset.
         """
         start = time.monotonic()
 
         def _progress(pct: int, msg: str) -> None:
             if progress_callback:
                 progress_callback(pct, msg)
+
+        if type(require_calibration) is not bool:
+            return self._fail(start, error="require_calibration must be a literal boolean")
+        if scene_training_input is not None:
+            try:
+                scene_training_input = revalidate_scene_training_input(scene_training_input)
+                if (
+                    not require_calibration or group_id is not None
+                    or skip_baseline_validation is not False
+                    or camera_id != scene_training_input.camera_id or zone_id != "default"
+                    or baseline_dir_override != scene_training_input.images_dir
+                    or type(image_count_override) is not int
+                    or image_count_override != scene_training_input.image_count
+                ):
+                    raise ValueError("scene training requires its exact V3 input and mandatory calibration")
+            except (OSError, TypeError, ValueError) as exc:
+                return self._fail(start, error=f"场景训练输入校验失败: {exc}")
 
         if baseline_dir_override is not None:
             baseline_dir = baseline_dir_override
@@ -391,6 +735,10 @@ class ModelTrainer:
 
         if image_count_override is not None:
             image_count = image_count_override
+        elif group_id:
+            # Group baselines live under _groups/<id>, not the synthetic
+            # registry camera ID group:<id> used for the resulting model.
+            image_count = len(_list_images(baseline_dir))
         else:
             image_count = self._baseline_manager.count_images(camera_id, zone_id)
 
@@ -448,16 +796,27 @@ class ModelTrainer:
             validation_skipped=skip_baseline_validation,
         )
 
-        output_dir = self._models_dir / camera_id / zone_id
-        output_dir.mkdir(parents=True, exist_ok=True)
+        run = new_artifact_run(self._models_dir, self._exports_dir, camera_id, zone_id)
+        output_dir = run.training_dir
 
         # Train/val split (TRN-002)
         self._status = TrainingStatus.SPLITTING
         _progress(10, "正在切分训练/验证集...")
 
-        train_dir, val_dir, train_count, val_count = self._split_train_val(
-            baseline_dir, output_dir
-        )
+        try:
+            train_dir, val_dir, train_count, val_count = self._split_train_val(
+                baseline_dir,
+                output_dir,
+                expected_camera_id=camera_id,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            logger.error("training.split_failed", error=str(exc))
+            return self._fail(
+                start,
+                error=f"训练/校准集切分失败: {exc}",
+                image_count=image_count,
+                pre_validation=pre_validation,
+            )
 
         # Anomalib training
         self._status = TrainingStatus.TRAINING
@@ -502,6 +861,7 @@ class ModelTrainer:
 
             # Export
             export_path_str = None
+            artifact_path = None
             actual_export_format = export_format
             actual_quantization = quantization
             if export_format:
@@ -509,8 +869,7 @@ class ModelTrainer:
                 quant_label = f" + {quantization}" if quantization != "fp32" else ""
                 _progress(70, f"正在导出 {export_format}{quant_label} 格式...")
                 try:
-                    export_path_str = str(self._exports_dir / camera_id / zone_id)
-                    Path(export_path_str).mkdir(parents=True, exist_ok=True)
+                    export_path_str = str(run.export_dir)
                     export_result = self._export_model(
                         engine=engine,
                         model=model,
@@ -523,6 +882,9 @@ class ModelTrainer:
                     )
                     actual_export_format = export_result["actual_format"]
                     actual_quantization = export_result["actual_quantization"]
+                    artifact_path = exported_artifact(
+                        run.export_dir, actual_export_format, export_result.get("artifact_path"),
+                    )
                     if actual_export_format != export_format:
                         logger.warning(
                             "training.export_format_changed",
@@ -561,9 +923,15 @@ class ModelTrainer:
             output_dir,
             Path(export_path_str) if export_path_str else None,
             val_dir,
+            artifact_path=artifact_path,
         )
 
-        if not output_validation["checkpoint_valid"] and not output_validation["smoke_test_passed"]:
+        if artifact_path is not None and not output_validation["smoke_test_passed"]:
+            return self._fail(
+                start, error="部署模型冒烟推理失败，未注册模型",
+                output_validation=output_validation, **common_fail_kwargs,
+            )
+        if artifact_path is None and not output_validation["checkpoint_valid"]:
             return self._fail(
                 start,
                 error="训练未产生有效模型文件",
@@ -577,6 +945,39 @@ class ModelTrainer:
         _progress(85, f"正在验证集上评估模型 ({val_count} 张)...")
 
         val_stats = self._validate_on_val_set(val_dir, detector=detector)
+        if artifact_path is not None:
+            try:
+                scores = np.asarray(val_stats.get("scores", []), dtype=float)
+                valid_scores = scores.size > 0 and bool(np.isfinite(scores).all())
+            except (TypeError, ValueError):
+                valid_scores = False
+            if not valid_scores:
+                return self._fail(
+                    start, error="部署模型未产生有效有限验证分数，未注册模型",
+                    output_validation=output_validation, **common_fail_kwargs,
+                )
+        if require_calibration and scene_training_input is not None:
+            # Every frozen calibration image must produce exactly one finite
+            # score. A skipped decode cannot be hidden by having >=50 scores
+            # left over, nor may a truncated/capped evaluation claim success.
+            try:
+                calibration_scores = np.asarray(val_stats.get("scores", []), dtype=float)
+                expected_count = scene_training_input.calibration_count
+                complete_calibration = (
+                    expected_count >= 50
+                    and type(val_count) is int and val_count == expected_count
+                    and calibration_scores.ndim == 1
+                    and calibration_scores.size == expected_count
+                    and bool(np.isfinite(calibration_scores).all())
+                )
+            except (TypeError, ValueError):
+                complete_calibration = False
+            if not complete_calibration:
+                return self._fail(
+                    start, error="场景校准未完整覆盖冻结校准集，未注册模型",
+                    calibration_status="failed", output_validation=output_validation,
+                    **common_fail_kwargs,
+                )
 
         # Threshold recommendation (TRN-005)
         threshold_recommended = self._recommend_threshold(val_stats)
@@ -622,35 +1023,6 @@ class ModelTrainer:
 
         _progress(95, f"训练完成 — 质量等级: {quality_report.grade}")
 
-        # C4: Register model version in registry
-        model_version_id = None
-        if self._model_registry is not None:
-            try:
-                model_version_id = self._model_registry.register(
-                    model_path=output_dir,
-                    baseline_dir=baseline_dir,
-                    camera_id=camera_id,
-                    model_type=model_type,
-                    training_params={
-                        "image_size": image_size,
-                        "export_format": actual_export_format,
-                        "quantization": actual_quantization,
-                        "train_count": train_count,
-                        "val_count": val_count,
-                        "quality_grade": quality_report.grade,
-                    },
-                )
-                # Model stays in CANDIDATE stage — promotion to production
-                # must go through the release pipeline (shadow → canary → production).
-                logger.info(
-                    "training.model_registered",
-                    model_version_id=model_version_id,
-                    camera_id=camera_id,
-                    stage="candidate",
-                )
-            except Exception as e:
-                logger.error("training.model_registry_failed", error=str(e))
-
         # Conformal calibration (A2-3): run on val set scores if detector available.
         # Must run before TrainingResult construction so the final status is captured
         # in the result dataclass instead of a local variable that gets discarded.
@@ -668,6 +1040,15 @@ class ModelTrainer:
                         cal_result, cal_path, sorted_scores=np.sort(cal_scores)
                     )
                     logger.info("trainer.calibration_saved", path=str(cal_path))
+                    synced_paths = self._sync_calibration_to_export(
+                        cal_path,
+                        Path(export_path_str) if export_path_str else None,
+                    )
+                    if synced_paths:
+                        logger.info(
+                            "trainer.calibration_export_synced",
+                            paths=[str(path) for path in synced_paths],
+                        )
                     calibration_status = "ok"
                 else:
                     logger.warning(
@@ -678,6 +1059,59 @@ class ModelTrainer:
                 calibration_status = "failed"
                 logger.warning("trainer.calibration_failed", error=str(e))
 
+        # Freeze the deployment bundle before registry hashing. A failed
+        # calibration must not leave a registered, partially updated candidate.
+        if require_calibration and (artifact_path is None or calibration_status != "ok"):
+            return self._fail(
+                start, error="场景训练必须完成部署模型校准，未注册模型",
+                calibration_status=calibration_status,
+                **common_fail_kwargs,
+            )
+        if scene_training_input is not None:
+            try:
+                scene_training_input = revalidate_scene_training_input(scene_training_input)
+            except (OSError, TypeError, ValueError) as exc:
+                return self._fail(
+                    start, error=f"场景训练输入在训练期间发生变化，未注册模型: {exc}",
+                    calibration_status=calibration_status,
+                    **common_fail_kwargs,
+                )
+        model_version_id = None
+        if artifact_path is not None:
+            if calibration_status == "failed":
+                return self._fail(start, error="模型校准失败，未注册模型", **common_fail_kwargs)
+            try:
+                metadata = write_artifact_manifest(
+                    run, artifact_path, model_type=model_type,
+                    calibration_status=calibration_status,
+                )
+                if self._model_registry is not None:
+                    model_version_id = self._model_registry.register(
+                        model_path=artifact_path,
+                        baseline_dir=baseline_dir,
+                        camera_id=camera_id,
+                        model_type=model_type,
+                        training_params={
+                            "image_size": image_size,
+                            "export_format": actual_export_format,
+                            "quantization": actual_quantization,
+                            "train_count": train_count,
+                            "val_count": val_count,
+                            "image_count": image_count,
+                            "quality_grade": quality_report.grade,
+                            "zone_id": zone_id,
+                            "run_id": run.run_id,
+                            "training_dir": str(output_dir),
+                            "export_dir": str(run.export_dir),
+                            "artifact_manifest": metadata,
+                            **({"scene_workflow": dict(scene_training_input.lineage)}
+                               if scene_training_input is not None else {}),
+                        },
+                    )
+            except Exception as e:
+                logger.error("training.model_registry_failed", error=str(e))
+                return self._fail(start, error=f"模型产物登记失败: {e}", **common_fail_kwargs)
+
         # Strip raw scores from val_stats to avoid bloating DB/JSON storage.
         # Percentile statistics are already computed and sufficient for reporting.
         if val_stats.get("scores"):
@@ -686,7 +1120,7 @@ class ModelTrainer:
         duration = time.monotonic() - start
         result = TrainingResult(
             status=TrainingStatus.COMPLETE,
-            model_path=str(output_dir),
+            model_path=str(artifact_path) if artifact_path else None,
             duration_seconds=duration,
             image_count=image_count,
             train_count=train_count,
@@ -700,6 +1134,11 @@ class ModelTrainer:
             validation_report=validation_report,
             calibration_status=calibration_status,
             baseline_validation_skipped=skip_baseline_validation and not pre_validation.get("passed", True),
+            training_dir=str(output_dir),
+            export_dir=export_path_str,
+            run_id=run.run_id,
+            actual_export_format=actual_export_format,
+            actual_quantization=actual_quantization,
         )
         self._status = TrainingStatus.COMPLETE
         self._last_result = result
@@ -924,28 +1363,49 @@ class ModelTrainer:
 
     @staticmethod
     def _split_train_val(
-        baseline_dir: Path, output_dir: Path, seed: int = 42
+        baseline_dir: Path,
+        output_dir: Path,
+        seed: int = 42,
+        *,
+        expected_camera_id: str | None = None,
     ) -> tuple[Path, Path, int, int]:
-        """Split baseline images into train (80%) and val (20%) sets.
+        """Split normal images into training and calibration/validation sets.
+
+        A validated scene-profile baseline v2/v3 manifest is authoritative and is
+        copied exactly by whole-session roles. Only a missing adjacent manifest
+        permits the legacy seeded 80/20 random split.
 
         Files are physically copied to ensure portability.
         Returns (train_dir, val_dir, train_count, val_count).
         val_dir contains a 'normal' subdirectory with the actual images.
         """
-        images = _list_images(baseline_dir)
-
-        if len(images) < 5:
-            raise ValueError(
-                f"基线图片太少，无法拆分训练/验证集: {len(images)} 张 (至少需要 5 张)"
-            )
-
-        rng = random.Random(seed)
-        shuffled = list(images)
-        rng.shuffle(shuffled)
-
-        split_idx = max(2, int(len(shuffled) * 0.8))  # train 至少 2 张
-        train_images = shuffled[:split_idx]
-        val_images = shuffled[split_idx:] or shuffled[-1:]  # val 至少 1 张
+        manifest_samples = _scene_profile_manifest_samples(
+            baseline_dir,
+            expected_camera_id=expected_camera_id,
+        )
+        expected_hashes: dict[Path, str] = {}
+        if manifest_samples is not None:
+            train_manifest_samples, calibration_manifest_samples = manifest_samples
+            train_images = [item.path for item in train_manifest_samples]
+            val_images = [item.path for item in calibration_manifest_samples]
+            expected_hashes = {
+                item.path: item.sha256
+                for item in train_manifest_samples + calibration_manifest_samples
+            }
+            split_strategy = "scene_profile_manifest_v2_or_v3"
+        else:
+            images = _list_images(baseline_dir)
+            if len(images) < 5:
+                raise ValueError(
+                    f"基线图片太少，无法拆分训练/验证集: {len(images)} 张 (至少需要 5 张)"
+                )
+            rng = random.Random(seed)
+            shuffled = list(images)
+            rng.shuffle(shuffled)
+            split_idx = max(2, int(len(shuffled) * 0.8))
+            train_images = shuffled[:split_idx]
+            val_images = shuffled[split_idx:] or shuffled[-1:]
+            split_strategy = "legacy_seeded_random_80_20"
 
         split_dir = output_dir / "_split"
         train_dir = split_dir / "train" / "normal"
@@ -957,17 +1417,29 @@ class ModelTrainer:
         train_dir.mkdir(parents=True)
         val_dir.mkdir(parents=True)
 
-        for img in train_images:
-            shutil.copy2(str(img), str(train_dir / img.name))
-
-        for img in val_images:
-            shutil.copy2(str(img), str(val_dir / img.name))
+        try:
+            for source_dir, destination_dir in (
+                (train_images, train_dir),
+                (val_images, val_dir),
+            ):
+                for image in source_dir:
+                    target = destination_dir / image.name
+                    shutil.copy2(str(image), str(target))
+                    expected_hash = expected_hashes.get(image)
+                    if expected_hash is not None and _sha256_file(target) != expected_hash:
+                        raise ValueError(
+                            "scene-profile sample changed while creating the split"
+                        )
+        except BaseException:
+            shutil.rmtree(split_dir, ignore_errors=True)
+            raise
 
         logger.info(
             "training.split_complete",
             train=len(train_images),
             val=len(val_images),
-            total=len(images),
+            total=len(train_images) + len(val_images),
+            strategy=split_strategy,
         )
         return train_dir.parent, val_dir.parent, len(train_images), len(val_images)
 
@@ -998,6 +1470,10 @@ class ModelTrainer:
                 if frame is None:
                     continue
                 result = detector.predict(frame)
+                if getattr(result, "detection_failed", False) is True:
+                    raise RuntimeError("Inference failed while collecting validation scores")
+                if not np.isfinite(result.anomaly_score):
+                    raise RuntimeError("Non-finite validation score")
                 scores.append(result.anomaly_score)
         except Exception as e:
             logger.error("training.val_inference_failed", error=str(e))
@@ -1088,7 +1564,8 @@ class ModelTrainer:
     # ── TRN-006: Output validation ──
 
     def _validate_output(
-        self, output_dir: Path, export_path: Path | None, val_dir: Path
+        self, output_dir: Path, export_path: Path | None, val_dir: Path,
+        artifact_path: Path | None = None,
     ) -> tuple[dict, object | None]:
         """Validate training output: checkpoint integrity, export files, smoke test.
 
@@ -1105,8 +1582,8 @@ class ModelTrainer:
         loaded_detector = None
 
         # Search export directory first (inference-ready formats), then training output
-        model_file = None
-        if export_path and export_path.exists():
+        model_file = artifact_path
+        if model_file is None and export_path and export_path.exists():
             model_file = self._find_best_model_file(export_path)
         if model_file is None:
             model_file = self._find_best_model_file(output_dir)
@@ -1138,14 +1615,23 @@ class ModelTrainer:
                 try:
                     from argus.anomaly.detector import AnomalibDetector
 
-                    detector = AnomalibDetector(model_path=model_file, threshold=0.5)
+                    # Validation/calibration must observe this artifact's
+                    # native scores, never inherit a shared ancestor's old
+                    # calibration or calibrate already calibrated scores.
+                    detector = AnomalibDetector(
+                        model_path=model_file, threshold=0.5, enable_calibration=False,
+                    )
                     if detector.load():
                         frame = cv2.imread(str(test_images[0]))
                         if frame is not None:
                             t0 = time.monotonic()
                             pred = detector.predict(frame)
                             latency = (time.monotonic() - t0) * 1000
-                            if np.isfinite(pred.anomaly_score) and 0 <= pred.anomaly_score <= 1:
+                            if (
+                                getattr(pred, "detection_failed", False) is not True
+                                and np.isfinite(pred.anomaly_score)
+                                and 0 <= pred.anomaly_score <= 1
+                            ):
                                 result["smoke_test_passed"] = True
                                 result["inference_latency_ms"] = round(latency, 1)
                                 loaded_detector = detector
@@ -1155,6 +1641,42 @@ class ModelTrainer:
                     result["errors"].append(f"冒烟测试失败: {e}")
 
         return result, loaded_detector
+
+    @staticmethod
+    def _sync_calibration_to_export(
+        calibration_path: Path,
+        export_path: Path | None,
+    ) -> list[Path]:
+        """Copy calibration beside exported model files for detector discovery.
+
+        ``AnomalibDetector`` searches for ``calibration.json`` from the model
+        file's directory upward. Training writes calibration into the model
+        output directory, while deployment usually loads the OpenVINO export.
+        Keep the export self-contained so loading ``.../model.xml`` cannot
+        silently run uncalibrated.
+        """
+        if export_path is None or not export_path.exists():
+            return []
+        if not calibration_path.exists():
+            return []
+
+        target_dirs = {export_path}
+        for model_file in export_path.rglob("*"):
+            if model_file.suffix.lower() in {".xml", ".onnx", ".pt"}:
+                target_dirs.add(model_file.parent)
+
+        copied: list[Path] = []
+        source_resolved = calibration_path.resolve()
+        for target_dir in sorted(target_dirs):
+            target = target_dir / "calibration.json"
+            if target.exists() and target.resolve() == source_resolved:
+                copied.append(target)
+                continue
+            target_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(calibration_path, target)
+            copied.append(target)
+
+        return copied
 
     # ── TRN-008: Model A/B comparison ──
 
@@ -1243,6 +1765,8 @@ class ModelTrainer:
 
         Preference: .xml (OpenVINO) > .onnx > .pt (Torch) > .ckpt (Lightning)
         """
+        if model_dir.is_file():
+            return model_dir if model_dir.suffix in {".xml", ".onnx", ".pt", ".ckpt"} else None
         for pattern in ("**/*.xml", "**/*.onnx", "**/*.pt", "**/*.ckpt"):
             files = sorted(model_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
             if files:
@@ -1349,17 +1873,23 @@ class ModelTrainer:
                         state_dict = torch.load(
                             backbone_checkpoint, map_location="cpu", weights_only=True,
                         )
-                        model.model.encoder.load_state_dict(state_dict, strict=False)
+                        # The selected backbone is part of the model's
+                        # provenance. Partial/zero-key loads must not silently
+                        # train and register a different pretrained encoder.
+                        model.model.encoder.load_state_dict(state_dict, strict=True)
                         logger.info(
                             "trainer.custom_backbone_loaded",
                             path=backbone_checkpoint,
                         )
                     except Exception as e:
-                        logger.warning(
+                        logger.error(
                             "trainer.custom_backbone_failed",
                             path=backbone_checkpoint,
                             error=str(e),
                         )
+                        raise RuntimeError(
+                            f"Selected backbone checkpoint could not be loaded: {backbone_checkpoint}"
+                        ) from e
             except ImportError:
                 raise ImportError(
                     "Dinomaly 模型在当前 anomalib 版本中不可用。"
@@ -1454,13 +1984,23 @@ class ModelTrainer:
     # ── Re-export & Re-calibrate ──
 
     @staticmethod
-    def _find_checkpoint(model_dir: Path) -> Path | None:
+    def _find_checkpoint(model_dir: Path, *, legacy_only: bool = False) -> Path | None:
         """Find the best Lightning checkpoint in a model directory."""
+        if model_dir.is_file():
+            return model_dir if model_dir.suffix == ".ckpt" else None
         ckpts = sorted(
-            model_dir.rglob("*.ckpt"),
+            (
+                path for path in model_dir.rglob("*.ckpt")
+                if path.is_file() and (
+                    not legacy_only
+                    or not any(part.startswith("run-") for part in path.relative_to(model_dir).parts)
+                )
+            ),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
+        if legacy_only and len(ckpts) > 1:
+            raise ValueError("旧模型目录包含多个checkpoint，请指定精确checkpoint或版本清单")
         return ckpts[0] if ckpts else None
 
     @staticmethod
@@ -1521,23 +2061,42 @@ class ModelTrainer:
         Returns:
             Dict with status, export_path, and format.
         """
-        ckpt = self._find_checkpoint(model_dir)
+        source_path = Path(model_dir)
+        metadata = artifact_metadata(source_path.parent if source_path.suffix == ".ckpt" else source_path)
+        source_training_dir = training_directory(
+            source_path.parent if source_path.suffix == ".ckpt" else source_path
+        )
+        if metadata and not source_training_dir.resolve().is_relative_to(self._models_dir.resolve()):
+            return {"status": "error", "error": "模型清单中的训练目录超出配置的模型根目录"}
+        try:
+            ckpt = self._find_checkpoint(
+                source_path if source_path.suffix == ".ckpt" else source_training_dir,
+                legacy_only=not metadata,
+            )
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}
         if ckpt is None:
             return {"status": "error", "error": "未找到 checkpoint (.ckpt) 文件"}
+        if self._model_registry is None:
+            return {"status": "error", "error": "模型注册服务不可用，不能创建候选版本"}
 
         # Use explicit IDs if provided, else derive from model_dir path structure:
         # data/models/{camera_id}/{zone_id}
-        parts = model_dir.parts
+        parts = source_training_dir.parts
         if zone_id is None:
-            zone_id = parts[-1] if len(parts) >= 2 else "default"
+            zone_id = metadata.get("zone_id") or (parts[-1] if len(parts) >= 2 else "default")
         if camera_id is None:
-            camera_id = parts[-2] if len(parts) >= 2 else "unknown"
-
-        export_path = str(self._exports_dir / camera_id / zone_id)
+            camera_id = metadata.get("camera_id") or (parts[-2] if len(parts) >= 2 else "unknown")
 
         try:
             from anomalib.engine import Engine
 
+            run = new_artifact_run(self._models_dir, self._exports_dir, camera_id, zone_id)
+            export_path = str(run.export_dir)
+            # Lightning may write beside its checkpoint while exporting. Copy
+            # it into the new run so a published source stays untouched.
+            derived_checkpoint = run.training_dir / "source.ckpt"
+            shutil.copy2(ckpt, derived_checkpoint)
             model = self._instantiate_model(model_type)
             export_kwargs = {}
             if export_format in {"openvino", "onnx"}:
@@ -1552,40 +2111,87 @@ class ModelTrainer:
                 }
                 export_kwargs["input_size"] = (image_size, image_size)
 
-            engine = Engine(default_root_dir=str(model_dir), max_epochs=1)
-            engine.export(
+            engine = Engine(default_root_dir=str(run.training_dir), max_epochs=1)
+            returned = engine.export(
                 model=model,
                 export_type=export_format,
                 export_root=export_path,
-                ckpt_path=str(ckpt),
+                ckpt_path=str(derived_checkpoint),
                 **export_kwargs,
             )
-            logger.info(
-                "reexport.complete",
-                format=export_format,
-                export_path=export_path,
-                checkpoint=str(ckpt),
+            artifact = exported_artifact(run.export_dir, export_format, returned)
+            if export_format == "openvino":
+                self._assert_openvino_static(run.export_dir)
+            baseline_dir = self._baseline_manager.get_baseline_dir(camera_id, zone_id)
+            actual_quantization = quantization
+            if quantization == "int8" and export_format == "openvino":
+                if not self._quantize_int8(
+                    export_path=run.export_dir,
+                    val_dir=baseline_dir if baseline_dir.is_dir() else None,
+                    calibration_images=calibration_images,
+                ):
+                    actual_quantization = "fp32"
+            elif export_format != "openvino":
+                actual_quantization = "fp32"
+
+            # Re-export can change normalization or quantization. Thresholds
+            # from the source artifact must not be copied onto new scores.
+            calibration_status = "skipped"
+            calibration_dir = (
+                baseline_dir / "normal" if (baseline_dir / "normal").is_dir() else baseline_dir
+            )
+            if len(_list_images(calibration_dir)) >= 50:
+                from argus.alerts.calibration import ConformalCalibrator
+                from argus.anomaly.detector import AnomalibDetector
+
+                detector = AnomalibDetector(model_path=artifact, threshold=0.5, enable_calibration=False)
+                if not detector.load():
+                    raise RuntimeError("Re-exported model failed calibration load")
+                if getattr(detector, "_minmax_broken", False):
+                    raise RuntimeError("Re-exported model still has invalid normalization parameters")
+                scores = self._validate_on_val_set(calibration_dir, detector=detector).get("scores", [])
+                if len(scores) < 50:
+                    raise RuntimeError("Re-exported model produced insufficient calibration scores")
+                calibrator = ConformalCalibrator()
+                score_array = np.asarray(scores)
+                cal_result = calibrator.calibrate(score_array)
+                cal_path = run.training_dir / "calibration.json"
+                calibrator.save(cal_result, cal_path, sorted_scores=np.sort(score_array))
+                self._sync_calibration_to_export(cal_path, run.export_dir)
+                calibration_status = "ok"
+            manifest = write_artifact_manifest(
+                run, artifact, model_type=model_type,
+                calibration_status=calibration_status,
+                source_model_path=str(source_path),
+            )
+            version_id = self._model_registry.register(
+                model_path=artifact,
+                baseline_dir=baseline_dir,
+                camera_id=camera_id,
+                model_type=model_type,
+                training_params={
+                    "zone_id": zone_id,
+                    "run_id": run.run_id,
+                    "image_size": image_size,
+                    "export_format": export_format,
+                    "quantization": actual_quantization,
+                    "derived_operation": "reexport",
+                    "artifact_manifest": manifest,
+                },
+                registered_by="model_reexport",
             )
         except Exception as e:
             logger.error("reexport.failed", error=str(e))
             return {"status": "error", "error": f"导出失败: {e}"}
 
-        # INT8 post-training quantization
-        if quantization == "int8" and export_format == "openvino":
-            # Use baseline dir as calibration source (split dir is cleaned up)
-            baseline_dir = self._baseline_manager.get_baseline_dir(camera_id, zone_id)
-            val_dir = baseline_dir if baseline_dir.is_dir() else None
-            self._quantize_int8(
-                export_path=Path(export_path),
-                val_dir=val_dir,
-                calibration_images=calibration_images,
-            )
-
         return {
             "status": "ok",
             "export_path": export_path,
+            "model_path": str(artifact),
+            "model_version_id": version_id,
+            "run_id": run.run_id,
             "format": export_format,
-            "quantization": quantization,
+            "quantization": actual_quantization,
         }
 
     def recalibrate_model(
@@ -1594,14 +2200,13 @@ class ModelTrainer:
         baseline_dir: Path,
         camera_id: str,
         zone_id: str = "default",
+        model_type: str = "patchcore",
     ) -> dict:
         """Re-calibrate score normalization using baseline images.
 
-        Performs two calibrations:
-        1. Conformal calibration — statistically guaranteed FPR thresholds,
-           saved to calibration.json (used by AlertGrader).
-        2. Sigmoid calibration — raw score normalization when PostProcessor
-           MinMax is broken (midpoint + scale parameters).
+        Creates a new candidate with conformal thresholds in calibration.json.
+        Broken PostProcessor normalization requires re-export first; an
+        in-memory sigmoid fit is not a persistent deployment artifact.
 
         Args:
             model_dir: Path to the model training output directory.
@@ -1612,13 +2217,35 @@ class ModelTrainer:
         Returns:
             Dict with status, n_samples, and calibration thresholds.
         """
-        # Find the exported model file (prefer export dir, fallback to model dir)
-        export_dir = self._exports_dir / camera_id / zone_id
-        model_file = self._find_best_model_file(export_dir)
+        if self._model_registry is None:
+            return {"status": "error", "error": "模型注册服务不可用，不能创建候选版本"}
+        source_path = Path(model_dir)
+        metadata = artifact_metadata(source_path)
+        source_training_dir = training_directory(source_path)
+        if metadata and not source_training_dir.resolve().is_relative_to(self._models_dir.resolve()):
+            return {"status": "error", "error": "模型清单中的训练目录超出配置的模型根目录"}
+        model_file = None
+        if source_path.is_file() and source_path.suffix in {".pt", ".xml", ".onnx"}:
+            model_file = source_path
+        elif metadata.get("artifact_path"):
+            model_file = Path(metadata["artifact_path"])
+        else:
+            # Legacy directories are supported only when the runtime artifact
+            # is unambiguous. Never pick a new run by mtime from a shared root.
+            legacy_export = self._exports_dir / camera_id / zone_id
+            candidates = []
+            for root in (source_training_dir, legacy_export):
+                if root.is_dir():
+                    candidates.extend(
+                        file for file in root.rglob("*")
+                        if file.is_file() and file.suffix in {".pt", ".xml", ".onnx"}
+                        and not any(part.startswith("run-") for part in file.relative_to(root).parts)
+                        and not file.stem.endswith("_fp32")
+                    )
+            if len(candidates) == 1:
+                model_file = candidates[0]
         if model_file is None:
-            model_file = self._find_best_model_file(model_dir)
-        if model_file is None:
-            return {"status": "error", "error": "未找到已导出的模型文件"}
+            return {"status": "error", "error": "未找到唯一已导出的模型文件，请指定精确模型路径"}
 
         if not baseline_dir.is_dir():
             return {"status": "error", "error": f"基线目录不存在: {baseline_dir}"}
@@ -1626,9 +2253,30 @@ class ModelTrainer:
         try:
             from argus.anomaly.detector import AnomalibDetector
 
-            detector = AnomalibDetector(model_path=model_file, threshold=0.5)
+            run = new_artifact_run(self._models_dir, self._exports_dir, camera_id, zone_id)
+            # Copy only the selected runtime bundle, not a camera-wide tree.
+            # Its .bin and local sidecars remain beside the new exact file.
+            bundle_files = [model_file]
+            if model_file.suffix == ".xml":
+                bundle_files.append(model_file.with_suffix(".bin"))
+            bundle_files.extend(
+                model_file.parent / name
+                for name in ("metadata.json", "calibration.json", "scene_profile.json")
+            )
+            for source in bundle_files:
+                if source.is_file():
+                    shutil.copy2(source, run.export_dir / source.name)
+            derived_artifact = run.export_dir / model_file.name
+            checkpoint = self._find_checkpoint(source_training_dir, legacy_only=not metadata)
+            if checkpoint is not None:
+                shutil.copy2(checkpoint, run.training_dir / "source.ckpt")
+            detector = AnomalibDetector(
+                model_path=derived_artifact, threshold=0.5, enable_calibration=False,
+            )
             if not detector.load():
                 return {"status": "error", "error": "模型加载失败"}
+            if getattr(detector, "_minmax_broken", False):
+                return {"status": "error", "error": "归一化参数无效，请先重新导出模型再校准"}
 
             # Collect anomaly scores from baseline images
             scores = []
@@ -1639,6 +2287,8 @@ class ModelTrainer:
                 if frame is None:
                     continue
                 prediction = detector.predict(frame)
+                if getattr(prediction, "detection_failed", False) is True:
+                    raise RuntimeError("Inference failed while collecting calibration scores")
                 score = float(prediction.anomaly_score)
                 if np.isfinite(score):
                     scores.append(score)
@@ -1656,20 +2306,33 @@ class ModelTrainer:
             calibrator = ConformalCalibrator()
             cal_result = calibrator.calibrate(cal_scores)
 
-            # Save to model_dir (primary) and export_dir (if exists)
-            for save_dir in (model_dir, export_dir):
-                if save_dir.is_dir():
-                    cal_path = save_dir / "calibration.json"
-                    calibrator.save(
-                        cal_result, cal_path, sorted_scores=np.sort(cal_scores)
-                    )
-                    logger.info("recalibrate.saved", path=str(cal_path))
+            for save_dir in (run.training_dir, run.export_dir):
+                calibrator.save(
+                    cal_result, save_dir / "calibration.json", sorted_scores=np.sort(cal_scores),
+                )
 
-            # Sigmoid recalibration if MinMax is broken
+            # Broken normalization is rejected above. In-memory sigmoid
+            # fitting does not persist across reload and cannot certify a new
+            # candidate artifact as calibrated.
             sigmoid_recalibrated = False
-            if getattr(detector, "_minmax_broken", False):
-                detector.calibrate_raw_scores(baseline_dir)
-                sigmoid_recalibrated = True
+
+            manifest = write_artifact_manifest(
+                run, derived_artifact, model_type=model_type,
+                calibration_status="ok", source_model_path=str(source_path),
+            )
+            version_id = self._model_registry.register(
+                model_path=derived_artifact,
+                baseline_dir=baseline_dir,
+                camera_id=camera_id,
+                model_type=model_type,
+                training_params={
+                    "zone_id": zone_id,
+                    "run_id": run.run_id,
+                    "derived_operation": "recalibrate",
+                    "artifact_manifest": manifest,
+                },
+                registered_by="model_recalibrate",
+            )
 
             logger.info(
                 "recalibrate.complete",
@@ -1681,6 +2344,10 @@ class ModelTrainer:
 
             return {
                 "status": "ok",
+                "model_path": str(derived_artifact),
+                "export_path": str(run.export_dir),
+                "model_version_id": version_id,
+                "run_id": run.run_id,
                 "n_samples": len(scores),
                 "thresholds": {
                     "info": round(cal_result.info_threshold, 4),

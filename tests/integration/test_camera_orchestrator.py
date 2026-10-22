@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from argus.camera.orchestrator import CameraOrchestrator
 from argus.streaming.stream_registry import StreamRegistry
 
@@ -121,3 +123,23 @@ def test_reconcile_streams_re_registers_after_go2rtc_restart():
         ("cam_01", "rtsp://example/cam_01", "rtsp"),
         ("cam_01", "rtsp://example/cam_01", "rtsp"),
     ]
+
+
+def test_usb_registration_failure_never_starts_direct_capture():
+    events: list[tuple] = []
+    camera = SimpleNamespace(
+        camera_id="usb",
+        source="/dev/video0",
+        protocol="usb",
+    )
+    manager = FakeCameraManager([camera], events)
+
+    class FailedRegistry:
+        def ensure_registered(self, *_args, **_kwargs):
+            raise RuntimeError("go2rtc unavailable")
+
+    orchestrator = CameraOrchestrator(manager, FailedRegistry())
+
+    with pytest.raises(RuntimeError, match="direct capture is forbidden"):
+        orchestrator.start("usb")
+    assert manager.start_calls == []

@@ -3,6 +3,7 @@ import { message } from 'ant-design-vue'
 import { getCameras, getTasks, dismissTask } from '../api'
 import { useWebSocket } from './useWebSocket'
 import type { CameraSummary, TaskInfo } from '../types/api'
+import { extractErrorMessage } from '../utils/error'
 
 // ── Constants ──
 
@@ -98,11 +99,19 @@ export const TRIGGER_LABELS: Record<string, string> = {
   scheduled: '定时',
 }
 
+type TaskWsPayload = TaskInfo | { tasks: TaskInfo[] }
+
 // ── Shared state composable ──
 
 export function useModelState() {
   const cameras = ref<CameraSummary[]>([])
   const tasks = ref<TaskInfo[]>([])
+  const camerasLoading = ref(true)
+  const camerasLoaded = ref(false)
+  const camerasError = ref('')
+  const tasksLoading = ref(false)
+  const tasksLoaded = ref(false)
+  const tasksError = ref('')
 
   function upsertTaskUpdate(task: TaskInfo) {
     const index = tasks.value.findIndex(existing => existing.task_id === task.task_id)
@@ -114,14 +123,14 @@ export function useModelState() {
     tasks.value = [task, ...tasks.value]
   }
 
-  useWebSocket({
+  useWebSocket<TaskWsPayload>({
     topics: ['tasks'],
     onMessage: (_topic, data) => {
-      if (Array.isArray(data?.tasks)) {
+      if ('tasks' in data && Array.isArray(data.tasks)) {
         tasks.value = data.tasks
         return
       }
-      if (data?.task_id) {
+      if ('task_id' in data && data.task_id) {
         upsertTaskUpdate(data)
       }
     },
@@ -130,20 +139,36 @@ export function useModelState() {
   })
 
   async function loadCameras() {
+    camerasLoading.value = true
+    camerasError.value = ''
     try {
       const res = await getCameras()
       cameras.value = res.cameras || []
+      return true
     } catch (e) {
-      message.error('加载摄像头列表失败')
+      camerasError.value = extractErrorMessage(e, '加载摄像头列表失败')
+      message.error(camerasError.value)
+      return false
+    } finally {
+      camerasLoaded.value = true
+      camerasLoading.value = false
     }
   }
 
   async function loadTasks() {
+    tasksLoading.value = true
+    tasksError.value = ''
     try {
       const res = await getTasks()
       tasks.value = res.tasks || []
+      return true
     } catch (e) {
-      message.error('加载任务列表失败')
+      tasksError.value = extractErrorMessage(e, '加载任务列表失败')
+      message.error(tasksError.value)
+      return false
+    } finally {
+      tasksLoaded.value = true
+      tasksLoading.value = false
     }
   }
 
@@ -195,6 +220,12 @@ export function useModelState() {
   return {
     cameras,
     tasks,
+    camerasLoading,
+    camerasLoaded,
+    camerasError,
+    tasksLoading,
+    tasksLoaded,
+    tasksError,
     loadCameras,
     loadTasks,
     handleDismissTask,

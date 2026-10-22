@@ -11,10 +11,16 @@ Stores alert replay data (H.264 MP4 video + signal timeseries) under:
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import threading
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import av
 import cv2
@@ -30,6 +36,48 @@ from argus.core.video_encoder import (
 logger = structlog.get_logger()
 
 
+_ALERT_LOCKS_GUARD = threading.Lock()
+_ALERT_LOCKS: dict[tuple[str, str], tuple[threading.RLock, int]] = {}
+
+
+@contextmanager
+def _alert_lock(archive_dir: Path, alert_id: str):
+    """Serialize one alert's artifact access across store instances."""
+    key = (str(archive_dir.resolve()), alert_id)
+    with _ALERT_LOCKS_GUARD:
+        entry = _ALERT_LOCKS.get(key)
+        if entry is None:
+            lock = threading.RLock()
+            references = 0
+        else:
+            lock, references = entry
+        _ALERT_LOCKS[key] = (lock, references + 1)
+
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _ALERT_LOCKS_GUARD:
+            current = _ALERT_LOCKS.get(key)
+            if current is not None and current[0] is lock:
+                if current[1] == 1:
+                    _ALERT_LOCKS.pop(key, None)
+                else:
+                    _ALERT_LOCKS[key] = (lock, current[1] - 1)
+
+
+@dataclass(frozen=True)
+class RecordingAvailability:
+    """Replay availability resolved from on-disk artifacts."""
+
+    has_recording: bool
+    replay_ready: bool
+    status: str | None
+    unavailable_reason: str | None = None
+    video_path: Path | None = None
+
+
 def _find_video_file(rec_dir: Path) -> Path | None:
     """Return the active video file in a recording directory, or None."""
     for name in ("recording.mp4", "pre.mp4"):
@@ -37,6 +85,59 @@ def _find_video_file(rec_dir: Path) -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert common numpy/domain values into strict JSON primitives."""
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, Enum):
+        return _json_safe(value.value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _json_dumps(value: Any) -> str:
+    """Strict JSON dump used for replay artifacts."""
+    return json.dumps(_json_safe(value), ensure_ascii=False, allow_nan=False)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Durably replace a text file without exposing a partial JSON document."""
+    temp_path = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+    )
+    try:
+        with temp_path.open("x", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        if os.name != "nt":
+            # Persist the directory entry as well as the file contents. This
+            # is required for the replace to survive a host power loss.
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    _atomic_write_text(path, _json_dumps(value))
 
 
 def _aggregate_trajectories(
@@ -63,6 +164,23 @@ def _aggregate_trajectories(
     return by_track
 
 
+def _aggregate_candidate_events(
+    frames: list[FrameSnapshot],
+    frame_index_offset: int = 0,
+) -> list[dict]:
+    """Flatten per-frame candidate diagnostics for replay evidence panels."""
+    events: list[dict] = []
+    for local_idx, snap in enumerate(frames):
+        frame_idx = frame_index_offset + local_idx
+        for record in snap.candidate_records:
+            event = dict(record)
+            event["frame_index"] = frame_idx
+            event["timestamp"] = float(snap.timestamp)
+            event["frame_number"] = snap.frame_number
+            events.append(event)
+    return events
+
+
 def _encode_heatmap_jpeg(heatmap_raw: np.ndarray, quality: int = 60) -> bytes | None:
     """Encode a raw anomaly map to a JET-colorized JPEG. Returns None on failure."""
     hmap = heatmap_raw
@@ -82,6 +200,27 @@ def _detect_frame_dimensions(frames: list[FrameSnapshot]) -> tuple[int, int]:
             if dims is not None:
                 return dims
     return (1280, 720)  # fallback
+
+
+def _frame_identity_dict(snap: FrameSnapshot | None) -> dict | None:
+    if snap is None or snap.identity is None:
+        return None
+    return snap.identity.to_dict()
+
+
+def _recording_frame_identity(recording: SolidifiedRecording) -> dict | None:
+    frames = recording.frames
+    if not frames:
+        return None
+    trigger_idx = max(0, min(recording.trigger_frame_index, len(frames) - 1))
+    summary = {
+        "first": _frame_identity_dict(frames[0]),
+        "trigger": _frame_identity_dict(frames[trigger_idx]),
+        "last": _frame_identity_dict(frames[-1]),
+    }
+    if not any(summary.values()):
+        return None
+    return summary
 
 
 class AlertRecordingStore:
@@ -123,19 +262,27 @@ class AlertRecordingStore:
                     meta_path = alert_dir / "metadata.json"
                     if not meta_path.exists():
                         continue
-                    try:
-                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                        if meta.get("pts_repaired"):
-                            continue
-                        fps = meta.get("fps", 15)
-                        if repair_video_timestamps(video_path, fps, self._video_crf, self._video_preset):
-                            meta["pts_repaired"] = True
-                            meta_path.write_text(
-                                json.dumps(meta, ensure_ascii=False), encoding="utf-8",
+                    with _alert_lock(self._archive_dir, alert_dir.name):
+                        try:
+                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                            if meta.get("pts_repaired"):
+                                continue
+                            fps = meta.get("fps", 15)
+                            if repair_video_timestamps(
+                                video_path,
+                                fps,
+                                self._video_crf,
+                                self._video_preset,
+                            ):
+                                meta["pts_repaired"] = True
+                                _atomic_write_json(meta_path, meta)
+                                repaired += 1
+                        except Exception:
+                            logger.warning(
+                                "alert_recording.repair_skip",
+                                path=str(alert_dir),
+                                exc_info=True,
                             )
-                            repaired += 1
-                    except Exception:
-                        logger.warning("alert_recording.repair_skip", path=str(alert_dir), exc_info=True)
 
         if repaired > 0:
             logger.info("alert_recording.repair_complete", repaired=repaired)
@@ -146,54 +293,31 @@ class AlertRecordingStore:
 
         Returns (recording_dir_path, file_size_bytes).
         """
+        with _alert_lock(self._archive_dir, recording.alert_id):
+            return self._save_locked(recording)
+
+    def _save_locked(self, recording: SolidifiedRecording) -> tuple[str, int]:
+        """Persist a recording while its per-alert mutation lock is held."""
         date_str = datetime.fromtimestamp(
             recording.trigger_timestamp, tz=timezone.utc
         ).strftime("%Y-%m-%d")
 
-        rec_dir = self._archive_dir / date_str / recording.camera_id / recording.alert_id
-        rec_dir.mkdir(parents=True, exist_ok=True)
+        camera_dir = self._archive_dir / date_str / recording.camera_id
+        rec_dir = camera_dir / recording.alert_id
+        tmp_dir = camera_dir / f".{recording.alert_id}.tmp-{time.time_ns()}"
+        backup_dir: Path | None = None
 
         # Determine video filename based on recording status
         # pre.mp4 during recording (post-trigger window still collecting)
         # recording.mp4 when complete
         is_recording = recording.status == RecordingStatus.RECORDING
         video_name = "pre.mp4" if is_recording else "recording.mp4"
-        video_path = rec_dir / video_name
 
         # Detect frame dimensions from actual data
         width, height = _detect_frame_dimensions(recording.frames)
 
-        # Encode frames to H.264 MP4
-        file_size = 0
-        if recording.frames:
-            encoder = Mp4Encoder(
-                video_path,
-                fps=recording.fps,
-                width=width,
-                height=height,
-                crf=self._video_crf,
-                preset=self._video_preset,
-            )
-            for snap in recording.frames:
-                encoder.write_jpeg_frame(snap.frame_jpeg)
-            file_size = encoder.finalize()
-
-        # Write heatmap overlays as JPEG sequence (sparse, used for Canvas overlay)
-        has_heatmaps = any(snap.heatmap_raw is not None for snap in recording.frames)
-        if has_heatmaps:
-            heatmaps_dir = rec_dir / "heatmaps"
-            heatmaps_dir.mkdir(parents=True, exist_ok=True)
-            for i, snap in enumerate(recording.frames):
-                if snap.heatmap_raw is not None:
-                    heatmap_bytes = _encode_heatmap_jpeg(snap.heatmap_raw)
-                    if heatmap_bytes:
-                        (heatmaps_dir / f"{i:06d}.jpg").write_bytes(heatmap_bytes)
-
         # Build signals timeseries
         signals = self._build_signals(recording.frames)
-        (rec_dir / "signals.json").write_text(
-            json.dumps(signals, ensure_ascii=False), encoding="utf-8"
-        )
 
         # Write metadata
         metadata = {
@@ -214,9 +338,69 @@ class AlertRecordingStore:
             "codec": "h264",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        (rec_dir / "metadata.json").write_text(
-            json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
-        )
+        frame_identity = _recording_frame_identity(recording)
+        if frame_identity is not None:
+            metadata["frame_identity"] = frame_identity
+
+        # Validate JSON before any externally visible artifact is published.
+        signals_json = _json_dumps(signals)
+        metadata_json = _json_dumps(metadata)
+
+        file_size = 0
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=False)
+            video_path = tmp_dir / video_name
+
+            # Encode frames to H.264 MP4
+            if recording.frames:
+                encoder = Mp4Encoder(
+                    video_path,
+                    fps=recording.fps,
+                    width=width,
+                    height=height,
+                    crf=self._video_crf,
+                    preset=self._video_preset,
+                )
+                for snap in recording.frames:
+                    encoder.write_jpeg_frame(snap.frame_jpeg)
+                file_size = encoder.finalize()
+
+            # Write heatmap overlays as JPEG sequence (sparse, used for Canvas overlay)
+            has_heatmaps = any(snap.heatmap_raw is not None for snap in recording.frames)
+            if has_heatmaps:
+                heatmaps_dir = tmp_dir / "heatmaps"
+                heatmaps_dir.mkdir(parents=True, exist_ok=True)
+                for i, snap in enumerate(recording.frames):
+                    if snap.heatmap_raw is not None:
+                        heatmap_bytes = _encode_heatmap_jpeg(snap.heatmap_raw)
+                        if heatmap_bytes:
+                            (heatmaps_dir / f"{i:06d}.jpg").write_bytes(heatmap_bytes)
+
+            _atomic_write_text(tmp_dir / "signals.json", signals_json)
+            _atomic_write_text(tmp_dir / "metadata.json", metadata_json)
+
+            if rec_dir.exists():
+                backup_dir = camera_dir / (
+                    f".{recording.alert_id}.previous-{time.time_ns()}"
+                )
+                rec_dir.rename(backup_dir)
+            try:
+                tmp_dir.rename(rec_dir)
+            except Exception:
+                if (
+                    backup_dir is not None
+                    and backup_dir.exists()
+                    and not rec_dir.exists()
+                ):
+                    backup_dir.rename(rec_dir)
+                raise
+            if backup_dir is not None:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+        except Exception:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._path_cache.pop(recording.alert_id, None)
+            raise
 
         self._path_cache[recording.alert_id] = rec_dir
 
@@ -238,6 +422,15 @@ class AlertRecordingStore:
         Encodes post_frames as post.mp4, concatenates with pre.mp4 to produce
         recording.mp4, then cleans up temp files. Returns True on success.
         """
+        with _alert_lock(self._archive_dir, alert_id):
+            return self._append_post_frames_locked(alert_id, post_frames)
+
+    def _append_post_frames_locked(
+        self,
+        alert_id: str,
+        post_frames: list[FrameSnapshot],
+    ) -> bool:
+        """Finalize a recording while its per-alert mutation lock is held."""
         rec_dir = self._find_recording_dir(alert_id)
         if rec_dir is None:
             logger.warning("alert_recording.append_not_found", alert_id=alert_id)
@@ -248,6 +441,22 @@ class AlertRecordingStore:
         pre_path = rec_dir / "pre.mp4"
         post_path = rec_dir / "post.mp4"
         final_path = rec_dir / "recording.mp4"
+
+        missing = [
+            name for name, path in (
+                ("metadata", metadata_path),
+                ("signals", signals_path),
+                ("pre_video", pre_path),
+            )
+            if not path.exists()
+        ]
+        if missing:
+            logger.warning(
+                "alert_recording.append_incomplete",
+                alert_id=alert_id,
+                missing=missing,
+            )
+            return False
 
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         existing_count = metadata["frame_count"]
@@ -300,8 +509,25 @@ class AlertRecordingStore:
         # Update signals
         existing_signals = json.loads(signals_path.read_text(encoding="utf-8"))
         post_signals = self._build_signals(post_frames)
-        for key in ("timestamps", "anomaly_scores", "simplex_scores"):
-            existing_signals[key].extend(post_signals[key])
+        if "frame_numbers" not in existing_signals:
+            existing_signals["frame_numbers"] = list(range(existing_count))
+        if "frame_identities" not in existing_signals:
+            existing_signals["frame_identities"] = [None] * existing_count
+        if "candidate_records" not in existing_signals:
+            existing_signals["candidate_records"] = [[] for _ in range(existing_count)]
+        existing_signals.setdefault("candidate_events", [])
+        for key in (
+            "timestamps",
+            "anomaly_scores",
+            "simplex_scores",
+            "frame_numbers",
+            "frame_identities",
+            "candidate_records",
+        ):
+            existing_signals.setdefault(key, []).extend(post_signals.get(key, []))
+        existing_signals["candidate_events"].extend(
+            _aggregate_candidate_events(post_frames, frame_index_offset=existing_count)
+        )
         for zone_id in post_signals["cusum_evidence"]:
             if zone_id not in existing_signals["cusum_evidence"]:
                 existing_signals["cusum_evidence"][zone_id] = []
@@ -323,9 +549,6 @@ class AlertRecordingStore:
         )
         for tid, pts in post_traj.items():
             existing_traj.setdefault(tid, []).extend(pts)
-        signals_path.write_text(
-            json.dumps(existing_signals, ensure_ascii=False), encoding="utf-8"
-        )
 
         # Update metadata
         metadata["frame_count"] = existing_count + len(post_frames)
@@ -334,9 +557,15 @@ class AlertRecordingStore:
         )
         metadata["status"] = RecordingStatus.COMPLETE.value
         metadata["video_file"] = "recording.mp4"
-        metadata_path.write_text(
-            json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
-        )
+        if post_frames:
+            frame_identity = metadata.setdefault("frame_identity", {})
+            last_identity = _frame_identity_dict(post_frames[-1])
+            if last_identity is not None:
+                frame_identity["last"] = last_identity
+        signals_json = _json_dumps(existing_signals)
+        metadata_json = _json_dumps(metadata)
+        _atomic_write_text(signals_path, signals_json)
+        _atomic_write_text(metadata_path, metadata_json)
 
         logger.info(
             "alert_recording.post_frames_appended",
@@ -349,23 +578,78 @@ class AlertRecordingStore:
 
     def load_metadata(self, alert_id: str) -> dict | None:
         """Load recording metadata for an alert."""
-        rec_dir = self._find_recording_dir(alert_id)
-        if rec_dir is None:
-            return None
-        meta_path = rec_dir / "metadata.json"
-        if not meta_path.exists():
-            return None
-        return json.loads(meta_path.read_text(encoding="utf-8"))
+        with _alert_lock(self._archive_dir, alert_id):
+            rec_dir = self._find_recording_dir(alert_id)
+            if rec_dir is None:
+                return None
+            meta_path = rec_dir / "metadata.json"
+            if not meta_path.exists():
+                return None
+            return json.loads(meta_path.read_text(encoding="utf-8"))
 
     def load_signals(self, alert_id: str) -> dict | None:
         """Load signal timeseries for an alert."""
+        with _alert_lock(self._archive_dir, alert_id):
+            rec_dir = self._find_recording_dir(alert_id)
+            if rec_dir is None:
+                return None
+            sig_path = rec_dir / "signals.json"
+            if not sig_path.exists():
+                return None
+            return json.loads(sig_path.read_text(encoding="utf-8"))
+
+    def get_availability(self, alert_id: str) -> RecordingAvailability:
+        """Return whether a recording has all artifacts needed for replay."""
+        with _alert_lock(self._archive_dir, alert_id):
+            return self._get_availability_locked(alert_id)
+
+    def _get_availability_locked(self, alert_id: str) -> RecordingAvailability:
+        """Resolve replay availability while the alert artifact lock is held."""
         rec_dir = self._find_recording_dir(alert_id)
         if rec_dir is None:
-            return None
-        sig_path = rec_dir / "signals.json"
-        if not sig_path.exists():
-            return None
-        return json.loads(sig_path.read_text(encoding="utf-8"))
+            return RecordingAvailability(
+                has_recording=False,
+                replay_ready=False,
+                status=None,
+                unavailable_reason="missing_directory",
+            )
+
+        metadata_path = rec_dir / "metadata.json"
+        signals_path = rec_dir / "signals.json"
+        video_path = self._get_video_file(rec_dir)
+
+        if not metadata_path.exists():
+            return RecordingAvailability(
+                has_recording=False,
+                replay_ready=False,
+                status="incomplete",
+                unavailable_reason="missing_metadata",
+                video_path=video_path,
+            )
+        if not signals_path.exists():
+            return RecordingAvailability(
+                has_recording=False,
+                replay_ready=False,
+                status="incomplete",
+                unavailable_reason="missing_signals",
+                video_path=video_path,
+            )
+        if video_path is None:
+            return RecordingAvailability(
+                has_recording=False,
+                replay_ready=False,
+                status="incomplete",
+                unavailable_reason="missing_video",
+            )
+
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        return RecordingAvailability(
+            has_recording=True,
+            replay_ready=True,
+            status=metadata.get("status"),
+            unavailable_reason=None,
+            video_path=video_path,
+        )
 
     def load_frame(self, alert_id: str, index: int) -> bytes | None:
         """Extract a single JPEG frame by index from the MP4 video."""
@@ -401,18 +685,21 @@ class AlertRecordingStore:
 
     def pin_frame(self, alert_id: str, index: int, label: str) -> bool:
         """Add a user-pinned key frame bookmark to recording metadata."""
-        rec_dir = self._find_recording_dir(alert_id)
-        if rec_dir is None:
-            return False
-        meta_path = rec_dir / "metadata.json"
-        if not meta_path.exists():
-            return False
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if "pinned_frames" not in meta:
-            meta["pinned_frames"] = []
-        meta["pinned_frames"].append({"index": index, "label": label, "type": "user"})
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-        return True
+        with _alert_lock(self._archive_dir, alert_id):
+            rec_dir = self._find_recording_dir(alert_id)
+            if rec_dir is None:
+                return False
+            meta_path = rec_dir / "metadata.json"
+            if not meta_path.exists():
+                return False
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            pinned_frames = meta.get("pinned_frames")
+            if not isinstance(pinned_frames, list):
+                pinned_frames = []
+            pinned_frames.append({"index": index, "label": label, "type": "user"})
+            meta["pinned_frames"] = pinned_frames
+            _atomic_write_json(meta_path, meta)
+            return True
 
     def list_clips(self, alert_id: str) -> list[dict] | None:
         """Return the persisted operator clip ranges for a recording.
@@ -421,17 +708,18 @@ class AlertRecordingStore:
         exists but has no clips yet. Each clip is ``{start_index, end_index,
         label, created_at}``.
         """
-        rec_dir = self._find_recording_dir(alert_id)
-        if rec_dir is None:
-            return None
-        sig_path = rec_dir / "signals.json"
-        if not sig_path.exists():
-            return []
-        signals = json.loads(sig_path.read_text(encoding="utf-8"))
-        clips = signals.get("clips")
-        if not isinstance(clips, list):
-            return []
-        return clips
+        with _alert_lock(self._archive_dir, alert_id):
+            rec_dir = self._find_recording_dir(alert_id)
+            if rec_dir is None:
+                return None
+            sig_path = rec_dir / "signals.json"
+            if not sig_path.exists():
+                return []
+            signals = json.loads(sig_path.read_text(encoding="utf-8"))
+            clips = signals.get("clips")
+            if not isinstance(clips, list):
+                return []
+            return clips
 
     def add_clip(
         self,
@@ -445,47 +733,49 @@ class AlertRecordingStore:
         Returns the created clip dict on success, ``None`` if the recording
         does not exist.
         """
-        rec_dir = self._find_recording_dir(alert_id)
-        if rec_dir is None:
-            return None
-        sig_path = rec_dir / "signals.json"
-        if not sig_path.exists():
-            return None
-        signals = json.loads(sig_path.read_text(encoding="utf-8"))
-        clips = signals.get("clips")
-        if not isinstance(clips, list):
-            clips = []
-        clip = {
-            "start_index": int(start_index),
-            "end_index": int(end_index),
-            "label": str(label or ""),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        clips.append(clip)
-        signals["clips"] = clips
-        sig_path.write_text(json.dumps(signals, ensure_ascii=False), encoding="utf-8")
-        return clip
+        with _alert_lock(self._archive_dir, alert_id):
+            rec_dir = self._find_recording_dir(alert_id)
+            if rec_dir is None:
+                return None
+            sig_path = rec_dir / "signals.json"
+            if not sig_path.exists():
+                return None
+            signals = json.loads(sig_path.read_text(encoding="utf-8"))
+            clips = signals.get("clips")
+            if not isinstance(clips, list):
+                clips = []
+            clip = {
+                "start_index": int(start_index),
+                "end_index": int(end_index),
+                "label": str(label or ""),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            clips.append(clip)
+            signals["clips"] = clips
+            _atomic_write_json(sig_path, signals)
+            return clip
 
     def delete_clip(self, alert_id: str, index: int) -> bool:
         """Remove a clip by its array index. Returns ``True`` on success."""
-        rec_dir = self._find_recording_dir(alert_id)
-        if rec_dir is None:
-            return False
-        sig_path = rec_dir / "signals.json"
-        if not sig_path.exists():
-            return False
-        signals = json.loads(sig_path.read_text(encoding="utf-8"))
-        clips = signals.get("clips")
-        if not isinstance(clips, list) or index < 0 or index >= len(clips):
-            return False
-        clips.pop(index)
-        signals["clips"] = clips
-        sig_path.write_text(json.dumps(signals, ensure_ascii=False), encoding="utf-8")
-        return True
+        with _alert_lock(self._archive_dir, alert_id):
+            rec_dir = self._find_recording_dir(alert_id)
+            if rec_dir is None:
+                return False
+            sig_path = rec_dir / "signals.json"
+            if not sig_path.exists():
+                return False
+            signals = json.loads(sig_path.read_text(encoding="utf-8"))
+            clips = signals.get("clips")
+            if not isinstance(clips, list) or index < 0 or index >= len(clips):
+                return False
+            clips.pop(index)
+            signals["clips"] = clips
+            _atomic_write_json(sig_path, signals)
+            return True
 
     def has_recording(self, alert_id: str) -> bool:
         """Check if a recording exists for the given alert."""
-        return self._find_recording_dir(alert_id) is not None
+        return self.get_availability(alert_id).replay_ready
 
     def reindex_moov(self) -> int:
         """Re-mux all existing MP4 files with moov atom at the beginning.
@@ -555,9 +845,9 @@ class AlertRecordingStore:
                 inp.close()
                 inp = None
 
-                # Replace original
-                mp4_path.unlink()
-                tmp_path.rename(mp4_path)
+                # Atomically publish the re-indexed artifact. If replacement
+                # fails, the original video remains intact.
+                os.replace(tmp_path, mp4_path)
                 count += 1
                 logger.info("alert_recording.reindex_moov", path=str(mp4_path))
             except Exception as e:
@@ -585,12 +875,13 @@ class AlertRecordingStore:
 
     def delete_recording(self, alert_id: str) -> bool:
         """Delete the recording directory for an alert. Returns True if it existed."""
-        rec_dir = self._find_recording_dir(alert_id)
-        if rec_dir is None:
-            return False
-        shutil.rmtree(rec_dir, ignore_errors=True)
-        self._path_cache.pop(alert_id, None)
-        return True
+        with _alert_lock(self._archive_dir, alert_id):
+            rec_dir = self._find_recording_dir(alert_id)
+            if rec_dir is None:
+                return False
+            shutil.rmtree(rec_dir, ignore_errors=True)
+            self._path_cache.pop(alert_id, None)
+            return True
 
     def cleanup_old(self, max_age_days: int = 30) -> int:
         """Remove recordings older than max_age_days.
@@ -674,6 +965,8 @@ class AlertRecordingStore:
 
         signals = {
             "timestamps": [f.timestamp for f in frames],
+            "frame_numbers": [f.frame_number for f in frames],
+            "frame_identities": [_frame_identity_dict(f) for f in frames],
             "anomaly_scores": [f.anomaly_score for f in frames],
             "simplex_scores": [f.simplex_score for f in frames],
             "cusum_evidence": {
@@ -689,14 +982,20 @@ class AlertRecordingStore:
                 for f in frames
             ],
             "yolo_boxes": [f.yolo_boxes or [] for f in frames],
+            "candidate_records": [f.candidate_records for f in frames],
+            "candidate_events": _aggregate_candidate_events(frames),
             "has_heatmaps": any(f.heatmap_raw is not None for f in frames),
             "trajectory_points": _aggregate_trajectories(frames),
         }
         return signals
 
-    @staticmethod
-    def _archive_recording(rec_dir: Path) -> None:
+    def _archive_recording(self, rec_dir: Path) -> None:
         """Downsample a recording for archival: extract trigger frame, delete video."""
+        with _alert_lock(self._archive_dir, rec_dir.name):
+            self._archive_recording_locked(rec_dir)
+
+    @staticmethod
+    def _archive_recording_locked(rec_dir: Path) -> None:
         meta_path = rec_dir / "metadata.json"
         if not meta_path.exists():
             return
@@ -723,6 +1022,4 @@ class AlertRecordingStore:
         # Update metadata
         metadata["status"] = RecordingStatus.ARCHIVED.value
         metadata["video_file"] = None
-        meta_path.write_text(
-            json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
-        )
+        _atomic_write_json(meta_path, metadata)

@@ -1,5 +1,5 @@
-import { api, u } from './client'
-import type { TrajectoryFit } from '../types/api'
+import { api, unwrap } from './client'
+import type { ApiResponse, TrajectoryFit } from '../types/api'
 
 export interface TrajectoryPrimary {
   speed_ms: number | null
@@ -32,7 +32,11 @@ export interface ActiveTracksResponse {
 }
 
 export const getAlertTrajectory = (alertId: string): Promise<TrajectoryResponse> =>
-  api.get(`/physics/${alertId}/trajectory`).then(u)
+  api
+    .get<ApiResponse<TrajectoryResponse>>(`/physics/${alertId}/trajectory`)
+    .then(unwrap)
 
 export const getActiveTracks = (cameraId: string): Promise<ActiveTracksResponse> =>
-  api.get(`/physics/${cameraId}/active-tracks`).then(u)
+  api
+    .get<ApiResponse<ActiveTracksResponse>>(`/physics/${cameraId}/active-tracks`)
+    .then(unwrap)

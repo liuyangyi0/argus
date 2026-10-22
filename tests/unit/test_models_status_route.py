@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,8 +11,10 @@ from fastapi.testclient import TestClient
 from argus.anomaly.detector import AnomalibDetector, MultiScaleDetector
 from argus.core.health import HealthMonitor
 from argus.core.model_status import ModelStatus
+from argus.core.pipeline import DetectionPipeline
 from argus.dashboard.app import create_app
 from argus.storage.database import Database
+from argus.storage.models import ModelStage
 
 
 @pytest.fixture
@@ -30,13 +32,20 @@ def client(db, tmp_path):
     return TestClient(app)
 
 
-def _make_runner(camera_id: str, anomaly_status: ModelStatus,
-                 yolo_status: ModelStatus) -> SimpleNamespace:
+def _model_status_snapshot(
+    camera_id: str,
+    anomaly_status: ModelStatus,
+    yolo_status: ModelStatus,
+    *,
+    quality: dict | None = None,
+) -> list[dict]:
     pipeline = SimpleNamespace(
+        camera_config=SimpleNamespace(camera_id=camera_id),
         _anomaly_detector=SimpleNamespace(status=anomaly_status),
         _object_detector=SimpleNamespace(status=yolo_status),
+        get_input_quality_status=MagicMock(return_value=quality or {}),
     )
-    return SimpleNamespace(_pipeline=pipeline)
+    return DetectionPipeline.get_model_statuses_snapshot(pipeline)
 
 
 class TestModelsStatusRoute:
@@ -64,10 +73,10 @@ class TestModelsStatusRoute:
         cam2_yolo.mark_load_failed("missing weights")
 
         manager = MagicMock()
-        manager._runners = {
-            "cam1": _make_runner("cam1", cam1_anom, cam1_yolo),
-            "cam2": _make_runner("cam2", cam2_anom, cam2_yolo),
-        }
+        manager.get_model_statuses_snapshot.return_value = [
+            *_model_status_snapshot("cam1", cam1_anom, cam1_yolo),
+            *_model_status_snapshot("cam2", cam2_anom, cam2_yolo),
+        ]
         client.app.state.camera_manager = manager
 
         resp = client.get("/api/models/status")
@@ -89,18 +98,18 @@ class TestModelsStatusRoute:
         yolo = ModelStatus(name="yolo", camera_id="cam1")
         yolo.mark_loaded(backend="cpu")
 
-        pipeline = SimpleNamespace(
-            _anomaly_detector=SimpleNamespace(status=anomaly),
-            _object_detector=SimpleNamespace(status=yolo),
-            get_input_quality_status=MagicMock(return_value={
+        manager = MagicMock()
+        manager.get_model_statuses_snapshot.return_value = _model_status_snapshot(
+            "cam1",
+            anomaly,
+            yolo,
+            quality={
                 "low_light": True,
                 "detection_limited": True,
                 "detection_limited_reason": "low_light",
                 "ssim_calibration_blocked": True,
-            }),
+            },
         )
-        manager = MagicMock()
-        manager._runners = {"cam1": SimpleNamespace(_pipeline=pipeline)}
         client.app.state.camera_manager = manager
 
         resp = client.get("/api/models/status")
@@ -113,9 +122,9 @@ class TestModelsStatusRoute:
         assert quality["detection_limited_reason"] == "low_light"
         assert "input_quality" not in by_key[("cam1", "yolo")]["extra"]
 
-    def test_skips_runners_without_pipeline(self, client):
+    def test_empty_runtime_snapshot_is_safe(self, client):
         manager = MagicMock()
-        manager._runners = {"dead": SimpleNamespace(_pipeline=None)}
+        manager.get_model_statuses_snapshot.return_value = []
         client.app.state.camera_manager = manager
 
         resp = client.get("/api/models/status")
@@ -132,14 +141,15 @@ class TestModelsStatusRoute:
         yolo.mark_loaded(backend="cpu", model_path="yolo11n.pt")
 
         manager = MagicMock()
-        manager._runners = {
-            "cam1": SimpleNamespace(
-                _pipeline=SimpleNamespace(
-                    _anomaly_detector=wrapped,
-                    _object_detector=SimpleNamespace(status=yolo),
-                ),
-            ),
-        }
+        pipeline = SimpleNamespace(
+            camera_config=SimpleNamespace(camera_id="cam1"),
+            _anomaly_detector=wrapped,
+            _object_detector=SimpleNamespace(status=yolo),
+            get_input_quality_status=MagicMock(return_value={}),
+        )
+        manager.get_model_statuses_snapshot.return_value = (
+            DetectionPipeline.get_model_statuses_snapshot(pipeline)
+        )
         client.app.state.camera_manager = manager
 
         resp = client.get("/api/models/status")
@@ -148,3 +158,51 @@ class TestModelsStatusRoute:
         by_key = {(m["camera_id"], m["name"]): m for m in body}
         assert by_key[("cam1", "anomaly")]["backend"] == "ssim-fallback"
         assert by_key[("cam1", "anomaly")]["extra"]["reason"] == "no_model_found"
+
+
+@pytest.mark.parametrize(
+    ("stage", "runtime_state", "expected"),
+    [
+        (
+            ModelStage.SHADOW.value,
+            {"primary_model_version": "v1", "shadow_model_version": "v2"},
+            "applied",
+        ),
+        (
+            ModelStage.CANARY.value,
+            {"primary_model_version": "v2", "shadow_model_version": None},
+            "applied",
+        ),
+        (
+            ModelStage.PRODUCTION.value,
+            {"primary_model_version": "old", "shadow_model_version": None},
+            "failed",
+        ),
+    ],
+)
+def test_model_runtime_state_uses_public_manager_snapshot(
+    stage,
+    runtime_state,
+    expected,
+):
+    from argus.dashboard.routes.models import _model_runtime_state
+
+    model = SimpleNamespace(
+        camera_id="cam1",
+        model_version_id="v2",
+        stage=stage,
+    )
+    manager = MagicMock(spec=["get_runtime_model_state"])
+    manager.get_runtime_model_state.return_value = runtime_state
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(camera_manager=manager)),
+    )
+
+    with patch(
+        "argus.dashboard.routes.models._expected_runtime_record",
+        return_value=model,
+    ):
+        result = _model_runtime_state(request, model)
+
+    assert result == expected
+    manager.get_runtime_model_state.assert_called_once_with("cam1")

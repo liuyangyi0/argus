@@ -1,6 +1,11 @@
+import type {
+  ReleaseReadinessGate as GeneratedReleaseReadinessGate,
+  ReleaseReadinessResponse as GeneratedReleaseReadinessResponse,
+} from './generated-openapi'
+
 // ── Unified API Response Envelope: {code, msg, data} ──
 
-export interface ApiResponse<T = any> {
+export interface ApiResponse<T = unknown> {
   code: number
   msg: string
   data: T
@@ -17,7 +22,10 @@ export const ErrorCode = {
   AUTH_REQUIRED: 40100,
   FORBIDDEN: 40300,
   NOT_FOUND: 40400,
+  METHOD_NOT_ALLOWED: 40500,
   CONFLICT: 40900,
+  UNPROCESSABLE_ENTITY: 42200,
+  RATE_LIMITED: 42900,
   INTERNAL_ERROR: 50000,
   SERVICE_UNAVAILABLE: 50300,
 } as const
@@ -25,16 +33,66 @@ export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode]
 
 // ── ApiError class for structured error handling ──
 
-export class ApiError extends Error {
-  code: number
-  data?: unknown
+export interface ApiErrorInit {
+  httpStatus?: number | null
+  businessCode?: number | null
+  message: string
+  details?: unknown
+  /** Raw server payload retained for legacy call sites that read `error.data`. */
+  raw?: unknown
+}
 
-  constructor(code: number, msg: string, data?: unknown) {
-    super(msg)
+export class ApiError extends Error {
+  /** HTTP transport status. `null` means the failure did not reach HTTP. */
+  readonly httpStatus: number | null
+  /** Stable backend business code from the `{code,msg,data}` envelope. */
+  readonly businessCode: number | null
+  readonly details?: unknown
+
+  /**
+   * @deprecated Use `httpStatus` or `businessCode`. For compatibility this is
+   * the non-2xx HTTP status when present, otherwise the business code.
+   */
+  readonly code: number
+  /** @deprecated Use `details`; retained for existing replay/error consumers. */
+  readonly data?: unknown
+
+  constructor(code: number, message: string, data?: unknown)
+  constructor(init: ApiErrorInit)
+  constructor(codeOrInit: number | ApiErrorInit, message = '请求失败', data?: unknown) {
+    const init: ApiErrorInit = typeof codeOrInit === 'number'
+      ? {
+          httpStatus: codeOrInit > 0 && codeOrInit < 1000 ? codeOrInit : null,
+          businessCode: codeOrInit >= 1000 ? codeOrInit : null,
+          message,
+          details: data,
+          raw: data,
+        }
+      : codeOrInit
+
+    super(init.message)
     this.name = 'ApiError'
-    this.code = code
-    this.data = data
+    this.httpStatus = init.httpStatus ?? null
+    this.businessCode = init.businessCode ?? null
+    this.details = init.details
+    const failedHttpStatus = this.httpStatus !== null
+      && (this.httpStatus < 200 || this.httpStatus >= 300)
+      ? this.httpStatus
+      : null
+    this.code = failedHttpStatus ?? this.businessCode ?? this.httpStatus ?? -1
+    this.data = init.raw ?? init.details
   }
+}
+
+export interface WsEvent<T = unknown> {
+  schema_version: 1
+  event_id: string
+  topic: string
+  type: string
+  resource_id: string
+  revision: number
+  occurred_at: string
+  data: T
 }
 
 // ── Domain Types ──
@@ -51,7 +109,7 @@ export interface CameraHealth {
   last_heartbeat?: string | null
   recent_errors?: string[] | null
   fps?: number | null
-  [k: string]: any
+  [k: string]: unknown
 }
 
 export interface CameraSummary {
@@ -165,6 +223,109 @@ export interface CameraStats {
   avg_latency_ms: number
 }
 
+export interface ZoneVertex {
+  x: number
+  y: number
+}
+
+export interface CameraZone {
+  zone_id: string
+  zone_type: 'include' | 'exclude'
+  vertices: ZoneVertex[]
+  name?: string
+  priority?: string
+  [key: string]: unknown
+}
+
+export interface SceneGuardStatus {
+  enabled: boolean
+  usable: boolean
+  state: string
+  raw_state?: string | null
+  reason?: string | null
+  profile_id?: string | null
+  bound_model_version?: string | null
+  bound_model_artifact_sha256?: string | null
+  runtime_model_artifact_sha256?: string | null
+  reference_available?: boolean
+  policy_recovery_count?: number
+  required_recovery_count?: number | null
+  last_checked_frame?: number | null
+  [key: string]: unknown
+}
+
+export interface CameraSourceDiagnostics {
+  declared_source?: string | null
+  runtime_source?: string | null
+  go2rtc_stream?: string | null
+  fps_observed?: number | null
+  last_frame_index?: number | null
+  last_snapshot_frame_index?: number | null
+  last_snapshot_ts?: number | null
+  last_preview_stream_frame_index?: number | null
+  source_consistency?: 'direct' | 'go2rtc_redirect' | 'mismatch' | string | null
+  [key: string]: unknown
+}
+
+export interface CameraDetectorStatus {
+  low_light?: boolean
+  last_brightness?: number | null
+  ssim_calibration_blocked?: boolean
+  exposure_recovering?: boolean
+  detection_limited?: boolean
+  detection_limited_reason?: string | null
+  [key: string]: unknown
+}
+
+export interface CameraRuntimeDetail {
+  pipeline_mode?: PipelineMode | null
+  anomaly_locked?: boolean
+  scene_guard?: SceneGuardStatus | null
+  [key: string]: unknown
+}
+
+export interface CameraLifecycleStage {
+  name?: string
+  status: 'active' | 'completed' | 'pending' | 'failed' | string
+  [key: string]: unknown
+}
+
+export interface CameraDetailPayload {
+  camera_id: string
+  name: string
+  connected: boolean
+  running: boolean
+  model_backend?: string | null
+  expected_model_backend?: string | null
+  stats?: CameraStats | null
+  stages?: CameraLifecycleStage[] | null
+  zones?: CameraZone[]
+  config?: Record<string, unknown> | null
+  runtime?: CameraRuntimeDetail | null
+  runner?: Record<string, unknown> | null
+  detector?: CameraDetectorStatus | null
+  health?: Record<string, unknown> | null
+  candidate_diagnostics?: unknown[]
+  source_diagnostics?: CameraSourceDiagnostics | null
+  scene_guard?: SceneGuardStatus | null
+  [key: string]: unknown
+}
+
+export interface AlertEvidenceJson {
+  detection_type?: string | null
+  frame_number?: number | null
+  [key: string]: unknown
+}
+
+export interface CandidateEvidenceEvent {
+  candidate_id?: string | null
+  candidate_type: string
+  frame_index?: number | null
+  decision: string
+  suppression_reason?: string | null
+  [key: string]: unknown
+}
+
 export interface AlertSummary {
   alert_id: string
   timestamp: string
@@ -172,10 +333,17 @@ export interface AlertSummary {
   zone_id: string
   severity: 'low' | 'medium' | 'high' | 'info'
   anomaly_score: number
+  detection_type?: string | null
+  evidence_summary?: string | null
+  evidence_json?: AlertEvidenceJson | null
+  suppression_reason?: string | null
+  frame_number?: number | null
   acknowledged: boolean
   false_positive: boolean
   has_recording: boolean
+  replay_ready?: boolean
   recording_status: string | null
+  recording_unavailable_reason?: string | null
   workflow_status: string
   notes: string
   // Open-vocabulary classifier output (null when classifier is disabled
@@ -223,6 +391,14 @@ export interface AlertSummary {
   // Workflow
   assigned_to?: string | null
   resolved_at?: string | null
+  model_version_id?: string | null
+  candidate_evidence?: {
+    event_count?: number
+    trigger_frame_index?: number | null
+    events?: CandidateEvidenceEvent[]
+    trigger_window?: number
+    truncated?: boolean
+  } | null
 }
 
 export interface SegmentationObject {
@@ -284,6 +460,7 @@ export interface ModelHealthStatus {
   last_success_ts: number | null
   extra: Record<string, unknown> & {
     input_quality?: ModelInputQualityStatus
+    expected_backend?: string
   }
 }
 
@@ -451,6 +628,17 @@ export interface TrainingMetricsResponse {
   }
 }
 
+export interface TrainingValidationReport {
+  all_passed?: boolean
+  auroc?: number | null
+  recall?: number | null
+  replay?: {
+    new_detection_rate?: number | null
+    [key: string]: unknown
+  } | null
+  [key: string]: unknown
+}
+
 export interface TrainingJobInfo {
   id: number
   job_id: string
@@ -469,7 +657,7 @@ export interface TrainingJobInfo {
   hyperparameters: string | Record<string, unknown> | null
   metrics: string | Record<string, unknown> | null
   artifacts_path: string | null
-  validation_report: string | Record<string, any> | null
+  validation_report: string | TrainingValidationReport | null
   model_version_id: string | null
   created_at: string | null
   started_at: string | null
@@ -499,7 +687,9 @@ export interface ModelInfo {
   component_type: string
   model_path: string | null
   canary_camera_id: string | null
+  release_revision?: number | null
   runtime_state?: ModelRuntimeState | null
+  latest_release_operation?: ReleaseOperation | null
 }
 
 export interface ModelVersionEvent {
@@ -585,11 +775,41 @@ export interface ModelRuntimeMutationResponse {
 
 export type ModelReleaseRuntimeState = ModelRuntimeState | Record<string, unknown> | null
 
+export type ReleaseOperationStatus = 'pending' | 'applied' | 'failed'
+
+export interface ReleaseOperation {
+  operation_id: string
+  idempotency_key?: string | null
+  model_version_id: string
+  camera_id: string
+  from_stage: string
+  target_stage: string
+  expected_revision: number
+  applied_revision: number | null
+  status: ReleaseOperationStatus
+  requested_by: string
+  reason?: string | null
+  runtime_state?: ModelReleaseRuntimeState
+  error?: string | null
+  requested_at?: string | null
+  completed_at?: string | null
+}
+
 export interface ModelReleaseMutationResponse {
+  operation: ReleaseOperation
   model: ModelInfo
   runtime_synced: boolean
   runtime_state?: ModelReleaseRuntimeState
 }
+
+export interface ReleaseOperationResponse {
+  operation: ReleaseOperation
+}
+
+/** OpenAPI-generated server-authoritative production release state. */
+export type ReleaseReadinessGate = GeneratedReleaseReadinessGate
+export type ReleaseReadiness = GeneratedReleaseReadinessResponse
+export type ReleaseReadinessStatus = ReleaseReadiness['status']
 
 export interface TrainingJobsResponse {
   jobs: TrainingJobInfo[]
@@ -602,8 +822,21 @@ export interface ShadowReportResponse {
   production_alert_rate: number
   shadow_alert_rate: number
   false_positive_delta: number
+  alert_rate_delta?: number
+  abs_alert_rate_delta?: number
   avg_score_divergence: number
   avg_shadow_latency_ms: number
+  gate_report?: {
+    ready_for_canary: boolean
+    checks: Array<{
+      name: string
+      label: string
+      value: number
+      limit: number
+      passed: boolean
+      enabled: boolean
+    }>
+  }
 }
 
 export interface ABScoresResponse {

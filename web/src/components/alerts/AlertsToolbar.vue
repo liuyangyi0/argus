@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { onBeforeUnmount } from 'vue'
 import { Select } from 'ant-design-vue'
 import { storeToRefs } from 'pinia'
 import { useAlertStore } from '../../stores/useAlertStore'
@@ -6,17 +7,29 @@ import { useAlertStore } from '../../stores/useAlertStore'
 defineOptions({ name: 'AlertsToolbar' })
 
 const store = useAlertStore()
-const { cameras, filters, totalAlerts, activeCount, resolvedCount } = storeToRefs(store)
+const {
+  cameras,
+  camerasLoading,
+  camerasError,
+  filters,
+  totalAlerts,
+  activeCount,
+  resolvedCount,
+} = storeToRefs(store)
 
 let _filterTimer: ReturnType<typeof setTimeout> | null = null
 function debouncedFetchData() {
   if (_filterTimer) clearTimeout(_filterTimer)
-  _filterTimer = setTimeout(() => store.fetchData(), 300)
+  _filterTimer = setTimeout(() => store.fetchAlerts(), 300)
 }
+
+onBeforeUnmount(() => {
+  if (_filterTimer) clearTimeout(_filterTimer)
+})
 
 function setSeverity(value: string) {
   filters.value.severity = value
-  store.fetchData()
+  store.fetchAlerts()
 }
 
 function buildExportParams(): string {
@@ -54,21 +67,33 @@ function handleExportPDF() {
         allow-clear
         size="small"
         style="width: 130px"
+        :loading="camerasLoading"
+        :status="camerasError ? 'error' : undefined"
+        :aria-label="camerasError ? `摄像头筛选加载失败：${camerasError}` : '按摄像头筛选告警'"
         @change="debouncedFetchData"
       >
         <Select.Option v-for="cam in cameras" :key="cam.camera_id" :value="cam.camera_id">
           {{ cam.camera_id }}
         </Select.Option>
       </Select>
+      <button
+        v-if="camerasError"
+        type="button"
+        class="alerts-filter-retry"
+        :title="camerasError"
+        @click="store.fetchCameraOptions"
+      >
+        摄像头筛选加载失败，重试
+      </button>
       <div class="alerts-chip-group">
-        <button :class="['alerts-chip', { on: !filters.severity }]" @click="setSeverity('')">全部</button>
-        <button :class="['alerts-chip', { on: filters.severity === 'high' }]" @click="setSeverity('high')">高</button>
-        <button :class="['alerts-chip', { on: filters.severity === 'medium' }]" @click="setSeverity('medium')">中</button>
-        <button :class="['alerts-chip', { on: filters.severity === 'low' }]" @click="setSeverity('low')">低</button>
+        <button type="button" :class="['alerts-chip', { on: !filters.severity }]" :aria-pressed="!filters.severity" @click="setSeverity('')">全部</button>
+        <button type="button" :class="['alerts-chip', { on: filters.severity === 'high' }]" :aria-pressed="filters.severity === 'high'" @click="setSeverity('high')">高</button>
+        <button type="button" :class="['alerts-chip', { on: filters.severity === 'medium' }]" :aria-pressed="filters.severity === 'medium'" @click="setSeverity('medium')">中</button>
+        <button type="button" :class="['alerts-chip', { on: filters.severity === 'low' }]" :aria-pressed="filters.severity === 'low'" @click="setSeverity('low')">低</button>
       </div>
       <div class="alerts-chip-group alerts-chip-group--end">
-        <button class="alerts-chip alerts-chip--export" @click="handleExportCSV">CSV ↓</button>
-        <button class="alerts-chip alerts-chip--export" @click="handleExportPDF">PDF ↓</button>
+        <button type="button" class="alerts-chip alerts-chip--export" aria-label="导出当前筛选结果为 CSV" @click="handleExportCSV">CSV ↓</button>
+        <button type="button" class="alerts-chip alerts-chip--export" aria-label="导出当前筛选结果为 PDF" @click="handleExportPDF">PDF ↓</button>
       </div>
     </div>
   </div>
@@ -112,6 +137,20 @@ function handleExportPDF() {
 .alerts-chip-group {
   display: flex;
   gap: 4px;
+}
+.alerts-filter-retry {
+  border: 0;
+  padding: 3px 6px;
+  background: transparent;
+  color: var(--argus-danger, #dc2626);
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.alerts-filter-retry:focus-visible {
+  outline: 2px solid var(--argus-focus-ring, #2563eb);
+  outline-offset: 2px;
 }
 .alerts-chip-group--end {
   margin-left: auto;

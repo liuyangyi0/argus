@@ -31,6 +31,7 @@ from argus.alerts.grader import Alert, AlertSeverity
 from argus.config.schema import AlertConfig
 from argus.storage.database import Database
 from argus.storage.model_registry import ModelRegistry
+from argus.storage.release_pipeline import ReleasePipeline
 
 
 @pytest.fixture
@@ -59,8 +60,13 @@ def _register_and_activate(
     camera_id: str,
     model_path: Path,
     baseline_dir: Path,
+    release_evidence_factory,
 ) -> str:
-    """Register a candidate, then activate it. Returns the version id."""
+    """Register and release a model. Returns the version id."""
+    model_path.write_text("model", encoding="utf-8")
+    model_path.with_suffix(".bin").write_bytes(b"weights")
+    baseline_dir.mkdir(parents=True)
+    (baseline_dir / "baseline.png").write_bytes(b"baseline")
     model_version_id = registry.register(
         model_path=str(model_path),
         baseline_dir=str(baseline_dir),
@@ -68,7 +74,34 @@ def _register_and_activate(
         model_type="patchcore",
         training_params={"image_size": 256, "export_format": "openvino"},
     )
-    registry.activate(model_version_id, allow_bypass=True)
+    release_pipeline = ReleasePipeline(
+        registry._session_factory,
+        min_shadow_days=0,
+        min_canary_days=0,
+    )
+    release_pipeline.transition(
+        model_version_id=model_version_id,
+        target_stage="shadow",
+        triggered_by="test-fixture",
+    )
+    release_pipeline.transition(
+        model_version_id=model_version_id,
+        target_stage="canary",
+        triggered_by="test-fixture",
+        canary_camera_id=camera_id,
+    )
+    record = registry.get_by_version_id(model_version_id)
+    release_pipeline.transition(
+        model_version_id=model_version_id,
+        target_stage="production",
+        triggered_by="test-fixture",
+        release_evidence=release_evidence_factory(
+            model_path=model_path,
+            model_version_id=model_version_id,
+            registry_model_hash=record.model_hash,
+            camera_id=camera_id,
+        ),
+    )
     return model_version_id
 
 
@@ -91,7 +124,10 @@ def _make_alert(
 
 
 def test_alert_carries_active_model_version_to_db(
-    tmp_db: Database, dispatcher: AlertDispatcher, tmp_path: Path
+    tmp_db: Database,
+    dispatcher: AlertDispatcher,
+    tmp_path: Path,
+    release_evidence_factory,
 ):
     """Dispatcher must forward Alert.model_version_id into the AlertRecord row."""
     registry = ModelRegistry(session_factory=tmp_db.get_session)
@@ -100,6 +136,7 @@ def test_alert_carries_active_model_version_to_db(
         camera_id="cam_01",
         model_path=tmp_path / "m_v1.xml",
         baseline_dir=tmp_path / "baseline_v1",
+        release_evidence_factory=release_evidence_factory,
     )
 
     dispatcher._dispatch_database(_make_alert("A-1", model_version_id=v1), None, None)
@@ -111,7 +148,10 @@ def test_alert_carries_active_model_version_to_db(
 
 
 def test_model_switch_preserves_historical_lineage(
-    tmp_db: Database, dispatcher: AlertDispatcher, tmp_path: Path
+    tmp_db: Database,
+    dispatcher: AlertDispatcher,
+    tmp_path: Path,
+    release_evidence_factory,
 ):
     """After swapping the active model, old alerts keep v1, new alerts carry v2."""
     registry = ModelRegistry(session_factory=tmp_db.get_session)
@@ -120,6 +160,7 @@ def test_model_switch_preserves_historical_lineage(
         camera_id="cam_01",
         model_path=tmp_path / "m_v1.xml",
         baseline_dir=tmp_path / "baseline_v1",
+        release_evidence_factory=release_evidence_factory,
     )
     dispatcher._dispatch_database(_make_alert("A-1", model_version_id=v1), None, None)
 
@@ -128,6 +169,7 @@ def test_model_switch_preserves_historical_lineage(
         camera_id="cam_01",
         model_path=tmp_path / "m_v2.xml",
         baseline_dir=tmp_path / "baseline_v2",
+        release_evidence_factory=release_evidence_factory,
     )
     assert v2 != v1
     dispatcher._dispatch_database(_make_alert("A-2", model_version_id=v2), None, None)

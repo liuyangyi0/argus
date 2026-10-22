@@ -5,13 +5,27 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 INFERENCE_MODEL_PATTERNS = ("model.xml", "model.pt")
 _INFERENCE_MODEL_SUFFIXES = {".xml", ".pt"}
+InferenceBackend = Literal["auto", "torch-cuda", "openvino", "torch-cpu"]
 
 
-def _latest_match(search_dir: Path) -> Path | None:
-    for pattern in INFERENCE_MODEL_PATTERNS:
+def _patterns_for_backend(backend: InferenceBackend = "auto") -> tuple[str, ...]:
+    if backend == "openvino":
+        return ("model.xml",)
+    if backend in {"torch-cuda", "torch-cpu"}:
+        return ("model.pt",)
+    return INFERENCE_MODEL_PATTERNS
+
+
+def _suffixes_for_backend(backend: InferenceBackend = "auto") -> set[str]:
+    return {Path(pattern).suffix for pattern in _patterns_for_backend(backend)}
+
+
+def _latest_match(search_dir: Path, backend: InferenceBackend = "auto") -> Path | None:
+    for pattern in _patterns_for_backend(backend):
         matches = sorted(
             search_dir.rglob(pattern),
             key=lambda path: path.stat().st_mtime,
@@ -22,7 +36,11 @@ def _latest_match(search_dir: Path) -> Path | None:
     return None
 
 
-def find_runtime_model_in_dir(base: Path, camera_id: str) -> Path | None:
+def find_runtime_model_in_dir(
+    base: Path,
+    camera_id: str,
+    backend: InferenceBackend = "auto",
+) -> Path | None:
     """Find the best inference-ready model for a camera from a directory."""
     search_dirs: list[Path] = []
     exports_dir = Path("data/exports") / camera_id
@@ -37,28 +55,38 @@ def find_runtime_model_in_dir(base: Path, camera_id: str) -> Path | None:
         if resolved_dir in seen:
             continue
         seen.add(resolved_dir)
-        match = _latest_match(search_dir)
+        match = _latest_match(search_dir, backend)
         if match is not None:
             return match
     return None
 
 
-def find_runtime_model(camera_id: str) -> Path | None:
+def find_runtime_model(camera_id: str, backend: InferenceBackend = "auto") -> Path | None:
     """Auto-discover the latest inference-ready model for a camera."""
     for search_dir in (Path("data/exports") / camera_id, Path("data/models") / camera_id):
         if not search_dir.exists():
             continue
-        match = _latest_match(search_dir)
+        match = _latest_match(search_dir, backend)
         if match is not None:
             return match
     return None
 
 
-def resolve_runtime_model_path(model_path: str | Path, camera_id: str) -> Path | None:
+def resolve_runtime_model_path(
+    model_path: str | Path,
+    camera_id: str,
+    backend: InferenceBackend = "auto",
+) -> Path | None:
     """Resolve a requested path to a deployable runtime artifact."""
     candidate = Path(model_path)
-    if candidate.is_file() and candidate.suffix.lower() in _INFERENCE_MODEL_SUFFIXES:
+    allowed_suffixes = _suffixes_for_backend(backend)
+    if candidate.is_file() and candidate.suffix.lower() in allowed_suffixes:
         return candidate.resolve()
+    if candidate.is_file() and candidate.suffix.lower() in _INFERENCE_MODEL_SUFFIXES:
+        # An explicitly requested runtime artifact of the wrong backend must
+        # fail closed.  Non-runtime files such as Lightning checkpoints may
+        # still resolve to their separately exported deployment artifact.
+        return None
 
     search_dirs: list[Path] = []
     exports_dir = Path("data/exports") / camera_id
@@ -76,11 +104,11 @@ def resolve_runtime_model_path(model_path: str | Path, camera_id: str) -> Path |
         if resolved_dir in seen or not search_dir.exists():
             continue
         seen.add(resolved_dir)
-        match = _latest_match(search_dir)
+        match = _latest_match(search_dir, backend)
         if match is not None:
             return match
 
-    return find_runtime_model(camera_id)
+    return find_runtime_model(camera_id, backend)
 
 
 def find_all_models(camera_id: str) -> list[Path]:

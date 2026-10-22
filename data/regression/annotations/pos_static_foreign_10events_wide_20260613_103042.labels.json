@@ -1,0 +1,15 @@
+{
+  "positive_ranges": [
+    {"start_sec": 140, "end_sec": 164, "label": "static_foreign_event_01"},
+    {"start_sec": 225, "end_sec": 270, "label": "static_foreign_event_02"},
+    {"start_sec": 340, "end_sec": 372, "label": "static_foreign_event_03"},
+    {"start_sec": 444, "end_sec": 477, "label": "static_foreign_event_04"},
+    {"start_sec": 541, "end_sec": 582, "label": "static_foreign_event_05"},
+    {"start_sec": 653, "end_sec": 690, "label": "static_foreign_event_06"},
+    {"start_sec": 771, "end_sec": 795, "label": "static_foreign_event_07"},
+    {"start_sec": 860, "end_sec": 900, "label": "static_foreign_event_08"},
+    {"start_sec": 960, "end_sec": 1001, "label": "static_foreign_event_09"},
+    {"start_sec": 1069, "end_sec": 1110, "label": "static_foreign_event_10"}
+  ],
+  "ignore_ranges": []
+}

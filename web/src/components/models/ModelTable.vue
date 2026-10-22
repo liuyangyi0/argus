@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, reactive } from 'vue'
+import { ref, computed, reactive, onUnmounted, watch } from 'vue'
 import {
-  Card, Table, Button, Tag, Space, Modal, Form, Select, Input,
+  Card, Button, Tag, Space, Modal, Form, Select, Input,
   Descriptions, Drawer, Steps, Tooltip, Dropdown, Menu, message,
 } from 'ant-design-vue'
 import {
@@ -11,15 +11,27 @@ import {
 } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import {
-  rollbackModel, deleteModel,
+  deleteModel,
   promoteModel, retireModel,
-  getStageHistory, getShadowReport,
+  getStageHistory, getShadowReport, getReleaseOperation,
+  acknowledgeReleaseOperation,
   reexportModel, recalibrateModel,
 } from '../../api'
 import { STAGE_MAP, VALID_TRANSITIONS, STAGE_LABELS } from '../../composables/useModelState'
 import { useWebSocket } from '../../composables/useWebSocket'
 import { extractErrorMessage } from '../../utils/error'
-import type { ModelInfo, ModelVersionEvent, CameraSummary } from '../../types/api'
+import { ApiError } from '../../types/api'
+import type {
+  CameraSummary,
+  ModelInfo,
+  ModelVersionEvent,
+  ModelReleaseMutationResponse,
+  ReleaseOperation,
+  ReleaseReadiness,
+  ShadowReportResponse,
+} from '../../types/api'
+import type { ModelReleaseRequest } from '../../api/models'
+import ResponsiveTable from '../common/ResponsiveTable.vue'
 
 // ── Release pipeline stage stepper config ──
 // 后端 stage 字段为小写 enum 字符串（candidate/shadow/canary/production/retired）。
@@ -30,6 +42,7 @@ const STAGES: { key: string; label: string }[] = [
   { key: 'canary', label: '灰度' },
   { key: 'production', label: '生产' },
 ]
+const ROLLBACK_NO_GO_REASON = '两阶段 rollback 尚未实现；发布 readiness 为 NO-GO，禁止调用 legacy 回滚接口'
 const STAGE_INDEX: Record<string, number> = STAGES.reduce(
   (acc, s, i) => ((acc[s.key] = i), acc),
   {} as Record<string, number>,
@@ -50,6 +63,7 @@ function shortVid(vid: string): string {
 const props = defineProps<{
   models: ModelInfo[]
   cameras: CameraSummary[]
+  releaseReadiness?: Record<string, ReleaseReadiness>
   focusedVersionId?: string
 }>()
 
@@ -63,7 +77,7 @@ const router = useRouter()
 const promotingModel = ref<string | null>(null)
 const promoteModalVisible = ref(false)
 const promoteForm = ref({ version_id: '', target_stage: '', triggered_by: '', reason: '', canary_camera_id: '' })
-const shadowReport = ref<any>(null)
+const shadowReport = ref<ShadowReportResponse | null>(null)
 const shadowReportVisible = ref(false)
 const shadowReportLoading = ref(false)
 const stageHistoryVisible = ref(false)
@@ -73,6 +87,83 @@ const reexportModalVisible = ref(false)
 const reexportForm = ref({ version_id: '', export_format: 'openvino', quantization: 'fp16' })
 const reexportLoading = ref(false)
 const recalibrateLoading = ref<string | null>(null)
+const releaseOperations = reactive<Record<string, ReleaseOperation>>({})
+const releaseOperationTimers = new Map<string, ReturnType<typeof setTimeout>>()
+let releaseTrackingDisposed = false
+
+function operationRevision(operation: ReleaseOperation): number {
+  return operation.applied_revision ?? operation.expected_revision
+}
+
+function isCurrentOperation(operation: ReleaseOperation, record?: { release_revision?: number | null }): boolean {
+  const revision = record?.release_revision
+  return typeof revision !== 'number' || operationRevision(operation) >= revision
+}
+
+function scheduleReleaseOperationRefresh(operation: ReleaseOperation): boolean {
+  if (releaseTrackingDisposed) return false
+  const existing = releaseOperationTimers.get(operation.operation_id)
+  if (existing) clearTimeout(existing)
+  releaseOperationTimers.delete(operation.operation_id)
+  const model = props.models.find(item => item.model_version_id === operation.model_version_id)
+  const previous = releaseOperations[operation.model_version_id]
+  if (!isCurrentOperation(operation, model)) return false
+  if (previous) {
+    if (operationRevision(operation) < operationRevision(previous)) return false
+    if (operation.operation_id === previous.operation_id) {
+      if (previous.status !== 'pending' && operation.status === 'pending') return false
+    } else if (operationRevision(operation) === operationRevision(previous)) {
+      const previousTime = Date.parse(previous.requested_at || '')
+      const incomingTime = Date.parse(operation.requested_at || '')
+      if (Number.isFinite(previousTime) && Number.isFinite(incomingTime) && incomingTime < previousTime) return false
+      if (!Number.isFinite(incomingTime) && previous.status === 'pending' && operation.status !== 'pending') return false
+    }
+    if (previous.operation_id !== operation.operation_id) {
+      const previousTimer = releaseOperationTimers.get(previous.operation_id)
+      if (previousTimer) clearTimeout(previousTimer)
+      releaseOperationTimers.delete(previous.operation_id)
+    }
+  }
+  releaseOperations[operation.model_version_id] = operation
+  if (operation.status !== 'pending') {
+    acknowledgeReleaseOperation(operation)
+    releaseOperationTimers.delete(operation.operation_id)
+    return true
+  }
+  const timer = setTimeout(async () => {
+    releaseOperationTimers.delete(operation.operation_id)
+    try {
+      const current = await getReleaseOperation(operation.operation_id)
+      scheduleReleaseOperationRefresh(current)
+      if (current.status !== 'pending') emit('changed')
+    } catch {
+      // Keep the accepted operation visible. The WS channel and the next
+      // explicit registry refresh remain independent recovery paths.
+      scheduleReleaseOperationRefresh(operation)
+    }
+  }, 2_000)
+  releaseOperationTimers.set(operation.operation_id, timer)
+  return true
+}
+
+onUnmounted(() => {
+  releaseTrackingDisposed = true
+  for (const timer of releaseOperationTimers.values()) clearTimeout(timer)
+  releaseOperationTimers.clear()
+})
+
+// The durable registry read carries the latest operation, including commands
+// submitted in another browser or before this page was mounted. WS is a change
+// notification, not the only place an accepted operation can be discovered.
+watch(
+  () => props.models.map(model => model.latest_release_operation),
+  operations => {
+    for (const operation of operations) {
+      if (operation) scheduleReleaseOperationRefresh(operation)
+    }
+  },
+  { immediate: true },
+)
 
 // ── Release pipeline live progress (model_release WS topic) ──
 // 后端在 release_pipeline.transition() commit 成功后会广播一条
@@ -92,6 +183,17 @@ useWebSocket({
       from_stage?: string
       to_stage?: string
       triggered_by?: string
+      operation?: ReleaseOperation
+    }
+    if (payload?.type?.startsWith('release_operation_') && payload.operation) {
+      if (!scheduleReleaseOperationRefresh(payload.operation)) return
+      if (payload.operation.status === 'applied') {
+        message.success(`发布操作 ${shortVid(payload.operation.operation_id)} 已应用`)
+      } else if (payload.operation.status === 'failed') {
+        message.error(`发布失败：${payload.operation.error || '运行时未应用'}`)
+      }
+      emit('changed')
+      return
     }
     if (payload?.type !== 'stage_transition') return
     const vid = payload.model_version_id ?? ''
@@ -218,9 +320,69 @@ const RUNTIME_STATE_MAP: Record<string, { text: string; color: string }> = {
 }
 
 function runtimeStateDisplay(record: Record<string, any>): { text: string; color: string } {
+  const cached = releaseOperations[String(record.model_version_id)]
+  const operation = cached && isCurrentOperation(cached, record) ? cached : undefined
   const state = typeof record.runtime_state === 'string' ? record.runtime_state : ''
-  if (!state) return { text: '-', color: 'default' }
-  return RUNTIME_STATE_MAP[state] || { text: state, color: 'default' }
+  // Registry runtime health remains authoritative after a successful release.
+  // A historical operation cannot paint a stopped/failed runtime green.
+  if (state === 'waiting' || state === 'failed') return RUNTIME_STATE_MAP[state]
+  if (operation?.status === 'pending') return { text: '发布处理中', color: 'processing' }
+  if (state) return RUNTIME_STATE_MAP[state] || { text: state, color: 'default' }
+  if (operation?.status === 'failed') return { text: '发布失败', color: 'error' }
+  if (operation?.status === 'applied') return { text: '发布已应用', color: 'success' }
+  return { text: '-', color: 'default' }
+}
+
+function releaseOperationMeta(record: Record<string, any>): string | null {
+  const operation = releaseOperations[String(record.model_version_id)]
+  if (!operation || !isCurrentOperation(operation, record)) return null
+  const revision = operation.applied_revision ?? operation.expected_revision
+  const state = { pending: '发布处理中', applied: '发布已应用', failed: '发布失败' }[operation.status]
+  return `${state} · ${shortVid(operation.operation_id)} · r${revision}${operation.error ? ` · ${operation.error}` : ''}`
+}
+
+function isProductionTransition(record: Record<string, any>): boolean {
+  return (VALID_TRANSITIONS[String(record.stage)] || [])[0] === 'production'
+}
+
+function productionReadiness(record: Record<string, any>): ReleaseReadiness | null {
+  return props.releaseReadiness?.[String(record.model_version_id)] ?? null
+}
+
+function productionReadinessReason(record: Record<string, any>): string {
+  const readiness = productionReadiness(record)
+  if (!readiness) {
+    return '服务端发布 readiness 尚未返回；按 fail-closed 策略保持 NO-GO'
+  }
+  if (readiness.reasons.length > 0) return readiness.reasons.join('；')
+  if (readiness.status === 'pending') return '生产发布操作正在处理，禁止重复提交'
+  if (readiness.status === 'failed') return '最近一次生产发布失败，请先处理失败原因'
+  return '生产发布必须通过服务端 baseline v3、回归指标与可信 72 小时 soak 证据校验'
+}
+
+function productionReadinessLabel(record: Record<string, any>): string {
+  const readiness = productionReadiness(record)
+  if (readiness?.status === 'pending') return '生产发布处理中'
+  if (readiness?.status === 'failed') return '生产发布失败'
+  return '生产 NO-GO'
+}
+
+function productionReadinessMeta(record: Record<string, any>): string | null {
+  const appliedProduction = record.stage === 'production'
+  if (!isProductionTransition(record) && !appliedProduction) return null
+  const readiness = productionReadiness(record)
+  if (!readiness) return 'Readiness 未加载 · NO-GO'
+  const failedGates = readiness.gates.filter(gate => gate.blocking && !gate.passed).length
+  if (appliedProduction) {
+    return readiness.production_ready
+      ? 'Readiness · 已应用且安全门通过'
+      : `Readiness · 已应用但 NO-GO · ${failedGates} 项未通过`
+  }
+  if (readiness.status === 'pending') return 'Readiness · 发布处理中'
+  if (readiness.status === 'failed') return `Readiness · 失败 · ${failedGates} 项未通过`
+  return readiness.production_ready
+    ? 'Readiness · 已满足（需受控证据提交）'
+    : `Readiness · NO-GO · ${failedGates} 项未通过`
 }
 
 const promoteModelRecord = computed(() =>
@@ -246,31 +408,39 @@ function notifyRuntimeResult(
   message.success(successText)
 }
 
-// ── Actions: rollback / delete ──
-
-function handleRollback(record: any) {
-  Modal.confirm({
-    title: '确认回滚',
-    content: `确定要回滚摄像头 ${record.camera_id} 到上一个模型版本吗？`,
-    okText: '确认回滚',
-    cancelText: '取消',
-    okType: 'danger',
-    async onOk() {
-      try {
-        const res = await rollbackModel(record.model_version_id)
-        notifyRuntimeResult(res, `已回滚到 ${res.activated}`)
-        emit('changed')
-      } catch (e) {
-        message.error(extractErrorMessage(e, '回滚失败'))
-      }
-    },
-  })
+function notifyReleaseResult(result: ModelReleaseMutationResponse, successText: string): void {
+  const operation = result.operation
+  if (!operation) {
+    notifyRuntimeResult(result, successText)
+    return
+  }
+  if (!scheduleReleaseOperationRefresh(operation)) return
+  if (operation.status === 'pending') {
+    message.info(`${successText}，发布请求已受理（${shortVid(operation.operation_id)}）`)
+    return
+  }
+  if (operation.status === 'failed') {
+    message.error(`${successText}失败：${operation.error || '运行时未应用'}`)
+    return
+  }
+  message.success(`${successText}，运行时已确认（r${operation.applied_revision ?? operation.expected_revision}）`)
 }
+
+function releaseOperationFromError(error: unknown): ReleaseOperation | null {
+  if (!(error instanceof ApiError) || !error.details || typeof error.details !== 'object') return null
+  const operation = (error.details as Record<string, unknown>).operation
+  if (!operation || typeof operation !== 'object') return null
+  const candidate = operation as Partial<ReleaseOperation>
+  if (!candidate.operation_id || !candidate.model_version_id || !candidate.status) return null
+  return candidate as ReleaseOperation
+}
+
+// ── Actions: delete ──
 
 function handleDeleteModel(record: any) {
   Modal.confirm({
     title: '删除模型',
-    content: `确定删除模型 ${record.model_version_id}？模型文件将从磁盘永久删除。`,
+    content: `确定删除模型 ${record.model_version_id} 的注册记录？模型文件将在确认没有引用后稍后安全清理。`,
     okText: '确认删除',
     okType: 'danger',
     cancelText: '取消',
@@ -294,12 +464,13 @@ function handlePromote(record: any) {
     message.warning('该模型当前阶段不支持推进')
     return
   }
+  const defaultTarget = transitions.find(stage => stage !== 'production') ?? transitions[0]
   promoteForm.value = {
     version_id: record.model_version_id,
-    target_stage: transitions[0],
+    target_stage: defaultTarget,
     triggered_by: '',
     reason: '',
-    canary_camera_id: transitions[0] === 'canary' ? record.camera_id : '',
+    canary_camera_id: defaultTarget === 'canary' ? record.camera_id : '',
   }
   promoteModalVisible.value = true
 }
@@ -315,26 +486,25 @@ async function submitPromote() {
   }
   promotingModel.value = promoteForm.value.version_id
   try {
-    const payload: {
-      target_stage: string
-      triggered_by?: string
-      reason?: string
-      canary_camera_id?: string
-    } = {
+    const payload: ModelReleaseRequest = {
       target_stage: promoteForm.value.target_stage,
     }
     if (promoteForm.value.triggered_by) payload.triggered_by = promoteForm.value.triggered_by
     if (promoteForm.value.reason) payload.reason = promoteForm.value.reason
     if (promoteForm.value.canary_camera_id) payload.canary_camera_id = promoteForm.value.canary_camera_id
+    const currentRevision = promoteModelRecord.value?.release_revision
+    if (typeof currentRevision === 'number') payload.expected_revision = currentRevision
 
     const res = await promoteModel(promoteForm.value.version_id, payload)
-    notifyRuntimeResult(
+    notifyReleaseResult(
       res,
       `模型已推进到 ${STAGE_MAP[promoteForm.value.target_stage]?.text || promoteForm.value.target_stage}`,
     )
     promoteModalVisible.value = false
     emit('changed')
   } catch (e) {
+    const operation = releaseOperationFromError(e)
+    if (operation) scheduleReleaseOperationRefresh(operation)
     message.error(extractErrorMessage(e, '推进失败'))
   } finally {
     promotingModel.value = null
@@ -350,8 +520,13 @@ function handleRetire(record: any) {
     okType: 'danger',
     async onOk() {
       try {
-        const res = await retireModel(record.model_version_id)
-        notifyRuntimeResult(res, '模型已退役')
+        const data = typeof record.release_revision === 'number'
+          ? { expected_revision: record.release_revision }
+          : undefined
+        const res = data
+          ? await retireModel(record.model_version_id, data)
+          : await retireModel(record.model_version_id)
+        notifyReleaseResult(res, '模型已退役')
         emit('changed')
       } catch (e) {
         message.error(extractErrorMessage(e, '退役失败'))
@@ -376,6 +551,17 @@ async function handleViewShadowReport(record: any) {
   }
 }
 
+function enabledGateChecks() {
+  return shadowReport.value?.gate_report?.checks?.filter(check => check.enabled) || []
+}
+
+function formatGateValue(name: string, value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  if (name.includes('samples')) return String(Math.round(value))
+  if (name.includes('latency')) return `${value.toFixed(1)} ms`
+  return value.toFixed(3)
+}
+
 async function handleViewStageHistory(record: any) {
   stageHistoryLoading.value = true
   stageHistoryVisible.value = true
@@ -393,10 +579,13 @@ async function handleViewStageHistory(record: any) {
 // ── Actions: reexport / recalibrate ──
 
 function handleReexport(record: any) {
+  const sourcePath = typeof record.model_path === 'string' ? record.model_path.toLowerCase() : ''
+  const exportFormat = sourcePath.endsWith('.pt') ? 'torch'
+    : sourcePath.endsWith('.onnx') ? 'onnx' : 'openvino'
   reexportForm.value = {
     version_id: record.model_version_id,
-    export_format: 'openvino',
-    quantization: 'fp16',
+    export_format: exportFormat,
+    quantization: exportFormat === 'openvino' ? 'fp16' : 'fp32',
   }
   reexportModalVisible.value = true
 }
@@ -408,7 +597,7 @@ async function submitReexport() {
       export_format: reexportForm.value.export_format,
       quantization: reexportForm.value.quantization,
     })
-    message.success('重新导出成功')
+    message.success('已创建重新导出的候选版本，请在模型列表中审核与发布')
     reexportModalVisible.value = false
     emit('changed')
   } catch (e) {
@@ -421,7 +610,7 @@ async function submitReexport() {
 function handleRecalibrate(record: any) {
   Modal.confirm({
     title: '确认重新校准',
-    content: `确定要重新校准模型 ${record.model_version_id} 的评分标准化吗？将使用基线图片重新计算校准参数。`,
+    content: `使用基线图片重新校准模型 ${record.model_version_id}，并创建新的候选版本。候选版本需要单独审核与发布。`,
     okText: '确认',
     cancelText: '取消',
     async onOk() {
@@ -429,7 +618,7 @@ function handleRecalibrate(record: any) {
       try {
         const res = await recalibrateModel(record.model_version_id)
         const n = res.n_samples
-        message.success(`重新校准成功 (${n} 个样本)`)
+        message.success(`已创建校准候选版本 (${n} 个样本)，请审核与发布`)
         emit('changed')
       } catch (e) {
         message.error(extractErrorMessage(e, '重新校准失败'))
@@ -468,10 +657,10 @@ const columns = [
   { title: '摄像头', dataIndex: 'camera_id', key: 'camera_id', width: 90 },
   { title: '类型', dataIndex: 'model_type', key: 'model_type', width: 100 },
   { title: '阶段', key: 'stage', width: 240 },
-  { title: '运行态', key: 'runtime_state', width: 100 },
+  { title: '运行态', key: 'runtime_state', width: 170 },
   { title: '激活', key: 'is_active', width: 80 },
   { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 150 },
-  { title: '操作', key: 'action', width: 220 },
+  { title: '操作', key: 'action', width: 250 },
 ]
 </script>
 
@@ -497,7 +686,7 @@ const columns = [
         </Button>
       </div>
     </template>
-    <Table
+    <ResponsiveTable
       :columns="columns"
       :data-source="sortedModels"
       :pagination="{ pageSize: 15, showSizeChanger: false }"
@@ -505,6 +694,8 @@ const columns = [
       size="small"
       :row-class-name="rowClassName"
       :expanded-row-keys="expandedRowKeys"
+      :min-width="1120"
+      accessible-label="模型发布列表，可横向滚动"
       @expanded-rows-change="onExpandedRowsChange"
     >
       <template #expandedRowRender="{ record }">
@@ -581,7 +772,16 @@ const columns = [
           <Tag v-else color="default">未激活</Tag>
         </template>
         <template v-if="column.key === 'runtime_state'">
-          <Tag :color="runtimeStateDisplay(record).color">{{ runtimeStateDisplay(record).text }}</Tag>
+          <div class="runtime-state-cell">
+            <Tag :color="runtimeStateDisplay(record).color">{{ runtimeStateDisplay(record).text }}</Tag>
+            <small v-if="releaseOperationMeta(record)">{{ releaseOperationMeta(record) }}</small>
+            <small
+              v-if="productionReadinessMeta(record)"
+              :title="productionReadinessReason(record)"
+            >
+              {{ productionReadinessMeta(record) }}
+            </small>
+          </div>
         </template>
         <template v-if="column.key === 'created_at'">
           {{ record.created_at ? record.created_at.replace('T', ' ').substring(0, 16) : '-' }}
@@ -589,27 +789,41 @@ const columns = [
         <template v-if="column.key === 'action'">
           <Space :size="4">
             <!-- Promote -->
-            <Tooltip title="推进阶段">
+            <Tooltip :title="isProductionTransition(record)
+              ? productionReadinessReason(record)
+              : '推进阶段'">
               <Button
                 v-if="record.stage !== 'production' && record.stage !== 'retired'"
                 size="small"
                 type="primary"
                 ghost
+                :disabled="isProductionTransition(record)"
+                :title="isProductionTransition(record) ? productionReadinessReason(record) : '推进阶段'"
+                :aria-label="isProductionTransition(record)
+                  ? `${productionReadinessLabel(record)}：${productionReadinessReason(record)}`
+                  : `推进模型 ${record.model_version_id}`"
                 :loading="promotingModel === record.model_version_id"
                 @click="handlePromote(record)"
               >
-                推进
+                {{ isProductionTransition(record) ? productionReadinessLabel(record) : '推进' }}
               </Button>
             </Tooltip>
-            <!-- Rollback -->
-            <Tooltip title="回滚到上一版本">
+            <Tooltip v-if="record.stage === 'canary'" title="回退到影子阶段">
+              <Button size="small" @click="handlePromote(record)">回退</Button>
+            </Tooltip>
+            <!-- Rollback stays visible as an explicit release gate. The legacy
+                 endpoint cannot guarantee desired/applied atomicity. -->
+            <Tooltip :title="ROLLBACK_NO_GO_REASON">
               <Button
                 v-if="record.is_active && record.stage !== 'retired'"
                 size="small"
                 danger
-                @click="handleRollback(record)"
+                disabled
+                :title="ROLLBACK_NO_GO_REASON"
+                :aria-label="`回滚模型 ${record.model_version_id} 不可用：${ROLLBACK_NO_GO_REASON}`"
               >
                 <template #icon><RollbackOutlined /></template>
+                回滚 NO-GO
               </Button>
             </Tooltip>
             <!-- More dropdown -->
@@ -650,7 +864,7 @@ const columns = [
           </Space>
         </template>
       </template>
-    </Table>
+    </ResponsiveTable>
     <div v-if="models.length === 0" style="text-align: center; padding: 32px; color: #666">
       暂无注册的模型版本
     </div>
@@ -672,6 +886,7 @@ const columns = [
             v-for="stage in (VALID_TRANSITIONS[models.find(m => m.model_version_id === promoteForm.version_id)?.stage ?? ''] || [])"
             :key="stage"
             :value="stage"
+            :disabled="stage === 'production'"
           >
             {{ STAGE_LABELS[stage] || stage }}
           </Select.Option>
@@ -702,7 +917,7 @@ const columns = [
   <!-- Reexport Modal -->
   <Modal
     v-model:open="reexportModalVisible"
-    title="重新导出模型"
+    title="重新导出为候选版本"
     :confirmLoading="reexportLoading"
     @ok="submitReexport"
     okText="确认导出"
@@ -735,18 +950,48 @@ const columns = [
     <div v-if="shadowReportLoading" style="text-align: center; padding: 40px">
       <LoadingOutlined spin style="font-size: 24px" />
     </div>
-    <Descriptions v-else-if="shadowReport" :column="1" bordered size="small">
-      <Descriptions.Item label="采样总数">{{ shadowReport.total_samples }}</Descriptions.Item>
-      <Descriptions.Item label="影子告警率">{{ (shadowReport.shadow_alert_rate * 100).toFixed(1) }}%</Descriptions.Item>
-      <Descriptions.Item label="生产告警率">{{ (shadowReport.production_alert_rate * 100).toFixed(1) }}%</Descriptions.Item>
-      <Descriptions.Item label="误报差异">
-        <span :style="{ color: shadowReport.false_positive_delta > 0 ? '#e5484d' : '#15a34a' }">
-          {{ shadowReport.false_positive_delta > 0 ? '+' : '' }}{{ shadowReport.false_positive_delta }}
-        </span>
-      </Descriptions.Item>
-      <Descriptions.Item label="平均分数偏差">{{ shadowReport.avg_score_divergence?.toFixed(4) || '-' }}</Descriptions.Item>
-      <Descriptions.Item label="平均推理延迟">{{ shadowReport.avg_shadow_latency_ms?.toFixed(1) || '-' }} ms</Descriptions.Item>
-    </Descriptions>
+    <template v-else-if="shadowReport">
+      <Descriptions :column="1" bordered size="small">
+        <Descriptions.Item label="采样总数">{{ shadowReport.total_samples }}</Descriptions.Item>
+        <Descriptions.Item label="影子告警率">{{ (shadowReport.shadow_alert_rate * 100).toFixed(1) }}%</Descriptions.Item>
+        <Descriptions.Item label="生产告警率">{{ (shadowReport.production_alert_rate * 100).toFixed(1) }}%</Descriptions.Item>
+        <Descriptions.Item label="误报差异">
+          <span :style="{ color: shadowReport.false_positive_delta > 0 ? '#e5484d' : '#15a34a' }">
+            {{ shadowReport.false_positive_delta > 0 ? '+' : '' }}{{ shadowReport.false_positive_delta }}
+          </span>
+        </Descriptions.Item>
+        <Descriptions.Item label="平均分数偏差">{{ shadowReport.avg_score_divergence?.toFixed(4) || '-' }}</Descriptions.Item>
+        <Descriptions.Item label="平均推理延迟">{{ shadowReport.avg_shadow_latency_ms?.toFixed(1) || '-' }} ms</Descriptions.Item>
+      </Descriptions>
+      <div v-if="shadowReport.gate_report" style="margin-top: 12px">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px">
+          <strong>推进到金丝雀检查</strong>
+          <Tag :color="shadowReport.gate_report.ready_for_canary ? 'green' : 'orange'">
+            {{ shadowReport.gate_report.ready_for_canary ? '满足' : '未满足' }}
+          </Tag>
+        </div>
+        <div v-if="enabledGateChecks().length === 0" style="color: #666; font-size: 12px">
+          未配置影子证据门槛
+        </div>
+        <Descriptions v-else :column="1" bordered size="small">
+          <Descriptions.Item
+            v-for="check in enabledGateChecks()"
+            :key="check.name"
+            :label="check.label"
+          >
+            <Space>
+              <Tag :color="check.passed ? 'green' : 'red'">
+                {{ check.passed ? '通过' : '未通过' }}
+              </Tag>
+              <span>
+                {{ formatGateValue(check.name, check.value) }} /
+                {{ formatGateValue(check.name, check.limit) }}
+              </span>
+            </Space>
+          </Descriptions.Item>
+        </Descriptions>
+      </div>
+    </template>
     <div v-else style="text-align: center; padding: 40px; color: #666">
       暂无影子推理数据
     </div>
@@ -1007,5 +1252,22 @@ const columns = [
   color: #1d39c4;
   font-size: 12px;
   line-height: 1.5;
+}
+
+.runtime-state-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+.runtime-state-cell small {
+  max-width: 150px;
+  overflow: hidden;
+  color: var(--argus-text-muted);
+  font-family: var(--argus-mono);
+  font-size: 10px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

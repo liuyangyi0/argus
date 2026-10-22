@@ -44,6 +44,13 @@ quantize = ["nncf>=2.7.0"]
 segment = ["sam2>=1.0"]
 polarization = ["polanalyser>=1.0"]
 lucid = ["arena-api>=2.0"]
+cvat = ["cvat-sdk>=2.79,<2.80"]
+# Offline review tools are optional; prefer an isolated venv for FiftyOne.
+review = ["cvat-sdk>=2.79,<2.80", "fiftyone>=1.8,<2.0"]
+# Explicit offline SceneGuard comparison only; never imported by the live pipeline.
+lightglue = [
+    "lightglue @ git+https://github.com/cvg/LightGlue.git@eb42fee2d71449efb0aa5c10549752b5d75384d8",
+]
 # FLIR Spinnaker: PySpin is distributed via FLIR's SDK installer, not PyPI.
 # Install manually from https://www.flir.com/products/spinnaker-sdk/
 # flir = ["PySpin"]
@@ -57,6 +64,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/argus"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

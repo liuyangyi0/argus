@@ -77,7 +77,8 @@ class TestDeniedResponse:
     def test_denied_response_format(self):
         req = _FakeRequest("viewer")
         resp = get_denied_response(req, "edit_zones")
-        assert resp["error"] == "权限不足"
-        assert resp["required_permission"] == "edit_zones"
-        assert resp["your_role"] == "viewer"
-        assert "viewer" in resp["message"]
+        assert resp["code"] == 40300
+        assert resp["msg"] == "权限不足"
+        assert resp["data"]["required_permission"] == "edit_zones"
+        assert resp["data"]["your_role"] == "viewer"
+        assert "viewer" in resp["data"]["message"]

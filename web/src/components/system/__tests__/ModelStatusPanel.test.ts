@@ -100,4 +100,36 @@ describe('ModelStatusPanel', () => {
 
     wrapper.unmount()
   })
+
+  it('surfaces expected backend mismatches as an explicit model degradation', async () => {
+    vi.mocked(getModelsStatus).mockResolvedValue([
+      {
+        name: 'anomaly',
+        camera_id: 'cam_gpu',
+        loaded: true,
+        backend: 'openvino',
+        model_path: '/models/model.xml',
+        image_size: [256, 256],
+        last_error: null,
+        last_error_ts: null,
+        consecutive_failures: 0,
+        total_inferences: 12,
+        total_failures: 0,
+        last_success_ts: null,
+        extra: {
+          expected_backend: 'torch-cuda',
+        },
+      },
+    ])
+
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    const alert = wrapper.find('[data-test="status-alert"]')
+    expect(alert.attributes('data-type')).toBe('error')
+    expect(alert.text()).toContain('模型后端不符合要求')
+    expect(alert.text()).toContain('inference_backend')
+
+    wrapper.unmount()
+  })
 })

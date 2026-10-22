@@ -20,7 +20,8 @@ describe('PlayerFactory', () => {
         data: {
           camera_id: 'cam1',
           go2rtc: true,
-          webrtc_ws: 'ws://localhost/webrtc'
+          webrtc_ws: 'ws://localhost/webrtc',
+          fallback: '/api/cameras/cam1/stream',
         }
       }
     })
@@ -47,7 +48,8 @@ describe('PlayerFactory', () => {
           camera_id: 'cam1',
           go2rtc: true,
           webrtc_ws: 'ws://localhost/webrtc',
-          mse_ws: 'ws://localhost/mse'
+          mse_ws: 'ws://localhost/mse',
+          fallback: '/api/cameras/cam1/stream',
         }
       }
     })
@@ -56,6 +58,19 @@ describe('PlayerFactory', () => {
 
     expect(info?.go2rtc).toBe(true)
     expect(info?.webrtc_ws).toBe('ws://localhost/webrtc')
+  })
+
+  it('rejects business-error and malformed stream envelopes', async () => {
+    vi.mocked(axios.get)
+      .mockResolvedValueOnce({
+        data: { code: 50001, msg: 'stream unavailable', data: { reason: 'offline' } },
+      })
+      .mockResolvedValueOnce({
+        data: { code: 0, msg: 'ok', data: { camera_id: 'cam1', go2rtc: 'yes' } },
+      })
+
+    await expect(PlayerFactory.fetchStreamInfo('cam1')).resolves.toBeNull()
+    await expect(PlayerFactory.fetchStreamInfo('cam1')).resolves.toBeNull()
   })
 
   it('returns null immediately when backend advertises MJPEG fallback only', async () => {
@@ -77,6 +92,22 @@ describe('PlayerFactory', () => {
     expect(player).toBeNull()
     expect(axios.get).toHaveBeenCalledTimes(1)
     expect(axios.get).toHaveBeenCalledWith('/api/streaming/file_cam')
+  })
+
+  it('fails fast with an explicit reason when the video element is not mounted', async () => {
+    const isCancelled = vi.fn().mockReturnValue(false)
+    const onFailureReason = vi.fn()
+
+    const player = await PlayerFactory.create(
+      'cam1',
+      null,
+      isCancelled,
+      onFailureReason,
+    )
+
+    expect(player).toBeNull()
+    expect(onFailureReason).toHaveBeenCalledWith('video_element_unavailable')
+    expect(axios.get).not.toHaveBeenCalled()
   })
   
   it('returns null if stream info not found', async () => {

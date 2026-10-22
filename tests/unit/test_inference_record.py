@@ -34,6 +34,9 @@ class TestFinalDecision:
     def test_all_values(self):
         assert FinalDecision.NORMAL.value == "normal"
         assert FinalDecision.INFO.value == "info"
+        assert FinalDecision.INFO_CANDIDATE.value == "info_candidate"
+        assert FinalDecision.DEBUG_NORMAL_SAMPLE.value == "debug_normal_sample"
+        assert FinalDecision.SKIPPED_HEARTBEAT.value == "skipped_heartbeat"
         assert FinalDecision.ALERT.value == "alert"
         assert FinalDecision.SUPPRESSED.value == "suppressed"
 

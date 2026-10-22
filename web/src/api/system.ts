@@ -1,5 +1,44 @@
-import type { ApiResponse, HealthPayload, ModelHealthStatus } from '../types/api'
+import type {
+  ApiResponse,
+  DetectionParamsResponse,
+  HealthPayload,
+  ModelHealthStatus,
+} from '../types/api'
 import { api, unwrap, u } from './client'
+
+export type DegradationLevel = 'info' | 'warning' | 'moderate' | 'severe'
+
+export interface DegradationSummaryEvent {
+  event_id: string
+  level: DegradationLevel
+  category: string
+  camera_id: string | null
+  title: string
+  impact: string
+  action: string
+  started_at: number
+  resolved_at?: number | null
+}
+
+export interface DegradationSummaryPayload {
+  active_count: number
+  max_level: DegradationLevel | null
+  events: DegradationSummaryEvent[]
+}
+
+export interface CameraStatusCollection {
+  cameras: Array<Record<string, unknown>>
+}
+
+export interface BackupInfo {
+  name?: string
+  created?: string
+  size_mb?: number
+  has_database?: boolean
+  has_configs?: boolean
+  has_models?: boolean
+  [key: string]: unknown
+}
 
 // ── Health ──
 export const getHealth = () =>
@@ -17,16 +56,26 @@ export const reloadConfig = () => api.post('/config/reload').then(u)
 
 // ── Storage & Retention ──
 export const getStorageInfo = () => api.get('/config/storage/info').then(u)
-export const cleanupAlerts = () => api.post('/config/cleanup').then(u)
+export const cleanupAlerts = () =>
+  api
+    .post<ApiResponse<{ deleted: number; files: number }>>('/config/cleanup')
+    .then(unwrap)
 
 // ── Backup ──
 export const createBackup = () => api.post('/backup/create').then(u)
 
 // ── Degradation ──
 export const getDegradationActive = () => api.get('/degradation/active').then(u)
-export const getDegradationSummary = () => api.get('/degradation/summary').then(u)
+export const getDegradationSummary = () =>
+  api
+    .get<ApiResponse<DegradationSummaryPayload>>('/degradation/summary')
+    .then(unwrap)
 export const getDegradationHistory = (days?: number) =>
-  api.get('/degradation/history', { params: { days } }).then(u)
+  api
+    .get<ApiResponse<{ items: DegradationSummaryEvent[] }>>('/degradation/history', {
+      params: { days },
+    })
+    .then(unwrap)
 
 // ── Anomaly head degradation (per-pipeline simplex fallback) ──
 // Distinct from the global degradation bar (`/degradation/*`): this surfaces
@@ -53,14 +102,51 @@ export const getAnomalyDegradation = () =>
   api.get<ApiResponse<AnomalyDegradationStatus>>('/system/anomaly-degradation').then(unwrap)
 
 // ── Audio Alerts ──
+export interface AudioAlertLevelConfig {
+  enabled?: boolean
+  sound?: string
+  voice_template?: string
+}
+
+export interface AudioAlertsUpdate {
+  low: AudioAlertLevelConfig
+  medium: AudioAlertLevelConfig
+  high: AudioAlertLevelConfig
+}
+
 export const getAudioAlerts = () => api.get('/config/audio-alerts').then(u)
-export const updateAudioAlerts = (data: any) => api.put('/config/audio-alerts', data).then(u)
+export const updateAudioAlerts = (data: AudioAlertsUpdate) =>
+  api.put('/config/audio-alerts', data).then(u)
 
 // ── Drift & Camera Health ──
-export const getDriftStatus = () => api.get('/system/drift').then(u)
-export const getCameraHealth = () => api.get('/system/camera-health').then(u)
+export const getDriftStatus = () =>
+  api.get<ApiResponse<CameraStatusCollection>>('/system/drift').then(unwrap)
+export const getCameraHealth = () =>
+  api.get<ApiResponse<CameraStatusCollection>>('/system/camera-health').then(unwrap)
 
 // ── Classifier (open-vocabulary detector) ──
+export interface AuxiliaryRuntimeDetail {
+  camera_id: string
+  state: string
+  backend: string | null
+  loaded: boolean
+  ready: boolean
+  degraded: boolean
+  reason?: string | null
+  busy?: boolean
+}
+
+export interface AuxiliaryRuntimeSummary {
+  total_pipelines: number
+  pipelines_attached: number
+  pipelines_loaded: number
+  // Optional while older servers are upgraded: "loaded" alone does not prove readiness.
+  pipelines_ready?: number
+  pipelines_degraded?: number
+  pipelines_failed?: number
+  details?: AuxiliaryRuntimeDetail[]
+}
+
 export interface ClassifierConfigPayload {
   enabled: boolean
   model_name: string
@@ -70,11 +156,7 @@ export interface ClassifierConfigPayload {
   low_risk_labels: string[]
   suppress_labels: string[]
   custom_vocabulary_path: string | null
-  runtime: {
-    total_pipelines: number
-    pipelines_attached: number
-    pipelines_loaded: number
-  }
+  runtime: AuxiliaryRuntimeSummary
 }
 
 export const getClassifierConfig = () =>
@@ -107,11 +189,7 @@ export interface SegmenterConfigPayload {
   min_anomaly_score: number
   min_mask_area_px: number
   timeout_seconds: number
-  runtime: {
-    total_pipelines: number
-    pipelines_attached: number
-    pipelines_loaded: number
-  }
+  runtime: AuxiliaryRuntimeSummary
 }
 
 export const getSegmenterConfig = () =>
@@ -178,18 +256,50 @@ export interface ModuleToggleResult {
   hot_reload_failed: number
   pipelines_seen: number
   persisted: boolean
+  all_applied?: boolean
 }
 
 export const getModuleStates = (): Promise<Record<string, boolean>> =>
-  api.get('/config/modules').then(u)
+  api.get<ApiResponse<Record<string, boolean>>>('/config/modules').then(unwrap)
 
 export const toggleModule = (key: string, value: boolean): Promise<ModuleToggleResult> =>
-  api.post('/config/modules', { key, value }).then(u)
+  api
+    .post<ApiResponse<ModuleToggleResult>>('/config/modules', { key, value })
+    .then(unwrap)
 
 // ── Config management ──
+export interface ThresholdUpdate {
+  anomaly_threshold?: number
+  info_threshold?: number
+  low_threshold?: number
+  medium_threshold?: number
+  high_threshold?: number
+}
+
+export interface DetectionParamsUpdate {
+  anomaly_threshold?: number
+  sev_info?: number
+  sev_low?: number
+  sev_medium?: number
+  sev_high?: number
+  temp_gap?: number
+  temp_overlap?: number
+  supp_zone?: number
+}
+
+export interface NotificationUpdate {
+  webhook_enabled?: boolean
+  webhook_url?: string
+  webhook_timeout?: number
+}
+
 export const saveConfig = () => api.post('/config/save').then(u)
-export const updateThresholds = (data: any) => api.post('/config/thresholds', data).then(u)
-export const updateDetectionParams = (data: any) => api.post('/config/detection-params', data).then(u)
+export const updateThresholds = (data: ThresholdUpdate) =>
+  api.post('/config/thresholds', data).then(u)
+export const updateDetectionParams = (data: DetectionParamsUpdate) =>
+  api
+    .post<ApiResponse<DetectionParamsResponse>>('/config/detection-params', data)
+    .then(unwrap)
 export const reloadModel = (data: { camera_id: string; model_path: string }) =>
   api.post('/config/reload-model', data).then(u)
 export const clearLock = (cameraId: string) => api.post(`/config/clear-lock/${cameraId}`).then(u)
@@ -198,11 +308,15 @@ export const restartCamera = (cameraId: string) =>
 
 // ── Webhook ──
 // Email/SMS/template surface was removed in 2026-05; only webhook remains.
-export const updateNotifications = (data: any) => api.post('/config/notifications', data).then(u)
+export const updateNotifications = (data: NotificationUpdate) =>
+  api.post('/config/notifications', data).then(u)
 export const testWebhook = () => api.post('/config/test-webhook').then(u)
 
 // ── Backup management ──
-export const listBackups = () => api.get('/backup/list/json').then(u)
+export const listBackups = () =>
+  api
+    .get<ApiResponse<{ backups: BackupInfo[] }>>('/backup/list/json')
+    .then(unwrap)
 export const restoreBackup = (name: string) => {
   const form = new URLSearchParams()
   form.append('backup_name', name)

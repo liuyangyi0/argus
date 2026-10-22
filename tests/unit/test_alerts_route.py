@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from argus.config.schema import ArgusConfig, AuthConfig
 from argus.core.health import HealthMonitor
 from argus.dashboard.app import create_app
-from argus.dashboard.auth import create_session_token
+from argus.dashboard.auth import create_session_token, hash_password
 from argus.storage.alert_recording import AlertRecordingStore
 from argus.storage.database import Database
 from argus.storage.models import AlertRecord, AlertRecordingRecord
@@ -81,7 +81,16 @@ def _insert_alert(db: Database, alert_id: str = "test-alert-001", **overrides):
 
 
 def _set_role_cookie(client: TestClient, app, role: str) -> None:
-    token = create_session_token(f"{role}_user", role, app.state.session_secret)
+    username = f"{role}_user"
+    db = app.state.db
+    if db.get_user(username) is None:
+        db.create_user(
+            username,
+            hash_password("role-test-password"),
+            role,
+            username,
+        )
+    token = create_session_token(username, role, app.state.session_secret)
     client.cookies.set("argus_session", token)
 
 
@@ -186,6 +195,7 @@ class TestAlertDetailRecordingState:
         assert resp.status_code == 200
         data = resp.json()["data"]
         assert data["has_recording"] is True
+        assert data["replay_ready"] is True
         assert data["recording_status"] == "recording"
 
     def test_detail_prefers_replay_metadata_status_over_db_status(
@@ -210,13 +220,188 @@ class TestAlertDetailRecordingState:
             }),
             encoding="utf-8",
         )
+        (rec_dir / "signals.json").write_text(json.dumps({}), encoding="utf-8")
 
         resp = client.get("/api/alerts/detail-store-rec/detail")
 
         assert resp.status_code == 200
         data = resp.json()["data"]
         assert data["has_recording"] is True
+        assert data["replay_ready"] is True
         assert data["recording_status"] == "complete"
+        assert data["recording_unavailable_reason"] is None
+
+    def test_detail_marks_pre_only_directory_incomplete(
+        self, db, health, alerts_dir, tmp_path,
+    ):
+        _insert_alert(db, "detail-pre-only")
+
+        store = AlertRecordingStore(archive_dir=str(tmp_path / "recordings"))
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+        app.state.recording_store = store
+        client = TestClient(app)
+
+        rec_dir = store.archive_dir / "2026-04-10" / "cam_01" / "detail-pre-only"
+        rec_dir.mkdir(parents=True)
+        (rec_dir / "pre.mp4").write_bytes(b"partial")
+
+        resp = client.get("/api/alerts/detail-pre-only/detail")
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["has_recording"] is False
+        assert data["replay_ready"] is False
+        assert data["recording_status"] == "incomplete"
+        assert data["recording_unavailable_reason"] == "missing_metadata"
+
+    def test_detail_includes_candidate_evidence_summary(
+        self, db, health, alerts_dir, tmp_path,
+    ):
+        _insert_alert(db, "detail-candidate-evidence")
+
+        store = AlertRecordingStore(archive_dir=str(tmp_path / "recordings"))
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+        app.state.recording_store = store
+        client = TestClient(app)
+
+        rec_dir = (
+            store.archive_dir
+            / "2026-04-10"
+            / "cam_01"
+            / "detail-candidate-evidence"
+        )
+        rec_dir.mkdir(parents=True)
+        (rec_dir / "metadata.json").write_text(
+            json.dumps({
+                "alert_id": "detail-candidate-evidence",
+                "camera_id": "cam_01",
+                "status": "complete",
+                "trigger_frame_index": 3,
+            }),
+            encoding="utf-8",
+        )
+        (rec_dir / "signals.json").write_text(
+            json.dumps({
+                "candidate_events": [
+                    {
+                        "candidate_id": "far",
+                        "candidate_type": "persistent_change",
+                        "decision": "pending",
+                        "stage": "persistent_change",
+                        "frame_index": 0,
+                        "frame_number": 0,
+                        "timestamp": 100.0,
+                        "evidence": {"score": 0.31},
+                        "suppression_reason": "persistence_not_met",
+                    },
+                    {
+                        "candidate_id": "near",
+                        "candidate_type": "persistent_change",
+                        "decision": "candidate",
+                        "stage": "persistent_change",
+                        "frame_index": 2,
+                        "frame_number": 22,
+                        "timestamp": 102.0,
+                        "evidence": {
+                            "score": 0.87,
+                            "changed_fraction": 0.0123,
+                            "candidate_count": 1,
+                            "candidates": [
+                                {
+                                    "bbox": [10, 12, 20, 18],
+                                    "area_px": 360,
+                                    "persistence_seconds": 2.4,
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "candidate_id": "final",
+                        "candidate_type": "frame_anomaly",
+                        "decision": "alert",
+                        "stage": "grader",
+                        "frame_index": 3,
+                        "frame_number": 23,
+                        "timestamp": 103.0,
+                        "evidence": {
+                            "anomaly_score": 0.91,
+                            "persistent_change": {
+                                "score": 0.89,
+                                "candidate_count": 1,
+                            },
+                        },
+                    },
+                ]
+            }),
+            encoding="utf-8",
+        )
+
+        resp = client.get("/api/alerts/detail-candidate-evidence/detail")
+
+        assert resp.status_code == 200
+        evidence = resp.json()["data"]["candidate_evidence"]
+        assert evidence["event_count"] == 3
+        assert evidence["trigger_frame_index"] == 3
+        assert [event["frame_index"] for event in evidence["events"]] == [2, 3]
+        assert evidence["events"][0]["score"] == 0.87
+        assert evidence["events"][0]["evidence"]["candidate_count"] == 1
+        assert evidence["events"][0]["evidence"]["candidates"][0]["bbox"] == [
+            10, 12, 20, 18,
+        ]
+        assert evidence["events"][1]["score"] == 0.91
+        assert evidence["events"][1]["evidence"]["persistent_change"]["score"] == 0.89
+
+    def test_detail_candidate_evidence_falls_back_to_frame_records(
+        self, db, health, alerts_dir, tmp_path,
+    ):
+        _insert_alert(db, "detail-frame-records")
+
+        store = AlertRecordingStore(archive_dir=str(tmp_path / "recordings"))
+        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
+        app.state.recording_store = store
+        client = TestClient(app)
+
+        rec_dir = store.archive_dir / "2026-04-10" / "cam_01" / "detail-frame-records"
+        rec_dir.mkdir(parents=True)
+        (rec_dir / "metadata.json").write_text(
+            json.dumps({
+                "alert_id": "detail-frame-records",
+                "camera_id": "cam_01",
+                "status": "complete",
+                "trigger_frame_index": 1,
+            }),
+            encoding="utf-8",
+        )
+        (rec_dir / "signals.json").write_text(
+            json.dumps({
+                "timestamps": [100.0, 101.0],
+                "frame_numbers": [10, 11],
+                "candidate_events": [],
+                "candidate_records": [
+                    [],
+                    [
+                        {
+                            "candidate_id": "legacy-record",
+                            "candidate_type": "persistent_change",
+                            "decision": "candidate",
+                            "stage": "persistent_change",
+                            "evidence": {"score": 0.82},
+                        }
+                    ],
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        resp = client.get("/api/alerts/detail-frame-records/detail")
+
+        assert resp.status_code == 200
+        events = resp.json()["data"]["candidate_evidence"]["events"]
+        assert len(events) == 1
+        assert events[0]["frame_index"] == 1
+        assert events[0]["frame_number"] == 11
+        assert events[0]["timestamp"] == 101.0
+        assert events[0]["score"] == 0.82
 
 
 # ── Image path safety ──

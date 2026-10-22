@@ -1,0 +1,30 @@
+version: 1
+suite_id: argus-phase1-example
+description: Example manifest for the real-site video regression corpus.
+default_camera_id: obsbot_01
+
+clips:
+  - id: neg_lights_reflection_001
+    kind: negative
+    camera_id: obsbot_01
+    video: clips/negative/neg_lights_reflection_001.mp4
+    description: Normal scene with lights toggled, operator walk-through, and reflection.
+    tags: [lights_on_off, people, reflection]
+
+  - id: pos_static_book_001
+    kind: static_foreign
+    camera_id: obsbot_01
+    video: clips/positive/pos_static_book_001.mp4
+    annotations: annotations/pos_static_book_001.labels.json
+    expected_detection_types: [new_object, persistent_change, anomaly, scene_change]
+    description: Book placed on desk at medium size under normal indoor light.
+    tags: [static_foreign, normal_light]
+
+  - id: pos_projectile_screw_001
+    kind: projectile
+    camera_id: obsbot_01
+    video: clips/positive/pos_projectile_screw_001.mp4
+    annotations: annotations/pos_projectile_screw_001.labels.json
+    expected_detection_types: [projectile]
+    description: Small screw passes through frame with visible blur.
+    tags: [projectile, small_object]

@@ -74,8 +74,14 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
     if not camera_manager:
         return api_unavailable("摄像头管理器不可用")
 
-    pipeline = camera_manager.get_pipeline(zone_req.camera_id)
-    if not pipeline:
+    get_zones = getattr(camera_manager, "get_camera_zones_snapshot", None)
+    update_runtime_zones = getattr(camera_manager, "update_camera_zones", None)
+    current_zones = (
+        get_zones(zone_req.camera_id)
+        if callable(get_zones)
+        else None
+    )
+    if current_zones is None or not callable(update_runtime_zones):
         return api_not_found(f"摄像头 {zone_req.camera_id} 不存在")
 
     priority_map = {
@@ -93,9 +99,10 @@ async def create_zone(request: Request, zone_req: ZoneCreateRequest):
         anomaly_threshold=zone_req.anomaly_threshold,
     )
 
-    current_zones = list(pipeline.camera_config.zones)
+    current_zones = list(current_zones)
     current_zones.append(new_zone)
-    pipeline.update_zones(current_zones)
+    if update_runtime_zones(zone_req.camera_id, current_zones) is not True:
+        return api_not_found(f"摄像头 {zone_req.camera_id} 不存在")
     _persist_zones(request, zone_req.camera_id, current_zones)
 
     audit = getattr(request.app.state, "audit_logger", None)
@@ -137,8 +144,8 @@ async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkI
     if not camera_manager:
         return api_unavailable("摄像头管理器不可用")
 
-    pipeline = camera_manager.get_pipeline(camera_id)
-    if not pipeline:
+    update_runtime_zones = getattr(camera_manager, "update_camera_zones", None)
+    if not callable(update_runtime_zones):
         return api_not_found(f"摄像头 {camera_id} 不存在")
 
     priority_map = {
@@ -159,7 +166,8 @@ async def update_zones(request: Request, camera_id: str, payload: list[ZoneBulkI
             anomaly_threshold=item.anomaly_threshold,
         ))
 
-    pipeline.update_zones(new_zones)
+    if update_runtime_zones(camera_id, new_zones) is not True:
+        return api_not_found(f"摄像头 {camera_id} 不存在")
     _persist_zones(request, camera_id, new_zones)
 
     audit = getattr(request.app.state, "audit_logger", None)
@@ -191,12 +199,15 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
     if not camera_manager:
         return api_unavailable("摄像头管理器不可用")
 
-    pipeline = camera_manager.get_pipeline(camera_id)
-    if not pipeline:
+    get_zones = getattr(camera_manager, "get_camera_zones_snapshot", None)
+    update_runtime_zones = getattr(camera_manager, "update_camera_zones", None)
+    current_zones = get_zones(camera_id) if callable(get_zones) else None
+    if current_zones is None or not callable(update_runtime_zones):
         return api_not_found(f"摄像头 {camera_id} 不存在")
 
-    new_zones = [z for z in pipeline.camera_config.zones if z.zone_id != zone_id]
-    pipeline.update_zones(new_zones)
+    new_zones = [z for z in current_zones if z.zone_id != zone_id]
+    if update_runtime_zones(camera_id, new_zones) is not True:
+        return api_not_found(f"摄像头 {camera_id} 不存在")
     _persist_zones(request, camera_id, new_zones)
 
     audit = getattr(request.app.state, "audit_logger", None)
@@ -219,20 +230,44 @@ async def delete_zone(request: Request, camera_id: str, zone_id: str):
 
 @router.get("/snapshot/{camera_id}")
 def camera_snapshot(request: Request, camera_id: str):
-    """Get a JPEG snapshot from a camera for the zone editor."""
+    """Get the latest cached JPEG frame for the zone editor.
+
+    The detection pipeline is the sole consumer of the capture adapter.  A
+    second direct ``read()`` here can steal a frame, block the request thread,
+    or race reconnect logic, so the editor only reads the manager's public
+    latest-frame cache.
+    """
     import cv2
 
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
         return api_unavailable("摄像头管理器不可用")
 
-    pipeline = camera_manager.get_pipeline(camera_id)
-    if not pipeline or not pipeline._camera.state.connected:
-        return api_unavailable("摄像头未连接")
+    get_latest_frame = getattr(camera_manager, "get_latest_frame", None)
+    if not callable(get_latest_frame):
+        return api_unavailable("摄像头最新画面接口不可用")
 
-    frame_data = pipeline._camera.read()
-    if frame_data is None:
-        return api_unavailable("无法获取画面")
+    try:
+        frame = get_latest_frame(camera_id)
+    except Exception:
+        logger.exception("zone_snapshot.latest_frame_failed camera_id=%s", camera_id)
+        return api_unavailable("无法读取最新画面")
+    if frame is None:
+        return api_unavailable("暂无可用的最新画面")
 
-    _, jpeg = cv2.imencode(".jpg", frame_data.frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    return Response(content=jpeg.tobytes(), media_type="image/jpeg")
+    try:
+        encoded, jpeg = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 80],
+        )
+    except (cv2.error, TypeError, ValueError):
+        logger.exception("zone_snapshot.encode_failed camera_id=%s", camera_id)
+        return api_unavailable("最新画面编码失败")
+    if not encoded:
+        return api_unavailable("最新画面编码失败")
+    return Response(
+        content=jpeg.tobytes(),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, no-store"},
+    )

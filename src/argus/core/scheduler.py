@@ -442,7 +442,12 @@ def create_retraining_task(
 
     For each camera, checks if enough new baseline images have been added
     (e.g. from false-positive feedback) and triggers retraining if threshold met.
-    Optionally auto-deploys if quality grade is sufficient.
+    Optionally registers a high-quality candidate for operator release review.
+
+    ``auto_deploy`` is retained as a compatibility configuration name, but the
+    scheduler never activates or promotes a model.  Non-interactive release
+    would bypass the evidence, approval, runtime-prepare and atomic-commit
+    guarantees owned by ``ModelReleaseService``.
 
     The ``dataset_strategy`` config knob controls which baseline versions are
     fed into each retraining run:
@@ -455,6 +460,11 @@ def create_retraining_task(
     """
     if not config.retraining.enabled:
         return
+
+    from argus.anomaly.trainer import ModelTrainer
+
+    if issubclass(type(trainer), ModelTrainer) and model_registry is not None:
+        trainer.bind_model_registry(model_registry)
 
     retrain_cfg = config.retraining
     min_grade_rank = _GRADE_RANK.get(retrain_cfg.auto_deploy_min_grade, 3)
@@ -477,9 +487,22 @@ def create_retraining_task(
                 models = model_registry.list_models(camera_id=camera_id)
                 last_image_count = 0
                 if models:
-                    # The latest model has metadata with image_count
                     last = models[0]
-                    last_image_count = getattr(last, "image_count", 0) or 0
+                    raw_params = getattr(last, "training_params", None)
+                    if isinstance(raw_params, str):
+                        try:
+                            previous_params = json.loads(raw_params)
+                        except (ValueError, TypeError):
+                            previous_params = {}
+                        if isinstance(previous_params, dict):
+                            recorded_count = previous_params.get("image_count")
+                            if type(recorded_count) is int:
+                                last_image_count = recorded_count
+                            else:
+                                last_image_count = sum(
+                                    count for key in ("train_count", "val_count")
+                                    if type(count := previous_params.get(key)) is int
+                                )
 
                 new_images = current_count - last_image_count
                 if new_images < retrain_cfg.min_new_baselines:
@@ -515,6 +538,8 @@ def create_retraining_task(
                     selection_size=(len(selection.items) if selection else 0),
                 )
 
+                backend = getattr(cam.anomaly, "inference_backend", "auto")
+                torch_backend = backend in {"torch-cuda", "torch-cpu"}
                 train_kwargs = dict(
                     camera_id=camera_id,
                     zone_id="default",
@@ -522,8 +547,8 @@ def create_retraining_task(
                     image_size=cam.anomaly.image_size[0]
                     if isinstance(cam.anomaly.image_size, (list, tuple))
                     else cam.anomaly.image_size,
-                    export_format="openvino",
-                    quantization=cam.anomaly.quantization,
+                    export_format="torch" if torch_backend else "openvino",
+                    quantization="fp32" if torch_backend else cam.anomaly.quantization,
                     anomaly_config=cam.anomaly,
                 )
 
@@ -548,7 +573,11 @@ def create_retraining_task(
                     # Single-version legacy path
                     result = trainer.train(**train_kwargs)
 
-                grade = getattr(result, "quality_grade", "F") or "F"
+                grade = getattr(getattr(result, "quality_report", None), "grade", None)
+                if not isinstance(grade, str):
+                    grade = getattr(result, "quality_grade", "F")
+                if not isinstance(grade, str):
+                    grade = "F"
                 logger.info(
                     "retraining.complete",
                     camera_id=camera_id,
@@ -560,68 +589,88 @@ def create_retraining_task(
                 status_value = getattr(status_obj, "value", status_obj)
                 result_complete = str(status_value).lower() == "complete"
                 model_version_for_feedback = getattr(result, "model_version_id", None)
+                if not isinstance(model_version_for_feedback, str) or not model_version_for_feedback:
+                    model_version_for_feedback = None
 
-                # Auto-deploy if grade meets threshold
+                # Register a release candidate if the legacy auto_deploy
+                # quality gate is enabled and the training run completed.
                 if (
                     retrain_cfg.auto_deploy
                     and _GRADE_RANK.get(grade, 0) >= min_grade_rank
                     and result_complete
                 ):
-                    version_id = None
+                    version_id = model_version_for_feedback
                     try:
-                        version_id = model_registry.register(
-                            camera_id=camera_id,
-                            model_type=cam.anomaly.model_type,
-                            model_path=str(getattr(result, "model_path", "")),
-                            image_count=current_count,
-                            quality_grade=grade,
-                        )
+                        if version_id is None:
+                            from argus.anomaly.artifacts import artifact_metadata, exported_artifact
+
+                            if selection is not None and selection.items:
+                                raise ValueError(
+                                    "Merged-dataset training must register before its temporary dataset is removed"
+                                )
+                            model_path = getattr(result, "model_path", None)
+                            if not isinstance(model_path, str) or not model_path:
+                                raise ValueError("Training did not return a deployable artifact")
+                            artifact = Path(model_path)
+                            formats = {".pt": "torch", ".xml": "openvino", ".onnx": "onnx"}
+                            if not artifact.is_file() or artifact.suffix not in formats:
+                                raise ValueError("Training did not return an exact runtime model file")
+                            if torch_backend and artifact.suffix != ".pt":
+                                raise ValueError("Torch runtime requires a model.pt artifact")
+                            artifact = exported_artifact(artifact.parent, formats[artifact.suffix], artifact)
+                            actual_quantization = getattr(result, "actual_quantization", None)
+                            if not isinstance(actual_quantization, str):
+                                actual_quantization = (
+                                    train_kwargs["quantization"] if artifact.suffix == ".xml" else "fp32"
+                                )
+                            version_id = model_registry.register(
+                                camera_id=camera_id,
+                                model_type=cam.anomaly.model_type,
+                                model_path=artifact,
+                                baseline_dir=baseline_manager.get_baseline_dir(camera_id, "default"),
+                                training_params={
+                                    "zone_id": "default",
+                                    "image_count": current_count,
+                                    "quality_grade": grade,
+                                    "export_format": formats[artifact.suffix],
+                                    "quantization": actual_quantization,
+                                    "artifact_manifest": artifact_metadata(artifact),
+                                },
+                                registered_by="scheduled_retraining",
+                            )
                         model_version_for_feedback = version_id
-                        # P1 fix: never bypass the candidate→shadow→canary→production
-                        # gate from a non-interactive scheduler. Auto-deploy now
-                        # only succeeds when the operator (or an explicit canary
-                        # promotion job) has already advanced this version to
-                        # PRODUCTION/RETIRED. Otherwise we log + audit and leave
-                        # the run as a CANDIDATE for human review.
-                        try:
-                            model_registry.activate(
-                                version_id, triggered_by="auto_retrain",
-                            )
-                            logger.info(
-                                "retraining.auto_deployed",
-                                camera_id=camera_id,
-                                version_id=version_id,
-                                grade=grade,
-                            )
-                        except ValueError as gate_err:
-                            logger.warning(
-                                "retraining.activation_blocked_by_stage_gate",
-                                camera_id=camera_id,
-                                version_id=version_id,
-                                grade=grade,
-                                error=str(gate_err),
-                                msg=(
-                                    "Auto-deploy refused: model still at "
-                                    "candidate stage. Promote via the release "
-                                    "pipeline (shadow → canary → production) "
-                                    "before activation."
-                                ),
-                            )
-                            audit = (
-                                getattr(scheduler, "_audit_logger", None)
-                                or getattr(scheduler, "audit_logger", None)
-                            )
-                            if audit is not None:
-                                try:
-                                    audit.log(
-                                        user="auto_retrain",
-                                        action="auto_retrain_activation_blocked",
-                                        target_type="model_version",
-                                        target_id=str(version_id),
-                                        detail=str(gate_err)[:200],
-                                    )
-                                except Exception:  # noqa: BLE001
-                                    pass
+                        # Fail closed after candidate registration.  This task
+                        # has no authenticated operator approval or two-phase
+                        # runtime transaction and therefore must never call the
+                        # low-level registry activation/promotion APIs.
+                        release_required = (
+                            "Automatic activation is disabled; candidate must "
+                            "use ModelReleaseService (shadow → canary → "
+                            "production) with baseline v3 and trusted soak "
+                            "evidence."
+                        )
+                        logger.warning(
+                            "retraining.release_required",
+                            camera_id=camera_id,
+                            version_id=version_id,
+                            grade=grade,
+                            msg=release_required,
+                        )
+                        audit = (
+                            getattr(scheduler, "_audit_logger", None)
+                            or getattr(scheduler, "audit_logger", None)
+                        )
+                        if audit is not None:
+                            try:
+                                audit.log(
+                                    user="auto_retrain",
+                                    action="auto_retrain_release_required",
+                                    target_type="model_version",
+                                    target_id=str(version_id),
+                                    detail=release_required[:200],
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
                     except Exception as e:
                         logger.error(
                             "retraining.deploy_failed",
@@ -708,6 +757,8 @@ def create_retraining_task(
                 if group_cam is None:
                     continue
 
+                group_backend = getattr(group_cam.anomaly, "inference_backend", "auto")
+                group_torch_backend = group_backend in {"torch-cuda", "torch-cpu"}
                 trainer.train(
                     camera_id=f"group:{group.group_id}",
                     zone_id=group.zone_id,
@@ -715,8 +766,8 @@ def create_retraining_task(
                     image_size=group_cam.anomaly.image_size[0]
                     if isinstance(group_cam.anomaly.image_size, (list, tuple))
                     else group_cam.anomaly.image_size,
-                    export_format="openvino",
-                    quantization=group_cam.anomaly.quantization,
+                    export_format="torch" if group_torch_backend else "openvino",
+                    quantization="fp32" if group_torch_backend else group_cam.anomaly.quantization,
                     anomaly_config=group_cam.anomaly,
                     group_id=group.group_id,
                 )

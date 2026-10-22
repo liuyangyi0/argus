@@ -3,19 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 import time
 from collections.abc import Callable
 from concurrent.futures import Executor
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, urlparse
 
 import cv2
 import structlog
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
+from argus.core.frame_identity import FrameIdentity
+
 logger = structlog.get_logger()
 
 SourceProbe = Callable[[str | int, float, str | None], dict[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class Go2RTCProxyTarget:
+    """Validated loopback target used by the authenticated stream proxy."""
+
+    camera_id: str
+    stream_name: str
+    api_port: int
 
 
 def _camera_attr(camera: Any, name: str, default: Any = None) -> Any:
@@ -28,11 +42,78 @@ def _manager_running(manager: Any) -> bool:
     return bool(getattr(manager, "running", False))
 
 
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    host = host.strip("[]").lower()
+    return host == "localhost" or host == "::1" or host.startswith("127.")
+
+
 def _encode_jpeg(frame: Any, quality: int) -> bytes | None:
     ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         return None
     return buffer.tobytes()
+
+
+def _frame_identity_overlay_enabled(state: Any) -> bool:
+    config = getattr(state, "config", None)
+    debug = getattr(config, "debug", None)
+    if debug is not None and hasattr(debug, "frame_identity_overlay"):
+        return bool(getattr(debug, "frame_identity_overlay", False))
+    dashboard = getattr(config, "dashboard", None)
+    return bool(getattr(dashboard, "frame_identity_overlay", False))
+
+
+def _draw_frame_identity_overlay(frame: Any, identity: FrameIdentity | None) -> Any:
+    if identity is None:
+        return frame
+    lines = [
+        f"cam={identity.camera_id}",
+        f"frame={identity.frame_index}",
+        f"src={identity.runtime_source_hash}",
+        f"cap={identity.capture_wall_ts:.3f}",
+        f"pipe={identity.pipeline_ingest_ts:.3f}"
+        if identity.pipeline_ingest_ts is not None
+        else "pipe=-",
+    ]
+    overlay = frame.copy()
+    x, y = 12, 24
+    line_h = 22
+    width = max(260, max(len(line) for line in lines) * 10)
+    height = line_h * len(lines) + 12
+    cv2.rectangle(overlay, (6, 6), (6 + width, 6 + height), (0, 0, 0), -1)
+    frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
+    for idx, line in enumerate(lines):
+        cv2.putText(
+            frame,
+            line,
+            (x, y + idx * line_h),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return frame
+
+
+def _frame_identity_headers(identity: FrameIdentity | None) -> dict[str, str]:
+    if identity is None:
+        return {}
+    headers = {
+        "X-Argus-Camera-Id": identity.camera_id,
+        "X-Argus-Frame-Index": str(identity.frame_index),
+        "X-Argus-Capture-Ts": f"{identity.capture_wall_ts:.6f}",
+        "X-Argus-Runtime-Source-Hash": identity.runtime_source_hash,
+    }
+    if identity.pipeline_ingest_ts is not None:
+        headers["X-Argus-Pipeline-Ts"] = f"{identity.pipeline_ingest_ts:.6f}"
+    if identity.snapshot_id:
+        headers["X-Argus-Snapshot-Id"] = identity.snapshot_id
+    if identity.stream_id:
+        headers["X-Argus-Stream-Id"] = identity.stream_id
+    return headers
 
 
 def probe_source_blocking(
@@ -165,20 +246,44 @@ class PreviewGateway:
         if camera_manager is None:
             return Response(status_code=503)
 
-        get_latest_frame = getattr(camera_manager, "get_latest_frame", None)
-        if not callable(get_latest_frame):
-            return Response(status_code=503)
-        frame = get_latest_frame(camera_id)
+        get_latest = getattr(camera_manager, "get_latest_frame_with_identity", None)
+        if callable(get_latest):
+            frame, identity = get_latest(camera_id)
+        else:
+            get_latest_frame = getattr(camera_manager, "get_latest_frame", None)
+            if not callable(get_latest_frame):
+                return Response(status_code=503)
+            frame = get_latest_frame(camera_id)
+            identity = None
+            get_identity = getattr(camera_manager, "get_latest_frame_identity", None)
+            if callable(get_identity):
+                identity = get_identity(camera_id)
         if frame is None:
             return Response(status_code=404)
+
+        snapshot_id = uuid.uuid4().hex
+        record_snapshot = getattr(camera_manager, "record_snapshot_access", None)
+        if callable(record_snapshot):
+            recorded = record_snapshot(camera_id, snapshot_id)
+            if recorded is not None:
+                identity = recorded
+        elif identity is not None:
+            identity = identity.with_updates(snapshot_id=snapshot_id)
+
+        if _frame_identity_overlay_enabled(self._state):
+            frame = _draw_frame_identity_overlay(frame, identity)
 
         jpeg = _encode_jpeg(frame, 70)
         if jpeg is None:
             return Response(status_code=503)
+        headers = {
+            "Cache-Control": "no-cache, no-store",
+            **_frame_identity_headers(identity),
+        }
         return Response(
             content=jpeg,
             media_type="image/jpeg",
-            headers={"Cache-Control": "no-cache, no-store"},
+            headers=headers,
         )
 
     def latest_frame_stream_response(self, request: Request, camera_id: str) -> Response:
@@ -191,6 +296,9 @@ class PreviewGateway:
             frame = camera_manager.get_latest_frame(camera_id)
             if frame is None:
                 return None
+            record_preview = getattr(camera_manager, "record_preview_stream_access", None)
+            if callable(record_preview):
+                record_preview(camera_id)
             return _encode_jpeg(frame, 60)
 
         return self._mjpeg_response(request, _grab)
@@ -226,42 +334,38 @@ class PreviewGateway:
         return self._mjpeg_response(request, _grab)
 
     def streaming_info(self, request: Request, camera: Any) -> dict[str, Any]:
-        """Return browser-facing streaming URLs for a camera."""
+        """Return same-origin browser streaming URLs for a camera.
+
+        The go2rtc API port is deliberately never exposed to browsers.  Both
+        WebRTC and MSE signalling flow through ``/ws/stream`` where the normal
+        Argus session and camera-read RBAC checks are applied.
+        """
         camera_id = str(_camera_attr(camera, "camera_id", ""))
         fallback = f"/api/cameras/{camera_id}/stream"
+        target = self.resolve_proxy_target(camera)
+        if target is None:
+            return {
+                "camera_id": camera_id,
+                "go2rtc": False,
+                "fallback": fallback,
+            }
+        return self._same_origin_streaming_info(request, camera_id, fallback)
+
+    def resolve_proxy_target(self, camera: Any) -> Go2RTCProxyTarget | None:
+        """Resolve a camera to a server-side-only go2rtc proxy target."""
+        camera_id = str(_camera_attr(camera, "camera_id", ""))
         resolution = self.ensure_stream_registered(camera)
-        if resolution is None or not getattr(resolution, "go2rtc_managed", False):
-            return {
-                "camera_id": camera_id,
-                "go2rtc": False,
-                "fallback": fallback,
-            }
-
-        manager = self.stream_manager()
-        api_port = getattr(manager, "api_port", None)
-        if api_port is None:
-            return {
-                "camera_id": camera_id,
-                "go2rtc": False,
-                "fallback": fallback,
-            }
-
-        stream_name = str(getattr(resolution, "stream_name", None) or camera_id)
-        base = self._client_base_url(request, int(api_port))
-        ws_scheme = "wss" if request.url.scheme == "https" else "ws"
-        host = request.headers.get("host", "").split(":")[0] or "127.0.0.1"
-        ws_base = f"{ws_scheme}://{host}:{api_port}"
-
-        return {
-            "camera_id": camera_id,
-            "go2rtc": True,
-            "webrtc_ws": f"{ws_base}/api/ws?src={stream_name}",
-            "mse_ws": f"{ws_base}/api/ws?src={stream_name}&mode=mse",
-            "hls": f"{base}/api/stream.m3u8?src={stream_name}",
-            "mjpeg": f"{base}/api/frame.jpeg?src={stream_name}",
-            "player": f"{base}/stream.html?src={stream_name}",
-            "fallback": fallback,
-        }
+        if resolution is not None and getattr(resolution, "go2rtc_managed", False):
+            manager = self.stream_manager()
+            api_port = getattr(manager, "api_port", None)
+            if api_port is None:
+                return None
+            return Go2RTCProxyTarget(
+                camera_id=camera_id,
+                stream_name=str(getattr(resolution, "stream_name", None) or camera_id),
+                api_port=int(api_port),
+            )
+        return self._external_go2rtc_proxy_target(camera, camera_id)
 
     def ensure_stream_registered(self, camera: Any) -> Any | None:
         """Register a camera stream through StreamRegistry or legacy go2rtc."""
@@ -395,8 +499,58 @@ class PreviewGateway:
     def _stream_registry(self) -> Any | None:
         return getattr(self._state, "stream_registry", None)
 
+    def _external_go2rtc_proxy_target(
+        self,
+        camera: Any,
+        camera_id: str,
+    ) -> Go2RTCProxyTarget | None:
+        """Resolve an already-running local go2rtc stream for proxying.
+
+        Some deployments run go2rtc outside Argus because the generated
+        ``ffmpeg:device`` source is not compatible with the host ffmpeg.  If the
+        camera source already points at the local go2rtc RTSP listener, the
+        server may proxy its signalling without exposing the go2rtc API port.
+        """
+        dashboard = getattr(getattr(self._state, "config", None), "dashboard", None)
+        api_port = int(getattr(dashboard, "go2rtc_api_port", 1984))
+        rtsp_port = int(getattr(dashboard, "go2rtc_rtsp_port", 8554))
+
+        source = str(_camera_attr(camera, "source", "") or "")
+        parsed = urlparse(source)
+        if parsed.scheme.lower() != "rtsp":
+            return None
+        if not _is_loopback_host(parsed.hostname):
+            return None
+        if parsed.port is not None and parsed.port != rtsp_port:
+            return None
+
+        stream_name = (
+            _camera_attr(camera, "stream_name", None)
+            or parsed.path.strip("/")
+            or camera_id
+        )
+        if not stream_name:
+            return None
+        return Go2RTCProxyTarget(
+            camera_id=camera_id,
+            stream_name=str(stream_name),
+            api_port=api_port,
+        )
+
     @staticmethod
-    def _client_base_url(request: Request, port: int) -> str:
-        host = request.headers.get("host", "").split(":")[0] or "127.0.0.1"
-        scheme = "https" if request.url.scheme == "https" else "http"
-        return f"{scheme}://{host}:{port}"
+    def _same_origin_streaming_info(
+        request: Request,
+        camera_id: str,
+        fallback: str,
+    ) -> dict[str, Any]:
+        ws_scheme = "wss" if request.url.scheme == "https" else "ws"
+        host = request.headers.get("host", "").strip() or request.url.netloc
+        camera_path = quote(camera_id, safe="")
+        ws_base = f"{ws_scheme}://{host}/ws/stream/{camera_path}"
+        return {
+            "camera_id": camera_id,
+            "go2rtc": True,
+            "webrtc_ws": f"{ws_base}?mode=webrtc",
+            "mse_ws": f"{ws_base}?mode=mse",
+            "fallback": fallback,
+        }

@@ -1,6 +1,7 @@
 """Tests for the dashboard API."""
 
 from datetime import datetime, timezone
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -8,7 +9,7 @@ from unittest.mock import MagicMock
 import cv2
 import numpy as np
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette import requests as starlette_requests
 
@@ -19,14 +20,53 @@ from argus.capture.manager import CameraManager
 from argus.config.loader import load_config, save_config
 from argus.config.schema import AlertConfig, ArgusConfig, AuthConfig, CameraConfig
 from argus.core.health import HealthMonitor
-from argus.dashboard.auth import create_session_token
+from argus.dashboard.auth import create_session_token, hash_password
 from argus.dashboard.app import _mount_vue_spa, create_app
 from argus.dashboard.routes.baseline import _train_model_task
 from argus.dashboard.routes.alerts import _generate_composite, _is_safe_path
 from argus.streaming.go2rtc_manager import usb_to_go2rtc_source
 from argus.storage.model_registry import ModelRegistry
+from argus.storage.model_release_service import (
+    RuntimeReleaseCommit,
+    RuntimeReleaseIdentity,
+    RuntimeReleasePreparation,
+)
 from argus.storage.database import Database
 from argus.storage.models import ModelVersionEvent
+from argus.storage.release_pipeline import ReleasePipeline
+
+
+def _release_model_fixture(
+    db: Database,
+    registry: ModelRegistry,
+    version_id: str,
+    model_path: Path,
+    release_evidence_factory,
+    *,
+    camera_id: str = "cam_01",
+) -> None:
+    pipeline = ReleasePipeline(db.get_session, min_shadow_days=0, min_canary_days=0)
+    pipeline.transition(
+        model_version_id=version_id,
+        target_stage="shadow",
+        triggered_by="test-fixture",
+    )
+    pipeline.transition(
+        model_version_id=version_id,
+        target_stage="canary",
+        triggered_by="test-fixture",
+        canary_camera_id=camera_id,
+    )
+    pipeline.transition(
+        model_version_id=version_id,
+        target_stage="production",
+        triggered_by="test-fixture",
+        release_evidence=release_evidence_factory(
+            model_path=model_path,
+            model_version_id=version_id,
+            registry_model_hash=registry.get_by_version_id(version_id).model_hash,
+        ),
+    )
 
 
 @pytest.fixture
@@ -55,6 +95,50 @@ def alerts_dir(tmp_path):
 def client(db, health, alerts_dir):
     app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
     return TestClient(app)
+
+
+def _two_phase_release_runtime() -> SimpleNamespace:
+    """Minimal runtime double that proves the release identity it prepared."""
+
+    def prepare_model_release(plan) -> RuntimeReleasePreparation:
+        class Transaction:
+            def commit(self) -> RuntimeReleaseCommit:
+                return RuntimeReleaseCommit(
+                    True,
+                    state={
+                        "camera_id": plan.camera_id,
+                        "primary_model_version": (
+                            plan.model_version_id
+                            if plan.target_stage in {"canary", "production"}
+                            else None
+                        ),
+                        "shadow_model_version": (
+                            plan.model_version_id
+                            if plan.target_stage == "shadow"
+                            else None
+                        ),
+                        "errors": [],
+                    },
+                )
+
+            def abort(self) -> RuntimeReleaseCommit:
+                return RuntimeReleaseCommit(True, state={"restored": True})
+
+            def finalize(self) -> RuntimeReleaseCommit:
+                return RuntimeReleaseCommit(True, state={"released": True})
+
+        return RuntimeReleasePreparation(
+            True,
+            identity=RuntimeReleaseIdentity(
+                camera_id=plan.camera_id,
+                model_version_id=plan.model_version_id,
+                target_stage=plan.target_stage,
+                runtime_artifact_sha256=plan.runtime_artifact_sha256,
+            ),
+            transaction=Transaction(),
+        )
+
+    return SimpleNamespace(prepare_model_release=prepare_model_release)
 
 
 class TestDashboardPages:
@@ -106,6 +190,54 @@ class TestDashboardPages:
             assert response.status_code == 404, path
             assert "<div id=\"app\">" not in response.text, path
 
+    @pytest.mark.parametrize(
+        "traversal_path",
+        [
+            "/%2e%2e/sibling-secret.txt",
+            "/..%2fsibling-secret.txt",
+        ],
+    )
+    def test_spa_fallback_rejects_paths_outside_dist(
+        self,
+        tmp_path,
+        traversal_path,
+    ):
+        vue_dist = tmp_path / "dist"
+        vue_dist.mkdir()
+        (vue_dist / "index.html").write_text('<div id="app"></div>', encoding="utf-8")
+        secret = "must-not-be-served-by-the-spa"
+        (tmp_path / "sibling-secret.txt").write_text(secret, encoding="utf-8")
+
+        app = FastAPI()
+        _mount_vue_spa(app, vue_dist)
+        client = TestClient(app)
+
+        response = client.get(traversal_path)
+
+        assert secret not in response.text
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_spa_fallback_rejects_plain_parent_segment(self, tmp_path):
+        vue_dist = tmp_path / "dist"
+        vue_dist.mkdir()
+        (vue_dist / "index.html").write_text('<div id="app"></div>', encoding="utf-8")
+        secret = "must-not-be-served-by-the-spa"
+        (tmp_path / "sibling-secret.txt").write_text(secret, encoding="utf-8")
+
+        app = FastAPI()
+        _mount_vue_spa(app, vue_dist)
+        spa_route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == "/{full_path:path}"
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await spa_route.endpoint(MagicMock(), "../sibling-secret.txt")
+
+        assert exc_info.value.status_code == 404
+
     def test_vue_spa_mount_tolerates_missing_assets_dir(self, tmp_path):
         """A partial web/dist should not break backend startup."""
         vue_dist = tmp_path / "dist"
@@ -120,27 +252,41 @@ class TestDashboardPages:
         assert '<div id="app">' in response.text
 
     def test_index_page_loads(self, client):
-        """Root page should return Vue SPA HTML."""
+        """Root serves the built SPA, or an explicit JSON 404 before build."""
         response = client.get("/")
-        assert response.status_code == 200
-        assert '<div id="app">' in response.text or "<div id=\"app\">" in response.text
-        assert "text/html" in response.headers["content-type"]
+        if response.status_code == 404:
+            assert response.json()["code"] == 40400
+        else:
+            assert response.status_code == 200
+            assert '<div id="app">' in response.text or "<div id=\"app\">" in response.text
+            assert "text/html" in response.headers["content-type"]
 
     def test_cameras_page_loads(self, client):
-        """Cameras page should return Vue SPA HTML (client-side routing)."""
+        """Cameras serves the built SPA, or an explicit JSON 404 before build."""
         response = client.get("/cameras")
-        assert response.status_code == 200
-        assert '<div id="app">' in response.text or "<div id=\"app\">" in response.text
+        if response.status_code == 404:
+            assert response.json()["code"] == 40400
+        else:
+            assert response.status_code == 200
+            assert '<div id="app">' in response.text or "<div id=\"app\">" in response.text
 
     def test_alerts_page_loads(self, client):
-        """Alerts page should return HTML."""
+        """Alerts route does not masquerade as HTML without a built SPA."""
         response = client.get("/alerts")
-        assert response.status_code == 200
+        if response.status_code == 404:
+            assert response.json()["code"] == 40400
+        else:
+            assert response.status_code == 200
+            assert "text/html" in response.headers["content-type"]
 
     def test_system_page_loads(self, client):
-        """System page should return HTML."""
+        """System route does not masquerade as HTML without a built SPA."""
         response = client.get("/system")
-        assert response.status_code == 200
+        if response.status_code == 404:
+            assert response.json()["code"] == 40400
+        else:
+            assert response.status_code == 200
+            assert "text/html" in response.headers["content-type"]
 
 
 class TestHealthAPI:
@@ -165,6 +311,7 @@ class TestCameraForms:
 
         camera_manager = MagicMock()
         camera_manager._cameras = []
+        camera_manager.get_camera_config.return_value = None
 
         app = create_app(
             database=db,
@@ -237,6 +384,46 @@ class TestCameraForms:
         data = body["data"]
         assert data["cameras"][0]["camera_id"] == "cam_02"
         assert data["cameras"][0]["degradation"] == "rtsp_broken"
+
+    def test_wall_status_surfaces_model_backend_mismatch(self, health, alerts_dir):
+        """Video wall must expose backend policy failures, not hide them in logs."""
+        camera_manager = MagicMock()
+        camera_manager.get_status.return_value = [
+            SimpleNamespace(
+                camera_id="cam_gpu",
+                name="GPU Camera",
+                connected=True,
+                running=True,
+                model_version_id=None,
+                stats=None,
+            ),
+        ]
+        camera_manager.get_backpressure_stats.return_value = {
+            "cam_gpu": {"pending": 0, "dropped": 0, "backpressured": False},
+        }
+        camera_manager.get_wall_status.return_value = {
+            "current_score": 0.12,
+            "score_sparkline": [0.1, 0.12],
+        }
+        camera_manager.get_anomaly_backend_status.return_value = {
+            "actual": "openvino",
+            "expected": "torch-cuda",
+        }
+
+        app = create_app(
+            camera_manager=camera_manager,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.get("/api/cameras/wall/status")
+
+        assert response.status_code == 200
+        tile = response.json()["data"]["cameras"][0]
+        assert tile["degradation"] == "model_backend_mismatch"
+        assert tile["model_backend"] == "openvino"
+        assert tile["expected_model_backend"] == "torch-cuda"
 
     def test_wall_status_uses_batched_db_query(self, db, health, alerts_dir):
         """wall/status must collapse to O(1) SQL queries regardless of camera count.
@@ -622,6 +809,18 @@ class TestCameraJsonAPI:
         camera_manager.get_learning_progress.return_value = {"progress_pct": 10}
         camera_manager.get_pipeline_mode.return_value = "learning"
         camera_manager.is_anomaly_locked.return_value = False
+        camera_manager.get_anomaly_backend_status.return_value = {
+            "actual": "torch-cuda",
+            "expected": "torch-cuda",
+        }
+        camera_manager.get_scene_guard_status.return_value = {
+            "enabled": True,
+            "usable": False,
+            "state": "recovering",
+            "reason": "awaiting consecutive approved-scene matches",
+            "profile_id": "scene-main-v3",
+            "recovery_progress": {"current": 2, "required": 3},
+        }
 
         app = create_app(
             database=db,
@@ -640,8 +839,20 @@ class TestCameraJsonAPI:
         assert data["camera_id"] == "cam_01"
         assert data["config"]["source"] == "rtsp://example/stream"
         assert data["runtime"]["pipeline_mode"] == "learning"
+        assert data["scene_guard"] == data["runtime"]["scene_guard"]
+        assert data["scene_guard"]["usable"] is False
+        assert data["scene_guard"]["profile_id"] == "scene-main-v3"
+        assert data["scene_guard"]["bound_model_version"] is None
+        assert data["scene_guard"]["required_recovery_count"] == 3
+        assert data["scene_guard"]["recovery_progress"] == {
+            "current": 2,
+            "required": 3,
+            "complete": False,
+        }
         assert data["runner"]["version_tag"] == "v1"
         assert data["detector"]["threshold"] == 0.15
+        assert data["model_backend"] == "torch-cuda"
+        assert data["expected_model_backend"] == "torch-cuda"
         assert data["health"]["camera_id"] == "cam_01"
 
 
@@ -649,6 +860,12 @@ class TestCameraControlRoutes:
     def test_start_camera_offloads_to_thread(self, db, health, alerts_dir, monkeypatch):
         """Camera start route should offload blocking initialization from the event loop."""
         camera_manager = MagicMock()
+        camera_manager.get_camera_config.return_value = None
+        camera_manager.get_camera_status_payload.return_value = {
+            "camera_id": "cam_01",
+            "connected": True,
+            "running": True,
+        }
         calls = []
 
         async def fake_to_thread(func, *args, **kwargs):
@@ -671,10 +888,23 @@ class TestCameraControlRoutes:
         assert len(calls) == 1
         assert calls[0][0] == camera_manager.start_camera
         assert calls[0][1] == ("cam_01",)
+        data = response.json()["data"]
+        assert {
+            key: data[key] for key in ("camera_id", "connected", "running")
+        } == {
+            "camera_id": "cam_01",
+            "connected": True,
+            "running": True,
+        }
 
     def test_stop_camera_offloads_to_thread(self, db, health, alerts_dir, monkeypatch):
         """Camera stop route should offload thread joins from the event loop."""
         camera_manager = MagicMock()
+        camera_manager.get_camera_status_payload.return_value = {
+            "camera_id": "cam_01",
+            "connected": False,
+            "running": False,
+        }
         calls = []
 
         async def fake_to_thread(func, *args, **kwargs):
@@ -697,6 +927,14 @@ class TestCameraControlRoutes:
         assert len(calls) == 1
         assert calls[0][0] == camera_manager.stop_camera
         assert calls[0][1] == ("cam_01",)
+        data = response.json()["data"]
+        assert {
+            key: data[key] for key in ("camera_id", "connected", "running")
+        } == {
+            "camera_id": "cam_01",
+            "connected": False,
+            "running": False,
+        }
 
     def test_set_camera_mode_switches_running_pipeline(self, db, health, alerts_dir, monkeypatch):
         """Camera mode route should expose ACTIVE/LEARNING/MAINTENANCE control."""
@@ -746,7 +984,9 @@ class TestCameraControlRoutes:
 
         response = client.post("/api/cameras/cam_01/mode", json={"mode": "bad"})
 
-        assert response.status_code == 400
+        assert response.status_code == 422
+        assert response.json()["code"] == 42200
+        assert response.json()["data"]["errors"]
         camera_manager.set_pipeline_mode.assert_not_called()
 
     def test_set_camera_mode_requires_running_pipeline(self, db, health, alerts_dir):
@@ -921,14 +1161,14 @@ class TestCameraControlRoutes:
         assert payload["resolution"] == [640, 480]
         assert payload["source"] == "running_pipeline"
 
-    def test_restart_camera_offloads_stop_and_start(self, db, health, alerts_dir, monkeypatch):
-        """Camera restart route should offload stop/start instead of blocking the server."""
+    def test_restart_camera_offloads_atomic_restart(self, db, health, alerts_dir, monkeypatch):
+        """One owned restart operation must not abandon half a stop/start pair."""
         camera_manager = MagicMock()
         calls = []
 
         async def fake_to_thread(func, *args, **kwargs):
             calls.append((func, args, kwargs))
-            if func == camera_manager.start_camera:
+            if func == camera_manager.restart_camera:
                 return True
             return None
 
@@ -945,17 +1185,26 @@ class TestCameraControlRoutes:
         response = client.post("/api/config/camera/cam_01/restart")
 
         assert response.status_code == 200
-        assert len(calls) == 2
-        assert calls[0][0] == camera_manager.stop_camera
-        assert calls[1][0] == camera_manager.start_camera
+        assert len(calls) == 1
+        assert calls[0][0] == camera_manager.restart_camera
         assert calls[0][1] == ("cam_01",)
-        assert calls[1][1] == ("cam_01",)
+        camera_manager.stop_camera.assert_not_called()
+        camera_manager.start_camera.assert_not_called()
 
 
 class TestModelPublishRoutes:
     @staticmethod
     def _set_role_cookie(client: TestClient, app, role: str) -> None:
-        token = create_session_token(f"{role}_user", role, app.state.session_secret)
+        username = f"{role}_user"
+        db = app.state.db
+        if db.get_user(username) is None:
+            db.create_user(
+                username,
+                hash_password("role-test-password"),
+                role,
+                username,
+            )
+        token = create_session_token(username, role, app.state.session_secret)
         client.cookies.set("argus_session", token)
 
     @staticmethod
@@ -963,31 +1212,38 @@ class TestModelPublishRoutes:
         model_dir = root / "model"
         model_dir.mkdir(parents=True)
         (model_dir / "model.xml").write_text("model")
+        (model_dir / "model.bin").write_bytes(b"weights")
         baseline_dir = root / "baseline"
         baseline_dir.mkdir(parents=True)
         (baseline_dir / "img.png").write_bytes(b"img")
         return registry.register(model_dir, baseline_dir, camera_id, "patchcore")
 
-    def test_activate_promoted_model_syncs_runtime(self, db, health, alerts_dir, tmp_path):
-        """Activating a model that has walked the release pipeline (now at
-        PRODUCTION stage) should hot-reload the running camera.
-
-        P1 fix (2026-05): registered models default to CANDIDATE and cannot be
-        directly activated — promotion is required first.
-        """
+    def test_legacy_activate_fails_closed_even_for_production(
+        self,
+        db,
+        health,
+        alerts_dir,
+        tmp_path,
+        release_evidence_factory,
+    ):
+        """A production row cannot be re-applied outside the release service."""
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("model")
+        (model_dir / "model.bin").write_bytes(b"weights")
         baseline_dir = tmp_path / "baseline"
         baseline_dir.mkdir()
         (baseline_dir / "img.png").write_bytes(b"img")
 
         registry = ModelRegistry(session_factory=db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
-        # Walk the release pipeline so the version reaches PRODUCTION.
-        registry.promote(version_id, "shadow", triggered_by="test")
-        registry.promote(version_id, "canary", triggered_by="test", canary_camera_id="cam_01")
-        registry.promote(version_id, "production", triggered_by="test")
+        _release_model_fixture(
+            db,
+            registry,
+            version_id,
+            model_dir,
+            release_evidence_factory,
+        )
 
         camera_manager = MagicMock()
         camera_manager.reload_model.return_value = True
@@ -1002,26 +1258,17 @@ class TestModelPublishRoutes:
 
         response = client.post(f"/api/models/{version_id}/activate")
 
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["code"] == 0
-        data = payload["data"]
-        assert data["activated"] == version_id
-        assert data["runtime_synced"] is True
-        assert data["runtime_state"] == "applied"
-        assert data["model"]["model_version_id"] == version_id
-        camera_manager.reload_model.assert_called_once_with(
-            "cam_01",
-            str(model_dir / "model.xml"),
-            version_tag=version_id,
-        )
+        assert response.status_code == 409
+        assert "直接激活入口已关闭" in response.json()["msg"]
+        unchanged = registry.get_by_version_id(version_id)
+        assert unchanged.stage == "production"
+        assert unchanged.is_active is True
+        camera_manager.reload_model.assert_not_called()
 
-    def test_activate_candidate_model_rejected_by_stage_gate(
+    def test_activate_candidate_model_rejected_by_closed_legacy_entrypoint(
         self, db, health, alerts_dir, tmp_path,
     ):
-        """P1 fix: a CANDIDATE model cannot be activated directly. The route
-        must surface a 400 telling the user to promote it through shadow →
-        canary → production first."""
+        """Candidates are directed to the sole two-phase promotion API."""
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("model")
@@ -1044,11 +1291,14 @@ class TestModelPublishRoutes:
 
         response = client.post(f"/api/models/{version_id}/activate")
 
-        assert response.status_code == 400
+        assert response.status_code == 409
         body = response.json()
-        # Must mention release pipeline so the operator knows what to do.
+        # Must point at the controlled release command without mutating state.
         msg = (body.get("msg") or body.get("message") or "").lower()
-        assert "candidate" in msg or "stage" in msg or "shadow" in msg
+        assert "/promote" in msg
+        unchanged = registry.get_by_version_id(version_id)
+        assert unchanged.stage == "candidate"
+        assert unchanged.is_active is False
         camera_manager.reload_model.assert_not_called()
 
     @pytest.mark.parametrize("role", ["viewer", "operator"])
@@ -1075,22 +1325,25 @@ class TestModelPublishRoutes:
     @pytest.mark.parametrize("role", ["engineer", "admin"])
     def test_model_mutation_allows_manage_models_roles(
         self, role, db, health, alerts_dir, tmp_path,
+        running_release_client, await_release_operation,
     ):
         config = ArgusConfig(auth=AuthConfig(enabled=True, api_token="test-token"))
+        config.dashboard.go2rtc_enabled = False
         app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir), config=config)
-        client = TestClient(app)
+        client = running_release_client(app)
         self._set_role_cookie(client, app, role)
 
         registry = ModelRegistry(session_factory=db.get_session)
         version_id = self._register_model(registry, tmp_path / role)
+        app.state.camera_manager = _two_phase_release_runtime()
 
         response = client.post(
             f"/api/models/{version_id}/promote",
             json={"target_stage": "shadow", "triggered_by": role},
         )
 
-        assert response.status_code == 200
-        assert response.json()["data"]["model"]["stage"] == "shadow"
+        assert response.status_code == 202, response.text
+        assert await_release_operation(client, response)["model"]["stage"] == "shadow"
 
 
 class TestUserManagementRoutes:
@@ -1122,8 +1375,100 @@ class TestUserManagementRoutes:
         assert update_resp.status_code == 200
         assert update_resp.json()["data"]["user"]["role"] == "engineer"
 
-    def test_config_reload_model_uses_manager_reload(self, db, health, alerts_dir, tmp_path, monkeypatch):
-        """Config reload-model route should use the shared runtime reload path."""
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            [],
+            {
+                "username": "strict-create",
+                "password": "secret1",
+                "role": "viewer",
+                "active": "false",
+            },
+        ],
+    )
+    def test_create_user_rejects_non_object_and_string_boolean(
+        self,
+        db,
+        health,
+        alerts_dir,
+        payload,
+    ):
+        app = create_app(
+            database=db,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.post("/api/users/json", json=payload)
+
+        assert response.status_code == 422
+        assert response.json()["code"] == 42200
+        assert db.get_user("strict-create") is None
+
+    def test_update_user_rejects_string_boolean_without_mutating_user(
+        self,
+        db,
+        health,
+        alerts_dir,
+    ):
+        db.create_user(
+            "strict-update",
+            hash_password("secret1"),
+            "viewer",
+            "Strict Update",
+        )
+        app = create_app(
+            database=db,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.put(
+            "/api/users/strict-update/json",
+            json={"active": "false"},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["code"] == 42200
+        unchanged = db.get_user("strict-update")
+        assert unchanged is not None
+        assert unchanged.active is True
+
+    def test_update_user_preserves_omitted_fields(
+        self,
+        db,
+        health,
+        alerts_dir,
+    ):
+        db.create_user(
+            "partial-update",
+            hash_password("secret1"),
+            "viewer",
+            "Keep This Name",
+        )
+        app = create_app(
+            database=db,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+        )
+        client = TestClient(app)
+
+        response = client.put(
+            "/api/users/partial-update/json",
+            json={"role": "operator"},
+        )
+
+        assert response.status_code == 200
+        user = response.json()["data"]["user"]
+        assert user["role"] == "operator"
+        assert user["display_name"] == "Keep This Name"
+        assert user["active"] is True
+
+    def test_config_reload_model_is_fail_closed(self, db, health, alerts_dir, tmp_path, monkeypatch):
+        """A path-based reload cannot bypass the two-phase release service."""
         monkeypatch.chdir(tmp_path)
 
         model_dir = tmp_path / "data" / "models" / "cam_01" / "default"
@@ -1135,7 +1480,7 @@ class TestUserManagementRoutes:
         (baseline_dir / "img.png").write_bytes(b"img")
 
         registry = ModelRegistry(session_factory=db.get_session)
-        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
 
         camera_manager = MagicMock()
         camera_manager._pipelines = {"cam_01": MagicMock()}
@@ -1154,14 +1499,9 @@ class TestUserManagementRoutes:
             json={"camera_id": "cam_01", "model_path": str(model_path)},
         )
 
-        assert response.status_code == 200
-        assert response.json()["code"] == 0
-        assert response.json()["data"]["result"] == "ok"
-        camera_manager.reload_model.assert_called_once_with(
-            "cam_01",
-            str(model_path.resolve()),
-            version_tag=version_id,
-        )
+        assert response.status_code == 409
+        assert response.json()["data"]["runtime_changed"] is False
+        camera_manager.reload_model.assert_not_called()
 
     def test_config_reload_model_resolves_checkpoint_to_exported_torch(
         self,
@@ -1171,7 +1511,7 @@ class TestUserManagementRoutes:
         tmp_path,
         monkeypatch,
     ):
-        """Config reload-model should resolve nested ckpt paths to deployable torch exports."""
+        """Even a resolvable export cannot bypass the release service."""
         monkeypatch.chdir(tmp_path)
 
         model_dir = tmp_path / "data" / "models" / "cam_01" / "default"
@@ -1190,7 +1530,7 @@ class TestUserManagementRoutes:
         (baseline_dir / "img.png").write_bytes(b"img")
 
         registry = ModelRegistry(session_factory=db.get_session)
-        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+        registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
 
         camera_manager = MagicMock()
         camera_manager._pipelines = {"cam_01": MagicMock()}
@@ -1209,14 +1549,9 @@ class TestUserManagementRoutes:
             json={"camera_id": "cam_01", "model_path": str(ckpt_path)},
         )
 
-        assert response.status_code == 200
-        assert response.json()["code"] == 0
-        assert response.json()["data"]["result"] == "ok"
-        camera_manager.reload_model.assert_called_once_with(
-            "cam_01",
-            str(exported_model),
-            version_tag=version_id,
-        )
+        assert response.status_code == 409
+        assert response.json()["data"]["runtime_changed"] is False
+        camera_manager.reload_model.assert_not_called()
 
     def test_config_reload_model_rejects_checkpoint_without_runtime_artifact(
         self,
@@ -1226,7 +1561,7 @@ class TestUserManagementRoutes:
         tmp_path,
         monkeypatch,
     ):
-        """Config reload-model should fail clearly when only a training checkpoint exists."""
+        """Legacy reload remains closed regardless of artifact layout."""
         monkeypatch.chdir(tmp_path)
 
         model_dir = tmp_path / "data" / "models" / "cam_01" / "default"
@@ -1251,19 +1586,20 @@ class TestUserManagementRoutes:
             json={"camera_id": "cam_01", "model_path": str(ckpt_path)},
         )
 
-        assert response.status_code == 404
-        assert response.json()["msg"] == "未找到可部署的模型文件 (.xml/.pt)"
+        assert response.status_code == 409
+        assert response.json()["data"]["runtime_changed"] is False
         camera_manager.reload_model.assert_not_called()
 
-    def test_baseline_deploy_resolves_checkpoint_to_exported_torch(
+    def test_baseline_deploy_is_fail_closed_for_registered_production(
         self,
         db,
         health,
         alerts_dir,
         tmp_path,
         monkeypatch,
+        release_evidence_factory,
     ):
-        """Baseline deploy should prefer exported torch artifacts over nested lightning checkpoints."""
+        """The legacy path deploy cannot reload even an approved production."""
         monkeypatch.chdir(tmp_path)
 
         model_dir = tmp_path / "data" / "models" / "cam_01" / "default"
@@ -1282,12 +1618,14 @@ class TestUserManagementRoutes:
         (baseline_dir / "img.png").write_bytes(b"img")
 
         registry = ModelRegistry(session_factory=db.get_session)
-        version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
-        # P1 fix: stage gate now blocks CANDIDATE activation. Promote so the
-        # deploy path under test can hot-reload the runtime model.
-        registry.promote(version_id, "shadow", triggered_by="test")
-        registry.promote(version_id, "canary", triggered_by="test", canary_camera_id="cam_01")
-        registry.promote(version_id, "production", triggered_by="test")
+        version_id = registry.register(export_dir, baseline_dir, "cam_01", "patchcore")
+        _release_model_fixture(
+            db,
+            registry,
+            version_id,
+            export_dir,
+            release_evidence_factory,
+        )
 
         camera_manager = MagicMock()
         camera_manager._pipelines = {"cam_01": MagicMock()}
@@ -1303,26 +1641,36 @@ class TestUserManagementRoutes:
 
         response = client.post(
             "/api/baseline/deploy",
-            json={"camera_id": "cam_01", "model_path": str(ckpt_path)},
+            json={"camera_id": "cam_01", "model_path": str(export_dir)},
         )
 
-        assert response.status_code == 200
-        assert response.json()["code"] == 0
-        assert response.json()["data"]["model_version_id"] == version_id
-        camera_manager.reload_model.assert_called_once_with(
-            "cam_01",
-            str(exported_model),
-            version_tag=version_id,
-        )
+        assert response.status_code == 409
+        assert "路径部署入口已关闭" in response.json()["msg"]
+        unchanged = registry.get_by_version_id(version_id)
+        assert unchanged.stage == "production"
+        assert unchanged.is_active is True
+        camera_manager.reload_model.assert_not_called()
 
-    def test_promote_production_syncs_runtime(self, db, health, alerts_dir, tmp_path):
-        """Promoting a canary model to production should sync the runtime model."""
+    def test_v2_baseline_keeps_production_promotion_no_go(
+        self,
+        db,
+        health,
+        alerts_dir,
+        tmp_path,
+        release_baseline_factory,
+        release_evidence_sources_factory,
+        running_release_client,
+        await_release_operation,
+    ):
+        """Offline v2 baseline decoder evidence cannot authorize production."""
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("model")
+        (model_dir / "model.bin").write_bytes(b"weights")
         baseline_dir = tmp_path / "baseline"
         baseline_dir.mkdir()
         (baseline_dir / "img.png").write_bytes(b"img")
+        baseline_dir = release_baseline_factory(root=baseline_dir)
 
         registry = ModelRegistry(session_factory=db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
@@ -1346,30 +1694,38 @@ class TestUserManagementRoutes:
         camera_manager = MagicMock()
         camera_manager.reload_model.return_value = True
 
+        config = ArgusConfig()
+        config.dashboard.go2rtc_enabled = False
         app = create_app(
             database=db,
             camera_manager=camera_manager,
             health_monitor=health,
             alerts_dir=str(alerts_dir),
+            config=config,
         )
-        client = TestClient(app)
+        client = running_release_client(app)
+        registered = registry.get_by_version_id(version_id)
+        release_evidence_sources = release_evidence_sources_factory(
+            root=tmp_path / "release-sources",
+            model_path=model_dir,
+            model_version_id=version_id,
+            registry_model_hash=registered.model_hash,
+            baseline_path=baseline_dir,
+        )
 
         response = client.post(
             f"/api/models/{version_id}/promote",
-            json={"target_stage": "production", "triggered_by": "operator"},
+            json={
+                "target_stage": "production",
+                "triggered_by": "operator",
+                "release_evidence_sources": release_evidence_sources,
+            },
         )
 
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["code"] == 0
-        data = payload["data"]
-        assert data["model"]["stage"] == "production"
-        assert data["runtime_synced"] is True
-        camera_manager.reload_model.assert_called_once_with(
-            "cam_01",
-            str(model_dir / "model.xml"),
-            version_tag=version_id,
-        )
+        failed = await_release_operation(client, response, status="failed")
+        assert "decoder evidence is insufficient" in failed["operation"]["error"]
+        assert registry.get_by_version_id(version_id).stage == "canary"
+        camera_manager.reload_model.assert_not_called()
 
 
 class TestTrainingRegistration:
@@ -1432,7 +1788,26 @@ class TestTrainingRegistration:
 
 
 class TestCameraManagerModelRouting:
-    def test_prefers_active_registry_model_on_startup(self, tmp_path):
+    def test_scene_guard_status_delegates_to_pipeline(self):
+        manager = CameraManager(cameras=[], alert_config=AlertConfig())
+        pipeline = MagicMock()
+        pipeline.get_scene_guard_status.return_value = {
+            "enabled": True,
+            "state": "stable",
+        }
+        manager._pipelines["cam_01"] = pipeline
+
+        assert manager.get_scene_guard_status("cam_01") == {
+            "enabled": True,
+            "state": "stable",
+        }
+        assert manager.get_scene_guard_status("missing") is None
+
+    def test_prefers_active_registry_model_on_startup(
+        self,
+        tmp_path,
+        release_evidence_factory,
+    ):
         """CameraManager should restore the active registry model for restarted cameras."""
         db = Database(database_url=f"sqlite:///{tmp_path / 'camera.db'}")
         db.initialize()
@@ -1440,13 +1815,20 @@ class TestCameraManagerModelRouting:
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("model")
+        (model_dir / "model.bin").write_bytes(b"weights")
         baseline_dir = tmp_path / "baseline"
         baseline_dir.mkdir()
         (baseline_dir / "img.png").write_bytes(b"img")
 
         registry = ModelRegistry(session_factory=db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
-        registry.activate(version_id, allow_bypass=True)
+        _release_model_fixture(
+            db,
+            registry,
+            version_id,
+            model_dir,
+            release_evidence_factory,
+        )
 
         cam_config = CameraConfig(
             camera_id="cam_01",
@@ -1466,8 +1848,8 @@ class TestCameraManagerModelRouting:
         assert manager._model_version_id(cam_config, resolved) == version_id
         db.close()
 
-    def test_reload_model_updates_pipeline_version_id(self):
-        """Hot reload should update both runner snapshot tag and pipeline record tag."""
+    def test_reload_model_entrypoint_is_fail_closed(self):
+        """Path-based reload must not bypass ModelReleaseService."""
         manager = CameraManager(cameras=[], alert_config=AlertConfig())
         pipeline = MagicMock()
         pipeline.reload_anomaly_model.return_value = True
@@ -1478,9 +1860,10 @@ class TestCameraManagerModelRouting:
 
         ok = manager.reload_model("cam_01", "data/models/cam_01/model.xml", version_tag="v2")
 
-        assert ok is True
-        runner.set_version_tag.assert_called_once_with("v2")
-        pipeline.set_model_version_id.assert_called_once_with("v2")
+        assert ok is False
+        runner.set_version_tag.assert_not_called()
+        pipeline.reload_anomaly_model.assert_not_called()
+        pipeline.set_model_version_id.assert_not_called()
 
     def test_detector_status_includes_input_quality(self):
         manager = CameraManager(cameras=[], alert_config=AlertConfig())
@@ -1507,8 +1890,8 @@ class TestCameraManagerModelRouting:
         assert status["low_light"] is True
         assert status["ssim_calibration_blocked"] is True
 
-    def test_reload_model_failure_broadcasts_activation_failed(self):
-        """Reload failure should emit a models-topic event; detector keeps old engine."""
+    def test_blocked_reload_broadcasts_release_service_requirement(self):
+        """Blocked legacy reload should be visible without touching the detector."""
         events: list[tuple[str, dict]] = []
         manager = CameraManager(
             cameras=[],
@@ -1529,8 +1912,9 @@ class TestCameraManagerModelRouting:
         assert data["event"] == "model.activation_failed"
         assert data["camera_id"] == "cam_01"
         assert data["attempted_version"] == "v2"
-        assert data["current_version"] == "v1-old"
-        assert data["reason"] == "hot_reload_failed"
+        assert data["current_version"] is None
+        assert data["reason"] == "release_service_required"
+        pipeline.reload_anomaly_model.assert_not_called()
 
 
 class TestSchedulerWiring:
@@ -1548,7 +1932,9 @@ class TestSchedulerWiring:
         executor_cls = MagicMock(return_value=MagicMock())
         register_task = MagicMock()
 
-        monkeypatch.setattr("argus.anomaly.backbone_trainer.BackboneTrainer", backbone_trainer_cls)
+        monkeypatch.setitem(sys.modules, "argus.anomaly.backbone_trainer", SimpleNamespace(
+            BackboneTrainer=backbone_trainer_cls,
+        ))
         monkeypatch.setattr("argus.storage.model_registry.ModelRegistry", registry_cls)
         monkeypatch.setattr("argus.anomaly.job_executor.TrainingJobExecutor", executor_cls)
         monkeypatch.setattr(
@@ -1759,15 +2145,12 @@ class TestModuleToggleRoutes:
         ]
         config.classifier.enabled = False
 
-        pipe_a = MagicMock()
-        pipe_a.reload_module.return_value = True
-        pipe_b = MagicMock()
-        pipe_b.reload_module.return_value = False
         camera_manager = MagicMock()
-        camera_manager.get_pipeline.side_effect = {
-            "cam_a": pipe_a,
-            "cam_b": pipe_b,
-        }.get
+        camera_manager.reload_module_for_cameras.return_value = {
+            "seen": 2,
+            "succeeded": 1,
+            "failed": 1,
+        }
 
         app = create_app(
             database=db,
@@ -1793,8 +2176,11 @@ class TestModuleToggleRoutes:
         assert data["restart_required"] is True
         assert data["persisted"] is False
         assert config.classifier.enabled is True
-        pipe_a.reload_module.assert_called_once_with("classifier.enabled", True)
-        pipe_b.reload_module.assert_called_once_with("classifier.enabled", True)
+        camera_manager.reload_module_for_cameras.assert_called_once_with(
+            ["cam_a", "cam_b"],
+            "classifier.enabled",
+            True,
+        )
 
     def test_toggle_without_config_returns_unavailable(self, db, health, alerts_dir):
         app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
@@ -1895,6 +2281,10 @@ class TestClassifierConfigRoutes:
             "total_pipelines": 0,
             "pipelines_attached": 0,
             "pipelines_loaded": 0,
+            "pipelines_ready": 0,
+            "pipelines_degraded": 0,
+            "pipelines_failed": 0,
+            "details": [],
         }
 
     def test_put_vocabulary_rejects_empty_list(self, classifier_client):
@@ -1997,6 +2387,10 @@ class TestSegmenterConfigRoutes:
             "total_pipelines": 0,
             "pipelines_attached": 0,
             "pipelines_loaded": 0,
+            "pipelines_ready": 0,
+            "pipelines_degraded": 0,
+            "pipelines_failed": 0,
+            "details": [],
         }
 
     def test_modules_endpoint_exposes_segmenter_enabled(self, segmenter_client):
@@ -2014,13 +2408,11 @@ class TestSegmenterConfigRoutes:
         client, cfg, cm = segmenter_client
         cfg.segmenter.enabled = True
 
-        cam_status = SimpleNamespace(camera_id="cam_a")
-        fake_segmenter = MagicMock()
-        fake_segmenter._loaded = True
-        fake_pipeline = SimpleNamespace(_segmenter=fake_segmenter)
-
-        cm.get_status.return_value = [cam_status]
-        cm.get_pipeline.return_value = fake_pipeline
+        cm.get_runtime_component_summary.return_value = {
+            "total_pipelines": 1,
+            "segmenter_attached": 1,
+            "segmenter_loaded": 1,
+        }
 
         res = client.get("/api/config/segmenter")
         data = res.json()["data"]
@@ -2096,10 +2488,10 @@ class TestCrossCameraConfigRoutes:
         """When a correlator is actually attached to the manager, runtime reports it."""
         client, cfg, cm = cross_camera_client
         cfg.cross_camera.enabled = True
-        cm._correlator = MagicMock()
-        cam_status = SimpleNamespace(camera_id="cam_a")
-        cm.get_status.return_value = [cam_status]
-        cm.get_pipeline.return_value = SimpleNamespace()
+        cm.get_runtime_component_summary.return_value = {
+            "total_pipelines": 1,
+            "correlator_present": True,
+        }
         res = client.get("/api/config/cross-camera")
         data = res.json()["data"]
         assert data["enabled"] is True

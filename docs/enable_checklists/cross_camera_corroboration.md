@@ -39,7 +39,7 @@
 ## 3. 配置项
 
 源定义：`src/argus/config/schema.py` 中的 `CrossCameraConfig` 与 `CameraOverlapConfig`。
-默认值：`configs/default.yaml` 第 246–251 行。
+默认值：`configs/default.yaml` 的 `cross_camera:` 段。
 
 ```yaml
 cross_camera:
@@ -54,13 +54,13 @@ cross_camera:
 
 | 字段 | 类型 / 范围 | 默认 | 说明 / 调优建议 |
 |---|---|---|---|
-| `enabled` | bool | `false` | 总开关。改动需重启进程（`config.py` 的 `_restart_required_keys` 包含 `cross_camera.enabled`）。|
+| `enabled` | bool | `false` | 总开关。改动需重启进程（`dashboard/routes/config.py` 的 `_restart_required_keys` 包含 `cross_camera.enabled`）。|
 | `overlap_pairs` | list of `{camera_a, camera_b, homography}` | `[]` | 每对摄像头一个条目。`homography` 是 3×3 浮点矩阵，把 `camera_a` 像素点投影到 `camera_b` 像素坐标。模块构造时同时算出反向矩阵 `H_inv`，所以无需手动提供 B→A 那一份。|
 | `corroboration_threshold` | float | `0.3` | 取值 0.1–0.9。partner 热力图在投影点 ±25px 区域内的 max 分数 ≥ 该值即视为佐证。**调高** → 更严格，更多告警被降级；**调低** → 更宽松，假阳性回升。建议从默认 0.3 起步，结合误报回放调整。|
 | `max_age_seconds` | float | `5.0` | 取值 1.0–30.0。partner 热力图比当前告警时间戳老超过该值就忽略。摄像头同步差时建议放大；流式延迟低时可压到 2–3s 减少滞后告警。|
 | `uncorroborated_severity_downgrade` | int 0–2 | `1` | 未佐证时把告警降几级（HIGH → MEDIUM → LOW → INFO）。设 `0` 关闭降级（仅打标，不改行为）；设 `2` 大幅压制；与 zone 内 `require_corroboration` 配合使用时，强制 zone 走"丢弃"，本字段对该 zone 不生效。|
 
-补充：单个 zone 可以在 `cameras[].zones[]` 配 `require_corroboration: true`（`ZoneConfig.require_corroboration`），未佐证时该 zone 的告警**直接丢弃**，不走降级。该开关源自 schema.py 第 47–51 行。
+补充：单个 zone 可以在 `cameras[].zones[]` 配 `require_corroboration: true`（`ZoneConfig.require_corroboration`），未佐证时该 zone 的告警**直接丢弃**，不走降级。
 
 ---
 
@@ -107,14 +107,14 @@ cross_camera:
 
 ### 5.1 数据库字段（`alerts` 表）
 
-源：`src/argus/storage/models.py` 第 115–120 行 + `src/argus/storage/database.py` 自动迁移条目第 116–118 行：
+源：`src/argus/storage/models.py` + `src/argus/storage/database.py` 的 `_AUTO_MIGRATIONS`：
 
 ```python
 ("alerts", "corroborated", "BOOLEAN"),
 ("alerts", "correlation_partner", "VARCHAR(50)"),
 ```
 
-写入时机（`src/argus/capture/manager.py:775-820`）：
+写入时机（`CameraManager._alert_handler`）：
 
 - `corroborated = None`：模块未开 / 该相机不在任何 pair 中 → 字段保持 NULL。
 - `corroborated = True`：partner 在投影点附近找到 ≥ threshold 的高分。
@@ -134,12 +134,12 @@ cross_camera:
 
 ## 6. UI 入口
 
-- 设置面板：路由 `/system`（`web/src/views/System.vue`），标签页 **"跨相机"**，组件 `CrossCameraPanel.vue`。可视化展示当前 `enabled` / threshold / max_age / pairs，并支持表内增删 pair、保存后热推送。
+- 设置面板：路由 `/system/cross-camera`（`web/src/views/System.vue`），标签页 **"跨相机"**，组件 `CrossCameraPanel.vue`。可视化展示当前 `enabled` / threshold / max_age / pairs，并支持表内增删 pair、保存后热推送。
 - API：
   - `GET /api/config/cross-camera`：读取当前配置 + 运行时计数（`total_pipelines`、`correlator_present`）。
   - `PUT /api/config/cross-camera/pairs`：更新 pairs 与三个 scalar，由 `update_cross_camera_config` 处理。
 - 告警侧：
-  - `GET /api/alerts/...` 返回字段已包含 `corroborated` / `correlation_partner`（`src/argus/dashboard/routes/alerts.py:114-115`）。
+  - `GET /api/alerts/...` 返回字段已包含 `corroborated` / `correlation_partner`。
   - 告警详情面板 `web/src/components/alerts/AlertDetailPanel.vue` 读取 `correlation_partner`，存在则会渲染"多机位回放"入口（同时受 `event_group_count` 影响）。
   - 列表页本身没有专门列展示 corroborated，但筛选/排序可以基于这个字段扩展（当前未实现）。
 
@@ -151,7 +151,7 @@ cross_camera:
 
 - **算法复杂度**：`CrossCameraCorrelator.check()` 对每条告警遍历 `self._pairs[camera_id]`（即该相机的所有 partner），每个 partner 只做一次 `cv2.perspectiveTransform`（单点）+ 一次 `partner_map[y1:y2, x1:x2].max()`（51×51 区域）。复杂度 O(P) 每告警，P=该相机的 partner 数。**不是 O(N²)**，没有空间索引（也不需要），实际上线上 P ≤ 4 即可覆盖典型场景。
 - **热力图缓存**：`_recent_maps` 每个相机保留 **最新 1 张**（`(timestamp, anomaly_map)`），不是滑窗。内存占用 ≈ `相机数 × 单张 anomaly_map 字节数`。256×256 fp32 ≈ 256KB，1024×1024 ≈ 4MB，N=20 路相机最多 80MB。`prune_stale(max_age=30)` 可手动清理，模块自身不定时跑。
-- **更新路径**：`CameraManager._loop` 每帧都会调 `correlator.update(camera_id, anomaly_map, time.time())`（`manager.py:963-969`），更新走 `_maps_lock` 单线程互斥，开销 ≈ 一次字典写入，纳秒级。
+- **更新路径**：`CameraManager._loop` 每帧都会调 `correlator.update(camera_id, anomaly_map, time.time())`，更新走 `_maps_lock` 单线程互斥，开销 ≈ 一次字典写入，纳秒级。
 - **主链路延迟**：关联只发生在 **告警触发瞬间**（每相机典型每分钟 ≤ 几次），不在帧链路中。单次 `check` 在 1024×1024 热力图上预计 < 1ms（TBD：用 `time.perf_counter()` 包裹 `correlator.check` 实测）。
 - **对比开销 / 收益**：当假阳性占告警总量 > 30% 时通常正收益，否则收益微弱。请先量化误报率，再决定是否启用。
 

@@ -1,9 +1,11 @@
 """Tests for open vocabulary classifier (D1)."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
+from argus.anomaly.auxiliary_runtime import AuxiliaryUnavailableError
 from argus.anomaly.classifier import OpenVocabClassifier, FOE_VOCAB
 from argus.config.schema import AlertSeverity
 
@@ -22,13 +24,13 @@ class TestOpenVocabClassifier:
         clf = OpenVocabClassifier(vocabulary=custom)
         assert clf._vocabulary == custom
 
-    def test_classify_returns_none_when_not_loaded(self):
-        """Without model, classify returns None (graceful degradation)."""
+    def test_classify_raises_when_model_is_unavailable(self):
+        """Unavailability is not a successful frame with no objects."""
         clf = OpenVocabClassifier(model_name="nonexistent.pt")
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
-        result = clf.classify(frame)
-        # Should not crash, returns None since model can't load
-        assert result is None
+        with patch.object(clf, "load", return_value=False):
+            with pytest.raises(AuxiliaryUnavailableError):
+                clf.classify(frame)
 
     def test_classify_empty_crop_returns_none(self):
         """Empty crop should return None."""
@@ -111,8 +113,8 @@ class TestOpenVocabClassifier:
         result = clf.classify(frame)
         assert result is None
 
-    def test_classify_model_exception_returns_none(self):
-        """If model throws an exception, classify returns None gracefully."""
+    def test_classify_model_exception_is_visible(self):
+        """The pipeline must be able to record a failed classification."""
         clf = OpenVocabClassifier()
         clf._loaded = True
 
@@ -121,8 +123,9 @@ class TestOpenVocabClassifier:
         clf._model = mock_model
 
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
-        result = clf.classify(frame)
-        assert result is None
+        with pytest.raises(RuntimeError, match="CUDA out of memory"):
+            clf.classify(frame)
+        clf.shutdown()
 
 
 class TestHighRiskEscalation:

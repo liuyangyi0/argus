@@ -1,13 +1,16 @@
 """Tests for the dashboard authentication system."""
 
 
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 from fastapi.testclient import TestClient
 
 from argus.config.schema import ArgusConfig, AuthConfig
-from argus.dashboard.app import create_app
+from argus.dashboard.app import _resolve_session_secret, create_app
 from argus.dashboard.auth import (
     PERMISSION_MAP,
+    _safe_next_url,
     create_session_token,
     current_username,
     has_permission,
@@ -245,6 +248,22 @@ def _build_auth_enabled_client(database: Database) -> tuple[TestClient, str]:
     return client, app.state.session_secret
 
 
+def test_session_secret_is_restart_stable_and_purpose_separated(monkeypatch):
+    config = AuthConfig(enabled=True, api_token="stable-api-token")
+
+    first = _resolve_session_secret(config)
+    second = _resolve_session_secret(config)
+
+    assert first == second
+    assert first != config.api_token
+    assert len(first) == 64
+
+    monkeypatch.setenv("ARGUS_SESSION_SECRET", "independent-session-material")
+    overridden = _resolve_session_secret(config)
+    assert overridden != first
+    assert overridden != "independent-session-material"
+
+
 class TestMeEndpoint:
     """GET /api/me — current-session identity probe used by the SPA."""
 
@@ -254,10 +273,25 @@ class TestMeEndpoint:
         # Force the API branch (not the HTML redirect branch) of the middleware.
         resp = client.get("/api/me", headers={"accept": "application/json"})
         assert resp.status_code == 401
-        assert resp.json() == {"error": "Authentication required"}
+        body = resp.json()
+        assert body["code"] == 40100
+        assert body["msg"] == "Authentication required"
+        assert body["data"]["request_id"] == resp.headers["x-request-id"]
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert resp.headers["cache-control"] == "no-store"
+
+    def test_api_request_never_redirects_to_html_login(self, _me_db):
+        client, _ = _build_auth_enabled_client(_me_db)
+
+        resp = client.get("/api/me", headers={"accept": "text/html"})
+
+        assert resp.status_code == 401
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.json()["code"] == 40100
 
     def test_authenticated_returns_username_and_role(self, _me_db):
-        """Valid session cookie → 200 with flat {username, role} body."""
+        """Valid session cookie → 200 with enveloped user identity."""
         _me_db.create_user(
             "alice", hash_password("pw-alice"), "operator", "Alice Operator",
         )
@@ -267,7 +301,7 @@ class TestMeEndpoint:
 
         resp = client.get("/api/me")
         assert resp.status_code == 200
-        body = resp.json()
+        body = resp.json()["data"]
         assert body["username"] == "alice"
         assert body["role"] == "operator"
         assert body["display_name"] == "Alice Operator"
@@ -277,7 +311,7 @@ class TestMeEndpoint:
         assert "api_token" not in body
 
     def test_authenticated_without_display_name_omits_field(self, _me_db):
-        """Users with no display_name get a body without the optional key."""
+        """Users with no display_name omit it inside the response envelope."""
         _me_db.create_user("bob", hash_password("pw-bob"), "viewer", None)
         client, secret = _build_auth_enabled_client(_me_db)
         token = create_session_token("bob", "viewer", secret)
@@ -285,5 +319,145 @@ class TestMeEndpoint:
 
         resp = client.get("/api/me")
         assert resp.status_code == 200
-        body = resp.json()
+        body = resp.json()["data"]
         assert body == {"username": "bob", "role": "viewer"}
+
+    def test_session_uses_current_database_role_and_fails_closed_when_disabled(
+        self,
+        _me_db,
+    ):
+        _me_db.create_user("carol", hash_password("pw-carol"), "admin", None)
+        client, secret = _build_auth_enabled_client(_me_db)
+        client.cookies.set(
+            "argus_session",
+            create_session_token("carol", "admin", secret),
+        )
+
+        _me_db.update_user("carol", role="viewer")
+        current = client.get("/api/me")
+        assert current.status_code == 200
+        assert current.json()["data"]["role"] == "viewer"
+
+        _me_db.update_user("carol", active=False)
+        disabled = client.get("/api/me")
+        assert disabled.status_code == 401
+        assert disabled.json()["code"] == 40100
+
+
+class TestLoginPage:
+    def test_rate_limit_response_keeps_security_headers(self, _me_db):
+        client, _ = _build_auth_enabled_client(_me_db)
+
+        response = None
+        for _ in range(61):
+            response = client.post(
+                "/login",
+                data={"username": "", "password": ""},
+                follow_redirects=False,
+            )
+
+        assert response is not None
+        assert response.status_code == 429
+        assert response.json()["code"] == 42900
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_login_page_is_self_contained_and_escapes_query_values(self, _me_db):
+        client, _ = _build_auth_enabled_client(_me_db)
+
+        resp = client.get(
+            "/login",
+            params={
+                "error": '<script>alert("xss")</script>',
+                "next": '/cameras?filter="online"',
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "/static/css/argus.css" not in resp.text
+        assert "<script>alert" not in resp.text
+        assert "&lt;script&gt;alert" in resp.text
+        assert 'value="/cameras?filter=&quot;online&quot;"' in resp.text
+        assert 'name="username"' in resp.text
+        assert 'name="password"' in resp.text
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("/overview", "/overview"),
+            ("https://example.invalid", "/"),
+            ("//example.invalid", "/"),
+            ("/\\example.invalid", "/"),
+            ("/overview\r\nX-Test: injected", "/"),
+        ],
+    )
+    def test_login_next_url_remains_same_origin(self, value, expected):
+        assert _safe_next_url(value) == expected
+
+    def test_auth_redirect_and_login_preserve_the_full_same_origin_url(self, _me_db):
+        _me_db.create_user(
+            "alice",
+            hash_password("pw-alice"),
+            "operator",
+            "Alice Operator",
+        )
+        client, _ = _build_auth_enabled_client(_me_db)
+
+        protected = client.get(
+            "/alerts?camera=cam-01&status=new",
+            headers={"accept": "text/html"},
+            follow_redirects=False,
+        )
+
+        assert protected.status_code == 302
+        assert protected.headers["x-content-type-options"] == "nosniff"
+        assert protected.headers["x-frame-options"] == "DENY"
+        assert protected.headers["cache-control"] == "no-store"
+        login_query = parse_qs(urlsplit(protected.headers["location"]).query)
+        assert login_query == {"next": ["/alerts?camera=cam-01&status=new"]}
+
+        logged_in = client.post(
+            "/login",
+            data={
+                "username": "alice",
+                "password": "pw-alice",
+                "next": login_query["next"][0],
+            },
+            follow_redirects=False,
+        )
+
+        assert logged_in.status_code == 302
+        assert logged_in.headers["location"] == "/alerts?camera=cam-01&status=new"
+        login_cookie = logged_in.headers["set-cookie"]
+        assert "argus_session=" in login_cookie
+        assert "HttpOnly" in login_cookie
+        assert "SameSite=lax" in login_cookie
+        assert "Path=/" in login_cookie
+        assert "Max-Age=28800" in login_cookie
+
+    def test_logout_requires_post_and_deletes_the_session_cookie(self, _me_db):
+        client, secret = _build_auth_enabled_client(_me_db)
+        client.cookies.set(
+            "argus_session",
+            create_session_token("alice", "operator", secret),
+        )
+
+        get_response = client.get("/logout", follow_redirects=False)
+        assert get_response.status_code == 405
+        assert get_response.headers["allow"] == "POST"
+        assert get_response.json() == {
+            "code": 40500,
+            "msg": "Method Not Allowed",
+            "data": None,
+        }
+        response = client.post("/logout", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert response.headers["location"] == "/login"
+        cookie = response.headers["set-cookie"]
+        assert "argus_session=" in cookie
+        assert "Max-Age=0" in cookie
+        assert "Path=/" in cookie
+        assert "HttpOnly" in cookie
+        assert "SameSite=lax" in cookie

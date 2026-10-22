@@ -64,6 +64,7 @@ def main():
         camera_config=cam_config,
         alert_config=config.alerts,
         on_alert=on_alert,
+        baselines_dir=config.storage.baselines_dir,
     )
 
     if not pipeline.initialize():

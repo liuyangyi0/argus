@@ -59,8 +59,10 @@ def test_resolve_dataset_dirs_empty_version(tmp_path):
         bm.resolve_dataset_dirs(sel)
 
 
-def test_resolve_dataset_dirs_rejects_none():
-    bm = BaselineManager(baselines_dir="/nonexistent")
+def test_resolve_dataset_dirs_rejects_none(tmp_path):
+    # BaselineManager creates its root eagerly. Keep this validation test
+    # portable for non-root Linux users instead of writing below filesystem /.
+    bm = BaselineManager(baselines_dir=tmp_path / "nonexistent")
     with pytest.raises(ValueError, match="required"):
         bm.resolve_dataset_dirs(None)
 
@@ -131,6 +133,35 @@ def test_dataset_merger_cleans_up_on_exception(tmp_path, monkeypatch):
             raise RuntimeError("boom")
 
     assert captured_root and not captured_root[0].exists()
+
+
+def test_dataset_merger_rejects_manifest_backed_input_before_temp_creation(
+    tmp_path,
+    monkeypatch,
+):
+    legacy = _populate_version(tmp_path, "cam01", "default", "v001", 1)
+    scene_root = tmp_path / "scene-profile"
+    scene_images = scene_root / "images"
+    scene_images.mkdir(parents=True)
+    (scene_images / "sample_000000.png").write_bytes(b"scene-normal")
+    # Presence is authoritative even if malformed: merger must not flatten it
+    # and silently recover through the legacy random splitter.
+    (scene_root / "manifest.json").write_text("{}", encoding="utf-8")
+
+    def fail_if_temp_created(*_args, **_kwargs):
+        raise AssertionError("manifest preflight must run before mkdtemp")
+
+    monkeypatch.setattr(
+        "argus.anomaly.trainer.tempfile.mkdtemp",
+        fail_if_temp_created,
+    )
+
+    with pytest.raises(ValueError, match="whole-session split"):
+        with _DatasetMerger([
+            ("legacy", legacy),
+            ("scene", scene_images),
+        ]):
+            pytest.fail("manifest-backed merger must not enter its context")
 
 
 def test_build_merger_items_pairs_labels_and_dirs(tmp_path):

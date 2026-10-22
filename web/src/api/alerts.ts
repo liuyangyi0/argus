@@ -1,7 +1,33 @@
-import type { ApiResponse, AlertsPayload, FeedbackStats } from '../types/api'
+import type {
+  AlertQueryParams,
+  AlertSummary,
+  ApiResponse,
+  AlertsPayload,
+  FeedbackStats,
+  ModelInfo,
+  ModelRegistryResponse,
+} from '../types/api'
+import type { AlertBulkMutationResponse } from '../types/generated-openapi'
 import { api, unwrap, u } from './client'
 
-export const getAlerts = (params?: Record<string, any>) =>
+export interface AlertWorkflowUpdate {
+  status: string
+  notes?: string
+  category?: string
+  assigned_to?: string
+  confirmed?: boolean
+  from_detail_view?: boolean
+}
+
+export interface AlertAnnotation {
+  x: number
+  y: number
+  width: number
+  height: number
+  label: string
+}
+
+export const getAlerts = (params?: AlertQueryParams) =>
   api.get<ApiResponse<AlertsPayload>>('/alerts/json', { params }).then(unwrap)
 export const getAlert = (id: string) => api.get(`/alerts/${id}/detail`).then(u)
 export const acknowledgeAlert = (id: string) => api.post(`/alerts/${id}/acknowledge`).then(u)
@@ -15,19 +41,29 @@ export const getFeedbackStats = (camera_id?: string) =>
       params: camera_id ? { camera_id } : undefined,
     })
     .then(unwrap)
-export const updateAlertWorkflow = (id: string, data: Record<string, any>) =>
+export const updateAlertWorkflow = (id: string, data: AlertWorkflowUpdate) =>
   api.post(`/alerts/${id}/workflow`, data).then(u)
 export const bulkAcknowledge = (ids: string[]) =>
-  api.post('/alerts/bulk-acknowledge', { alert_ids: ids }).then(u)
+  api
+    .post<ApiResponse<AlertBulkMutationResponse>>('/alerts/bulk-acknowledge', { alert_ids: ids })
+    .then(unwrap)
 export const bulkFalsePositive = (ids: string[]) =>
-  api.post('/alerts/bulk-false-positive', { alert_ids: ids }).then(u)
+  api
+    .post<ApiResponse<AlertBulkMutationResponse>>('/alerts/bulk-false-positive', {
+      alert_ids: ids,
+    })
+    .then(unwrap)
 export const deleteAlert = (id: string) => api.delete(`/alerts/${id}`).then(u)
 export const bulkDeleteAlerts = (ids: string[]) =>
-  api.post('/alerts/bulk-delete', { alert_ids: ids }).then(u)
-export const saveAnnotations = (alertId: string, annotations: any[]) =>
+  api
+    .post<ApiResponse<AlertBulkMutationResponse>>('/alerts/bulk-delete', { alert_ids: ids })
+    .then(unwrap)
+export const saveAnnotations = (alertId: string, annotations: AlertAnnotation[]) =>
   api.post(`/alerts/${alertId}/annotations`, { annotations }).then(u)
 export const getAlertGroup = (eventGroupId: string) =>
-  api.get(`/alerts/group/${eventGroupId}`).then(u)
+  api
+    .get<ApiResponse<{ alerts: AlertSummary[] }>>(`/alerts/group/${eventGroupId}`)
+    .then(unwrap)
 
 export async function downloadEvidencePackage(alertId: string): Promise<void> {
   const res = await api.get(`/alerts/${alertId}/evidence.zip`, {
@@ -62,9 +98,12 @@ export async function downloadEvidencePackage(alertId: string): Promise<void> {
 export const getModelVersionInfo = async (modelVersionId: string) => {
   if (!modelVersionId) return null
   try {
-    const res: any = await api.get('/models/json').then(u)
-    const models = res?.models || []
-    return models.find((m: any) => m.model_version_id === modelVersionId) || null
+    const res = await api
+      .get<ApiResponse<ModelRegistryResponse>>('/models/json')
+      .then(unwrap)
+    return res.models.find((model: ModelInfo) => (
+      model.model_version_id === modelVersionId
+    )) || null
   } catch {
     return null
   }

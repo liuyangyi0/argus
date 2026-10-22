@@ -133,7 +133,7 @@ function resetFilters() {
 </script>
 
 <template>
-  <main style="display: flex; flex-direction: column; gap: 16px">
+  <section aria-label="区域管理" style="display: flex; flex-direction: column; gap: 16px">
     <Card :bordered="false">
       <Space wrap>
         <Input v-model:value="filters.name" placeholder="按名称筛选" allow-clear style="width: 180px" />
@@ -189,7 +189,7 @@ function resetFilters() {
     >
       <Form layout="vertical">
         <Form.Item label="名称" required>
-          <Input v-model:value="regionForm.name" placeholder="例如：核反应堆主厂房" />
+          <Input v-model:value="regionForm.name" placeholder="例如：设备巡检区" />
         </Form.Item>
         <Form.Item label="负责人" required>
           <Input v-model:value="regionForm.owner" placeholder="姓名" />
@@ -199,5 +199,5 @@ function resetFilters() {
         </Form.Item>
       </Form>
     </Modal>
-  </main>
+  </section>
 </template>

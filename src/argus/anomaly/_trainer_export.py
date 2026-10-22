@@ -21,6 +21,8 @@ import cv2
 import numpy as np
 import structlog
 
+from argus.anomaly.artifacts import exported_artifact
+
 logger = structlog.get_logger()
 
 
@@ -270,7 +272,7 @@ def export_model(
         }
         export_kwargs["input_size"] = (image_size, image_size)
     try:
-        engine.export(
+        returned_path = engine.export(
             model=model,
             export_type=export_format,
             export_root=export_path,
@@ -285,7 +287,7 @@ def export_model(
                 msg="Falling back to torch export",
             )
             actual_format = "torch"
-            engine.export(
+            returned_path = engine.export(
                 model=model,
                 export_type="torch",
                 export_root=export_path,
@@ -311,11 +313,12 @@ def export_model(
                 requested="int8",
                 actual="fp32",
             )
-    elif quantization == "int8" and actual_format != "openvino":
-        # INT8 only supported with OpenVINO; record actual state
+    elif actual_format != "openvino":
+        # No quantization transform was applied to Torch/ONNX exports.
         actual_quantization = "fp32"
 
     return {
         "actual_format": actual_format,
         "actual_quantization": actual_quantization,
+        "artifact_path": str(exported_artifact(Path(export_path), actual_format, returned_path)),
     }

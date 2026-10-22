@@ -18,17 +18,31 @@ export interface PlayerInstance {
   destroy(): void
 }
 
+function isStreamInfo(value: unknown): value is StreamInfo {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return (
+    typeof record.camera_id === 'string'
+    && typeof record.go2rtc === 'boolean'
+    && typeof record.fallback === 'string'
+    && (record.webrtc_ws === undefined || typeof record.webrtc_ws === 'string')
+    && (record.mse_ws === undefined || typeof record.mse_ws === 'string')
+  )
+}
+
 export class WebRTCPlayer implements PlayerInstance {
   status: 'idle' | 'connecting' | 'playing' | 'error' | 'fallback' = 'connecting'
   onStatusChange: (status: 'idle' | 'connecting' | 'playing' | 'error' | 'fallback') => void = () => {}
   onReconnectRequest: () => void = () => {}
-  
+
   private pc: RTCPeerConnection | null = null
   private ws: WebSocket | null = null
   private settled = false
   private cameraId: string
   private wsUrl: string
   private videoEl: HTMLVideoElement
+  private ownedStream: MediaStream | null = null
+  private cancelConnection: (() => void) | null = null
 
   constructor(cameraId: string, wsUrl: string, videoEl: HTMLVideoElement) {
     this.cameraId = cameraId
@@ -51,52 +65,94 @@ export class WebRTCPlayer implements PlayerInstance {
         this.cleanup()
         settle(false)
       }, STREAM_CONNECT_TIMEOUT_MS)
+      this.cancelConnection = () => {
+        this.cleanup()
+        settle(false)
+      }
+      const failConnection = () => {
+        const wasPlaying = this.settled && this.status === 'playing'
+        this.cleanup()
+        if (!this.settled) settle(false)
+        else if (wasPlaying) {
+          // The initial connect promise is already resolved. Clearing media
+          // alone would leave the owner reporting "playing" indefinitely.
+          this.setStatus('error')
+          this.onReconnectRequest()
+        }
+      }
 
       try {
         this.ws = new WebSocket(this.wsUrl)
+        const ws = this.ws
         this.ws.onopen = () => {
-          this.pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
-          this.pc.ontrack = (event) => {
-            if (this.videoEl && event.streams[0]) {
-              this.videoEl.srcObject = event.streams[0]
-              this.setStatus('playing')
-              settle(true)
+          if (this.ws !== ws) return
+          try {
+            const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
+            this.pc = pc
+            pc.ontrack = (event) => {
+              if (this.pc !== pc || this.ws !== ws) return
+              if (this.videoEl && event.streams[0]) {
+                this.ownedStream = event.streams[0]
+                this.videoEl.srcObject = this.ownedStream
+                this.setStatus('playing')
+                settle(true)
+              }
             }
-          }
-          this.pc.onconnectionstatechange = () => {
-            if (this.pc && (this.pc.connectionState === 'failed' || this.pc.connectionState === 'disconnected')) {
-              this.onReconnectRequest()
+            pc.onconnectionstatechange = () => {
+              if (this.pc !== pc || this.ws !== ws) return
+              if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                this.onReconnectRequest()
+              }
             }
-          }
-          this.pc.onicecandidate = (event) => {
-            if (event.candidate && this.ws?.readyState === WebSocket.OPEN) {
-              this.ws.send(JSON.stringify({ type: 'webrtc/candidate', value: event.candidate.candidate }))
+            pc.onicecandidate = (event) => {
+              if (this.pc !== pc || this.ws !== ws) return
+              if (event.candidate && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'webrtc/candidate', value: event.candidate.candidate }))
+              }
             }
-          }
-          this.pc.addTransceiver('video', { direction: 'recvonly' })
-          this.pc.addTransceiver('audio', { direction: 'recvonly' })
-          this.pc.createOffer().then((offer) => {
-            this.pc!.setLocalDescription(offer).then(() => {
-              this.ws!.send(JSON.stringify({ type: 'webrtc/offer', value: offer.sdp }))
+            pc.addTransceiver('video', { direction: 'recvonly' })
+            pc.addTransceiver('audio', { direction: 'recvonly' })
+            void pc.createOffer().then(async (offer) => {
+              if (this.pc !== pc || this.ws !== ws) return
+              await pc.setLocalDescription(offer)
+              if (this.pc !== pc || this.ws !== ws) return
+              ws?.send(JSON.stringify({ type: 'webrtc/offer', value: offer.sdp }))
+            }).catch(() => {
+              if (this.pc !== pc || this.ws !== ws) return
+              failConnection()
             })
-          })
+          } catch {
+            if (this.ws === ws) failConnection()
+          }
         }
 
         this.ws.onmessage = (event) => {
-          const msg = JSON.parse(event.data)
-          if (msg.type === 'webrtc/answer' && this.pc) {
-            this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.value }))
-          } else if (msg.type === 'webrtc/candidate' && this.pc) {
-            this.pc.addIceCandidate(new RTCIceCandidate({ candidate: msg.value, sdpMid: '0' }))
+          if (this.ws !== ws) return
+          const pc = this.pc
+          try {
+            const msg: unknown = JSON.parse(event.data)
+            if (!msg || typeof msg !== 'object') throw new Error('Invalid WebRTC message')
+            const payload = msg as { type?: unknown; value?: unknown }
+            if (payload.type === 'webrtc/answer' && pc) {
+              if (typeof payload.value !== 'string') throw new Error('Invalid WebRTC answer')
+              void pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: payload.value }))
+                .catch(() => { if (this.pc === pc && this.ws === ws) failConnection() })
+            } else if (payload.type === 'webrtc/candidate' && pc) {
+              if (typeof payload.value !== 'string') throw new Error('Invalid WebRTC candidate')
+              void pc.addIceCandidate(new RTCIceCandidate({ candidate: payload.value, sdpMid: '0' }))
+                .catch(() => { if (this.pc === pc && this.ws === ws) failConnection() })
+            }
+          } catch {
+            if (this.ws === ws) failConnection()
           }
         }
 
         this.ws.onerror = () => {
-          this.cleanup()
-          settle(false)
+          if (this.ws === ws) failConnection()
         }
 
         this.ws.onclose = () => {
+          if (this.ws !== ws) return
           if (!this.settled) {
             this.cleanup()
             settle(false)
@@ -124,9 +180,17 @@ export class WebRTCPlayer implements PlayerInstance {
       this.ws.close()
       this.ws = null
     }
+    const stream = this.ownedStream
+    if (stream) {
+      for (const track of stream.getTracks()) track.stop()
+      if (this.videoEl.srcObject === stream) this.videoEl.srcObject = null
+      this.ownedStream = null
+    }
   }
 
   destroy() {
+    this.cancelConnection?.()
+    this.cancelConnection = null
     this.cleanup()
   }
 }
@@ -138,11 +202,17 @@ export class MSEPlayer implements PlayerInstance {
 
   private mseWs: WebSocket | null = null
   private mediaSource: MediaSource | null = null
+  private sourceBuffer: SourceBuffer | null = null
+  private sourceOpenHandler: (() => void) | null = null
+  private updateEndHandler: (() => void) | null = null
+  private objectUrl: string | null = null
+  private bufferQueue: ArrayBuffer[] = []
   private settled = false
   private MAX_MSE_BUFFER_QUEUE = 30
   private cameraId: string
   private wsUrl: string
   private videoEl: HTMLVideoElement
+  private cancelConnection: (() => void) | null = null
 
   constructor(cameraId: string, wsUrl: string, videoEl: HTMLVideoElement) {
     this.cameraId = cameraId
@@ -167,6 +237,10 @@ export class MSEPlayer implements PlayerInstance {
         this.cleanup()
         settle(false)
       }, STREAM_CONNECT_TIMEOUT_MS)
+      this.cancelConnection = () => {
+        this.cleanup()
+        settle(false)
+      }
 
       try {
         if (!this.videoEl) {
@@ -175,51 +249,58 @@ export class MSEPlayer implements PlayerInstance {
         }
         this.mediaSource = new MediaSource()
         this.videoEl.srcObject = null
-        this.videoEl.src = URL.createObjectURL(this.mediaSource)
+        this.objectUrl = URL.createObjectURL(this.mediaSource)
+        this.videoEl.src = this.objectUrl
 
-        this.mediaSource.addEventListener('sourceopen', () => {
+        this.sourceOpenHandler = () => {
           this.mseWs = new WebSocket(this.wsUrl)
           this.mseWs.binaryType = 'arraybuffer'
-
-          let sourceBuffer: SourceBuffer | null = null
-          const bufferQueue: ArrayBuffer[] = []
 
           this.mseWs.onmessage = (event) => {
             if (typeof event.data === 'string') {
               const msg = JSON.parse(event.data)
               if (msg.type === 'mse' && msg.value && this.mediaSource) {
                 try {
-                  sourceBuffer = this.mediaSource.addSourceBuffer(msg.value)
-                  sourceBuffer.mode = 'segments'
-                  sourceBuffer.addEventListener('updateend', () => {
-                    if (bufferQueue.length > 0 && sourceBuffer && !sourceBuffer.updating) {
-                      sourceBuffer.appendBuffer(bufferQueue.shift()!)
+                  this.sourceBuffer = this.mediaSource.addSourceBuffer(msg.value)
+                  this.sourceBuffer.mode = 'segments'
+                  this.updateEndHandler = () => {
+                    if (
+                      this.bufferQueue.length > 0
+                      && this.sourceBuffer
+                      && !this.sourceBuffer.updating
+                    ) {
+                      this.sourceBuffer.appendBuffer(this.bufferQueue.shift()!)
                     }
-                  })
+                  }
+                  this.sourceBuffer.addEventListener('updateend', this.updateEndHandler)
                 } catch {
                   this.cleanup()
                   settle(false)
                 }
               }
-            } else if (event.data instanceof ArrayBuffer && sourceBuffer) {
+            } else if (event.data instanceof ArrayBuffer && this.sourceBuffer) {
               if (!this.settled) {
                 this.setStatus('playing')
                 settle(true)
               }
-              if (bufferQueue.length >= this.MAX_MSE_BUFFER_QUEUE) {
-                bufferQueue.splice(0, bufferQueue.length - this.MAX_MSE_BUFFER_QUEUE + 1)
+              if (this.bufferQueue.length >= this.MAX_MSE_BUFFER_QUEUE) {
+                this.bufferQueue.splice(
+                  0,
+                  this.bufferQueue.length - this.MAX_MSE_BUFFER_QUEUE + 1,
+                )
               }
-              if (sourceBuffer.updating) {
-                bufferQueue.push(event.data)
+              if (this.sourceBuffer.updating) {
+                this.bufferQueue.push(event.data)
               } else {
-                sourceBuffer.appendBuffer(event.data)
+                this.sourceBuffer.appendBuffer(event.data)
               }
             }
           }
 
           this.mseWs.onerror = () => {
             this.cleanup()
-            settle(false)
+            if (!this.settled) settle(false)
+            else this.onReconnectRequest()
           }
 
           this.mseWs.onclose = () => {
@@ -230,7 +311,8 @@ export class MSEPlayer implements PlayerInstance {
               this.onReconnectRequest()
             }
           }
-        })
+        }
+        this.mediaSource.addEventListener('sourceopen', this.sourceOpenHandler)
       } catch {
         settle(false)
       }
@@ -246,21 +328,55 @@ export class MSEPlayer implements PlayerInstance {
       this.mseWs.close()
       this.mseWs = null
     }
+    this.bufferQueue.length = 0
+    if (this.sourceBuffer && this.updateEndHandler) {
+      this.sourceBuffer.removeEventListener('updateend', this.updateEndHandler)
+    }
+    if (this.mediaSource && this.sourceOpenHandler) {
+      this.mediaSource.removeEventListener('sourceopen', this.sourceOpenHandler)
+    }
+    if (
+      this.mediaSource
+      && this.mediaSource.readyState === 'open'
+      && this.sourceBuffer
+    ) {
+      try { this.mediaSource.removeSourceBuffer(this.sourceBuffer) } catch { /* ignore */ }
+    }
+    this.sourceBuffer = null
+    this.updateEndHandler = null
+    this.sourceOpenHandler = null
     if (this.mediaSource && this.mediaSource.readyState === 'open') {
       try { this.mediaSource.endOfStream() } catch { /* ignore */ }
     }
     this.mediaSource = null
+    // A newer WebRTC/MSE player may already own this shared element. Revoke
+    // our URL regardless, but detach only media that still belongs to us.
+    if (
+      this.objectUrl
+      && this.videoEl.getAttribute('src') === this.objectUrl
+      && this.videoEl.srcObject == null
+    ) {
+      this.videoEl.removeAttribute('src')
+      if (typeof this.videoEl.load === 'function') this.videoEl.load()
+    }
+    if (this.objectUrl) {
+      URL.revokeObjectURL(this.objectUrl)
+      this.objectUrl = null
+    }
   }
 
   destroy() {
+    this.cancelConnection?.()
+    this.cancelConnection = null
     this.cleanup()
   }
 }
 
 export class PlayerFactory {
-  static async fetchStreamInfo(cameraId: string): Promise<StreamInfo | null> {
+  static async fetchStreamInfo(cameraId: string, signal?: AbortSignal): Promise<StreamInfo | null> {
     try {
-      const resp = await axios.get(`/api/streaming/${cameraId}`)
+      const path = `/api/streaming/${cameraId}`
+      const resp = signal ? await axios.get(path, { signal }) : await axios.get(path)
       const payload = resp.data
       if (
         payload &&
@@ -268,51 +384,88 @@ export class PlayerFactory {
         'code' in payload &&
         'data' in payload
       ) {
-        return payload.data as StreamInfo
+        if (payload.code !== 0) return null
+        return isStreamInfo(payload.data) ? payload.data : null
       }
-      return payload as StreamInfo
+      return isStreamInfo(payload) ? payload : null
     } catch (e) {
       logger.debug(`[go2rtc] fetchStreamInfo failed for ${cameraId}:`, e)
       return null
     }
   }
 
-  static async create(cameraId: string, videoEl: HTMLVideoElement | null, isCancelled: () => boolean): Promise<PlayerInstance | null> {
+  private static async connectPlayer(player: PlayerInstance, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) {
+      player.destroy()
+      return false
+    }
+    const abort = () => player.destroy()
+    signal?.addEventListener('abort', abort, { once: true })
+    try {
+      return await player.connect()
+    } catch (error) {
+      player.destroy()
+      throw error
+    } finally {
+      signal?.removeEventListener('abort', abort)
+    }
+  }
+
+  static async create(
+    cameraId: string,
+    videoEl: HTMLVideoElement | null,
+    isCancelled: () => boolean,
+    onFailureReason?: (reason: string) => void,
+    signal?: AbortSignal,
+  ): Promise<PlayerInstance | null> {
+    const cancelled = () => isCancelled() || Boolean(signal?.aborted)
+    if (cancelled()) return null
+    if (!videoEl) {
+      onFailureReason?.('video_element_unavailable')
+      return null
+    }
+
     const MAX_RETRIES = 3
     const RETRY_BASE_MS = 2000
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (isCancelled()) return null
+      if (cancelled()) return null
 
       if (attempt > 0) {
         await new Promise(r => setTimeout(r, RETRY_BASE_MS * Math.pow(2, attempt - 1)))
-        if (isCancelled()) return null
+        if (cancelled()) return null
       }
 
-      const info = await this.fetchStreamInfo(cameraId)
-      if (isCancelled()) return null
+      const info = await this.fetchStreamInfo(cameraId, signal)
+      if (cancelled()) return null
 
       if (!info) {
-        if (attempt === MAX_RETRIES) return null
+        if (attempt === MAX_RETRIES) {
+          onFailureReason?.('stream_info_unavailable')
+          return null
+        }
         continue
       }
 
       if (info.go2rtc) {
         if (info.webrtc_ws && videoEl) {
           const player = new WebRTCPlayer(cameraId, info.webrtc_ws, videoEl)
-          const ok = await player.connect()
-          if (isCancelled()) { player.destroy(); return null }
+          const ok = await this.connectPlayer(player, signal)
+          if (cancelled()) { player.destroy(); return null }
           if (ok) return player
+          onFailureReason?.('webrtc_failed')
           player.destroy()
         }
         if (info.mse_ws && videoEl) {
           const player = new MSEPlayer(cameraId, info.mse_ws, videoEl)
-          const ok = await player.connect()
-          if (isCancelled()) { player.destroy(); return null }
+          const ok = await this.connectPlayer(player, signal)
+          if (cancelled()) { player.destroy(); return null }
           if (ok) return player
+          onFailureReason?.('mse_failed')
           player.destroy()
         }
       } else {
+        onFailureReason?.('go2rtc_unavailable')
         break
       }
     }

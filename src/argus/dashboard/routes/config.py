@@ -10,10 +10,10 @@ from pathlib import Path
 
 import structlog
 from fastapi import APIRouter, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
-from argus.core.model_discovery import resolve_runtime_model_path
 from argus.dashboard.api_response import (
+    api_conflict,
     api_forbidden,
     api_success,
     api_internal_error,
@@ -23,7 +23,6 @@ from argus.dashboard.api_response import (
 )
 from argus.dashboard.auth import current_username, require_permission
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
-from argus.dashboard.model_runtime import find_registered_model_by_path
 
 logger = structlog.get_logger()
 
@@ -56,6 +55,78 @@ def _as_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _runtime_component_summary(camera_manager) -> dict:
+    """Read component readiness through CameraManager's public snapshot API."""
+    defaults = {
+        "total_pipelines": 0,
+        "classifier_attached": 0,
+        "classifier_loaded": 0,
+        "classifier_ready": 0,
+        "classifier_degraded": 0,
+        "classifier_failed": 0,
+        "classifier_details": [],
+        "segmenter_attached": 0,
+        "segmenter_loaded": 0,
+        "segmenter_ready": 0,
+        "segmenter_degraded": 0,
+        "segmenter_failed": 0,
+        "segmenter_details": [],
+        "imaging_attached": 0,
+        "correlator_present": False,
+    }
+    if camera_manager is None:
+        return defaults
+    getter = getattr(camera_manager, "get_runtime_component_summary", None)
+    if not callable(getter):
+        return defaults
+    try:
+        summary = getter()
+    except Exception:
+        logger.debug("config.runtime_component_summary_failed", exc_info=True)
+        return defaults
+    return {**defaults, **summary} if isinstance(summary, dict) else defaults
+
+
+def _auxiliary_config_lock(request: Request) -> asyncio.Lock:
+    lock = getattr(request.app.state, "module_toggle_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.module_toggle_lock = lock
+    return lock
+
+
+async def _serialized_auxiliary_update(request: Request, operation, payload):
+    """Keep ownership until the worker finishes, even if the client leaves.
+
+    Cancelling to_thread does not stop its thread. The independent owned task
+    must retain the async lock through runtime application and persistence.
+    """
+    denied = _deny_without_permission(request, "edit_config")
+    if denied:
+        return denied
+    pending = getattr(request.app.state, "auxiliary_config_tasks", None)
+    if pending is None:
+        pending = set()
+        request.app.state.auxiliary_config_tasks = pending
+    if len(pending) >= 32:
+        return api_unavailable("辅助模块配置操作繁忙，请稍后重试")
+
+    async def apply():
+        async with _auxiliary_config_lock(request):
+            return await operation(request, payload)
+
+    task = asyncio.create_task(apply())
+    pending.add(task)
+
+    def finished(completed):
+        pending.discard(completed)
+        if not completed.cancelled() and completed.exception() is not None:
+            logger.error("config.auxiliary_update_failed", error=str(completed.exception()))
+
+    task.add_done_callback(finished)
+    return await asyncio.shield(task)
 
 
 class ThresholdUpdateRequest(BaseModel):
@@ -122,21 +193,16 @@ async def update_detection_params(request: Request):
     anomaly_threshold = float(form["anomaly_threshold"]) if _has_value(form, "anomaly_threshold") else None
 
     # Apply to pipelines
-    updated = 0
-    section_hot: dict[str, bool] = {}
-    for cam_cfg in config.cameras:
-        pipeline = camera_manager._pipelines.get(cam_cfg.camera_id)
-        if not pipeline:
-            continue
-        applied = pipeline.update_thresholds(
-            anomaly_threshold=anomaly_threshold,
-            severity_changed=severity_changed,
-            temporal_changed=temporal_changed,
-            suppression_changed=suppression_changed,
-        ) or {}
-        for k, v in applied.items():
-            section_hot[k] = section_hot.get(k, True) and bool(v)
-        updated += 1
+    update_runtime = getattr(camera_manager, "update_pipeline_thresholds", None)
+    if not callable(update_runtime):
+        return api_unavailable("运行时阈值更新接口不可用")
+    updated, section_hot = update_runtime(
+        camera_ids=[cam.camera_id for cam in config.cameras],
+        anomaly_threshold=anomaly_threshold,
+        severity_changed=severity_changed,
+        temporal_changed=temporal_changed,
+        suppression_changed=suppression_changed,
+    )
 
     logger.info("config.detection_params_updated", pipelines=updated)
     audit = getattr(request.app.state, "audit_logger", None)
@@ -310,17 +376,24 @@ async def update_thresholds(request: Request, req: ThresholdUpdateRequest):
         return api_unavailable("不可用")
 
     updated = 0
-    for pipeline in camera_manager._pipelines.values():
-        if req.anomaly_threshold is not None:
-            pipeline.update_thresholds(anomaly_threshold=req.anomaly_threshold)
-            updated += 1
+    if req.anomaly_threshold is not None:
+        update_runtime = getattr(camera_manager, "update_pipeline_thresholds", None)
+        if not callable(update_runtime):
+            return api_unavailable("运行时阈值更新接口不可用")
+        updated, _ = update_runtime(anomaly_threshold=req.anomaly_threshold)
 
     return api_success({"pipelines_updated": updated})
 
 
 @router.post("/reload-model")
 async def reload_model(request: Request, req: ModelReloadRequest):
-    """Trigger model hot-reload for a specific camera."""
+    """Reject the legacy path-based model hot-reload command.
+
+    A path plus a camera id is not an authorized release identity and cannot
+    participate in the desired/applied compare-and-swap transaction.  Model
+    changes must enter through ``ModelReleaseService`` so the registry stage,
+    artifact digest, SceneGuard profile and running detector change together.
+    """
     denied = _deny_without_permission(request, "manage_models")
     if denied:
         return denied
@@ -329,36 +402,17 @@ async def reload_model(request: Request, req: ModelReloadRequest):
     if not camera_manager:
         return api_unavailable("不可用")
 
-    if req.camera_id not in camera_manager._pipelines:
-        return api_not_found(f"摄像头 {req.camera_id} 不存在")
-
-    # Sanitize model path
-    allowed_roots = [Path("data/models").resolve(), Path("data/exports").resolve()]
-    try:
-        model_path = Path(req.model_path).resolve()
-        if not any(str(model_path).startswith(str(root)) for root in allowed_roots):
-            return api_validation_error("模型路径必须在 data/models/ 或 data/exports/ 下")
-        if not model_path.exists():
-            return api_not_found(f"模型文件不存在: {req.model_path}")
-    except (ValueError, OSError):
-        return api_validation_error("模型路径无效")
-
-    resolved_runtime_model = resolve_runtime_model_path(model_path, req.camera_id)
-    if resolved_runtime_model is None:
-        return api_not_found("未找到可部署的模型文件 (.xml/.pt)")
-
-    registry_record = find_registered_model_by_path(
-        request,
-        model_path,
-        camera_id=req.camera_id,
+    return api_conflict(
+        "按路径直接热加载模型的入口已关闭，未修改 registry 或运行时。请先注册 "
+        "artifact，再通过 POST /api/models/{version_id}/promote 提交带幂等键、"
+        "release revision 与 SceneGuard 绑定的两阶段发布。",
+        data={
+            "camera_id": req.camera_id,
+            "requested_model_path": req.model_path,
+            "runtime_changed": False,
+            "replacement": "/api/models/{version_id}/promote",
+        },
     )
-    version_tag = registry_record.model_version_id if registry_record is not None else None
-    success = camera_manager.reload_model(
-        req.camera_id,
-        str(resolved_runtime_model),
-        version_tag=version_tag,
-    )
-    return api_success({"result": "ok" if success else "failed", "camera_id": req.camera_id})
 
 
 @router.post("/clear-lock/{camera_id}")
@@ -372,11 +426,9 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
     if not camera_manager:
         return api_unavailable("不可用")
 
-    pipeline = camera_manager._pipelines.get(camera_id)
-    if not pipeline:
+    clear_lock = getattr(camera_manager, "clear_camera_anomaly_lock", None)
+    if not callable(clear_lock) or clear_lock(camera_id) is not True:
         return api_not_found(f"摄像头 {camera_id} 不存在")
-
-    pipeline.clear_anomaly_lock()
     audit = getattr(request.app.state, "audit_logger", None)
     client_ip = request.client.host if request.client else ""
     if audit:
@@ -392,6 +444,10 @@ async def clear_anomaly_lock(request: Request, camera_id: str):
 
 @router.post("/camera/{camera_id}/restart")
 async def restart_camera(request: Request, camera_id: str):
+    return await _serialized_auxiliary_update(request, _restart_camera, camera_id)
+
+
+async def _restart_camera(request: Request, camera_id: str):
     """Stop and restart a camera pipeline."""
     denied = _deny_without_permission(request, "edit_config")
     if denied:
@@ -401,8 +457,16 @@ async def restart_camera(request: Request, camera_id: str):
     if not camera_manager:
         return api_unavailable("不可用")
 
-    await asyncio.to_thread(camera_manager.stop_camera, camera_id)
-    success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
+    restart = getattr(camera_manager, "restart_camera", None)
+    if not callable(restart):
+        return api_unavailable("安全重启接口不可用")
+    try:
+        success = await asyncio.to_thread(restart, camera_id)
+    except Exception:
+        logger.warning("config.camera_restart_failed", camera_id=camera_id, exc_info=True)
+        return api_conflict("摄像头清理或重启失败，请核验状态后重试")
+    if success is not True:
+        return api_conflict("摄像头未完成重启，请检查启动或清理失败状态")
     return api_success(
         {"result": "ok" if success else "failed"},
         headers=htmx_toast_headers("摄像头已重启"),
@@ -410,7 +474,11 @@ async def restart_camera(request: Request, camera_id: str):
 
 
 @router.post("/reload")
-def reload_config(request: Request):
+async def reload_config(request: Request):
+    return await _serialized_auxiliary_update(request, _reload_config, None)
+
+
+async def _reload_config(request: Request, _payload):
     """Reload configuration from YAML."""
     denied = _deny_without_permission(request, "edit_config")
     if denied:
@@ -423,19 +491,32 @@ def reload_config(request: Request):
 
     try:
         from argus.config.loader import load_config as _load_config
-        new_config = _load_config(config_path)
+        new_config = await asyncio.to_thread(_load_config, config_path)
     except Exception as e:
         return api_validation_error(f"加载配置失败: {e}")
 
-    updated = 0
-    for cam_cfg in new_config.cameras:
-        pipeline = camera_manager._pipelines.get(cam_cfg.camera_id)
-        if not pipeline:
-            continue
-        pipeline.update_thresholds(anomaly_threshold=cam_cfg.anomaly.threshold)
-        if cam_cfg.zones:
-            pipeline.update_zones(cam_cfg.zones)
-        updated += 1
+    current_config = getattr(request.app.state, "config", None)
+    if current_config is None:
+        return api_unavailable("当前配置不可用")
+    # Auxiliary SDKs and their risk policy retain references to these objects.
+    # Replacing the app configuration alone would leave stale runtime authority.
+    for section in ("classifier", "segmenter", "physics"):
+        current = getattr(current_config, section, None)
+        replacement = getattr(new_config, section, None)
+        if current is None or replacement is None or current.model_dump() != replacement.model_dump():
+            return api_conflict("辅助识别配置变更不能通过配置重载生效，请使用专用接口或重启服务")
+        setattr(new_config, section, current)
+
+    apply_runtime_config = getattr(
+        camera_manager,
+        "apply_runtime_camera_config",
+        None,
+    )
+    if not callable(apply_runtime_config):
+        return api_unavailable("运行时配置更新接口不可用")
+    updated = await asyncio.to_thread(lambda: sum(
+        1 for cam_cfg in new_config.cameras if apply_runtime_config(cam_cfg) is True
+    ))
 
     request.app.state.config = new_config
 
@@ -565,38 +646,27 @@ async def get_classifier_config(request: Request):
         return api_unavailable("分类器配置不可用")
 
     camera_manager = getattr(request.app.state, "camera_manager", None)
-    total_pipelines = 0
-    pipelines_loaded = 0
-    pipelines_attached = 0
-    if camera_manager is not None:
-        try:
-            for cam_status in camera_manager.get_status():
-                pipeline = camera_manager.get_pipeline(cam_status.camera_id)
-                if pipeline is None:
-                    continue
-                total_pipelines += 1
-                classifier = getattr(pipeline, "_classifier", None)
-                if classifier is None:
-                    continue
-                pipelines_attached += 1
-                if getattr(classifier, "_loaded", False):
-                    pipelines_loaded += 1
-        except Exception:
-            logger.debug("classifier.pipeline_status_failed", exc_info=True)
+    runtime = _runtime_component_summary(camera_manager)
 
     return api_success({
         "enabled": cfg.enabled,
         "model_name": cfg.model_name,
         "min_anomaly_score_to_classify": cfg.min_anomaly_score_to_classify,
+        "timeout_seconds": cfg.timeout_seconds,
+        "min_confidence_to_affect_alert": cfg.min_confidence_to_affect_alert,
         "vocabulary": list(cfg.vocabulary),
         "high_risk_labels": list(cfg.high_risk_labels),
         "low_risk_labels": list(cfg.low_risk_labels),
         "suppress_labels": list(cfg.suppress_labels),
         "custom_vocabulary_path": cfg.custom_vocabulary_path,
         "runtime": {
-            "total_pipelines": total_pipelines,
-            "pipelines_attached": pipelines_attached,
-            "pipelines_loaded": pipelines_loaded,
+            "total_pipelines": runtime["total_pipelines"],
+            "pipelines_attached": runtime["classifier_attached"],
+            "pipelines_loaded": runtime["classifier_loaded"],
+            "pipelines_ready": runtime["classifier_ready"],
+            "pipelines_degraded": runtime["classifier_degraded"],
+            "pipelines_failed": runtime["classifier_failed"],
+            "details": runtime["classifier_details"],
         },
     })
 
@@ -605,14 +675,8 @@ async def get_classifier_config(request: Request):
 async def get_segmenter_config(request: Request):
     """Return the full segmenter config + runtime readiness.
 
-    Mirror of the classifier panel but for SAM2 instance segmentation.
-    ``runtime.attached/loaded`` counters tell the UI how many live
-    pipelines already have the segmenter warmed up — zero is expected
-    whenever the toggle is off (pipelines are only *created* with a
-    segmenter when the config had it enabled at startup, which means
-    toggling enabled ON here does NOT retroactively attach segmenters
-    to running pipelines; that's a "needs restart" warning we show in
-    the UI).
+    Attachment, target-model readiness and degraded/failure states are
+    separate; an enabled desired configuration is not proof of a loaded SAM2.
     """
     config = request.app.state.config
     if not config:
@@ -623,24 +687,7 @@ async def get_segmenter_config(request: Request):
         return api_unavailable("分割器配置不可用")
 
     camera_manager = getattr(request.app.state, "camera_manager", None)
-    total_pipelines = 0
-    pipelines_attached = 0
-    pipelines_loaded = 0
-    if camera_manager is not None:
-        try:
-            for cam_status in camera_manager.get_status():
-                pipeline = camera_manager.get_pipeline(cam_status.camera_id)
-                if pipeline is None:
-                    continue
-                total_pipelines += 1
-                segmenter = getattr(pipeline, "_segmenter", None)
-                if segmenter is None:
-                    continue
-                pipelines_attached += 1
-                if getattr(segmenter, "_loaded", False):
-                    pipelines_loaded += 1
-        except Exception:
-            logger.debug("segmenter.pipeline_status_failed", exc_info=True)
+    runtime = _runtime_component_summary(camera_manager)
 
     return api_success({
         "enabled": cfg.enabled,
@@ -650,9 +697,13 @@ async def get_segmenter_config(request: Request):
         "min_mask_area_px": cfg.min_mask_area_px,
         "timeout_seconds": cfg.timeout_seconds,
         "runtime": {
-            "total_pipelines": total_pipelines,
-            "pipelines_attached": pipelines_attached,
-            "pipelines_loaded": pipelines_loaded,
+            "total_pipelines": runtime["total_pipelines"],
+            "pipelines_attached": runtime["segmenter_attached"],
+            "pipelines_loaded": runtime["segmenter_loaded"],
+            "pipelines_ready": runtime["segmenter_ready"],
+            "pipelines_degraded": runtime["segmenter_degraded"],
+            "pipelines_failed": runtime["segmenter_failed"],
+            "details": runtime["segmenter_details"],
         },
     })
 
@@ -670,18 +721,7 @@ async def get_imaging_config(request: Request):
 
     # Check runtime status: how many pipelines have imaging processor
     camera_manager = getattr(request.app.state, "camera_manager", None)
-    total_pipelines = 0
-    pipelines_with_imaging = 0
-    if camera_manager is not None:
-        try:
-            for cam_status in camera_manager.get_status():
-                pipeline = camera_manager.get_pipeline(cam_status.camera_id)
-                if pipeline is not None:
-                    total_pipelines += 1
-                    if getattr(pipeline, "_imaging_processor", None) is not None:
-                        pipelines_with_imaging += 1
-        except Exception:
-            pass
+    runtime = _runtime_component_summary(camera_manager)
 
     return api_success({
         "enabled": cfg.enabled,
@@ -693,8 +733,8 @@ async def get_imaging_config(request: Request):
         "deglare_method": cfg.deglare_method,
         "dolp_threshold": cfg.dolp_threshold,
         "runtime": {
-            "total_pipelines": total_pipelines,
-            "pipelines_with_imaging": pipelines_with_imaging,
+            "total_pipelines": runtime["total_pipelines"],
+            "pipelines_with_imaging": runtime["imaging_attached"],
         },
     })
 
@@ -717,20 +757,7 @@ async def get_cross_camera_config(request: Request):
         return api_unavailable("跨相机配置不可用")
 
     camera_manager = getattr(request.app.state, "camera_manager", None)
-    total_pipelines = 0
-    correlator_present = False
-    if camera_manager is not None:
-        try:
-            for cam_status in camera_manager.get_status():
-                pipeline = camera_manager.get_pipeline(cam_status.camera_id)
-                if pipeline is None:
-                    continue
-                total_pipelines += 1
-            # The correlator lives on the CameraManager, not on each pipeline —
-            # a single instance is shared across all cameras for this manager.
-            correlator_present = getattr(camera_manager, "_correlator", None) is not None
-        except Exception:
-            logger.debug("cross_camera.pipeline_status_failed", exc_info=True)
+    runtime = _runtime_component_summary(camera_manager)
 
     # Serialize the overlap pairs (homography is a list of 3 lists of 3 floats)
     pairs_payload = []
@@ -748,8 +775,8 @@ async def get_cross_camera_config(request: Request):
         "uncorroborated_severity_downgrade": cfg.uncorroborated_severity_downgrade,
         "overlap_pairs": pairs_payload,
         "runtime": {
-            "total_pipelines": total_pipelines,
-            "correlator_present": correlator_present,
+            "total_pipelines": runtime["total_pipelines"],
+            "correlator_present": runtime["correlator_present"],
         },
     })
 
@@ -898,6 +925,10 @@ class SegmenterParamsRequest(BaseModel):
 async def update_segmenter_params_route(
     request: Request, req: SegmenterParamsRequest,
 ):
+    return await _serialized_auxiliary_update(request, _apply_segmenter_params, req)
+
+
+async def _apply_segmenter_params(request: Request, req: SegmenterParamsRequest):
     """Patch the segmenter's runtime-tunable parameters.
 
     Four knobs accepted: ``max_points`` / ``min_anomaly_score`` (pipeline
@@ -906,11 +937,8 @@ async def update_segmenter_params_route(
     reads of the "分割器" panel show the new values, and then fans the
     update out to every live pipeline via
     ``camera_manager.update_segmenter_params()``. ``enabled`` and
-    ``model_size`` are **not** tunable here — they require a pipeline
-    restart.
-
-    Validation: max_points in [1, 32], min_anomaly_score in [0, 1],
-    min_mask_area_px ≥ 0, timeout_seconds in (0, 120].
+    ``model_size`` are not tunable here. Validation uses the same schema as
+    persisted startup configuration, so an accepted update remains reloadable.
     """
     denied = _deny_without_permission(request, "edit_config")
     if denied:
@@ -924,30 +952,21 @@ async def update_segmenter_params_route(
     if cfg is None:
         return api_unavailable("分割器配置不可用")
 
-    # Validate — all four are optional, only validate the ones provided.
-    if req.max_points is not None and not (1 <= req.max_points <= 32):
-        return api_validation_error("max_points 必须在 [1, 32] 范围内")
-    if req.min_anomaly_score is not None and not (0.0 <= req.min_anomaly_score <= 1.0):
-        return api_validation_error("min_anomaly_score 必须在 [0, 1] 范围内")
-    if req.min_mask_area_px is not None and req.min_mask_area_px < 0:
-        return api_validation_error("min_mask_area_px 不能为负数")
-    if req.timeout_seconds is not None and not (0.0 < req.timeout_seconds <= 120.0):
-        return api_validation_error("timeout_seconds 必须在 (0, 120] 范围内")
+    from argus.config.schema import SegmenterConfig
 
-    if req.max_points is not None:
-        cfg.max_points = req.max_points
-    if req.min_anomaly_score is not None:
-        cfg.min_anomaly_score = req.min_anomaly_score
-    if req.min_mask_area_px is not None:
-        cfg.min_mask_area_px = req.min_mask_area_px
-    if req.timeout_seconds is not None:
-        cfg.timeout_seconds = req.timeout_seconds
+    updates = req.model_dump(exclude_none=True)
+    try:
+        candidate = SegmenterConfig.model_validate({**cfg.model_dump(), **updates})
+    except ValueError as exc:
+        return api_validation_error(str(exc))
+    for field in updates:
+        setattr(cfg, field, getattr(candidate, field))
 
     camera_manager = getattr(request.app.state, "camera_manager", None)
     pushed = 0
     if camera_manager is not None:
         try:
-            pushed = camera_manager.update_segmenter_params(
+            pushed = await asyncio.to_thread(camera_manager.update_segmenter_params,
                 max_points=req.max_points,
                 min_anomaly_score=req.min_anomaly_score,
                 min_mask_area_px=req.min_mask_area_px,
@@ -985,6 +1004,10 @@ class ClassifierVocabularyRequest(BaseModel):
 async def update_classifier_vocabulary(
     request: Request, req: ClassifierVocabularyRequest,
 ):
+    return await _serialized_auxiliary_update(request, _apply_classifier_vocabulary, req)
+
+
+async def _apply_classifier_vocabulary(request: Request, req: ClassifierVocabularyRequest):
     """Replace the classifier vocabulary + risk-bucket assignments.
 
     Writes to the in-memory ``config.classifier`` object and pushes the new
@@ -1047,6 +1070,12 @@ async def update_classifier_vocabulary(
     except ValueError as e:
         return api_validation_error(str(e))
 
+    active_high = set(high if high is not None else cfg.high_risk_labels) & seen
+    active_low = set(low if low is not None else cfg.low_risk_labels) & seen
+    active_suppress = set(suppress if suppress is not None else cfg.suppress_labels) & seen
+    if active_high & (active_low | active_suppress) or active_low & active_suppress:
+        return api_validation_error("同一有效标签不能同时属于高风险、低风险或抑制类别")
+
     cfg.vocabulary = vocab_clean
     if high is not None:
         cfg.high_risk_labels = high
@@ -1059,7 +1088,7 @@ async def update_classifier_vocabulary(
     pushed = 0
     if camera_manager is not None:
         try:
-            pushed = camera_manager.update_classifier_vocabulary(vocab_clean)
+            pushed = await asyncio.to_thread(camera_manager.update_classifier_vocabulary, vocab_clean)
         except Exception:
             logger.warning("config.classifier_vocab_push_failed", exc_info=True)
 
@@ -1083,11 +1112,15 @@ async def update_classifier_vocabulary(
 
 class ModuleToggleRequest(BaseModel):
     key: str
-    value: bool
+    value: StrictBool
 
 
 @router.post("/modules")
 async def update_module_toggle(request: Request, req: ModuleToggleRequest):
+    return await _serialized_auxiliary_update(request, _apply_module_toggle, req)
+
+
+async def _apply_module_toggle(request: Request, req: ModuleToggleRequest):
     """Toggle a module on/off at runtime.
 
     Accepts key paths like 'imaging.enabled', 'physics.speed_enabled',
@@ -1102,19 +1135,24 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
     if not config:
         return api_unavailable("配置不可用")
 
+    allowed = {
+        "imaging.enabled", "imaging.polarization_processing", "classifier.enabled",
+        "segmenter.enabled", "cross_camera.enabled", "physics.speed_enabled",
+        "physics.trajectory_enabled", "physics.localization_enabled",
+        "physics.triangulation_enabled", "continuous_recording.enabled",
+    }
+    if req.key not in allowed:
+        return api_validation_error(f"Unsupported module toggle: {req.key}")
     parts = req.key.split(".")
     if len(parts) != 2:
-        from argus.dashboard.api_response import api_validation_error
         return api_validation_error(f"Invalid key format: {req.key}")
 
     section, field = parts
     section_obj = getattr(config, section, None)
     if section_obj is None:
-        from argus.dashboard.api_response import api_validation_error
         return api_validation_error(f"Unknown config section: {section}")
 
     if not hasattr(section_obj, field):
-        from argus.dashboard.api_response import api_validation_error
         return api_validation_error(f"Unknown field: {field} in {section}")
 
     setattr(section_obj, field, req.value)
@@ -1129,31 +1167,42 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
     hot_reloaded = 0
     hot_reload_failed = 0
     pipelines_seen = 0
+    runtime_checked = False
 
     if req.key in _hot_reloadable_keys:
         camera_manager = getattr(request.app.state, "camera_manager", None)
         if camera_manager:
-            for cam_config in getattr(config, "cameras", []):
-                pipeline = camera_manager.get_pipeline(cam_config.camera_id)
-                if pipeline is not None:
-                    pipelines_seen += 1
-                    try:
-                        if pipeline.reload_module(req.key, req.value):
-                            hot_reloaded += 1
-                        else:
-                            hot_reload_failed += 1
-                    except Exception as e:
-                        hot_reload_failed += 1
-                        logger.warning("config.hot_reload_failed", camera_id=cam_config.camera_id, error=str(e))
-            restart_required = pipelines_seen > 0 and hot_reloaded < pipelines_seen
+            reload_modules = getattr(
+                camera_manager,
+                "reload_module_for_cameras",
+                None,
+            )
+            if callable(reload_modules):
+                try:
+                    result = await asyncio.to_thread(
+                        reload_modules,
+                        [cam.camera_id for cam in getattr(config, "cameras", [])],
+                        req.key, req.value,
+                    )
+                    if isinstance(result, dict):
+                        pipelines_seen = int(result.get("seen", 0))
+                        hot_reloaded = int(result.get("succeeded", 0))
+                        hot_reload_failed = int(result.get("failed", 0))
+                        runtime_checked = True
+                except Exception:
+                    hot_reload_failed = 1
+                    logger.warning("config.module_hot_reload_failed", exc_info=True)
+        restart_required = not runtime_checked or hot_reload_failed > 0 or hot_reloaded < pipelines_seen
     else:
         # These still need restart (no hot-reload path yet)
         _restart_required_keys = {
             "cross_camera.enabled",
             "imaging.enabled",
-            "low_light.enabled",
+            "imaging.polarization_processing",
             "physics.trajectory_enabled",
             "physics.localization_enabled",
+            "physics.triangulation_enabled",
+            "continuous_recording.enabled",
         }
         restart_required = req.key in _restart_required_keys
 
@@ -1187,4 +1236,5 @@ async def update_module_toggle(request: Request, req: ModuleToggleRequest):
         "hot_reload_failed": hot_reload_failed,
         "pipelines_seen": pipelines_seen,
         "persisted": persisted,
+        "all_applied": runtime_checked and hot_reload_failed == 0 and hot_reloaded == pipelines_seen,
     })

@@ -17,60 +17,72 @@ class TestBatchInferenceEndpoint:
         request.app.state.camera_manager = camera_manager
         return request
 
+    @staticmethod
+    def _body(body: dict):
+        from argus.dashboard.api_contracts import ModelBatchInferenceRequest
+
+        return ModelBatchInferenceRequest.model_validate(body)
+
     @pytest.mark.asyncio
     async def test_missing_camera_id(self):
-        from argus.dashboard.routes.models import batch_inference
+        from argus.dashboard.api_contracts import ModelBatchInferenceRequest
 
-        request = self._make_request({"image_paths": ["/tmp/a.jpg"]})
-        response = await batch_inference(request)
-        assert response.status_code == 400
-        assert b"camera_id" in response.body
+        with pytest.raises(ValueError):
+            ModelBatchInferenceRequest.model_validate({"image_paths": ["/tmp/a.jpg"]})
 
     @pytest.mark.asyncio
     async def test_empty_image_paths(self):
-        from argus.dashboard.routes.models import batch_inference
+        from argus.dashboard.api_contracts import ModelBatchInferenceRequest
 
-        request = self._make_request({"camera_id": "cam_01", "image_paths": []})
-        response = await batch_inference(request)
-        assert response.status_code == 400
+        with pytest.raises(ValueError):
+            ModelBatchInferenceRequest.model_validate({
+                "camera_id": "cam_01",
+                "image_paths": [],
+            })
 
     @pytest.mark.asyncio
     async def test_exceeds_max_batch_size(self):
-        from argus.dashboard.routes.models import batch_inference, MAX_BATCH_SIZE
+        from argus.dashboard.api_contracts import ModelBatchInferenceRequest
+        from argus.dashboard.routes.models import MAX_BATCH_SIZE
 
         paths = [f"/tmp/img_{i}.jpg" for i in range(MAX_BATCH_SIZE + 1)]
-        request = self._make_request({"camera_id": "cam_01", "image_paths": paths})
-        response = await batch_inference(request)
-        assert response.status_code == 400
-        assert b"Maximum" in response.body
+        with pytest.raises(ValueError):
+            ModelBatchInferenceRequest.model_validate({
+                "camera_id": "cam_01",
+                "image_paths": paths,
+            })
 
     @pytest.mark.asyncio
     async def test_camera_not_found(self):
         from argus.dashboard.routes.models import batch_inference
 
         mgr = MagicMock()
-        mgr._pipelines = {}
         mgr.get_detector_status.return_value = None
+        mgr.get_anomaly_inference_handle.return_value = None
         request = self._make_request(
             {"camera_id": "cam_99", "image_paths": ["/tmp/a.jpg"]},
             camera_manager=mgr,
         )
-        response = await batch_inference(request)
+        response = await batch_inference(request, self._body({
+            "camera_id": "cam_99",
+            "image_paths": ["/tmp/a.jpg"],
+        }))
         assert response.status_code == 404
 
     @pytest.mark.asyncio
     async def test_no_detector(self):
         from argus.dashboard.routes.models import batch_inference
 
-        pipeline = MagicMock()
-        pipeline._anomaly_detector = None
         mgr = MagicMock()
-        mgr._pipelines = {"cam_01": pipeline}
+        mgr.get_anomaly_inference_handle.return_value = None
         request = self._make_request(
             {"camera_id": "cam_01", "image_paths": ["/tmp/a.jpg"]},
             camera_manager=mgr,
         )
-        response = await batch_inference(request)
+        response = await batch_inference(request, self._body({
+            "camera_id": "cam_01",
+            "image_paths": ["/tmp/a.jpg"],
+        }))
         assert response.status_code == 503
 
     @pytest.mark.asyncio
@@ -86,11 +98,8 @@ class TestBatchInferenceEndpoint:
         detector.threshold = 0.5
         detector.predict.return_value = {"score": 0.7}
 
-        pipeline = MagicMock()
-        pipeline._anomaly_detector = detector
-
         mgr = MagicMock()
-        mgr._pipelines = {"cam_01": pipeline}
+        mgr.get_anomaly_inference_handle.return_value = detector
 
         import numpy as np
         with patch("cv2.imread", return_value=np.zeros((256, 256, 3), dtype=np.uint8)):
@@ -98,7 +107,10 @@ class TestBatchInferenceEndpoint:
                 {"camera_id": "cam_01", "image_paths": [str(img_file)]},
                 camera_manager=mgr,
             )
-            response = await batch_inference(request)
+            response = await batch_inference(request, self._body({
+                "camera_id": "cam_01",
+                "image_paths": [str(img_file)],
+            }))
 
         assert response.status_code == 200
         body = json.loads(response.body)
@@ -117,17 +129,17 @@ class TestBatchInferenceEndpoint:
         detector = MagicMock()
         detector.threshold = 0.5
 
-        pipeline = MagicMock()
-        pipeline._anomaly_detector = detector
-
         mgr = MagicMock()
-        mgr._pipelines = {"cam_01": pipeline}
+        mgr.get_anomaly_inference_handle.return_value = detector
 
         request = self._make_request(
             {"camera_id": "cam_01", "image_paths": ["/nonexistent/img.jpg"]},
             camera_manager=mgr,
         )
-        response = await batch_inference(request)
+        response = await batch_inference(request, self._body({
+            "camera_id": "cam_01",
+            "image_paths": ["/nonexistent/img.jpg"],
+        }))
 
         body = json.loads(response.body)
         assert body["code"] == 0
@@ -144,5 +156,8 @@ class TestBatchInferenceEndpoint:
             {"camera_id": "cam_01", "image_paths": ["/tmp/a.jpg"]},
             camera_manager=None,
         )
-        response = await batch_inference(request)
+        response = await batch_inference(request, self._body({
+            "camera_id": "cam_01",
+            "image_paths": ["/tmp/a.jpg"],
+        }))
         assert response.status_code == 503

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
@@ -51,7 +52,7 @@ class AlertDispatcher:
         config: AlertConfig,
         database: Database,
         alerts_dir: str | Path = "data/alerts",
-        on_alert: Callable[[str, dict], None] | None = None,
+        on_alert: Callable[..., bool | None] | None = None,
         audio_config: AudioAlertConfig | None = None,
     ):
         self._config = config
@@ -102,6 +103,7 @@ class AlertDispatcher:
         evidence_unavailable: bool = False,
     ) -> dict:
         """Convert an alert to a dict payload for dispatch channels."""
+        detection_type = getattr(alert.detection_type, "value", alert.detection_type)
         payload = {
             "alert_id": alert.alert_id,
             "timestamp": datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).isoformat(),
@@ -110,22 +112,34 @@ class AlertDispatcher:
             "severity": alert.severity.value,
             "anomaly_score": round(alert.anomaly_score, 4),
             "frame_number": alert.frame_number,
-            "detection_type": alert.detection_type,
+            "detection_type": detection_type,
             "detected_objects": alert.detected_objects,
+            "evidence_summary": getattr(alert, "evidence_summary", "") or None,
+            "evidence_json": getattr(alert, "evidence_json", None) or None,
+            "suppression_reason": getattr(alert, "suppression_reason", None),
             "corroborated": alert.corroborated,
             "handling_policy": alert.handling_policy,
             "event_group_count": alert.event_group_count,
         }
         recording = getattr(alert, "_solidified_recording", None)
         has_recording = getattr(alert, "_has_recording", None)
+        replay_ready = getattr(alert, "_replay_ready", None)
+        unavailable_reason = getattr(alert, "_recording_unavailable_reason", None)
         recording_status = getattr(alert, "_recording_status", None)
         if recording_status is None and recording is not None:
             status = getattr(recording, "status", None)
             recording_status = getattr(status, "value", status)
         if has_recording is None:
-            has_recording = recording is not None
+            # Legacy/direct dispatch callers attach the successfully persisted
+            # recording without the newer availability flags.  Preserve an
+            # explicit False from the pipeline while retaining that fallback.
+            has_recording = recording is not None or bool(replay_ready)
+        if replay_ready is None:
+            replay_ready = bool(has_recording)
         payload["has_recording"] = bool(has_recording)
+        payload["replay_ready"] = bool(replay_ready)
         payload["recording_status"] = recording_status
+        payload["recording_unavailable_reason"] = unavailable_reason
         if snapshot_path is not None:
             payload["snapshot_path"] = snapshot_path
         if heatmap_path is not None:
@@ -183,7 +197,10 @@ class AlertDispatcher:
             ]
         return payload
 
-    def set_websocket_broadcaster(self, broadcaster: Callable[[str, dict], None] | None) -> None:
+    def set_websocket_broadcaster(
+        self,
+        broadcaster: Callable[..., bool | None] | None,
+    ) -> None:
         """Wire (or rewire) the WebSocket broadcaster after construction.
 
         The dispatcher is built before the dashboard FastAPI app — and thus
@@ -193,6 +210,8 @@ class AlertDispatcher:
         in real time (P1 audit finding 2026-05).
         """
         self._on_alert_ws = broadcaster
+        if broadcaster is not None:
+            self._drain_alert_outbox()
 
     def dispatch(self, alert: Alert) -> None:
         """Send an alert to all configured channels."""
@@ -237,7 +256,12 @@ class AlertDispatcher:
             # 路径如果再静默吃掉就真的丢告警了。所以这里要求把异常上抛,让
             # 调用方(或上层 except)能感知到 alert 真的没落到任何持久层。
             try:
-                self._dispatch_database_strict(alert, snapshot_path, heatmap_path)
+                self._dispatch_database_strict(
+                    alert,
+                    snapshot_path,
+                    heatmap_path,
+                    evidence_unavailable,
+                )
             except Exception as exc:
                 logger.error(
                     "dispatch.fallback_db_failed",
@@ -296,34 +320,10 @@ class AlertDispatcher:
                     msg="Circuit breaker open, webhook skipped",
                 )
 
-        # Channel 3: WebSocket push (real-time dashboard notification)
-        # HIGH severity → priority dispatch (bypass queue, push directly)
-        ws_payload = self._alert_to_dict(
-            alert, snapshot_path, heatmap_path, evidence_unavailable,
-        )
-        if self._on_alert_ws:
-            try:
-                self._on_alert_ws("alerts", ws_payload)
-            except Exception as e:
-                logger.warning("dispatch.websocket_failed", alert_id=alert.alert_id, error=str(e))
-
-        # Channel 4: Audio alarm via WebSocket
-        if self._on_alert_ws:
-            try:
-                audio_msg = {
-                    "type": "audio_alert",
-                    "severity": ws_payload["severity"],
-                    "alert_id": ws_payload["alert_id"],
-                    "camera_id": ws_payload["camera_id"],
-                }
-                # Look up per-severity audio settings
-                sev_audio = getattr(self._audio_config, alert.severity.value, None)
-                if sev_audio is not None:
-                    audio_msg["sound"] = sev_audio.sound
-                    audio_msg["voice_template"] = sev_audio.voice_template
-                self._on_alert_ws("audio_alert", audio_msg)
-            except Exception as e:
-                logger.warning("dispatch.audio_alert_failed", alert_id=alert.alert_id, error=str(e))
+        # WebSocket + audio are intentionally emitted by
+        # _dispatch_database_strict *after* the alert transaction commits.
+        # This guarantees a client can fetch details immediately after a
+        # created event without racing the background DB queue.
 
         dispatch_latency_ms = (time.time() - alert.timestamp) * 1000
         logger.info(
@@ -336,7 +336,11 @@ class AlertDispatcher:
         )
 
     def _dispatch_database(
-        self, alert: Alert, snapshot_path: str | None, heatmap_path: str | None
+        self,
+        alert: Alert,
+        snapshot_path: str | None,
+        heatmap_path: str | None,
+        evidence_unavailable: bool = False,
     ) -> None:
         """Persist alert to database (worker-safe; swallows exceptions).
 
@@ -346,7 +350,12 @@ class AlertDispatcher:
         应改用 ``_dispatch_database_strict``。
         """
         try:
-            self._dispatch_database_strict(alert, snapshot_path, heatmap_path)
+            self._dispatch_database_strict(
+                alert,
+                snapshot_path,
+                heatmap_path,
+                evidence_unavailable,
+            )
         except Exception as e:
             logger.error("dispatch.db_failed", alert_id=alert.alert_id, error=str(e))
             get_error_channel().emit(
@@ -364,7 +373,11 @@ class AlertDispatcher:
             )
 
     def _dispatch_database_strict(
-        self, alert: Alert, snapshot_path: str | None, heatmap_path: str | None
+        self,
+        alert: Alert,
+        snapshot_path: str | None,
+        heatmap_path: str | None,
+        evidence_unavailable: bool = False,
     ) -> None:
         """Persist alert to database; raises on failure.
 
@@ -387,6 +400,17 @@ class AlertDispatcher:
                  for t, x, y in alert.trajectory_points]
             )
 
+        payload = self._alert_to_dict(
+            alert,
+            snapshot_path,
+            heatmap_path,
+            evidence_unavailable,
+        )
+        payload.setdefault("workflow_status", "new")
+        payload.setdefault("acknowledged", False)
+        payload.setdefault("false_positive", False)
+        event_id = str(uuid.uuid4())
+
         self._db.save_alert(
             alert_id=alert.alert_id,
             timestamp=datetime.fromtimestamp(alert.timestamp, tz=timezone.utc),
@@ -396,6 +420,14 @@ class AlertDispatcher:
             anomaly_score=alert.anomaly_score,
             snapshot_path=snapshot_path,
             heatmap_path=heatmap_path,
+            detection_type=getattr(
+                getattr(alert, "detection_type", None),
+                "value",
+                getattr(alert, "detection_type", None),
+            ),
+            evidence_summary=getattr(alert, "evidence_summary", None),
+            evidence_json=getattr(alert, "evidence_json", None),
+            suppression_reason=getattr(alert, "suppression_reason", None),
             event_group_id=getattr(alert, "event_group_id", None),
             event_group_count=getattr(alert, "event_group_count", 1),
             speed_ms=alert.speed_ms,
@@ -419,7 +451,117 @@ class AlertDispatcher:
             severity_adjusted_by_classifier=getattr(alert, "severity_adjusted_by_classifier", None),
             trajectory_points=traj_json,
             model_version_id=getattr(alert, "model_version_id", None),
+            outbox_event={
+                "event_id": event_id,
+                "topic": "alerts",
+                "event_type": "created",
+                "resource_id": alert.alert_id,
+                "payload": {
+                    "type": "created",
+                    "resource_id": alert.alert_id,
+                    **payload,
+                },
+            },
         )
+        self._drain_alert_outbox()
+
+    def _publish_persisted_alert(
+        self,
+        alert: Alert,
+        snapshot_path: str | None,
+        heatmap_path: str | None,
+        evidence_unavailable: bool,
+    ) -> None:
+        """Compatibility hook: committed events are now replayed from outbox."""
+        self._drain_alert_outbox()
+
+    @staticmethod
+    def _broadcaster_accepts_metadata(broadcaster: Callable[..., object]) -> bool:
+        """Return whether a callback supports the versioned WS keyword fields."""
+        import inspect
+
+        try:
+            parameters = inspect.signature(broadcaster).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "event_id"
+            for parameter in parameters
+        )
+
+    def _drain_alert_outbox(self, limit: int = 100) -> int:
+        """Publish committed alert events in order and retain failures."""
+        broadcaster = self._on_alert_ws
+        if broadcaster is None:
+            return 0
+
+        delivered = 0
+        supports_metadata = self._broadcaster_accepts_metadata(broadcaster)
+        for event in self._db.get_pending_outbox_events(limit=limit):
+            item = event.to_dict()
+            payload = item["payload"]
+            try:
+                if supports_metadata:
+                    accepted = broadcaster(
+                        item["topic"],
+                        payload,
+                        event_type=item["event_type"],
+                        resource_id=item["resource_id"],
+                        event_id=item["event_id"],
+                        occurred_at=item["created_at"],
+                    )
+                else:
+                    # Test doubles and legacy integrations can remain two-arg;
+                    # preserve the durable id inside data for observability.
+                    accepted = broadcaster(
+                        item["topic"],
+                        {"outbox_event_id": item["event_id"], **payload},
+                    )
+                if accepted is False:
+                    raise RuntimeError("websocket broadcaster did not accept event")
+                if not self._db.mark_outbox_published(item["event_id"]):
+                    raise RuntimeError("outbox event disappeared before acknowledgement")
+                delivered += 1
+            except Exception as exc:
+                self._db.mark_outbox_failed(item["event_id"], str(exc))
+                logger.warning(
+                    "dispatch.outbox_delivery_failed",
+                    event_id=item["event_id"],
+                    resource_id=item["resource_id"],
+                    error=str(exc),
+                )
+                # Preserve transaction order. A later retry will continue from
+                # this event instead of showing clients a newer state first.
+                break
+
+            if item["topic"] == "alerts" and item["event_type"] == "created":
+                self._publish_audio_alert(payload)
+        return delivered
+
+    def _publish_audio_alert(self, payload: dict) -> None:
+        """Publish the non-durable audio hint after the alert event is accepted."""
+        if self._on_alert_ws is None:
+            return
+        try:
+            audio_msg = {
+                "type": "audio_alert",
+                "severity": payload["severity"],
+                "alert_id": payload["alert_id"],
+                "camera_id": payload["camera_id"],
+            }
+            severity = str(payload.get("severity", ""))
+            sev_audio = getattr(self._audio_config, severity, None)
+            if sev_audio is not None:
+                audio_msg["sound"] = sev_audio.sound
+                audio_msg["voice_template"] = sev_audio.voice_template
+            self._on_alert_ws("audio_alert", audio_msg)
+        except Exception as exc:
+            logger.warning(
+                "dispatch.audio_alert_failed",
+                alert_id=payload.get("alert_id"),
+                error=str(exc),
+            )
 
     def _dispatch_with_retry(
         self,
@@ -507,13 +649,18 @@ class AlertDispatcher:
         rather than silently dropped.
         """
         logger.info("db_worker.started")
+        self._drain_alert_outbox()
         while not self._shutdown.is_set():
             try:
-                data = self._db_queue.get(timeout=5.0)
+                data = self._db_queue.get(timeout=1.0)
             except Empty:
+                self._drain_alert_outbox()
                 continue
             self._dispatch_database(
-                data["alert"], data["snapshot_path"], data["heatmap_path"],
+                data["alert"],
+                data["snapshot_path"],
+                data["heatmap_path"],
+                data.get("evidence_unavailable", False),
             )
 
         # Drain remaining items. _dispatch_database swallows its own exceptions
@@ -525,7 +672,10 @@ class AlertDispatcher:
             except Empty:
                 break
             self._dispatch_database(
-                data["alert"], data["snapshot_path"], data["heatmap_path"],
+                data["alert"],
+                data["snapshot_path"],
+                data["heatmap_path"],
+                data.get("evidence_unavailable", False),
             )
             drained += 1
         if drained:

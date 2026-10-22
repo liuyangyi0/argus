@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from argus.camera import CameraRuntimePlanner
-from argus.config.schema import CameraConfig, GigEConfig
+from argus.config.schema import CameraConfig, GigEConfig, USBCaptureConfig
 from argus.streaming.go2rtc_manager import gige_to_go2rtc_source, usb_to_go2rtc_source
 from argus.streaming.stream_registry import StreamRegistry
 
@@ -21,9 +21,11 @@ class FakeGo2RTCManager:
         register_return: object = _DEFAULT_REGISTER_RETURN,
     ) -> None:
         self.running = running
+        self.rtsp_port = 8554
         self.register_return = register_return
         self.raise_register = False
         self.start_calls: list[dict[str, str] | None] = []
+        self.stop_calls = 0
         self.register_calls: list[tuple[str, str, str]] = []
         self.remove_calls: list[str] = []
 
@@ -38,6 +40,10 @@ class FakeGo2RTCManager:
         if self.register_return is _DEFAULT_REGISTER_RETURN:
             return f"rtsp://127.0.0.1:8554/{camera_id}"
         return self.register_return  # type: ignore[return-value]
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self.running = False
 
     def remove_stream(self, name: str) -> None:
         self.remove_calls.append(name)
@@ -134,6 +140,43 @@ def test_runtime_camera_config_preserves_original_camera_config():
     assert runtime_camera.protocol == "rtsp"
 
 
+def test_runtime_camera_config_does_not_rewrite_rtsp_detection_source():
+    manager = FakeGo2RTCManager(running=True)
+    registry = StreamRegistry(manager)
+    camera = CameraConfig(
+        camera_id="cam_rtsp",
+        name="RTSP",
+        source="rtsp://camera.local/stream",
+        protocol="rtsp",
+    )
+
+    registry.ensure_registered(camera)
+    runtime_camera = registry.runtime_camera_config(camera)
+
+    assert camera.source == "rtsp://camera.local/stream"
+    assert runtime_camera.source == "rtsp://camera.local/stream"
+    assert runtime_camera.protocol == "rtsp"
+    assert registry.resolutions["cam_rtsp"].stream_name == "cam_rtsp"
+
+
+def test_file_camera_is_not_go2rtc_managed():
+    manager = FakeGo2RTCManager(running=True)
+    registry = StreamRegistry(manager)
+    camera = CameraConfig(
+        camera_id="file_cam",
+        name="File",
+        source="data/dev/demo.mp4",
+        protocol="file",
+    )
+
+    resolution = registry.ensure_registered(camera)
+
+    assert resolution is not None
+    assert resolution.go2rtc_managed is False
+    assert resolution.runtime_source == "data/dev/demo.mp4"
+    assert manager.register_calls == []
+
+
 def test_reconcile_re_registers_after_go2rtc_restart():
     manager = FakeGo2RTCManager(running=False)
     registry = StreamRegistry(manager)
@@ -173,13 +216,108 @@ def test_reconcile_accepts_runtime_plan_for_gige_initial_streams():
     assert manager.start_calls == [{
         "gige_01": gige_to_go2rtc_source(capture_script),
     }]
-    assert manager.register_calls == [
-        ("gige_01", "192.0.2.20", "gige"),
-    ]
+    assert manager.register_calls == []
     assert resolutions["gige_01"].go2rtc_managed is True
     assert resolutions["gige_01"].runtime_source == "192.0.2.20"
     assert resolutions["gige_01"].runtime_protocol == "gige"
     assert resolutions["gige_01"].stream_name == "gige_01"
+
+
+def test_usb_exec_source_is_loaded_in_initial_config_for_nvenc():
+    manager = FakeGo2RTCManager(running=False)
+    registry = StreamRegistry(manager)
+    exec_source = (
+        "exec:ffmpeg -f v4l2 -i /dev/video0 -c:v h264_nvenc "
+        "-f rtsp {output}#video=h264"
+    )
+    camera = CameraConfig(
+        camera_id="obsbot",
+        name="OBSBOT",
+        source="/dev/video0",
+        protocol="usb",
+        usb=USBCaptureConfig(
+            pixel_format="mjpeg",
+            go2rtc_source=exec_source,
+        ),
+    )
+
+    resolutions = registry.reconcile([camera])
+
+    assert manager.start_calls == [{"obsbot": exec_source}]
+    assert manager.register_calls == []
+    assert resolutions["obsbot"].go2rtc_managed is True
+    assert resolutions["obsbot"].runtime_source == "rtsp://127.0.0.1:8554/obsbot"
+    assert registry.runtime_camera_config(camera).protocol == "rtsp"
+
+    changed_source = exec_source.replace("h264_nvenc", "h264_nvenc -preset p1")
+    changed = camera.model_copy(update={
+        "usb": camera.usb.model_copy(update={"go2rtc_source": changed_source}),
+    })
+    changed_resolutions = registry.reconcile([changed])
+
+    assert manager.stop_calls == 1
+    assert manager.start_calls[-1] == {"obsbot": changed_source}
+    assert changed_resolutions["obsbot"].go2rtc_managed is True
+
+
+def test_exec_source_restart_replays_every_dynamic_stream():
+    manager = FakeGo2RTCManager(running=False)
+    registry = StreamRegistry(manager)
+    rtsp = CameraConfig(
+        camera_id="rtsp",
+        name="RTSP",
+        source="rtsp://camera.invalid/live",
+        protocol="rtsp",
+    )
+    first_source = "exec:ffmpeg -i /dev/video0 -c:v h264_nvenc {output}"
+    usb = CameraConfig(
+        camera_id="obsbot",
+        name="OBSBOT",
+        source="/dev/video0",
+        protocol="usb",
+        usb=USBCaptureConfig(go2rtc_source=first_source),
+    )
+    registry.reconcile([rtsp, usb])
+
+    changed = usb.model_copy(update={
+        "usb": usb.usb.model_copy(update={
+            "go2rtc_source": first_source + "#video=h264",
+        }),
+    })
+    registry.reconcile([rtsp, changed])
+
+    assert manager.stop_calls == 1
+    assert manager.register_calls == [
+        ("rtsp", "rtsp://camera.invalid/live", "rtsp"),
+        ("rtsp", "rtsp://camera.invalid/live", "rtsp"),
+    ]
+    assert registry.resolutions["rtsp"].go2rtc_managed is True
+
+
+def test_delete_and_readd_exec_source_rewrites_initial_config():
+    manager = FakeGo2RTCManager(running=False)
+    registry = StreamRegistry(manager)
+    exec_source = "exec:ffmpeg -i /dev/video0 -c:v h264_nvenc {output}"
+    camera = CameraConfig(
+        camera_id="obsbot",
+        name="OBSBOT",
+        source="/dev/video0",
+        protocol="usb",
+        usb=USBCaptureConfig(go2rtc_source=exec_source),
+    )
+    registry.reconcile([camera])
+
+    assert registry.undeclare_camera(camera) is True
+    restored = registry.ensure_registered(camera, start_if_needed=True)
+
+    assert manager.stop_calls == 2
+    assert manager.start_calls == [
+        {"obsbot": exec_source},
+        None,
+        {"obsbot": exec_source},
+    ]
+    assert restored is not None and restored.go2rtc_managed is True
+    assert manager.remove_calls == []
 
 
 def test_reconcile_accepts_runtime_plan_for_usb_runtime_redirect():

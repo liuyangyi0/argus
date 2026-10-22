@@ -83,9 +83,15 @@ class TestPeakExtraction:
 
 class TestInstanceSegmenterFallback:
 
+    @pytest.fixture(autouse=True)
+    def fake_missing_sdk(self):
+        # These are CPU contour-unit tests, never a reason to download SAM2.
+        with patch.dict("sys.modules", {"sam2": None, "sam2.sam2_image_predictor": None}):
+            yield
+
     def test_no_sam2_returns_empty_on_blank_frame(self):
         """When SAM 2 is not installed and the frame is uniform, no objects."""
-        seg = InstanceSegmenter(model_size="small", min_mask_area_px=10)
+        seg = InstanceSegmenter(model_size="small", min_mask_area_px=10, allow_contour_fallback=True)
         frame = np.full((200, 200, 3), 128, dtype=np.uint8)
         result = seg.segment(frame, [(100, 100)])
         assert isinstance(result, SegmentationResult)
@@ -95,7 +101,7 @@ class TestInstanceSegmenterFallback:
 
     def test_segment_finds_bright_object(self):
         """A bright square on dark background is found by contour fallback."""
-        seg = InstanceSegmenter(model_size="small", min_mask_area_px=10)
+        seg = InstanceSegmenter(model_size="small", min_mask_area_px=10, allow_contour_fallback=True)
         frame = np.zeros((200, 200, 3), dtype=np.uint8)
         frame[80:120, 80:120] = 255  # 40x40 bright square
 
@@ -110,7 +116,7 @@ class TestInstanceSegmenterFallback:
 
     def test_min_area_filter(self):
         """Objects smaller than min_mask_area_px are discarded."""
-        seg = InstanceSegmenter(model_size="small", min_mask_area_px=5000)
+        seg = InstanceSegmenter(model_size="small", min_mask_area_px=5000, allow_contour_fallback=True)
         frame = np.zeros((200, 200, 3), dtype=np.uint8)
         frame[95:105, 95:105] = 255  # 10x10 = ~100 pixels, below 5000
 
@@ -132,7 +138,7 @@ class TestInstanceSegmenterFallback:
 
     def test_total_area_computed(self):
         """total_area_px is the sum of all object areas."""
-        seg = InstanceSegmenter(model_size="small", min_mask_area_px=10)
+        seg = InstanceSegmenter(model_size="small", min_mask_area_px=10, allow_contour_fallback=True)
         frame = np.zeros((300, 300, 3), dtype=np.uint8)
         # Two well-separated bright squares
         frame[30:70, 30:70] = 255
@@ -203,18 +209,22 @@ class TestSegmentWithMockModel:
         assert result.num_objects == 0
 
     def test_sam2_import_failure_uses_fallback(self):
-        """When sam2 import fails, fallback is used gracefully."""
-        seg = InstanceSegmenter(model_size="small", min_mask_area_px=10)
+        """Explicit fallback cannot report the target model as loaded."""
+        seg = InstanceSegmenter(model_size="small", min_mask_area_px=10, allow_contour_fallback=True)
 
         # Simulate import failure by calling load with sam2 not installed
         with patch.dict("sys.modules", {"sam2": None, "sam2.sam2_image_predictor": None}):
-            seg.load()
+            assert seg.load() is False
 
         assert seg._sam2_available is False
-        assert seg._loaded is True
+        assert seg._loaded is False
+        assert seg.get_status()["backend"] == "contour"
+        assert seg.get_status()["degraded"] is True
 
         # Should still work via fallback
         frame = np.zeros((200, 200, 3), dtype=np.uint8)
         frame[80:120, 80:120] = 255
         result = seg.segment(frame, [(100, 100)])
         assert isinstance(result, SegmentationResult)
+        assert result.backend == "contour"
+        seg.shutdown()

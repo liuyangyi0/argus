@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 
+from argus.dashboard.api_contracts import UserCreateRequest, UserUpdateRequest
 from argus.dashboard.api_response import (
     api_conflict,
     api_forbidden,
@@ -45,6 +46,14 @@ def _audit(request: Request, action: str, target_id: str, detail: str) -> None:
     )
 
 
+async def _disconnect_user_sessions(request: Request, username: str) -> None:
+    """Force live sockets to re-authenticate after a user-row mutation."""
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    disconnect = getattr(ws_manager, "disconnect_principal", None)
+    if disconnect is not None:
+        await disconnect(username)
+
+
 @router.get("/json")
 async def users_json(
     request: Request,
@@ -79,7 +88,7 @@ async def users_json(
 
 
 @router.post("/json")
-async def create_user_json(request: Request):
+async def create_user_json(request: Request, body: UserCreateRequest):
     """JSON API: create a new user."""
     if not require_role(request, "admin"):
         return api_forbidden("权限不足")
@@ -88,12 +97,11 @@ async def create_user_json(request: Request):
     if not db:
         return api_unavailable("数据库不可用")
 
-    body = await request.json()
-    username = str(body.get("username", "")).strip()
-    password = str(body.get("password", ""))
-    display_name = str(body.get("display_name", "")).strip() or None
-    role = str(body.get("role", "viewer")).strip()
-    active = bool(body.get("active", True))
+    username = body.username.strip()
+    password = body.password
+    display_name = body.display_name.strip() if body.display_name else None
+    role = body.role
+    active = body.active
 
     if not username or not password:
         return api_validation_error("用户名和密码不能为空")
@@ -116,7 +124,11 @@ async def create_user_json(request: Request):
 
 
 @router.put("/{username}/json")
-async def update_user_json(request: Request, username: str):
+async def update_user_json(
+    request: Request,
+    username: str,
+    body: UserUpdateRequest,
+):
     """JSON API: update a user."""
     if not require_role(request, "admin"):
         return api_forbidden("权限不足")
@@ -129,11 +141,10 @@ async def update_user_json(request: Request, username: str):
     if user is None:
         return api_not_found("用户不存在")
 
-    body = await request.json()
-    display_name = str(body.get("display_name", "")).strip() or None
-    role = str(body.get("role", user.role)).strip()
-    password = str(body.get("password", ""))
-    active = bool(body.get("active", user.active))
+    supplied_fields = body.model_fields_set
+    role = body.role if "role" in supplied_fields else user.role
+    password = body.password if "password" in supplied_fields else None
+    active = body.active if "active" in supplied_fields else user.active
     current_user = getattr(request.state, "user", {}) or {}
 
     if role not in VALID_ROLES:
@@ -143,15 +154,20 @@ async def update_user_json(request: Request, username: str):
     if username == current_user.get("username") and not active:
         return api_validation_error("不能禁用当前登录用户")
 
-    update_fields: dict[str, object] = {
-        "display_name": display_name,
-        "role": role,
-        "active": active,
-    }
+    update_fields: dict[str, object] = {}
+    if "display_name" in supplied_fields:
+        update_fields["display_name"] = (
+            body.display_name.strip() if body.display_name else None
+        )
+    if "role" in supplied_fields:
+        update_fields["role"] = role
+    if "active" in supplied_fields:
+        update_fields["active"] = active
     if password:
         update_fields["password_hash"] = hash_password(password)
 
     db.update_user(username, **update_fields)
+    await _disconnect_user_sessions(request, username)
     updated = db.get_user(username)
     assert updated is not None
 
@@ -176,6 +192,7 @@ async def delete_user_json(request: Request, username: str):
         return api_not_found("用户不存在")
 
     db.delete_user(username)
+    await _disconnect_user_sessions(request, username)
     _audit(request, "delete_user", username, f"删除用户 {username}")
     return api_success({"username": username})
 
@@ -199,6 +216,7 @@ async def toggle_active_json(request: Request, username: str):
         return api_validation_error("不能禁用当前登录用户")
 
     db.update_user(username, active=not user.active)
+    await _disconnect_user_sessions(request, username)
     _audit(request, "toggle_user_active", username, f"切换用户状态 {username}")
     return api_success({
         "username": username,

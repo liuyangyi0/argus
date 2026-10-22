@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -59,6 +60,7 @@ class TestCreateRetrainingTask:
         cam.anomaly.model_type = model_type
         cam.anomaly.image_size = [256, 256]
         cam.anomaly.quantization = "fp16"
+        cam.anomaly.inference_backend = "openvino"
         return cam
 
     def test_disabled_config_skips_registration(self):
@@ -195,7 +197,7 @@ class TestCreateRetrainingTask:
             ["fb-1", "fb-2"], "model-version-123",
         )
 
-    def test_auto_deploy_on_good_grade(self):
+    def test_auto_deploy_quality_gate_only_registers_candidate(self, tmp_path):
         from argus.core.scheduler import create_retraining_task
 
         scheduler = MagicMock()
@@ -206,7 +208,10 @@ class TestCreateRetrainingTask:
         result = MagicMock()
         result.quality_grade = "A"
         result.status.value = "COMPLETE"
-        result.model_path = "/tmp/model"
+        artifact = tmp_path / "model.pt"
+        artifact.write_bytes(b"runtime artifact")
+        result.model_path = str(artifact)
+        result.model_version_id = None
         trainer.train.return_value = result
 
         baseline_mgr = MagicMock()
@@ -229,12 +234,14 @@ class TestCreateRetrainingTask:
         callback()
 
         registry.register.assert_called_once()
-        # P1 fix: scheduler must NEVER bypass the stage gate. Use the same
-        # release pipeline path as a manual activation, identified by
-        # triggered_by="auto_retrain" so audit logs can attribute it.
-        registry.activate.assert_called_once_with(
-            "cam_01-patchcore-20260406-001", triggered_by="auto_retrain",
-        )
+        assert registry.register.call_args.kwargs["model_path"] == artifact
+        assert registry.register.call_args.kwargs["baseline_dir"] == baseline_mgr.get_baseline_dir.return_value
+        assert registry.register.call_args.kwargs["training_params"]["quality_grade"] == "A"
+        # Scheduled work has no operator approval or runtime transaction.  It
+        # may register the result, but publication remains a manual two-phase
+        # ModelReleaseService command.
+        registry.activate.assert_not_called()
+        registry.promote.assert_not_called()
 
     def test_skip_deploy_on_bad_grade(self):
         from argus.core.scheduler import create_retraining_task
@@ -270,9 +277,8 @@ class TestCreateRetrainingTask:
         registry.register.assert_not_called()
         registry.activate.assert_not_called()
 
-    def test_auto_deploy_respects_stage_gate(self):
-        """P1: when registry refuses activation because the version is still
-        a CANDIDATE, the scheduler must log + audit + continue, NOT bypass."""
+    def test_auto_deploy_fails_closed_before_registry_activation(self, tmp_path):
+        """The scheduler audits release-required without calling a mutator."""
         from argus.core.scheduler import create_retraining_task
 
         scheduler = MagicMock()
@@ -285,7 +291,10 @@ class TestCreateRetrainingTask:
         result = MagicMock()
         result.quality_grade = "A"
         result.status.value = "COMPLETE"
-        result.model_path = "/tmp/model"
+        artifact = tmp_path / "model.pt"
+        artifact.write_bytes(b"runtime artifact")
+        result.model_path = str(artifact)
+        result.model_version_id = None
         trainer.train.return_value = result
 
         baseline_mgr = MagicMock()
@@ -294,9 +303,6 @@ class TestCreateRetrainingTask:
         registry = MagicMock()
         registry.list_models.return_value = []
         registry.register.return_value = "cam_01-patchcore-20260406-001"
-        registry.activate.side_effect = ValueError(
-            "Cannot activate model at stage 'candidate'."
-        )
 
         create_retraining_task(
             scheduler=scheduler,
@@ -310,14 +316,14 @@ class TestCreateRetrainingTask:
         callback = scheduler.add_interval_task.call_args[0][1]
         callback()  # Must NOT raise
 
-        registry.activate.assert_called_once_with(
-            "cam_01-patchcore-20260406-001", triggered_by="auto_retrain",
-        )
-        # Audit must record the blocked attempt for forensics
+        registry.activate.assert_not_called()
+        registry.promote.assert_not_called()
+        # Audit records why a high-quality result remains a candidate.
         audit_logger.log.assert_called_once()
         kwargs = audit_logger.log.call_args.kwargs
-        assert kwargs["action"] == "auto_retrain_activation_blocked"
+        assert kwargs["action"] == "auto_retrain_release_required"
         assert kwargs["target_id"] == "cam_01-patchcore-20260406-001"
+        assert "ModelReleaseService" in kwargs["detail"]
 
     def test_all_active_strategy_merges_eligible_versions(self):
         """P2 follow-up: dataset_strategy='all_active' must call trainer with
@@ -500,3 +506,89 @@ class TestCreateRetrainingTask:
         callback()
 
         assert trainer.train.call_count == 2
+
+    @pytest.mark.parametrize(
+        ("backend", "expected_format", "expected_quantization"),
+        [("torch-cuda", "torch", "fp32"), ("torch-cpu", "torch", "fp32"),
+         ("openvino", "openvino", "fp16")],
+    )
+    def test_runtime_backend_selects_matching_export_and_does_not_duplicate_registration(
+        self, backend, expected_format, expected_quantization,
+    ):
+        from argus.anomaly.trainer import TrainingResult, TrainingStatus
+        from argus.core.scheduler import create_retraining_task
+
+        scheduler = MagicMock()
+        config = self._make_config(min_new_baselines=5, auto_deploy=True)
+        camera = self._make_camera()
+        camera.anomaly.inference_backend = backend
+        trainer = MagicMock()
+        trainer.train.return_value = TrainingResult(
+            status=TrainingStatus.COMPLETE, model_version_id="already-registered-run",
+            quality_report=SimpleNamespace(grade="A"),
+        )
+        baseline_mgr = MagicMock()
+        baseline_mgr.count_images.return_value = 50
+        registry = MagicMock()
+        registry.list_models.return_value = []
+
+        create_retraining_task(
+            scheduler=scheduler, config=config, camera_configs=[camera], trainer=trainer,
+            model_registry=registry, baseline_manager=baseline_mgr,
+        )
+        scheduler.add_interval_task.call_args[0][1]()
+
+        assert trainer.train.call_args.kwargs["export_format"] == expected_format
+        assert trainer.train.call_args.kwargs["quantization"] == expected_quantization
+        registry.register.assert_not_called()
+        registry.activate.assert_not_called()
+        registry.promote.assert_not_called()
+        assert scheduler._audit_logger.log.call_args.kwargs["target_id"] == "already-registered-run"
+
+    def test_persisted_training_counts_prevent_retraining_the_same_baselines(self):
+        from argus.core.scheduler import create_retraining_task
+
+        scheduler = MagicMock()
+        trainer = MagicMock()
+        baseline_mgr = MagicMock()
+        baseline_mgr.count_images.return_value = 50
+        registry = MagicMock()
+        registry.list_models.return_value = [SimpleNamespace(
+            training_params='{"train_count": 40, "val_count": 10}',
+        )]
+
+        create_retraining_task(
+            scheduler=scheduler, config=self._make_config(min_new_baselines=5),
+            camera_configs=[self._make_camera()], trainer=trainer,
+            model_registry=registry, baseline_manager=baseline_mgr,
+        )
+        scheduler.add_interval_task.call_args[0][1]()
+
+        trainer.train.assert_not_called()
+
+    def test_missing_exact_artifact_is_not_registered_as_a_successful_run(self):
+        from argus.anomaly.trainer import TrainingResult, TrainingStatus
+        from argus.core.scheduler import create_retraining_task
+
+        scheduler = MagicMock()
+        trainer = MagicMock()
+        trainer.train.return_value = TrainingResult(
+            status=TrainingStatus.COMPLETE, model_path="/missing/model.pt",
+            quality_report=SimpleNamespace(grade="A"),
+        )
+        baseline_mgr = MagicMock()
+        baseline_mgr.count_images.return_value = 50
+        registry = MagicMock()
+        registry.list_models.return_value = []
+        feedback = MagicMock()
+        feedback.get_pending_for_training.return_value = [MagicMock(feedback_id="pending")]
+
+        create_retraining_task(
+            scheduler=scheduler, config=self._make_config(min_new_baselines=5, auto_deploy=True),
+            camera_configs=[self._make_camera()], trainer=trainer,
+            model_registry=registry, baseline_manager=baseline_mgr, feedback_manager=feedback,
+        )
+        scheduler.add_interval_task.call_args[0][1]()
+
+        registry.register.assert_not_called()
+        feedback.mark_batch_processed.assert_not_called()

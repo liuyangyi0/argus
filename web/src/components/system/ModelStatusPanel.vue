@@ -36,13 +36,31 @@ const failingCount = computed(
   () => models.value.filter((m) => m.consecutive_failures > 5).length,
 )
 const degradedCount = computed(
-  () => models.value.filter(
-    (m) => !m.loaded || m.backend === 'ssim-fallback' || m.backend === 'none',
-  ).length,
+  () => models.value.filter((m) => isModelDegraded(m)).length,
+)
+const backendMismatchCount = computed(
+  () => models.value.filter((m) => hasBackendMismatch(m)).length,
 )
 const inputLimitedCount = computed(
   () => models.value.filter((m) => inputQuality(m)?.detection_limited).length,
 )
+
+function expectedBackend(m: ModelHealthStatus): string {
+  const expected = m.extra?.expected_backend
+  return typeof expected === 'string' && expected ? expected : 'auto'
+}
+
+function hasBackendMismatch(m: ModelHealthStatus): boolean {
+  const expected = expectedBackend(m)
+  return expected !== 'auto' && m.backend !== expected
+}
+
+function isModelDegraded(m: ModelHealthStatus): boolean {
+  return !m.loaded
+    || hasBackendMismatch(m)
+    || m.backend === 'ssim-fallback'
+    || m.backend === 'none'
+}
 
 function inputQuality(m: ModelHealthStatus): ModelInputQualityStatus | null {
   const quality = m.extra?.input_quality
@@ -72,12 +90,22 @@ type BadgeColor = 'green' | 'orange' | 'red' | 'default'
 function backendColor(m: ModelHealthStatus): BadgeColor {
   if (!m.loaded) return 'red'
   if (m.consecutive_failures > 5) return 'red'
+  if (hasBackendMismatch(m)) return 'red'
   if (m.backend === 'ssim-fallback') return 'orange'
   if (m.backend === 'torch-cpu' || m.backend === 'cpu') return 'orange'
   if (m.backend === 'openvino' || m.backend.startsWith('torch-cuda') || m.backend === 'cuda') {
     return 'green'
   }
   return 'default'
+}
+
+function backendLabel(m: ModelHealthStatus): string {
+  const actual = m.loaded ? m.backend : '未加载'
+  const expected = expectedBackend(m)
+  if (expected !== 'auto' && actual !== expected) {
+    return `${actual} / 期望 ${expected}`
+  }
+  return actual
 }
 
 function relativeTime(ts: number | null): string {
@@ -112,6 +140,13 @@ function rowKey(m: ModelHealthStatus): string {
       type="error"
       show-icon
       :message="`⚠ ${failingCount} 个模型正在持续失败（连续 >5 次推理错误）`"
+      style="margin-bottom: 12px"
+    />
+    <a-alert
+      v-else-if="backendMismatchCount > 0"
+      type="error"
+      show-icon
+      :message="`${backendMismatchCount} 个模型后端不符合要求，需检查模型 artifact 与 inference_backend 配置`"
       style="margin-bottom: 12px"
     />
     <a-alert
@@ -152,7 +187,7 @@ function rowKey(m: ModelHealthStatus): string {
       <a-table-column title="Backend" :width="140">
         <template #default="{ record }">
           <a-tag :color="backendColor(record)">
-            {{ record.loaded ? record.backend : '未加载' }}
+            {{ backendLabel(record) }}
           </a-tag>
         </template>
       </a-table-column>

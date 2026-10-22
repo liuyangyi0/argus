@@ -1,0 +1,15 @@
+{
+  "positive_ranges": [
+    {"start_sec": 90, "end_sec": 110, "label": "projectile_event_01"},
+    {"start_sec": 155, "end_sec": 175, "label": "projectile_event_02"},
+    {"start_sec": 220, "end_sec": 240, "label": "projectile_event_03"},
+    {"start_sec": 285, "end_sec": 305, "label": "projectile_event_04"},
+    {"start_sec": 350, "end_sec": 370, "label": "projectile_event_05"},
+    {"start_sec": 415, "end_sec": 435, "label": "projectile_event_06"},
+    {"start_sec": 480, "end_sec": 500, "label": "projectile_event_07"},
+    {"start_sec": 545, "end_sec": 565, "label": "projectile_event_08"},
+    {"start_sec": 610, "end_sec": 630, "label": "projectile_event_09"},
+    {"start_sec": 675, "end_sec": 695, "label": "projectile_event_10"}
+  ],
+  "ignore_ranges": []
+}

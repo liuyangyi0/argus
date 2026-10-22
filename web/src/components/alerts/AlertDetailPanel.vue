@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { storeToRefs } from 'pinia'
 import {
-  Tag, Button, Typography, Tooltip, Segmented, message, Modal,
+  Tag, Button, Typography, Tooltip, Segmented, message,
 } from 'ant-design-vue'
 import {
   CloseOutlined,
@@ -23,6 +23,7 @@ import { extractErrorMessage } from '../../utils/error'
 import ReplayPlayer from '../ReplayPlayer.vue'
 import AnnotationOverlay from '../AnnotationOverlay.vue'
 import ImageCompareSlider from '../ImageCompareSlider.vue'
+import DangerousActionConfirm from '../common/DangerousActionConfirm.vue'
 
 defineOptions({ name: 'AlertDetailPanel' })
 
@@ -42,17 +43,17 @@ const canViewModelRegistry = computed(() => auth.hasRole(['admin', 'engineer']))
 const imageMode = ref<'composite' | 'snapshot' | 'heatmap' | 'compare'>('composite')
 const annotationMode = ref(false)
 
-// When an alert has both a recording and a snapshot, the user can toggle between
-// "录像" (video replay) and "触发帧" (annotated trigger frame). Without a recording
-// there is nothing to toggle to, so the snapshot panel is shown unconditionally.
-const viewMode = ref<'recording' | 'snapshot'>('recording')
+const viewMode = ref<'recording' | 'snapshot'>('snapshot')
+const detailPanelRef = ref<HTMLElement | null>(null)
 
-// Reset view mode to "recording" when switching between alerts, otherwise the
-// operator jumps into the snapshot tab on an alert where that isn't the default.
-watch(() => selectedAlert.value?.alert_id, () => {
-  viewMode.value = 'recording'
+watch(() => selectedAlert.value?.alert_id, async (alertId) => {
+  viewMode.value = 'snapshot'
   imageMode.value = 'composite'
   annotationMode.value = false
+  if (alertId) {
+    await nextTick()
+    detailPanelRef.value?.focus()
+  }
 })
 
 // Track the compare/annotation layer's rendered size so we aren't hard-coding
@@ -95,11 +96,24 @@ const severityLabel: Record<string, string> = {
 const categoryMeta: Record<string, { label: string; color: string }> = {
   projectile: { label: '抛射物', color: 'red' },
   static_foreign: { label: '静态异物', color: 'orange' },
+  water_leak: { label: '可见漏水', color: 'cyan' },
+  visible_plume: { label: '可见烟雾/粉尘', color: 'purple' },
   scene_change: { label: '场景变化', color: 'blue' },
   environmental: { label: '环境干扰', color: 'default' },
   person_intrusion: { label: '人员入侵', color: 'purple' },
   equipment_displacement: { label: '设备位移', color: 'gold' },
   unknown: { label: '未分类', color: 'default' },
+}
+const detectionTypeMeta: Record<string, { label: string; color: string }> = {
+  scene_change: { label: '场景变化', color: 'blue' },
+  new_object: { label: '新增/遗留物', color: 'orange' },
+  persistent_change: { label: '新增/遗留物', color: 'orange' },
+  projectile: { label: '高速飞溅', color: 'volcano' },
+  water_leak: { label: '可见漏水', color: 'cyan' },
+  plume: { label: '可见烟雾/粉尘', color: 'purple' },
+  anomaly: { label: '异常变化', color: 'red' },
+  object: { label: '目标检测', color: 'geekblue' },
+  hybrid: { label: '混合检测', color: 'magenta' },
 }
 const workflowLabel: Record<string, string> = {
   new: '待处理', acknowledged: '已确认', investigating: '调查中',
@@ -109,6 +123,73 @@ const workflowColor: Record<string, string> = {
   new: 'default', acknowledged: 'green', investigating: 'blue',
   resolved: 'cyan', closed: 'default', false_positive: 'orange', uncertain: 'gold',
 }
+const candidateTypeMeta: Record<string, { label: string; color: string }> = {
+  persistent_change: { label: '固定变化', color: 'orange' },
+  water_leak: { label: '可见漏水', color: 'cyan' },
+  plume: { label: '可见烟雾', color: 'purple' },
+  frame_anomaly: { label: '帧异常', color: 'red' },
+  fast_motion: { label: '高速目标', color: 'volcano' },
+  scene_mode: { label: '模式判定', color: 'blue' },
+}
+const candidateDecisionMeta: Record<string, { label: string; color: string }> = {
+  alert: { label: '已报警', color: 'red' },
+  candidate: { label: '候选', color: 'orange' },
+  pending: { label: '等待确认', color: 'gold' },
+  suppressed: { label: '已抑制', color: 'default' },
+  skipped: { label: '已跳过', color: 'default' },
+  normal: { label: '正常', color: 'green' },
+}
+
+const candidateEvidence = computed(() => selectedAlert.value?.candidate_evidence || null)
+const candidateEvents = computed(() => {
+  const events = candidateEvidence.value?.events
+  return Array.isArray(events) ? events : []
+})
+const alertDetectionType = computed(() => (
+  selectedAlert.value?.detection_type
+  || selectedAlert.value?.evidence_json?.detection_type
+  || ''
+))
+const alertFrameIndex = computed(() => {
+  const alert = selectedAlert.value
+  const evidence = alert?.evidence_json
+  return (
+    alert?.frame_number
+    ?? evidence?.frame_number
+    ?? candidateEvidence.value?.trigger_frame_index
+    ?? null
+  )
+})
+const alertReplayPath = computed(() => (
+  selectedAlert.value?.alert_id ? `/replay/${selectedAlert.value.alert_id}` : ''
+))
+const replayReady = computed(() => selectedAlert.value?.replay_ready === true)
+const activeViewMode = computed<'recording' | 'snapshot'>(() => {
+  if (
+    replayReady.value
+    && (!selectedAlert.value?.snapshot_path || viewMode.value === 'recording')
+  ) {
+    return 'recording'
+  }
+  return 'snapshot'
+})
+const recordingUnavailableText = computed(() => {
+  const reason = selectedAlert.value?.recording_unavailable_reason
+  const status = selectedAlert.value?.recording_status
+  if (!reason && !status) return ''
+  const labels: Record<string, string> = {
+    missing_metadata: '录像索引缺失',
+    missing_signals: '录像信号缺失',
+    missing_video: '录像文件缺失',
+    missing_directory: '录像目录缺失',
+    recording_save_failed: '录像生成失败',
+    recording_store_unavailable: '录像存储不可用',
+    ring_buffer_empty: '触发前缓存为空',
+    ring_buffer_solidify_failed: '录像片段固化失败',
+    recording_store_error: '录像状态读取失败',
+  }
+  return labels[reason] || (status === 'incomplete' ? '录像数据不完整' : '')
+})
 
 // Pixels are hard to eyeball — kilo-pixels give a more scannable magnitude
 // for the 分割结果 row. We intentionally don't convert to % of frame area,
@@ -119,6 +200,101 @@ function formatArea(px: number): string {
   return `${(px / 1_000_000).toFixed(2)} M px`
 }
 
+function candidateTypeLabel(type: string): string {
+  return candidateTypeMeta[type]?.label || type || '候选'
+}
+
+function candidateTypeColor(type: string): string {
+  return candidateTypeMeta[type]?.color || 'default'
+}
+
+function candidateDecisionLabel(decision: string): string {
+  return candidateDecisionMeta[decision]?.label || decision || '未知'
+}
+
+function candidateDecisionColor(decision: string): string {
+  return candidateDecisionMeta[decision]?.color || 'default'
+}
+
+function detectionTypeLabel(type: string): string {
+  return detectionTypeMeta[type]?.label || type || '未知'
+}
+
+function detectionTypeColor(type: string): string {
+  return detectionTypeMeta[type]?.color || 'default'
+}
+
+function candidateFrameLabel(event: any): string {
+  const frame = event?.frame_number ?? event?.frame_index
+  return frame === undefined || frame === null ? '-' : `#${frame}`
+}
+
+function formatCandidateScore(event: any): string {
+  const score = Number(event?.score)
+  return Number.isFinite(score) ? score.toFixed(3) : '-'
+}
+
+function candidateEvidenceValue(event: any, key: string): any {
+  const evidence = event?.evidence
+  if (!evidence || typeof evidence !== 'object') return undefined
+  if (key in evidence) return evidence[key]
+  const persistent = evidence.persistent_change
+  if (persistent && typeof persistent === 'object' && key in persistent) {
+    return persistent[key]
+  }
+  return undefined
+}
+
+function candidateChangeFraction(event: any): string {
+  const value = Number(candidateEvidenceValue(event, 'changed_fraction'))
+  return Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : ''
+}
+
+function candidateCount(event: any): string {
+  const count = Number(candidateEvidenceValue(event, 'candidate_count'))
+  return Number.isFinite(count) ? `${count}` : ''
+}
+
+function firstCandidate(event: any): any | null {
+  const candidates = event?.evidence?.candidates
+  return Array.isArray(candidates) && candidates.length ? candidates[0] : null
+}
+
+function candidateBbox(event: any): string {
+  const bbox = firstCandidate(event)?.bbox
+  return Array.isArray(bbox) ? bbox.join(', ') : ''
+}
+
+function candidateLeakType(event: any): string {
+  const type = firstCandidate(event)?.leak_type
+  if (type === 'drip') return '滴水/水流'
+  if (type === 'pooling') return '积水扩大'
+  return ''
+}
+
+function candidatePlumeType(event: any): string {
+  const type = firstCandidate(event)?.plume_type
+  if (type === 'steam_or_mist') return '蒸汽/雾化'
+  if (type === 'smoke_or_dust') return '烟雾/粉尘'
+  if (type === 'visible_plume') return '可见羽流'
+  return ''
+}
+
+function candidateGrowth(event: any): string {
+  const growth = Number(firstCandidate(event)?.growth_area_px)
+  return Number.isFinite(growth) && growth > 0 ? formatArea(growth) : ''
+}
+
+function candidateEdgeDensity(event: any): string {
+  const density = Number(firstCandidate(event)?.edge_density)
+  return Number.isFinite(density) ? density.toFixed(3) : ''
+}
+
+function candidatePersistence(event: any): string {
+  const seconds = Number(firstCandidate(event)?.persistence_seconds)
+  return Number.isFinite(seconds) ? `${seconds.toFixed(1)}s` : ''
+}
+
 // A "多机位回放" storyboard is only meaningful when there's another camera
 // we can pair the alert with — either through the cross-camera correlation
 // pipeline (correlation_partner) or because the event grouping has picked
@@ -126,6 +302,7 @@ function formatArea(px: number): string {
 const hasMultiCam = computed(() => {
   const a = selectedAlert.value
   if (!a) return false
+  if (!replayReady.value) return false
   if (a.correlation_partner) return true
   if ((a.event_group_count ?? 0) > 1) return true
   return false
@@ -151,25 +328,21 @@ async function handleFalsePositive() {
   }
 }
 
-function handleDelete() {
+const deleting = ref(false)
+
+async function handleDelete() {
   if (!selectedAlert.value) return
   const id = selectedAlert.value.alert_id
-  Modal.confirm({
-    title: '确认删除',
-    content: '删除后无法恢复，确定要删除此条告警吗？',
-    okText: '删除',
-    okType: 'danger',
-    cancelText: '取消',
-    async onOk() {
-      try {
-        await store.delAlert(id)
-        message.success('已删除')
-        // Store clears selectedAlert on successful delete → panel collapses.
-      } catch (e) {
-        message.error(extractErrorMessage(e, '删除失败'))
-      }
-    },
-  })
+  deleting.value = true
+  try {
+    await store.delAlert(id)
+    message.success('已删除')
+    // Store clears selectedAlert on successful delete → panel collapses.
+  } catch (e) {
+    message.error(extractErrorMessage(e, '删除失败'))
+  } finally {
+    deleting.value = false
+  }
 }
 
 async function handleEvidenceExport() {
@@ -192,7 +365,14 @@ function goToModelVersion() {
 </script>
 
 <template>
-  <div v-if="selectedAlert" class="detail-panel">
+  <div
+    v-if="selectedAlert"
+    ref="detailPanelRef"
+    class="detail-panel"
+    role="region"
+    :aria-label="`告警 ${selectedAlert.alert_id} 详情`"
+    tabindex="-1"
+  >
     <div class="detail-header">
       <span :class="['sev-badge', `sev-${selectedAlert.severity}`]">
         {{ severityLabel[selectedAlert.severity] }}
@@ -212,7 +392,7 @@ function goToModelVersion() {
         >
           {{ workflowLabel[selectedAlert.workflow_status] || '待处理' }}
         </Tag>
-        <Tooltip v-if="selectedAlert.has_recording" title="在独立页面查看录像回放">
+        <Tooltip v-if="replayReady" title="在独立页面查看录像回放">
           <Button
             size="small"
             type="text"
@@ -239,23 +419,36 @@ function goToModelVersion() {
             size="small"
             type="text"
             style="color: var(--argus-text-muted)"
+            :aria-label="`导出告警 ${selectedAlert.alert_id} 证据包`"
             @click="handleEvidenceExport"
           >
             <template #icon><ExportOutlined /></template>
           </Button>
         </Tooltip>
-        <Button size="small" type="text" style="color: var(--argus-text-muted)" @click="emit('close')">
+        <Button
+          size="small"
+          type="text"
+          style="color: var(--argus-text-muted)"
+          aria-label="关闭告警详情"
+          @click="emit('close')"
+        >
           <template #icon><CloseOutlined /></template>
         </Button>
       </div>
     </div>
 
     <div class="detail-content">
-      <!-- View-mode switch: only shown when both a recording and a snapshot exist,
-           so the operator can flip between the video replay and the annotated
-           trigger frame (composite/heatmap/snapshot). -->
       <div
-        v-if="selectedAlert.has_recording && selectedAlert.snapshot_path"
+        v-if="recordingUnavailableText && selectedAlert.snapshot_path"
+        class="recording-unavailable-banner"
+      >
+        <Typography.Text type="secondary" style="font-size: 13px">
+          {{ recordingUnavailableText }}，已显示触发帧
+        </Typography.Text>
+      </div>
+
+      <div
+        v-if="replayReady && selectedAlert.snapshot_path"
         class="view-mode-bar"
       >
         <Segmented
@@ -269,14 +462,14 @@ function goToModelVersion() {
       </div>
 
       <ReplayPlayer
-        v-if="selectedAlert.has_recording && viewMode === 'recording'"
+        v-if="replayReady && activeViewMode === 'recording'"
         :key="selectedAlert.alert_id"
         :alert-id="selectedAlert.alert_id"
         class="detail-section-spacing"
       />
 
       <div
-        v-if="selectedAlert.snapshot_path && (!selectedAlert.has_recording || viewMode === 'snapshot')"
+        v-if="selectedAlert.snapshot_path && activeViewMode === 'snapshot'"
         class="detail-section-spacing"
       >
         <div class="image-mode-bar">
@@ -349,12 +542,74 @@ function goToModelVersion() {
       </div>
 
       <div
-        v-if="!selectedAlert.has_recording && !selectedAlert.snapshot_path"
+        v-if="!replayReady && !selectedAlert.snapshot_path"
         class="no-image-placeholder"
       >
         <Typography.Text type="secondary" style="font-size: 14px">
           无快照或录像数据
         </Typography.Text>
+      </div>
+
+      <div
+        v-if="candidateEvents.length"
+        class="candidate-evidence-panel detail-section-spacing"
+      >
+        <div class="candidate-evidence-hd">
+          <span>候选证据</span>
+          <b>
+            {{ candidateEvidence?.event_count || candidateEvents.length }} 条
+            <span v-if="candidateEvidence?.trigger_frame_index !== null && candidateEvidence?.trigger_frame_index !== undefined">
+              · 触发帧 #{{ candidateEvidence.trigger_frame_index }}
+            </span>
+          </b>
+        </div>
+        <div class="candidate-event-list">
+          <div
+            v-for="(event, idx) in candidateEvents"
+            :key="event.candidate_id || `${event.candidate_type}-${event.frame_index}-${idx}`"
+            class="candidate-event"
+          >
+            <div class="candidate-event-main">
+              <Tag :color="candidateTypeColor(event.candidate_type)" style="margin: 0">
+                {{ candidateTypeLabel(event.candidate_type) }}
+              </Tag>
+              <Tag :color="candidateDecisionColor(event.decision)" style="margin: 0">
+                {{ candidateDecisionLabel(event.decision) }}
+              </Tag>
+              <span class="candidate-event-frame">帧 {{ candidateFrameLabel(event) }}</span>
+              <span class="candidate-event-score">分数 {{ formatCandidateScore(event) }}</span>
+            </div>
+            <div class="candidate-event-detail">
+              <span v-if="candidateChangeFraction(event)">
+                变化面积 {{ candidateChangeFraction(event) }}
+              </span>
+              <span v-if="candidateCount(event)">
+                候选 {{ candidateCount(event) }}
+              </span>
+              <span v-if="candidateLeakType(event)">
+                迹象 {{ candidateLeakType(event) }}
+              </span>
+              <span v-if="candidatePlumeType(event)">
+                类型 {{ candidatePlumeType(event) }}
+              </span>
+              <span v-if="candidateGrowth(event)">
+                增长 {{ candidateGrowth(event) }}
+              </span>
+              <span v-if="candidateEdgeDensity(event)">
+                边缘密度 {{ candidateEdgeDensity(event) }}
+              </span>
+              <span v-if="candidateBbox(event)">
+                框 {{ candidateBbox(event) }}
+              </span>
+              <span v-if="candidatePersistence(event)">
+                持续 {{ candidatePersistence(event) }}
+              </span>
+              <span v-if="event.suppression_reason">
+                抑制 {{ event.suppression_reason }}
+              </span>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="meta-grid">
@@ -385,9 +640,21 @@ function goToModelVersion() {
                 </Tag>
               </span>
             </div>
+            <div v-if="alertDetectionType" class="meta-row">
+              <span class="meta-k">检测类型</span>
+              <span class="meta-v">
+                <Tag :color="detectionTypeColor(alertDetectionType)" style="margin: 0">
+                  {{ detectionTypeLabel(alertDetectionType) }}
+                </Tag>
+              </span>
+            </div>
             <div class="meta-row">
               <span class="meta-k">置信度</span>
               <span class="meta-v" :style="{ color: scoreColor(selectedAlert.anomaly_score), fontWeight: 600 }">{{ selectedAlert.anomaly_score?.toFixed(4) }}</span>
+            </div>
+            <div v-if="alertFrameIndex !== null && alertFrameIndex !== undefined" class="meta-row">
+              <span class="meta-k">触发帧</span>
+              <span class="meta-v">#{{ alertFrameIndex }}</span>
             </div>
             <div v-if="selectedAlert.classification_label" class="meta-row">
               <span class="meta-k">AI 分类</span>
@@ -446,6 +713,14 @@ function goToModelVersion() {
               <span class="meta-k">触发时间</span>
               <span class="meta-v">{{ formatTimestamp(selectedAlert.timestamp || selectedAlert.created_at) }}</span>
             </div>
+            <div v-if="selectedAlert.evidence_summary" class="meta-row">
+              <span class="meta-k">证据摘要</span>
+              <span class="meta-v meta-v--long">{{ selectedAlert.evidence_summary }}</span>
+            </div>
+            <div v-if="selectedAlert.suppression_reason" class="meta-row">
+              <span class="meta-k">抑制原因</span>
+              <span class="meta-v meta-v--long">{{ selectedAlert.suppression_reason }}</span>
+            </div>
             <div v-if="selectedAlert.assigned_to" class="meta-row">
               <span class="meta-k">指派</span>
               <span class="meta-v">{{ selectedAlert.assigned_to }}</span>
@@ -473,6 +748,19 @@ function goToModelVersion() {
                 <span v-else class="model-version-readonly">
                   {{ selectedAlert.model_version_id }}
                 </span>
+              </span>
+            </div>
+            <div v-if="replayReady && alertReplayPath" class="meta-row">
+              <span class="meta-k">证据回放</span>
+              <span class="meta-v">
+                <Button
+                  type="link"
+                  size="small"
+                  style="padding: 0; height: auto"
+                  @click="router.push(alertReplayPath)"
+                >
+                  打开回放
+                </Button>
               </span>
             </div>
             <div v-if="selectedAlert.workflow_status === 'false_positive'" class="meta-row meta-row--feedback-hint">
@@ -511,15 +799,20 @@ function goToModelVersion() {
                 {{ workflowLabel[selectedAlert.workflow_status] }}
               </Tag>
             </div>
-            <Button
+            <DangerousActionConfirm
               v-if="canMutateAlert"
-              danger
+              title="确认删除告警"
+              description="删除后无法恢复，确定要删除此条告警吗？"
+              action-label="删除告警"
+              :aria-label="`删除告警 ${selectedAlert.alert_id}`"
+              :loading="deleting"
               block
-              @click="handleDelete"
+              confirm-text="删除"
+              @confirm="handleDelete"
             >
               <template #icon><DeleteOutlined /></template>
               删除告警
-            </Button>
+            </DangerousActionConfirm>
 
           </div>
         </div>
@@ -588,6 +881,14 @@ function goToModelVersion() {
   margin-bottom: 20px;
 }
 
+.recording-unavailable-banner {
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  border: 1px solid var(--argus-border);
+  border-radius: 6px;
+  background: var(--argus-card-bg-solid);
+}
+
 .view-mode-bar {
   display: flex;
   align-items: center;
@@ -636,6 +937,63 @@ function goToModelVersion() {
   background: var(--argus-card-bg-solid);
   border-radius: 8px;
   margin-bottom: 20px;
+}
+
+.candidate-evidence-panel {
+  border: 1px solid var(--argus-border);
+  background: var(--argus-card-bg-solid);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.candidate-evidence-hd {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--argus-border);
+  color: var(--argus-text-muted);
+  font-size: 13px;
+  font-weight: 500;
+}
+.candidate-evidence-hd b {
+  color: var(--argus-text);
+  font-size: 12px;
+  font-weight: 500;
+}
+.candidate-event-list {
+  display: grid;
+  gap: 8px;
+  padding: 10px 14px;
+}
+.candidate-event {
+  display: grid;
+  gap: 5px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--argus-border);
+}
+.candidate-event:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+.candidate-event-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+}
+.candidate-event-frame,
+.candidate-event-score {
+  color: var(--argus-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.candidate-event-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--argus-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .meta-grid {
@@ -689,6 +1047,12 @@ function goToModelVersion() {
 .meta-v--notes {
   max-width: 180px;
   text-align: right;
+}
+.meta-v--long {
+  max-width: 260px;
+  text-align: right;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
 }
 .meta-v--classification,
 .meta-v--segmentation {

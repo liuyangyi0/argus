@@ -7,7 +7,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _default_foe_vocab() -> list[str]:
@@ -91,6 +91,124 @@ class SimplexConfig(BaseModel):
     match_radius_px: int = Field(default=50, ge=10, le=200)
 
 
+class PersistentChangeConfig(BaseModel):
+    """Fixed-scene added/left-behind object detector."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable persistent fixed-scene change scoring before MOG2 early exits.",
+    )
+    process_width: int = Field(default=640, ge=160, le=3840)
+    reference_frames: int = Field(
+        default=15,
+        ge=1,
+        le=1000,
+        description="Frames used to initialize the fixed-scene reference.",
+    )
+    diff_threshold: int = Field(default=28, ge=1, le=255)
+    min_area_px: int = Field(
+        default=250,
+        ge=1,
+        le=500000,
+        description="Minimum object area in original-frame pixels.",
+    )
+    max_area_fraction: float = Field(
+        default=0.20,
+        ge=0.001,
+        le=1.0,
+        description="Largest localized candidate as a fraction of the full frame.",
+    )
+    max_change_fraction: float = Field(
+        default=0.12,
+        ge=0.001,
+        le=1.0,
+        description="Suppress when too much of the frame changes at once.",
+    )
+    min_persistence_seconds: float = Field(default=2.0, ge=0.0, le=3600.0)
+    min_persistence_frames: int = Field(default=3, ge=1, le=10000)
+    learning_alpha: float = Field(
+        default=0.002,
+        ge=0.0,
+        le=0.5,
+        description="Slow reference update rate outside active changed regions.",
+    )
+    morph_kernel_size: int = Field(default=5, ge=3, le=31)
+    match_radius_px: int = Field(default=40, ge=1, le=1000)
+    max_missed_frames: int = Field(default=3, ge=0, le=1000)
+    alert_score: float = Field(
+        default=0.82,
+        ge=0.1,
+        le=0.99,
+        description="Base anomaly score assigned once persistence criteria are met.",
+    )
+    max_candidates_per_frame: int = Field(default=5, ge=1, le=100)
+
+
+class WaterLeakConfig(BaseModel):
+    """Visible drip/leak/pooling detector for fixed RGB cameras."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable visible water leak signs from RGB frames. This detects visible "
+            "drips, wet darkening/highlights, and pooling growth, not invisible gas."
+        ),
+    )
+    process_width: int = Field(default=640, ge=160, le=3840)
+    reference_frames: int = Field(default=15, ge=1, le=1000)
+    diff_threshold: int = Field(default=22, ge=1, le=255)
+    darkening_threshold: int = Field(default=14, ge=1, le=255)
+    brightening_threshold: int = Field(default=18, ge=1, le=255)
+    specular_value_threshold: int = Field(default=180, ge=1, le=255)
+    specular_saturation_max: int = Field(default=80, ge=0, le=255)
+    min_area_px: int = Field(default=120, ge=1, le=500000)
+    max_area_fraction: float = Field(default=0.12, ge=0.001, le=1.0)
+    max_change_fraction: float = Field(default=0.08, ge=0.001, le=1.0)
+    min_growth_area_px: int = Field(default=80, ge=0, le=500000)
+    min_persistence_seconds: float = Field(default=1.0, ge=0.0, le=3600.0)
+    min_persistence_frames: int = Field(default=3, ge=1, le=10000)
+    min_drip_length_px: int = Field(default=18, ge=1, le=5000)
+    min_vertical_aspect: float = Field(default=2.0, ge=1.0, le=100.0)
+    learning_alpha: float = Field(default=0.001, ge=0.0, le=0.5)
+    morph_kernel_size: int = Field(default=5, ge=3, le=31)
+    match_radius_px: int = Field(default=50, ge=1, le=1000)
+    max_missed_frames: int = Field(default=5, ge=0, le=1000)
+    alert_score: float = Field(default=0.84, ge=0.1, le=0.99)
+    max_candidates_per_frame: int = Field(default=5, ge=1, le=100)
+
+
+class PlumeConfig(BaseModel):
+    """Visible smoke/steam/dust/mist detector for fixed RGB cameras."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable visible plume signs from RGB frames. This detects visible "
+            "smoke, steam, dust, and mist-like changes, not invisible gas."
+        ),
+    )
+    process_width: int = Field(default=640, ge=160, le=3840)
+    reference_frames: int = Field(default=15, ge=1, le=1000)
+    diff_threshold: int = Field(default=16, ge=1, le=255)
+    brightening_threshold: int = Field(default=12, ge=1, le=255)
+    darkening_threshold: int = Field(default=12, ge=1, le=255)
+    max_saturation: int = Field(default=150, ge=0, le=255)
+    min_area_px: int = Field(default=180, ge=1, le=500000)
+    max_area_fraction: float = Field(default=0.25, ge=0.001, le=1.0)
+    max_change_fraction: float = Field(default=0.18, ge=0.001, le=1.0)
+    min_growth_area_px: int = Field(default=100, ge=0, le=500000)
+    min_persistence_seconds: float = Field(default=1.0, ge=0.0, le=3600.0)
+    min_persistence_frames: int = Field(default=3, ge=1, le=10000)
+    max_edge_density: float = Field(default=0.08, ge=0.0, le=1.0)
+    max_bbox_fill_fraction: float = Field(default=0.90, ge=0.01, le=1.0)
+    learning_alpha: float = Field(default=0.001, ge=0.0, le=0.5)
+    morph_kernel_size: int = Field(default=7, ge=3, le=31)
+    match_radius_px: int = Field(default=70, ge=1, le=1000)
+    max_missed_frames: int = Field(default=6, ge=0, le=1000)
+    alert_score: float = Field(default=0.83, ge=0.1, le=0.99)
+    max_candidates_per_frame: int = Field(default=5, ge=1, le=100)
+
+
 class USBCaptureConfig(BaseModel):
     """USB camera capture hints for OpenCV and go2rtc."""
 
@@ -101,6 +219,13 @@ class USBCaptureConfig(BaseModel):
     device_id: str | None = Field(
         default=None,
         description="Preferred USB camera stable/alternative device identifier for DirectShow/go2rtc.",
+    )
+    go2rtc_source: str | None = Field(
+        default=None,
+        description=(
+            "Optional operator-managed go2rtc source for this USB camera. "
+            "Use an initial-config exec source when hardware encoding is required."
+        ),
     )
     preferred_backend: Literal["auto", "dshow", "msmf", "ffmpeg", "v4l2", "default"] = Field(
         default="auto",
@@ -148,6 +273,15 @@ class FastMotionConfig(BaseModel):
             "too much of the frame; long structural edges are scene changes."
         ),
     )
+    streak_gap_px: int = Field(
+        default=4,
+        ge=1,
+        le=50,
+        description=(
+            "Processed-frame gap size to close when fragmented fast-projectile streaks "
+            "are broken by compression, blur, or rolling-shutter sampling."
+        ),
+    )
     instant_alert_score: float = Field(default=0.96, ge=0.5, le=0.99)
     max_candidates_per_frame: int = Field(default=5, ge=1, le=50)
     min_runtime_fps: float = Field(default=50.0, ge=1.0, le=120.0)
@@ -164,12 +298,30 @@ class PersonFilterConfig(BaseModel):
     multi-class COCO detection with optional tracking.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     confidence: float = Field(default=0.4, ge=0.1, le=0.95)
     skip_frame_on_person: bool = False
     model_name: str = "yolo11n.pt"
     classes_to_detect: list[int] = Field(
         default=[0],
         description="COCO class IDs to detect. [0]=person only.",
+    )
+    alert_class_ids: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Explicit non-person class IDs whose YOLO confidence may drive an "
+            "independent object-safety alert. Empty disables this alert channel."
+        ),
+    )
+    alert_min_confidence: float = Field(
+        default=0.9,
+        ge=0.1,
+        le=0.99,
+        description=(
+            "Minimum YOLO confidence for an allowlisted non-person class to "
+            "contribute an independent object-safety alert score."
+        ),
     )
     enable_tracking: bool = Field(
         default=False,
@@ -187,6 +339,24 @@ class PersonFilterConfig(BaseModel):
         default=0.25, ge=0.0, le=0.5,
         description="Overlap ratio between adjacent slices for SAHI",
     )
+
+    @model_validator(mode="after")
+    def validate_object_safety_alert_classes(self) -> PersonFilterConfig:
+        """Keep object-driven alerts explicit and aligned with detector output."""
+        alert_ids = set(self.alert_class_ids)
+        if len(alert_ids) != len(self.alert_class_ids):
+            raise ValueError("person_filter.alert_class_ids must not contain duplicates")
+        if 0 in alert_ids:
+            raise ValueError(
+                "person_filter.alert_class_ids must contain non-person classes only"
+            )
+        missing = sorted(alert_ids.difference(self.classes_to_detect))
+        if missing:
+            raise ValueError(
+                "person_filter.alert_class_ids must be a subset of "
+                f"classes_to_detect; missing={missing}"
+            )
+        return self
 
 
 class CaptureQualityConfig(BaseModel):
@@ -252,6 +422,14 @@ class AnomalyConfig(BaseModel):
     """Anomalib anomaly detection parameters."""
 
     model_type: Literal["patchcore", "efficient_ad", "fastflow", "padim", "dinomaly2"] = "patchcore"
+    inference_backend: Literal["auto", "torch-cuda", "openvino", "torch-cpu"] = Field(
+        default="auto",
+        description=(
+            "Runtime inference backend policy. Use torch-cuda for NVIDIA GPU "
+            "deployments; explicit policies do not silently fall back to other "
+            "artifact formats."
+        ),
+    )
     threshold: float = Field(default=0.7, ge=0.1, le=0.99)
     image_size: tuple[int, int] = Field(
         default=(256, 256),
@@ -359,6 +537,34 @@ class AnomalyConfig(BaseModel):
         default=3, ge=0, le=90,
         description="Minimum days in shadow stage before promotion to canary",
     )
+    min_shadow_samples: int = Field(
+        default=0, ge=0, le=1_000_000,
+        description=(
+            "Minimum shadow inference samples before promotion to canary. "
+            "0 disables the evidence-count gate."
+        ),
+    )
+    max_shadow_alert_rate_delta: float = Field(
+        default=1.0, ge=0.0, le=1.0,
+        description=(
+            "Maximum allowed absolute alert-rate delta between shadow and "
+            "production before promotion to canary."
+        ),
+    )
+    max_shadow_score_divergence: float = Field(
+        default=1.0, ge=0.0, le=1.0,
+        description=(
+            "Maximum allowed average absolute score divergence between shadow "
+            "and production before promotion to canary."
+        ),
+    )
+    max_shadow_latency_ms: float = Field(
+        default=0.0, ge=0.0, le=10000.0,
+        description=(
+            "Maximum allowed average shadow latency before promotion to canary. "
+            "0 disables the latency gate."
+        ),
+    )
     min_canary_days: int = Field(
         default=7, ge=0, le=90,
         description="Minimum days in canary stage before promotion to production",
@@ -388,6 +594,11 @@ class ClassifierConfig(BaseModel):
         default_factory=lambda: list(_default_foe_vocab()),
     )
     min_anomaly_score_to_classify: float = Field(default=0.5, ge=0.0, le=1.0)
+    timeout_seconds: float = Field(default=10.0, ge=0.1, le=60.0)
+    min_confidence_to_affect_alert: float = Field(
+        default=0.9, ge=0.9, le=1.0,
+        description="Only trusted vocabulary results may suppress or adjust alerts",
+    )
     high_risk_labels: list[str] = Field(
         default_factory=lambda: [
             "wrench", "bolt", "nut", "screwdriver", "hammer",
@@ -636,8 +847,255 @@ class AlignmentConfig(BaseModel):
     )
 
 
+class SceneGuardConfig(BaseModel):
+    """Fixed-scene identity and camera-pose safety gate.
+
+    Unlike micro-vibration alignment, this gate compares live frames with an
+    immutable, operator-approved scene reference before old baselines or models
+    are allowed to produce alerts.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True,
+        description="Require scene identity/pose validation before detection",
+    )
+    profiles_dir: str = Field(
+        default="data/scene_profiles",
+        description="Root directory containing approved scene profiles",
+    )
+    reference_image: str | None = Field(
+        default=None,
+        description="Explicit approved reference image; active profile is preferred when present",
+    )
+    fallback_to_baseline: bool = Field(
+        default=False,
+        description=(
+            "Use an image from the active training baseline when no scene profile exists; "
+            "ignored when require_profile_model_binding is enabled"
+        ),
+    )
+    allow_alignable: bool = Field(
+        default=False,
+        description=(
+            "Permit a small homography registration to reuse the old model; "
+            "disabled by default because 3D parallax cannot be corrected safely"
+        ),
+    )
+    require_profile_model_binding: bool = Field(
+        default=True,
+        description=(
+            "Require an active scene profile to name the exact runtime model "
+            "version, bind its complete Argus runtime artifact SHA-256, and "
+            "originate from the current active baseline"
+        ),
+    )
+    require_operator_approved_profile: bool = Field(
+        default=True,
+        description=(
+            "Accept only an active profile with literal operator_approved=true "
+            "that is not marked validation_only; validation runs must opt out "
+            "explicitly"
+        ),
+    )
+    process_width: int = Field(default=960, ge=320, le=3840)
+    feature_type: Literal["orb", "sift"] = "orb"
+    check_interval_frames: int = Field(
+        default=60, ge=1, le=10000,
+        description="Run the full pose check every N frames after the scene is stable",
+    )
+    check_interval_seconds: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=60.0,
+        description="Maximum wall-clock TTL for a cached scene match",
+    )
+    consecutive_matches: int = Field(
+        default=3, ge=1, le=30,
+        description="Consecutive matching decisions required before releasing isolation",
+    )
+    min_matches: int = Field(default=40, ge=4, le=10000)
+    min_inliers: int = Field(default=18, ge=4, le=10000)
+    min_inlier_ratio: float = Field(default=0.45, gt=0.0, le=1.0)
+    max_reprojection_error_px: float = Field(default=3.0, ge=0.1, le=100.0)
+    min_coverage_ratio: float = Field(default=0.12, gt=0.0, le=1.0)
+    min_overlap_ratio: float = Field(default=0.75, gt=0.0, le=1.0)
+    stable_max_shift_px: float = Field(default=3.0, gt=0.0, le=1000.0)
+    stable_max_corner_displacement_px: float = Field(
+        default=3.0,
+        gt=0.0,
+        le=1000.0,
+        description=(
+            "Maximum displacement of any image corner for an unwarped STABLE pose"
+        ),
+    )
+    stable_max_rotation_deg: float = Field(default=0.10, ge=0.0, le=90.0)
+    stable_max_scale_delta: float = Field(default=0.003, ge=0.0, le=1.0)
+    alignable_max_shift_px: float = Field(default=32.0, ge=1.0, le=4000.0)
+    alignable_max_rotation_deg: float = Field(default=3.0, ge=0.1, le=90.0)
+    alignable_max_scale_delta: float = Field(default=0.05, ge=0.0, le=2.0)
+
+    @model_validator(mode="after")
+    def validate_scene_guard_thresholds(self) -> SceneGuardConfig:
+        if self.min_inliers > self.min_matches:
+            raise ValueError("scene_guard.min_inliers cannot exceed min_matches")
+        if self.stable_max_shift_px > self.alignable_max_shift_px:
+            raise ValueError(
+                "scene_guard.stable_max_shift_px cannot exceed alignable_max_shift_px"
+            )
+        if self.stable_max_rotation_deg > self.alignable_max_rotation_deg:
+            raise ValueError(
+                "scene_guard.stable_max_rotation_deg cannot exceed "
+                "alignable_max_rotation_deg"
+            )
+        if self.stable_max_scale_delta > self.alignable_max_scale_delta:
+            raise ValueError(
+                "scene_guard.stable_max_scale_delta cannot exceed "
+                "alignable_max_scale_delta"
+            )
+        return self
+
+
+class CandidateModelEvidenceConfig(BaseModel):
+    """Shadow-first model evidence for persistent-change candidates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description="Collect calibrated candidate-level model evidence",
+    )
+    fusion_policy: Literal["structure_only", "model_required"] = Field(
+        default="structure_only",
+        description="Whether model evidence is telemetry-only or required by the gate",
+    )
+    calibration_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Expected runtime binding ID produced during offline calibration",
+    )
+    global_score_min: float | None = Field(
+        default=None, ge=0.0, allow_inf_nan=False
+    )
+    roi_p95_min: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    roi_context_delta_min: float | None = Field(
+        default=None, allow_inf_nan=False
+    )
+    context_ratio: float = Field(
+        default=0.5, gt=0.0, le=4.0, allow_inf_nan=False
+    )
+    hot_pixel_threshold: float = Field(
+        default=0.5, ge=0.0, allow_inf_nan=False
+    )
+    anomaly_attribution_min_hot_coverage: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description=(
+            "Minimum share of model-hot pixels that rejected persistent "
+            "candidates must explain before the duplicate global anomaly "
+            "channel can be suppressed"
+        ),
+    )
+    sample_every_n_candidates: int = Field(default=1, ge=1, le=10_000)
+    temporal_required_passes: int = Field(default=2, ge=2, le=10)
+    temporal_min_gap_seconds: float = Field(
+        default=0.4, ge=0.0, le=60.0, allow_inf_nan=False
+    )
+    temporal_max_gap_seconds: float = Field(
+        default=2.0, gt=0.0, le=300.0, allow_inf_nan=False
+    )
+    temporal_iou_threshold: float = Field(
+        default=0.5, gt=0.0, le=1.0, allow_inf_nan=False
+    )
+
+    @model_validator(mode="after")
+    def validate_temporal_window(self) -> "CandidateModelEvidenceConfig":
+        if self.temporal_min_gap_seconds > self.temporal_max_gap_seconds:
+            raise ValueError(
+                "temporal_min_gap_seconds cannot exceed temporal_max_gap_seconds"
+            )
+        return self
+
+    @property
+    def thresholds_complete(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self.global_score_min,
+                self.roi_p95_min,
+                self.roi_context_delta_min,
+            )
+        )
+
+
+class StaticCandidateConfirmationConfig(BaseModel):
+    """Second-stage structural confirmation for persistent scene changes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description="Require structural/photometric confirmation before persistent alerts",
+    )
+    mode: Literal["shadow", "enforce"] = Field(
+        default="shadow",
+        description=(
+            "shadow records would-accept/reject evidence without changing alerts; "
+            "enforce gates persistent-change candidates"
+        ),
+    )
+    sensitive_rois: list[tuple[int, int, int, int]] = Field(
+        default_factory=list,
+        description="Glass/display regions requiring stronger structural evidence",
+    )
+    min_bbox_size: int = Field(default=8, ge=2, le=1000)
+    min_local_mean_abs_difference: float = Field(default=0.025, ge=0.0, le=1.0)
+    changed_pixel_threshold: float = Field(default=0.04, ge=0.0, le=1.0)
+    global_illumination_min_delta: float = Field(default=0.025, ge=0.0, le=1.0)
+    global_changed_fraction_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    max_global_model_residual: float = Field(default=0.025, ge=0.0, le=1.0)
+    min_structure_score: float = Field(default=0.30, ge=0.0, le=1.0)
+    sensitive_min_structure_score: float = Field(default=0.55, ge=0.0, le=1.0)
+    external_anomaly_score_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Optional model-score corroboration; disabled until site calibration",
+    )
+    model_evidence: CandidateModelEvidenceConfig = Field(
+        default_factory=CandidateModelEvidenceConfig,
+        description="Comparable model-map telemetry and same-location temporal gate",
+    )
+
+    @model_validator(mode="after")
+    def validate_model_required_enforcement(self) -> "StaticCandidateConfirmationConfig":
+        cfg = self.model_evidence
+        if self.mode != "enforce" or cfg.fusion_policy != "model_required":
+            return self
+        if not self.enabled:
+            raise ValueError(
+                "model_required enforce mode requires static_confirmation.enabled"
+            )
+        if not cfg.enabled:
+            raise ValueError("model_required enforce mode requires model_evidence.enabled")
+        if cfg.calibration_id is None or not cfg.thresholds_complete:
+            raise ValueError(
+                "model_required enforce mode requires calibration_id and all model thresholds"
+            )
+        if cfg.sample_every_n_candidates != 1:
+            raise ValueError(
+                "model_required enforce mode cannot sample or rate-limit candidates"
+            )
+        return self
+
+
 class CameraConfig(BaseModel):
     """Configuration for a single camera."""
+
+    model_config = ConfigDict(extra="forbid")
 
     camera_id: str
     name: str
@@ -647,8 +1105,11 @@ class CameraConfig(BaseModel):
     @classmethod
     def migrate_legacy_region_field(cls, data):
         """Gracefully handle older configs that still store region_name."""
-        if isinstance(data, dict) and "region_id" not in data and "region_name" in data:
-            legacy = data.get("region_name")
+        if not isinstance(data, dict) or "region_name" not in data:
+            return data
+        data = dict(data)
+        legacy = data.pop("region_name")
+        if "region_id" not in data:
             if isinstance(legacy, int):
                 data["region_id"] = legacy
             elif isinstance(legacy, str) and legacy.strip().isdigit():
@@ -681,9 +1142,29 @@ class CameraConfig(BaseModel):
         default_factory=AlignmentConfig,
         description="Phase-correlation alignment for camera micro-vibration",
     )
+    scene_guard: SceneGuardConfig = Field(
+        default_factory=SceneGuardConfig,
+        description="Camera scene identity and pose gate",
+    )
     person_filter: PersonFilterConfig = Field(default_factory=PersonFilterConfig)
     anomaly: AnomalyConfig = Field(default_factory=AnomalyConfig)
     simplex: SimplexConfig = Field(default_factory=SimplexConfig)
+    persistent_change: PersistentChangeConfig = Field(
+        default_factory=PersistentChangeConfig,
+        description="Fixed-scene added/left-behind object detection",
+    )
+    static_confirmation: StaticCandidateConfirmationConfig = Field(
+        default_factory=StaticCandidateConfirmationConfig,
+        description="Second-stage confirmation for persistent scene-change candidates",
+    )
+    water_leak: WaterLeakConfig = Field(
+        default_factory=WaterLeakConfig,
+        description="Visible drip/leak/pooling detection for RGB cameras",
+    )
+    plume: PlumeConfig = Field(
+        default_factory=PlumeConfig,
+        description="Visible smoke/steam/dust/mist detection for RGB cameras",
+    )
     usb: USBCaptureConfig = Field(
         default_factory=USBCaptureConfig,
         description="USB camera backend and pixel-format preferences",
@@ -721,6 +1202,66 @@ class CameraConfig(BaseModel):
         default=10.0, ge=1.0, le=100.0,
         description="Velocity magnitude below which an object is considered stationary (px/frame)",
     )
+
+    @model_validator(mode="after")
+    def validate_scene_guard_alignment_contract(self) -> CameraConfig:
+        if (
+            self.scene_guard.enabled
+            and self.alignment.enabled
+            and self.scene_guard.stable_max_corner_displacement_px
+            > self.alignment.max_shift_px
+        ):
+            raise ValueError(
+                "scene_guard.stable_max_corner_displacement_px cannot exceed "
+                "alignment.max_shift_px when both guards are enabled"
+            )
+        confirmation = self.static_confirmation
+        if confirmation.enabled and confirmation.mode == "enforce":
+            if not self.persistent_change.enabled:
+                raise ValueError(
+                    "static_confirmation enforce mode requires persistent_change.enabled"
+                )
+            if not self.scene_guard.enabled:
+                raise ValueError(
+                    "static_confirmation enforce mode requires scene_guard.enabled"
+                )
+            if (
+                confirmation.model_evidence.fusion_policy == "model_required"
+            ):
+                if not self.scene_guard.require_profile_model_binding:
+                    raise ValueError(
+                        "model_required enforce mode requires "
+                        "scene_guard.require_profile_model_binding"
+                    )
+                if self.scene_guard.allow_alignable:
+                    raise ValueError(
+                        "model_required enforce mode requires "
+                        "scene_guard.allow_alignable=false until per-variant "
+                        "calibration is supported"
+                    )
+                if self.low_light.enabled and self.low_light.clahe_enabled:
+                    raise ValueError(
+                        "model_required enforce mode does not support dynamic "
+                        "low-light CLAHE without per-variant calibration"
+                    )
+                if self.anomaly.ensemble.enabled:
+                    raise ValueError(
+                        "model_required enforce mode does not support anomaly ensemble"
+                    )
+                if self.anomaly.dinomaly_multi_class:
+                    raise ValueError(
+                        "model_required enforce mode does not support shared "
+                        "dinomaly_multi_class detector lifecycle"
+                    )
+                if (
+                    confirmation.model_evidence.anomaly_attribution_min_hot_coverage
+                    != 1.0
+                ):
+                    raise ValueError(
+                        "model_required enforce mode requires complete (1.0) "
+                        "anomaly hot-support attribution"
+                    )
+        return self
 
 
 class CameraGroupConfig(BaseModel):
@@ -813,6 +1354,16 @@ class SuppressionConfig(BaseModel):
 
     same_zone_window_seconds: float = Field(default=300.0, ge=10.0, le=3600.0)
     same_camera_window_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
+    localized_alert_min_interval_seconds: float = Field(
+        default=45.0,
+        ge=0.0,
+        le=3600.0,
+        description=(
+            "Deprecated compatibility setting. Localized deduplication now uses "
+            "incident identity when available and spatial IoU otherwise; distinct "
+            "incidents are never subject to a blanket interval."
+        ),
+    )
 
 
 class EarlyWarningConfig(BaseModel):
@@ -882,7 +1433,8 @@ class AlertConfig(BaseModel):
     enabled_categories: list[str] = Field(
         default=[
             "projectile", "static_foreign", "scene_change",
-            "environmental", "person_intrusion", "equipment_displacement",
+            "water_leak", "visible_plume", "environmental", "person_intrusion",
+            "equipment_displacement",
         ],
         description="启用的告警分类列表",
     )
@@ -935,10 +1487,21 @@ class AudioAlertConfig(BaseModel):
     )
 
 
+class DebugConfig(BaseModel):
+    frame_identity_overlay: bool = Field(
+        default=False,
+        description="Overlay frame identity metadata on snapshot JPEG responses",
+    )
+
+
 class DashboardConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8080, ge=1024, le=65535)
     debug: bool = False
+    frame_identity_overlay: bool = Field(
+        default=False,
+        description="Deprecated compatibility flag; prefer debug.frame_identity_overlay",
+    )
     mjpeg_fps: float = Field(
         default=5.0, ge=1.0, le=30.0,
         description="MJPEG stream target FPS",
@@ -970,10 +1533,44 @@ class DashboardConfig(BaseModel):
         default=8555, ge=1024, le=65535,
         description="go2rtc WebRTC ICE/UDP listener port",
     )
+    go2rtc_webrtc_listen_host: str = Field(
+        default="0.0.0.0",
+        pattern=r"^(?:\d{1,3}\.){3}\d{1,3}$",
+        description=(
+            "IPv4 host for the go2rtc WebRTC ICE listener. API and RTSP stay "
+            "loopback-only; set 127.0.0.1 for host-local browser validation, "
+            "or an explicitly firewalled LAN binding for remote browsers."
+        ),
+    )
     go2rtc_binary: str | None = Field(
         default=None,
         description="Path to go2rtc binary (auto-detected if None)",
     )
+    go2rtc_config_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Directory for the generated go2rtc configuration; set this for "
+            "an isolated, inspectable runtime instead of an OS temp directory"
+        ),
+    )
+    go2rtc_replace_stale_process: bool = Field(
+        default=False,
+        description=(
+            "Allow go2rtc startup to terminate an existing listener on the "
+            "configured API port. Keep false for fail-closed process ownership."
+        ),
+    )
+
+    @field_validator("go2rtc_webrtc_listen_host")
+    @classmethod
+    def validate_go2rtc_webrtc_listen_host(cls, value: str) -> str:
+        from ipaddress import IPv4Address
+
+        try:
+            IPv4Address(value)
+        except ValueError as exc:
+            raise ValueError("go2rtc WebRTC listen host must be an IPv4 address") from exc
+        return value
 
 
 class LoggingConfig(BaseModel):
@@ -1376,6 +1973,35 @@ class SensorFusionConfig(BaseModel):
         description="Default time-to-live (seconds) for a pushed signal when "
         "the client does not specify one",
     )
+    gas_warning_ppm: float = Field(default=10.0, ge=0.0, le=100000.0)
+    gas_danger_ppm: float = Field(default=50.0, ge=0.0, le=100000.0)
+    pressure_drop_warning_kpa: float = Field(default=5.0, ge=0.0, le=100000.0)
+    pressure_drop_danger_kpa: float = Field(default=15.0, ge=0.0, le=100000.0)
+    humidity_warning_rh: float = Field(default=85.0, ge=0.0, le=100.0)
+    humidity_danger_rh: float = Field(default=95.0, ge=0.0, le=100.0)
+    temperature_warning_c: float = Field(default=70.0, ge=-100.0, le=1000.0)
+    temperature_danger_c: float = Field(default=90.0, ge=-100.0, le=1000.0)
+    warning_multiplier: float = Field(default=1.5, ge=0.1, le=5.0)
+    danger_multiplier: float = Field(default=2.5, ge=0.1, le=5.0)
+
+    @model_validator(mode="after")
+    def _validate_sensor_thresholds(self) -> SensorFusionConfig:
+        pairs = [
+            ("gas", self.gas_warning_ppm, self.gas_danger_ppm),
+            (
+                "pressure_drop",
+                self.pressure_drop_warning_kpa,
+                self.pressure_drop_danger_kpa,
+            ),
+            ("humidity", self.humidity_warning_rh, self.humidity_danger_rh),
+            ("temperature", self.temperature_warning_c, self.temperature_danger_c),
+        ]
+        for name, warning, danger in pairs:
+            if warning > danger:
+                raise ValueError(f"{name} warning threshold must be <= danger threshold")
+        if self.warning_multiplier > self.danger_multiplier:
+            raise ValueError("warning_multiplier must be <= danger_multiplier")
+        return self
 
 
 class ArgusConfig(BaseModel):
@@ -1385,6 +2011,7 @@ class ArgusConfig(BaseModel):
     cameras: list[CameraConfig] = Field(default_factory=list)
     alerts: AlertConfig = Field(default_factory=AlertConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    debug: DebugConfig = Field(default_factory=DebugConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)

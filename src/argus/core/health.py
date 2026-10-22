@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import platform
 import time
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from typing import Callable
 
@@ -34,6 +35,47 @@ class CameraHealth:
     reconnect_count: int = 0
     last_frame_time: float = 0.0
     error: str | None = None
+    observed_since: float = 0.0
+    capture_state: str = "waiting"
+    scene_guard_usable: bool | None = None
+    scene_guard_state: str | None = None
+    scene_guard_reason: str | None = None
+    model_ready: bool | None = None
+    model_error: str | None = None
+    pipeline_mode: str | None = "active"
+    detection_state: str = "waiting"
+    detection_reason: str | None = "runtime_status_unavailable"
+
+
+def runtime_detection_health(
+    scene_guard: dict | None, model_statuses: list[dict],
+    *, pipeline_mode: str | None = None,
+) -> dict:
+    """Summarize detached runtime diagnostics without masking unknown state."""
+    guard = scene_guard if isinstance(scene_guard, dict) else {}
+    models = [
+        model for model in model_statuses
+        if model.get("backend") != "disabled"
+    ]
+    failures = [
+        model for model in models
+        if model.get("loaded") is not True
+        or model.get("consecutive_failures", 0) > 0
+        or model.get("backend") in {"none", "ssim-fallback"}
+    ]
+    model_ready = not failures if models else None
+    model_error = None
+    if failures:
+        failed = failures[0]
+        model_error = str(failed.get("last_error") or f"{failed.get('name', 'model')}_not_ready")
+    return {
+        "scene_guard_usable": guard.get("usable") if isinstance(guard.get("usable"), bool) else None,
+        "scene_guard_state": guard.get("state"),
+        "scene_guard_reason": guard.get("reason"),
+        "model_ready": model_ready,
+        "model_error": model_error,
+        "pipeline_mode": pipeline_mode,
+    }
 
 
 @dataclass
@@ -69,6 +111,7 @@ class HealthMonitor:
         self._degradation_manager = degradation_manager
         self._last_status: str = ""
         self._last_connected_count: int = -1
+        self._last_readiness_signature: tuple = ()
         self._degradation_feedback_sent: set[str] = set()  # cameras already reported
 
     def update_camera(
@@ -79,10 +122,23 @@ class HealthMonitor:
         avg_latency_ms: float = 0.0,
         reconnect_count: int = 0,
         error: str | None = None,
+        *,
+        scene_guard_usable: bool | None = None,
+        scene_guard_state: str | None = None,
+        scene_guard_reason: str | None = None,
+        model_ready: bool | None = None,
+        model_error: str | None = None,
+        pipeline_mode: str | None = "active",
     ) -> None:
         """Update health data for a camera."""
         prev = self._camera_health.get(camera_id)
         was_connected = prev.connected if prev else True
+        now = time.monotonic()
+        # Polling a connected flag is not evidence of a newly captured frame.
+        # A reset counter must advance again before it renews freshness.
+        advanced = frames_captured > (prev.frames_captured if prev else 0)
+        last_frame_time = now if advanced else (prev.last_frame_time if prev else 0.0)
+        observed_since = prev.observed_since if prev and was_connected == connected else now
 
         self._camera_health[camera_id] = CameraHealth(
             camera_id=camera_id,
@@ -90,8 +146,15 @@ class HealthMonitor:
             frames_captured=frames_captured,
             avg_latency_ms=avg_latency_ms,
             reconnect_count=reconnect_count,
-            last_frame_time=time.monotonic(),
+            last_frame_time=last_frame_time,
             error=error,
+            observed_since=observed_since,
+            scene_guard_usable=scene_guard_usable,
+            scene_guard_state=scene_guard_state,
+            scene_guard_reason=scene_guard_reason,
+            model_ready=model_ready,
+            model_error=model_error,
+            pipeline_mode=pipeline_mode,
         )
         self._notify_change()
 
@@ -134,6 +197,21 @@ class HealthMonitor:
                 except Exception:
                     logger.debug("health.degradation_resolve_failed", camera_id=camera_id)
 
+    def retain_cameras(self, camera_ids: Iterable[str]) -> None:
+        """Forget removed configurations without hiding configured offline cameras.
+
+        The main loop supplies an authoritative configuration snapshot, not
+        only running pipelines. Otherwise a deleted camera remains stale in
+        readiness forever, or an offline configured camera disappears.
+        """
+        retained = set(camera_ids)
+        removed = set(self._camera_health) - retained
+        for camera_id in removed:
+            self._camera_health.pop(camera_id, None)
+            self._degradation_feedback_sent.discard(camera_id)
+        if removed:
+            self._notify_change()
+
     def record_alert(self) -> None:
         """Increment the total alert counter."""
         self._total_alerts += 1
@@ -149,10 +227,19 @@ class HealthMonitor:
         try:
             h = self.get_health()
             connected = sum(1 for c in h.cameras if c.connected)
-            if h.status.value == self._last_status and connected == self._last_connected_count:
+            readiness_signature = tuple(
+                (c.camera_id, c.capture_state, c.pipeline_mode, c.detection_state, c.detection_reason)
+                for c in h.cameras
+            )
+            if (
+                h.status.value == self._last_status
+                and connected == self._last_connected_count
+                and readiness_signature == self._last_readiness_signature
+            ):
                 return  # no meaningful change
             self._last_status = h.status.value
             self._last_connected_count = connected
+            self._last_readiness_signature = readiness_signature
             self._on_change("health", {
                 "status": h.status.value,
                 "uptime_seconds": round(h.uptime_seconds, 1),
@@ -164,6 +251,10 @@ class HealthMonitor:
                         "frames_captured": c.frames_captured,
                         "avg_latency_ms": round(c.avg_latency_ms, 1),
                         "reconnect_count": c.reconnect_count,
+                        "capture_state": c.capture_state,
+                        "detection_state": c.detection_state,
+                        "detection_reason": c.detection_reason,
+                        "pipeline_mode": c.pipeline_mode,
                     }
                     for c in h.cameras
                 ],
@@ -173,8 +264,10 @@ class HealthMonitor:
 
     def get_health(self) -> SystemHealth:
         """Get the current system health snapshot."""
-        cameras = list(self._camera_health.values())
-        connected_count = sum(1 for c in cameras if c.connected)
+        cameras = [self._camera_snapshot(c) for c in list(self._camera_health.values())]
+        connected_count = sum(
+            1 for c in cameras if c.connected and c.capture_state != "stale"
+        )
 
         if not cameras:
             status = HealthStatus.UNHEALTHY
@@ -200,23 +293,64 @@ class HealthMonitor:
         if health is None:
             return None
 
+        return asdict(self._camera_snapshot(health))
+
+    @staticmethod
+    def _camera_snapshot(health: CameraHealth, max_stale_seconds: float = 30.0) -> CameraHealth:
+        now = time.monotonic()
+        if not health.connected:
+            capture_state = "disconnected"
+        elif now - max(health.last_frame_time, health.observed_since) > max_stale_seconds:
+            capture_state = "stale"
+        elif health.last_frame_time < health.observed_since or health.frames_captured == 0:
+            capture_state = "waiting"
+        else:
+            capture_state = "receiving"
+
+        if capture_state != "receiving":
+            detection_state = "failed" if capture_state in {"stale", "disconnected"} else "waiting"
+            reason = f"capture_{capture_state}"
+        elif health.scene_guard_usable is False:
+            detection_state, reason = "blocked", health.scene_guard_reason or "scene_guard_blocked"
+        elif health.pipeline_mode in {"collection", "training", "learning"}:
+            detection_state = "blocked"
+            reason = (
+                "learning_alerts_suppressed"
+                if health.pipeline_mode == "learning"
+                else f"pipeline_mode_{health.pipeline_mode}"
+            )
+        elif health.pipeline_mode not in {"active", "maintenance"}:
+            detection_state, reason = "waiting", "runtime_mode_unavailable"
+        elif health.model_ready is False:
+            detection_state, reason = "failed", health.model_error or "model_not_ready"
+        elif health.scene_guard_usable is None or health.model_ready is None:
+            detection_state, reason = "waiting", "runtime_status_unavailable"
+        else:
+            detection_state, reason = "ready", None
+        return replace(
+            health,
+            capture_state=capture_state,
+            detection_state=detection_state,
+            detection_reason=reason,
+        )
+
+    def get_detection_readiness(self) -> dict:
+        """Detection readiness is independent from process liveness."""
+        cameras = [asdict(self._camera_snapshot(c)) for c in list(self._camera_health.values())]
+        ready = bool(cameras) and all(c["detection_state"] == "ready" for c in cameras)
         return {
-            "camera_id": health.camera_id,
-            "connected": health.connected,
-            "frames_captured": health.frames_captured,
-            "avg_latency_ms": health.avg_latency_ms,
-            "reconnect_count": health.reconnect_count,
-            "last_frame_time": health.last_frame_time,
-            "error": health.error,
+            "ready": ready,
+            "status": "ready" if ready else "not_ready",
+            "reasons": [
+                f"{c['camera_id']}:{c['detection_reason']}"
+                for c in cameras if c["detection_state"] != "ready"
+            ] if cameras else ["no_cameras"],
+            "cameras": cameras,
         }
 
     def check_stale_cameras(self, max_stale_seconds: float = 30.0) -> list[str]:
         """Find cameras that haven't produced frames recently."""
-        now = time.monotonic()
-        stale = []
-        for camera_id, health in self._camera_health.items():
-            if health.connected and health.last_frame_time > 0:
-                elapsed = now - health.last_frame_time
-                if elapsed > max_stale_seconds:
-                    stale.append(camera_id)
-        return stale
+        return [
+            camera_id for camera_id, health in list(self._camera_health.items())
+            if self._camera_snapshot(health, max_stale_seconds).capture_state == "stale"
+        ]

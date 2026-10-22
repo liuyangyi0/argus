@@ -14,6 +14,7 @@ from scripts.smoke_dashboard_business_flow import (
     _check_business_browser_dom,
     _clean_env,
     _cleanup_go2rtc_api_port,
+    _exercise_model_release_apis,
     _infer_camera_protocol,
     _models_system_browser_pages,
     _model_operation_timeout,
@@ -56,6 +57,10 @@ def test_prepare_runtime_config_redirects_writable_paths(tmp_path):
     assert config.dashboard.port == 18181
     assert config.dashboard.go2rtc_enabled is False
     assert config.cameras[0].anomaly.min_shadow_days == 0
+    assert config.cameras[0].anomaly.min_shadow_samples == 0
+    assert config.cameras[0].anomaly.max_shadow_alert_rate_delta == pytest.approx(1.0)
+    assert config.cameras[0].anomaly.max_shadow_score_divergence == pytest.approx(1.0)
+    assert config.cameras[0].anomaly.max_shadow_latency_ms == pytest.approx(0.0)
     assert config.cameras[0].anomaly.min_canary_days == 0
     assert config.storage.database_url == f"sqlite:///{(tmp_path / 'argus.db').as_posix()}"
     assert config.storage.alerts_dir == tmp_path / "alerts"
@@ -1153,7 +1158,6 @@ def test_models_system_browser_pages_include_seeded_model_and_system_markers():
         "candidate": "cam_a-patchcore-candidate",
         "shadow": "cam_a-patchcore-shadow",
         "canary": "cam_a-patchcore-canary",
-        "production": "cam_a-patchcore-production",
     }
 
     pages = _models_system_browser_pages(
@@ -1165,7 +1169,7 @@ def test_models_system_browser_pages_include_seeded_model_and_system_markers():
     assert "/models/registry" in pages
     assert "/system/overview" in pages
     assert "/system/config" in pages
-    assert "cam_a-patchcore-production" in pages["/models/registry"]
+    assert "cam_a-patchcore-canary" in pages["/models/registry"]
     assert "cam_a-patchcore-trained" in pages["/models/registry"]
     assert "Backend" in pages["/system/overview"]
     assert "输入质量" in pages["/system/overview"]
@@ -1297,11 +1301,24 @@ def test_objective_checklist_maps_business_evidence_to_completion_items():
                 "transitions": [
                     {"stage": "shadow", "runtime_synced": True},
                     {"stage": "canary", "runtime_synced": True},
-                    {"stage": "production", "runtime_synced": True},
                 ],
+                "production": {
+                    "status": "blocked_by_release_evidence",
+                    "http_status": 400,
+                },
+                "legacy_commands": {
+                    "activate": {"status": "fail_closed", "http_status": 409},
+                    "rollback": {"status": "fail_closed", "http_status": 409},
+                    "reload": {
+                        "status": "fail_closed",
+                        "http_status": 409,
+                        "data": {"runtime_changed": False},
+                    },
+                },
                 "rollback": {
-                    "activated": "model-0",
-                    "runtime_synced": True,
+                    "status": "not_exercised_no_approved_fixture",
+                    "activated": None,
+                    "runtime_synced": None,
                 },
             },
         },
@@ -1319,11 +1336,23 @@ def test_objective_checklist_maps_business_evidence_to_completion_items():
         },
     )
 
-    assert [item["passed"] for item in checklist] == [True] * 6
+    assert [item["passed"] for item in checklist] == [
+        True,
+        True,
+        True,
+        False,
+        True,
+        True,
+    ]
     assert checklist[0]["requirement"].startswith("1. Cameras")
     assert checklist[1]["evidence"]["websocket_alert_id"] == alert_id
     assert checklist[3]["evidence"]["training_mode"] == "dev-fast"
-    assert checklist[3]["evidence"]["release_stages"] == ["shadow", "canary", "production"]
+    assert checklist[3]["evidence"]["release_stages"] == ["shadow", "canary"]
+    assert (
+        checklist[3]["evidence"]["production_status"]
+        == "blocked_by_release_evidence"
+    )
+    assert checklist[3]["evidence"]["legacy_commands_closed"] is True
     assert checklist[4]["evidence"]["fallback_models"][0]["backend"] == "ssim-fallback"
     assert checklist[5]["evidence"]["total_alerts"] == 1
 
@@ -1415,11 +1444,24 @@ def test_objective_checklist_does_not_pass_full_ui_objective_when_browser_is_off
                 "transitions": [
                     {"stage": "shadow", "runtime_synced": True},
                     {"stage": "canary", "runtime_synced": True},
-                    {"stage": "production", "runtime_synced": True},
                 ],
+                "production": {
+                    "status": "blocked_by_release_evidence",
+                    "http_status": 400,
+                },
+                "legacy_commands": {
+                    "activate": {"status": "fail_closed", "http_status": 409},
+                    "rollback": {"status": "fail_closed", "http_status": 409},
+                    "reload": {
+                        "status": "fail_closed",
+                        "http_status": 409,
+                        "data": {"runtime_changed": False},
+                    },
+                },
                 "rollback": {
-                    "activated": "model-0",
-                    "runtime_synced": True,
+                    "status": "not_exercised_no_approved_fixture",
+                    "activated": None,
+                    "runtime_synced": None,
                 },
             },
         },
@@ -1446,7 +1488,139 @@ def test_seed_training_baselines_creates_current_version(tmp_path):
     assert (baseline_dir.parent / "current.txt").read_text(encoding="utf-8") == "v001"
 
 
-def test_seed_model_registry_creates_all_release_stages(tmp_path):
+def test_release_smoke_treats_missing_production_evidence_as_no_go():
+    legacy_calls: list[str] = []
+    operations: dict[str, dict] = {}
+    stages = {"trained": "candidate", "seed-canary": "canary"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/models/seed-canary/retire":
+            operation = {
+                "operation_id": "release-retire", "status": "pending",
+                "model_version_id": "seed-canary", "target_stage": "retired",
+            }
+            operations["release-retire"] = operation
+            return httpx.Response(
+                202,
+                json={"code": 0, "data": {"operation": operation}},
+            )
+        if path == "/api/models/trained/promote":
+            body = json.loads(request.content)
+            stage = body["target_stage"]
+            if stage == "production":
+                return httpx.Response(
+                    400,
+                    json={
+                        "code": 400,
+                        "msg": "release_evidence_sources must be an object",
+                    },
+                )
+            runtime_state = {
+                "errors": [],
+                "primary_model_version": (
+                    "trained" if stage == "canary" else None
+                ),
+                "primary_model_stage": stage if stage == "canary" else None,
+            }
+            operation = {
+                "operation_id": f"release-{stage}", "status": "pending",
+                "model_version_id": "trained", "target_stage": stage,
+                "runtime_state": runtime_state,
+            }
+            operations[operation["operation_id"]] = operation
+            return httpx.Response(
+                202,
+                json={
+                    "code": 0,
+                    "data": {
+                        "operation": operation,
+                        "runtime_synced": False,
+                    },
+                },
+            )
+        if path.startswith("/api/models/release-operations/"):
+            operation = dict(operations[path.rsplit("/", 1)[-1]])
+            operation["status"] = "applied"
+            stages[operation["model_version_id"]] = operation["target_stage"]
+            return httpx.Response(200, json={"code": 0, "data": {"operation": operation}})
+        if path == "/api/models/trained/activate":
+            legacy_calls.append("activate")
+            return httpx.Response(
+                409,
+                json={"code": 409, "msg": "直接激活入口已关闭", "data": None},
+            )
+        if path == "/api/models/trained/rollback":
+            legacy_calls.append("rollback")
+            return httpx.Response(
+                409,
+                json={"code": 409, "msg": "回滚入口已安全关闭", "data": None},
+            )
+        if path == "/api/config/reload-model":
+            legacy_calls.append("reload")
+            return httpx.Response(
+                409,
+                json={
+                    "code": 409,
+                    "msg": "按路径直接热加载模型的入口已关闭",
+                    "data": {"runtime_changed": False},
+                },
+            )
+        if path == "/api/models/json":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "models": [{
+                            "model_version_id": version,
+                            "stage": stage,
+                            "is_active": False,
+                        } for version, stage in stages.items()],
+                    },
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="http://argus.test",
+    )
+    try:
+        result = _exercise_model_release_apis(
+            client,
+            camera_id="cam_a",
+            model_ids={
+                "candidate": "seed-candidate",
+                "shadow": "seed-shadow",
+                "canary": "seed-canary",
+            },
+            version_id="trained",
+            timeout_s=30,
+        )
+    finally:
+        client.close()
+
+    assert [item["stage"] for item in result["transitions"]] == [
+        "shadow",
+        "canary",
+    ]
+    assert result["production"]["status"] == "blocked_by_release_evidence"
+    assert result["production"]["production_ready"] is False
+    assert result["production"]["http_status"] == 400
+    assert set(legacy_calls) == {"activate", "rollback", "reload"}
+    assert {
+        name: item["http_status"]
+        for name, item in result["legacy_commands"].items()
+    } == {"activate": 409, "rollback": 409, "reload": 409}
+    assert result["legacy_commands"]["reload"]["data"]["runtime_changed"] is False
+    assert result["rollback"]["status"] == (
+        "not_exercised_no_approved_fixture"
+    )
+    assert result["active_after_rollback"] is None
+
+
+def test_seed_model_registry_stops_before_unapproved_production(tmp_path):
     from argus.storage.database import Database
     from argus.storage.models import ModelRecord
 
@@ -1458,7 +1632,7 @@ def test_seed_model_registry_creates_all_release_stages(tmp_path):
         camera_id="cam_a",
     )
 
-    assert set(model_ids) == {"candidate", "shadow", "canary", "production"}
+    assert set(model_ids) == {"candidate", "shadow", "canary"}
 
     db = Database(database_url=database_url)
     db.initialize()
@@ -1471,29 +1645,26 @@ def test_seed_model_registry_creates_all_release_stages(tmp_path):
         assert rows[model_ids["candidate"]].stage == "candidate"
         assert rows[model_ids["shadow"]].stage == "shadow"
         assert rows[model_ids["canary"]].stage == "canary"
-        assert rows[model_ids["production"]].stage == "production"
-        assert rows[model_ids["production"]].is_active is True
-        first_production_path = Path(rows[model_ids["production"]].model_path)
-        assert first_production_path.name.endswith("-production")
-        assert first_production_path.name != "production"
+        assert all(row.is_active is False for row in rows.values())
+        first_canary_path = Path(rows[model_ids["canary"]].model_path)
+        assert first_canary_path.name.endswith("-canary")
 
         second_model_ids = _seed_model_registry(
             work_dir=tmp_path,
             database_url=database_url,
             camera_id="cam_a",
         )
-        assert set(second_model_ids) == {"candidate", "shadow", "canary", "production"}
+        assert set(second_model_ids) == {"candidate", "shadow", "canary"}
         with db.get_session() as session:
             rows = {
                 row.model_version_id: row
                 for row in session.query(ModelRecord).all()
             }
-        assert rows[second_model_ids["production"]].stage == "production"
-        assert rows[second_model_ids["production"]].is_active is True
-        second_production_path = Path(rows[second_model_ids["production"]].model_path)
-        assert second_production_path.name.endswith("-production")
-        assert second_production_path.name != "production"
-        assert first_production_path != second_production_path
+        assert rows[second_model_ids["canary"]].stage == "canary"
+        assert all(row.is_active is False for row in rows.values())
+        second_canary_path = Path(rows[second_model_ids["canary"]].model_path)
+        assert second_canary_path.name.endswith("-canary")
+        assert first_canary_path != second_canary_path
     finally:
         db.close()
 

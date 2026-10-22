@@ -285,11 +285,13 @@ class TestWebSocketBroadcaster:
             alert.trajectory_points = [(1.25, 10.0, 20.0), (1.30, 18.5, 21.0)]
 
             d.dispatch(alert)
+            d.flush_db_queue()
 
             payload = next(payload for topic, payload in captured if topic == "alerts")
             assert payload["snapshot_path"].endswith("_snapshot.jpg")
             assert payload["heatmap_path"].endswith("_heatmap.jpg")
             assert payload["has_recording"] is True
+            assert payload["replay_ready"] is True
             assert payload["recording_status"] == "recording"
             assert payload["category"] == "projectile"
             assert payload["trajectory_model"] == "projectile"
@@ -315,9 +317,11 @@ class TestWebSocketBroadcaster:
             monkeypatch.setattr(d, "_save_heatmap", lambda alert: None)
 
             d.dispatch(make_alert(with_heatmap=True))
+            d.flush_db_queue()
 
             payload = next(payload for topic, payload in captured if topic == "alerts")
             assert payload["has_recording"] is False
+            assert payload["replay_ready"] is False
             assert payload["recording_status"] is None
             assert payload["evidence_unavailable"] is True
             assert "heatmap_path" not in payload
@@ -332,5 +336,36 @@ class TestWebSocketBroadcaster:
             assert d._on_alert_ws is None
             # Subsequent dispatch must not raise NPE on the empty callback.
             d.dispatch(make_alert())
+        finally:
+            d.close()
+
+    def test_failed_ws_enqueue_stays_pending_and_replays_with_same_event_id(
+        self, db, tmp_path
+    ):
+        attempts: list[str] = []
+
+        def rejecting_broadcaster(topic, payload, **metadata):
+            if topic == "audio_alert":
+                return True
+            attempts.append(metadata["event_id"])
+            return len(attempts) > 1
+
+        d = AlertDispatcher(
+            config=AlertConfig(),
+            database=db,
+            alerts_dir=tmp_path / "alerts",
+            on_alert=rejecting_broadcaster,
+        )
+        try:
+            d.dispatch(make_alert(alert_id="ALT-REPLAY"))
+            d.flush_db_queue()
+
+            pending = db.get_pending_outbox_events()
+            assert len(pending) == 1
+            assert pending[0].attempts == 1
+
+            assert d._drain_alert_outbox() == 1
+            assert attempts == [pending[0].event_id, pending[0].event_id]
+            assert db.get_pending_outbox_events() == []
         finally:
             d.close()

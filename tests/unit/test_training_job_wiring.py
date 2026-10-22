@@ -1,4 +1,4 @@
-"""Tests for training_job_wiring._on_model_trained (P1 fix 2026-05).
+"""Training-job wiring must not expose an out-of-band model path callback.
 
 Training completion must register the model as CANDIDATE *only* — never
 hot-reload it onto the running pipeline. Promotion through the release
@@ -8,19 +8,16 @@ for putting a new model on the inference hot path.
 
 from __future__ import annotations
 
-from pathlib import Path
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
-def test_on_model_trained_does_not_call_pipeline_reload(tmp_path):
-    """Regression: prior behaviour invoked pipeline.reload_anomaly_model on
-    every successful training run, slipping a CANDIDATE model into production
-    with no audit / no operator gate."""
+def test_training_executor_has_no_model_path_callback(tmp_path):
+    """A callback could reload a candidate without a release operation."""
     from argus.runtime.training_job_wiring import register_training_job_processing
 
-    pipeline = MagicMock()
     camera_manager = MagicMock()
-    camera_manager.get_pipeline.return_value = pipeline
 
     scheduler = MagicMock()
     config = MagicMock()
@@ -29,11 +26,11 @@ def test_on_model_trained_does_not_call_pipeline_reload(tmp_path):
     database = MagicMock()
     database.get_session = MagicMock()
 
-    captured_callbacks: dict = {}
+    captured_kwargs: dict = {}
 
     class _ExecutorSpy:
         def __init__(self, **kwargs):
-            captured_callbacks["on_model_trained"] = kwargs.get("on_model_trained")
+            captured_kwargs.update(kwargs)
 
     captured_interval: dict = {}
 
@@ -45,8 +42,8 @@ def test_on_model_trained_does_not_call_pipeline_reload(tmp_path):
         _capture_job_task,
     ), patch(
         "argus.anomaly.job_executor.TrainingJobExecutor", _ExecutorSpy,
-    ), patch(
-        "argus.anomaly.backbone_trainer.BackboneTrainer", MagicMock,
+    ), patch.dict(
+        sys.modules, {"argus.anomaly.backbone_trainer": SimpleNamespace(BackboneTrainer=MagicMock)},
     ), patch(
         "argus.storage.model_registry.ModelRegistry", MagicMock,
     ):
@@ -60,12 +57,7 @@ def test_on_model_trained_does_not_call_pipeline_reload(tmp_path):
             interval_seconds=2.0,
         )
 
-    on_trained = captured_callbacks["on_model_trained"]
-    assert on_trained is not None
     assert captured_interval["interval_seconds"] == 2.0
-
-    on_trained("cam_01", Path(tmp_path / "fake_model.xml"))
-
-    # P1 contract: callback must NEVER touch the pipeline directly.
-    pipeline.reload_anomaly_model.assert_not_called()
+    assert "on_model_trained" not in captured_kwargs
+    assert captured_kwargs["camera_manager"] is camera_manager
     camera_manager.get_pipeline.assert_not_called()

@@ -31,6 +31,7 @@ from argus.core.error_channel import (
     SEVERITY_ERROR,
     get_error_channel,
 )
+from argus.core.frame_identity import build_frame_identity
 
 if TYPE_CHECKING:
     from argus.capture.frame_buffer import LatestFrameBuffer
@@ -136,6 +137,9 @@ class GigECapture:
         pixel_format: str = "Mono8",
         reconnect_delay: float = 5.0,
         max_reconnect_attempts: int = -1,
+        source_declared: str | None = None,
+        source_runtime: str | None = None,
+        stream_id: str | None = None,
     ):
         self.camera_id = camera_id
         self.source = source
@@ -146,6 +150,9 @@ class GigECapture:
         self.pixel_format = pixel_format
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_attempts = max_reconnect_attempts
+        self._source_declared = source_declared or source
+        self._source_runtime = source_runtime or source
+        self._stream_id = stream_id
 
         self._cam: MvCamera | None = None  # type: ignore[name-defined]
         self._state = CameraState()
@@ -176,6 +183,20 @@ class GigECapture:
     @property
     def state(self) -> CameraState:
         return self._state
+
+    def configure_frame_identity(
+        self,
+        *,
+        source_declared: str | None = None,
+        source_runtime: str | None = None,
+        stream_id: str | None = None,
+    ) -> None:
+        """Update frame identity source context for injected captures."""
+        if source_declared is not None:
+            self._source_declared = source_declared
+        if source_runtime is not None:
+            self._source_runtime = source_runtime
+        self._stream_id = stream_id
 
     # ------------------------------------------------------------------
     # Connection
@@ -366,15 +387,26 @@ class GigECapture:
             self._cam.MV_CC_FreeImageBuffer(frame_out)
 
         now = time.monotonic()
+        capture_wall_ts = time.time()
         self._state.last_frame_time = now
         self._state.total_frames += 1
+        frame_number = self._state.total_frames
 
         return FrameData(
             frame=frame,
             camera_id=self.camera_id,
             timestamp=now,
-            frame_number=self._state.total_frames,
+            frame_number=frame_number,
             resolution=(w, h),
+            identity=build_frame_identity(
+                camera_id=self.camera_id,
+                source_declared=str(self._source_declared),
+                source_runtime=str(self._source_runtime),
+                stream_id=self._stream_id,
+                frame_index=frame_number,
+                capture_wall_ts=capture_wall_ts,
+                capture_monotonic_ts=now,
+            ),
         )
 
     # ------------------------------------------------------------------

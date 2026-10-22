@@ -1,4 +1,5 @@
-import { api, u } from './client'
+import type { ApiResponse, CameraZone } from '../types/api'
+import { api, unwrap, u } from './client'
 
 export interface ZoneCreateRequest {
   camera_id: string
@@ -13,8 +14,14 @@ export interface ZoneCreateRequest {
 export const createZone = (data: ZoneCreateRequest) =>
   api.post('/zones', data).then(u)
 
-export const updateZones = (cameraId: string, zones: any[]) =>
-  api.put(`/zones/${cameraId}`, zones).then(u)
+export interface ZoneUpdateResult {
+  camera_id?: string
+  count?: number
+  zones?: CameraZone[]
+}
+
+export const updateZones = (cameraId: string, zones: CameraZone[]) =>
+  api.put<ApiResponse<ZoneUpdateResult>>(`/zones/${cameraId}`, zones).then(unwrap)
 
 export const deleteZone = (cameraId: string, zoneId: string) =>
   api.delete(`/zones/${cameraId}/${zoneId}`).then(u)

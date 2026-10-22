@@ -216,7 +216,7 @@ const remainingRecordingSeconds = computed(() => {
       </div>
 
       <span class="ctrl-frame-info">
-        <b>{{ currentTime }}</b> / {{ totalDuration }} · FRAME {{ ctrl.currentIndex.value + 1 }} / {{ ctrl.metadata.value.frame_count }}
+        <b>{{ currentTime }}</b> / {{ totalDuration }} · FRAME {{ ctrl.currentIndex.value + 1 }} / {{ ctrl.metadata.value?.frame_count ?? 0 }}
       </span>
     </div>
 
@@ -265,13 +265,13 @@ const remainingRecordingSeconds = computed(() => {
       <input
         type="range"
         :min="0"
-        :max="(ctrl.metadata.value.frame_count || 1) - 1"
+        :max="(ctrl.metadata.value?.frame_count || 1) - 1"
         :value="ctrl.currentIndex.value"
         @input="ctrl.seekTo(Number(($event.target as HTMLInputElement).value))"
         class="tl-input"
       />
       <!-- Recording-in-progress indicator -->
-      <div v-if="ctrl.metadata.value.status === 'recording'" class="replay-recording-bar">
+      <div v-if="ctrl.metadata.value?.status === 'recording'" class="replay-recording-bar">
         <div style="flex: 1; display: flex; align-items: center; gap: 4px">
           <div :style="{ width: triggerProgressPct + '%' }" />
           <div class="rec-dot" />

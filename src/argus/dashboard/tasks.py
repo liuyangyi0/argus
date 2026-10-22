@@ -38,6 +38,14 @@ class TaskAbortedError(Exception):
     """Raised when a task detects the abort event."""
 
 
+class TaskSubmissionRejected(RuntimeError):
+    """Preflight rejection: no task was reserved and no worker was started.
+
+    Callers may retry these failures. Errors after reservation deliberately do
+    not use this type because a worker may already have produced side effects.
+    """
+
+
 @dataclass
 class TaskInfo:
     """State of a background task."""
@@ -85,24 +93,21 @@ class TaskManager:
 
         Returns the task_id.
         """
-        # Check concurrent limit
-        running = sum(1 for t in self._tasks.values() if t.status == TaskStatus.RUNNING)
-        if running >= self._max_concurrent:
-            raise RuntimeError(f"已达到最大并发任务数 ({self._max_concurrent})")
-
-        # Check for duplicate camera tasks of the same type
-        for t in self._tasks.values():
-            if (
-                t.task_type == task_type
-                and t.camera_id == camera_id
-                and t.status in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.PAUSED)
-            ):
-                raise RuntimeError(f"摄像头 {camera_id} 已有相同类型的任务在运行")
-
-        task_id = f"{task_type}-{uuid.uuid4().hex[:8]}"
-        info = TaskInfo(task_id=task_id, task_type=task_type, camera_id=camera_id)
-
+        # Reserve both the global slot and camera/type ownership atomically.
+        # A registered-but-not-yet-started worker and a paused worker still own
+        # their budget; counting RUNNING alone allows parallel submitters to
+        # oversubscribe before either new thread gets scheduled.
         with self._lock:
+            active = [
+                task for task in tuple(self._tasks.values())
+                if task.status in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.PAUSED)
+            ]
+            if len(active) >= self._max_concurrent:
+                raise TaskSubmissionRejected(f"已达到最大并发任务数 ({self._max_concurrent})")
+            if any(task.task_type == task_type and task.camera_id == camera_id for task in active):
+                raise TaskSubmissionRejected(f"摄像头 {camera_id} 已有相同类型的任务在运行")
+            task_id = f"{task_type}-{uuid.uuid4().hex[:8]}"
+            info = TaskInfo(task_id=task_id, task_type=task_type, camera_id=camera_id)
             self._tasks[task_id] = info
 
         def _progress_callback(progress: int, message: str):
@@ -113,6 +118,11 @@ class TaskManager:
 
         def _run():
             with self._lock:
+                if info.status != TaskStatus.PENDING:
+                    # A failed starter may have scheduled a late thread. The
+                    # reservation was already failed/released, so it must not
+                    # resurrect itself and run outside the concurrency budget.
+                    return
                 info.status = TaskStatus.RUNNING
                 info.message = "正在启动..."
             self._notify_task_change(info)
@@ -133,17 +143,45 @@ class TaskManager:
                     info.completed_at = time.monotonic()
                 self._notify_task_change(info)
                 logger.info("task.aborted", task_id=task_id, task_type=task_type)
-            except Exception as e:
+            except BaseException as e:
+                # A background callable may raise SystemExit/KeyboardInterrupt
+                # (or have a broken __str__). It must still release its slot
+                # with an explicit failure instead of remaining RUNNING forever.
+                try:
+                    error = str(e) or type(e).__name__
+                except BaseException:
+                    error = type(e).__name__
                 with self._lock:
                     info.status = TaskStatus.FAILED
-                    info.error = str(e)
-                    info.message = f"失败: {e}"
+                    info.error = error
+                    info.message = f"失败: {error}"
                     info.completed_at = time.monotonic()
                 self._notify_task_change(info)
-                logger.error("task.failed", task_id=task_id, error=str(e))
+                logger.error("task.failed", task_id=task_id, error=error)
 
-        thread = threading.Thread(target=_run, name=f"argus-task-{task_id}", daemon=True)
-        thread.start()
+        try:
+            # Starting outside the lock also supports a worker that immediately
+            # reports progress or finishes before Thread.start() returns.
+            thread = threading.Thread(target=_run, name=f"argus-task-{task_id}", daemon=True)
+            thread.start()
+        except BaseException as exc:
+            failed_before_run = False
+            with self._lock:
+                if info.status == TaskStatus.PENDING:
+                    info.status = TaskStatus.FAILED
+                    info.error = f"Task worker could not start ({type(exc).__name__})"
+                    info.message = "后台任务启动失败"
+                    info.completed_at = time.monotonic()
+                    failed_before_run = True
+            if failed_before_run:
+                self._notify_task_change(info)
+            # If a custom starter actually launched the worker before failing,
+            # do not overwrite its RUNNING/terminal outcome or free a live slot.
+            if isinstance(exc, TaskSubmissionRejected):
+                # Preserve the public distinction even if a custom starter
+                # accidentally reuses the preflight error type after reservation.
+                raise RuntimeError("Task startup failed after reservation; inspect task state before retry") from exc
+            raise
 
         logger.info("task.submitted", task_id=task_id, task_type=task_type, camera_id=camera_id)
         return task_id
@@ -170,34 +208,40 @@ class TaskManager:
                 "message": info.message,
                 "error": info.error,
             })
-        except Exception as e:
-            logger.debug("task.notify_failed", error=str(e))
+        except BaseException as exc:
+            # Notification hooks are observational: even a broken adapter must
+            # not stop the worker before its terminal outcome is recorded.
+            try:
+                error = str(exc) or type(exc).__name__
+            except BaseException:
+                error = type(exc).__name__
+            logger.debug("task.notify_failed", error=error)
 
     def pause_task(self, task_id: str) -> bool:
         """Pause a running task. The task must check pause_event in its loop."""
-        task = self._tasks.get(task_id)
-        if task and task.status == TaskStatus.RUNNING:
-            with self._lock:
-                task.pause_event.clear()
-                task.status = TaskStatus.PAUSED
-                task.message = "已暂停"
-            self._notify_task_change(task)
-            logger.info("task.paused", task_id=task_id)
-            return True
-        return False
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status != TaskStatus.RUNNING:
+                return False
+            task.pause_event.clear()
+            task.status = TaskStatus.PAUSED
+            task.message = "已暂停"
+        self._notify_task_change(task)
+        logger.info("task.paused", task_id=task_id)
+        return True
 
     def resume_task(self, task_id: str) -> bool:
         """Resume a paused task."""
-        task = self._tasks.get(task_id)
-        if task and task.status == TaskStatus.PAUSED:
-            with self._lock:
-                task.status = TaskStatus.RUNNING
-                task.message = "已恢复"
-                task.pause_event.set()
-            self._notify_task_change(task)
-            logger.info("task.resumed", task_id=task_id)
-            return True
-        return False
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status != TaskStatus.PAUSED:
+                return False
+            task.status = TaskStatus.RUNNING
+            task.message = "已恢复"
+            task.pause_event.set()
+        self._notify_task_change(task)
+        logger.info("task.resumed", task_id=task_id)
+        return True
 
     def abort_task(self, task_id: str) -> bool:
         """Signal a running or paused task to abort."""
@@ -215,32 +259,38 @@ class TaskManager:
 
     def get_all_tasks(self) -> list[TaskInfo]:
         """Get all tasks, most recent first."""
-        return sorted(self._tasks.values(), key=lambda t: t.created_at, reverse=True)
+        with self._lock:
+            snapshot = tuple(self._tasks.values())
+        return sorted(snapshot, key=lambda t: t.created_at, reverse=True)
 
     def get_active_tasks(self) -> list[TaskInfo]:
         """Get running and recently completed tasks."""
         now = time.monotonic()
+        with self._lock:
+            snapshot = tuple(self._tasks.values())
         return [
-            t for t in self._tasks.values()
+            t for t in snapshot
             if t.status in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.PAUSED)
             or (t.completed_at and now - t.completed_at < 300)  # show completed for 5 min
         ]
 
     def dismiss(self, task_id: str) -> bool:
         """Remove a completed/failed task from the list."""
-        task = self._tasks.get(task_id)
-        if task and task.status in (TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.ABORTED):
-            del self._tasks[task_id]
-            return True
-        return False
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task and task.status in (TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.ABORTED):
+                del self._tasks[task_id]
+                return True
+            return False
 
     def cleanup_old(self, max_age_seconds: float = 3600) -> int:
         """Remove tasks completed more than max_age_seconds ago."""
         now = time.monotonic()
-        to_remove = [
-            tid for tid, t in self._tasks.items()
-            if t.completed_at and (now - t.completed_at) > max_age_seconds
-        ]
-        for tid in to_remove:
-            del self._tasks[tid]
+        with self._lock:
+            to_remove = [
+                tid for tid, t in self._tasks.items()
+                if t.completed_at and (now - t.completed_at) > max_age_seconds
+            ]
+            for tid in to_remove:
+                del self._tasks[tid]
         return len(to_remove)

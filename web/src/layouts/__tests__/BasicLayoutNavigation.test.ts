@@ -133,6 +133,7 @@ describe('BasicLayout core-loop navigation', () => {
     expect(text).toContain('系统概览')
     expect(text).toContain('配置管理')
     expect(text).toContain('降级事件')
+    expect(text).not.toContain('3D仓库')
 
     const links = wrapper.findAll('[data-to]').map(link => link.attributes('data-to'))
     expect(links).toEqual(expect.arrayContaining([

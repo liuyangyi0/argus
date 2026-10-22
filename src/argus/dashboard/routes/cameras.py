@@ -8,13 +8,23 @@ import concurrent.futures
 import cv2
 import structlog
 from fastapi import APIRouter, Request
+
 from argus.core.pipeline import PipelineMode
+from argus.dashboard.api_contracts import (
+    CameraDetailResponse,
+    CameraLifecycleResponse,
+    CameraListResponse,
+    CameraModeRequest,
+    CameraModeResponse,
+)
 from argus.dashboard.api_response import (
+    ApiEnvelope,
     api_conflict,
     api_forbidden,
     api_internal_error,
     api_not_found,
     api_success,
+    api_typed_success,
     api_unavailable,
     api_validation_error,
 )
@@ -79,6 +89,248 @@ _STAGE_NAMES = {"capture": "采集", "review": "基线审查", "training": "训�
 def _find_camera_config(request: Request, camera_id: str):
     """Find the persisted/original camera config for API responses."""
     return _preview_gateway(request).find_camera_config(camera_id)
+
+
+def _manager_camera_status_payload(
+    camera_manager,
+    camera_id: str,
+    *,
+    status=None,
+) -> dict | None:
+    """Read the manager's canonical camera payload when it supports it."""
+    if status is not None:
+        serializer = getattr(camera_manager, "serialize_camera_status", None)
+        if callable(serializer):
+            try:
+                payload = serializer(status)
+            except Exception:
+                logger.debug(
+                    "camera.status_serialize_failed",
+                    camera_id=camera_id,
+                    exc_info=True,
+                )
+            else:
+                if isinstance(payload, dict):
+                    return payload
+
+    getter = getattr(camera_manager, "get_camera_status_payload", None)
+    if callable(getter):
+        try:
+            payload = getter(camera_id)
+        except Exception:
+            logger.debug(
+                "camera.status_payload_failed",
+                camera_id=camera_id,
+                exc_info=True,
+            )
+        else:
+            if isinstance(payload, dict):
+                return payload
+    return None
+
+
+def _stream_resolution_for(request: Request, camera_id: str):
+    registry = getattr(request.app.state, "stream_registry", None)
+    resolutions = getattr(registry, "resolutions", None)
+    if isinstance(resolutions, dict):
+        return resolutions.get(camera_id)
+    return None
+
+
+def _source_consistency_status(
+    *,
+    declared_source: str,
+    runtime_source: str,
+    go2rtc_stream: str | None,
+) -> str:
+    if declared_source == runtime_source:
+        return "direct"
+    if go2rtc_stream and runtime_source.startswith("rtsp://"):
+        return "go2rtc_redirect"
+    return "mismatch"
+
+
+def _public_scene_guard_status(status: dict | None) -> dict | None:
+    """Normalize transitional runtime snapshots to the public safety DTO.
+
+    Older runners and lightweight test doubles may omit diagnostic fields.
+    The public response must still expose an unambiguous fail-closed state,
+    model/profile binding and recovery progress instead of making clients
+    infer them from missing keys.
+    """
+    if not isinstance(status, dict):
+        return None
+
+    usable = status.get("usable") is True
+    enabled = status.get("enabled") is True
+    state = str(status.get("state") or ("disabled" if not enabled else "blocked"))
+    recovery = status.get("recovery_progress")
+    if not isinstance(recovery, dict):
+        recovery = {}
+
+    def _count(value) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    current = _count(
+        status.get("policy_recovery_count", recovery.get("current", 0))
+    )
+    required = _count(
+        status.get("required_recovery_count", recovery.get("required", 0))
+    )
+    metrics = status.get("metrics")
+    reference_available = (
+        status.get("reference_available") is True
+        if "reference_available" in status
+        else isinstance(metrics, dict) and metrics.get("reference_available") is True
+    )
+    if not isinstance(metrics, dict):
+        metrics = {"reference_available": reference_available}
+    else:
+        metrics = {**metrics}
+        metrics.setdefault("reference_available", reference_available)
+
+    return {
+        "enabled": enabled,
+        "usable": usable,
+        "state": state,
+        "raw_state": status.get("raw_state") or state,
+        "reason": status.get("reason"),
+        "profile_id": status.get("profile_id"),
+        "bound_model_version": status.get("bound_model_version"),
+        "bound_model_artifact_sha256": status.get(
+            "bound_model_artifact_sha256"
+        ),
+        "runtime_model_artifact_sha256": status.get(
+            "runtime_model_artifact_sha256"
+        ),
+        "reference_source": status.get("reference_source"),
+        "reference_sha256": status.get("reference_sha256"),
+        "reference_error": status.get("reference_error"),
+        "runtime_error": status.get("runtime_error"),
+        "check_interval_frames": status.get("check_interval_frames"),
+        "check_interval_seconds": status.get("check_interval_seconds"),
+        "last_checked_frame": status.get("last_checked_frame"),
+        "quick_match_score": status.get("quick_match_score"),
+        "quick_shift_px": status.get("quick_shift_px"),
+        "reference_available": reference_available,
+        "policy_recovery_count": current,
+        "required_recovery_count": required,
+        "recovery_progress": {
+            "current": current,
+            "required": required,
+            "complete": bool(recovery.get("complete", usable)),
+        },
+        "metrics": metrics,
+    }
+
+
+def _serialize_diagnostic_record(record) -> dict:
+    if hasattr(record, "to_dict"):
+        return record.to_dict()
+    if isinstance(record, dict):
+        return record
+
+    def _serialize_stage(stage) -> dict:
+        if hasattr(stage, "to_dict"):
+            return stage.to_dict()
+        if isinstance(stage, dict):
+            return stage
+        return {
+            "stage_name": getattr(stage, "stage_name", ""),
+            "duration_ms": getattr(stage, "duration_ms", 0.0),
+            "skipped": getattr(stage, "skipped", False),
+            "skip_reason": getattr(stage, "skip_reason", ""),
+            "metadata": getattr(stage, "metadata", {}),
+        }
+
+    def _serialize_candidate(candidate) -> dict:
+        if hasattr(candidate, "to_dict"):
+            return candidate.to_dict()
+        if isinstance(candidate, dict):
+            return candidate
+        return {
+            "candidate_id": getattr(candidate, "candidate_id", ""),
+            "candidate_type": getattr(candidate, "candidate_type", ""),
+            "decision": getattr(candidate, "decision", ""),
+            "stage": getattr(candidate, "stage", ""),
+            "evidence": getattr(candidate, "evidence", {}),
+            "suppression_reason": getattr(candidate, "suppression_reason", None),
+        }
+
+    stages = getattr(record, "stages", [])
+    candidates = getattr(record, "candidate_records", [])
+    return {
+        "frame_number": getattr(record, "frame_number", None),
+        "timestamp": getattr(record, "timestamp", None),
+        "camera_id": getattr(record, "camera_id", None),
+        "total_duration_ms": getattr(record, "total_duration_ms", 0.0),
+        "stages": [_serialize_stage(stage) for stage in stages],
+        "anomaly_score": getattr(record, "anomaly_score", 0.0),
+        "is_anomalous": getattr(record, "is_anomalous", False),
+        "alert_emitted": getattr(record, "alert_emitted", False),
+        "pipeline_mode": getattr(record, "pipeline_mode", "active"),
+        "low_light": getattr(record, "low_light", False),
+        "frame_id": getattr(record, "frame_id", ""),
+        "alignment_shift_px": list(getattr(record, "alignment_shift_px", (0.0, 0.0))),
+        "scene_guard_state": getattr(record, "scene_guard_state", "disabled"),
+        "final_decision": getattr(record, "final_decision", "normal"),
+        "suppression_reason": getattr(record, "suppression_reason", None),
+        "candidate_records": [
+            _serialize_candidate(candidate) for candidate in candidates
+        ],
+    }
+
+
+def _recent_camera_diagnostics(camera_manager, camera_id: str, limit: int = 20) -> list[dict]:
+    if camera_manager is None:
+        return []
+    getter = getattr(camera_manager, "get_diagnostics", None)
+    if not callable(getter):
+        return []
+    try:
+        records = getter(camera_id, limit)
+    except Exception:
+        logger.debug(
+            "camera.diagnostics_failed",
+            camera_id=camera_id,
+            exc_info=True,
+        )
+        return []
+    if not isinstance(records, (list, tuple)):
+        return []
+    return [_serialize_diagnostic_record(record) for record in records]
+
+
+def _manager_anomaly_backend_status(
+    camera_manager,
+    camera_id: str,
+) -> tuple[str | None, str]:
+    """Return backend status through the manager's public runtime contract."""
+    if camera_manager is None:
+        return None, "auto"
+    getter = getattr(camera_manager, "get_anomaly_backend_status", None)
+    if not callable(getter):
+        return None, "auto"
+    try:
+        status = getter(camera_id)
+    except Exception:
+        logger.debug(
+            "camera.anomaly_backend_status_failed",
+            camera_id=camera_id,
+            exc_info=True,
+        )
+        return None, "auto"
+    if not isinstance(status, dict):
+        return None, "auto"
+    actual = status.get("actual")
+    expected = status.get("expected")
+    return (
+        actual if isinstance(actual, str) else None,
+        expected if isinstance(expected, str) else "auto",
+    )
 
 
 def _get_region_info(request: Request, region_id: int | None) -> dict:
@@ -263,7 +515,7 @@ async def add_camera(request: Request):
     try:
         # Thread-safe addition to the running manager's camera list
         if camera_manager is not None and hasattr(camera_manager, "add_camera_config"):
-            if camera_manager._cameras is not config.cameras:
+            if camera_manager.get_camera_config(camera_id) is None:
                 camera_manager.add_camera_config(cam_config)
 
         config_path = getattr(request.app.state, "config_path", None)
@@ -461,8 +713,15 @@ async def update_camera(request: Request, camera_id: str):
     })
 
 
-@router.post("/{camera_id}/mode")
-async def set_camera_mode(request: Request, camera_id: str):
+@router.post(
+    "/{camera_id}/mode",
+    response_model=ApiEnvelope[CameraModeResponse],
+)
+async def set_camera_mode(
+    request: Request,
+    camera_id: str,
+    body: CameraModeRequest,
+):
     """Switch a running camera pipeline between active/learning/maintenance modes."""
     if not require_role(request, "admin", "operator", "engineer"):
         return api_forbidden("权限不足")
@@ -471,17 +730,7 @@ async def set_camera_mode(request: Request, camera_id: str):
     if not camera_manager:
         return api_unavailable("不可用")
 
-    try:
-        body = await request.json()
-    except Exception:
-        return api_validation_error("无效的JSON请求")
-
-    raw_mode = str(body.get("mode", "")).strip().lower()
-    try:
-        mode = PipelineMode(raw_mode)
-    except ValueError:
-        allowed = ", ".join(item.value for item in PipelineMode)
-        return api_validation_error(f"无效运行模式: {raw_mode or '<empty>'}; 可选: {allowed}")
+    mode = PipelineMode(body.mode)
 
     previous = (
         camera_manager.get_pipeline_mode(camera_id)
@@ -497,14 +746,20 @@ async def set_camera_mode(request: Request, camera_id: str):
     if not ok:
         return api_not_found(f"摄像头 {camera_id} 未运行")
 
-    return api_success({
-        "camera_id": camera_id,
-        "previous_mode": previous,
-        "pipeline_mode": mode.value,
-    })
+    return api_typed_success(
+        {
+            "camera_id": camera_id,
+            "previous_mode": previous,
+            "pipeline_mode": mode.value,
+        },
+        CameraModeResponse,
+    )
 
 
-@router.post("/{camera_id}/start")
+@router.post(
+    "/{camera_id}/start",
+    response_model=ApiEnvelope[CameraLifecycleResponse],
+)
 async def start_camera(request: Request, camera_id: str):
     """Start a stopped camera."""
     if not require_role(request, "admin", "operator", "engineer"):
@@ -520,18 +775,26 @@ async def start_camera(request: Request, camera_id: str):
             success = await asyncio.to_thread(orchestrator.start, camera_id)
         else:
             # Register with go2rtc before the pipeline opens exclusive USB devices.
-            cam_config = next((c for c in camera_manager._cameras if c.camera_id == camera_id), None)
+            cam_config = camera_manager.get_camera_config(camera_id)
             if cam_config:
                 _ensure_go2rtc_stream(request, cam_config)
             success = await asyncio.to_thread(camera_manager.start_camera, camera_id)
     except RuntimeError:
         return api_unavailable("服务正在关闭")
     if success:
-        return api_success({}, headers=htmx_toast_headers("摄像头已启动"))
+        payload = _manager_camera_status_payload(camera_manager, camera_id)
+        return api_typed_success(
+            payload or {"camera_id": camera_id},
+            CameraLifecycleResponse,
+            headers=htmx_toast_headers("摄像头已启动"),
+        )
     return api_internal_error("启动失败")
 
 
-@router.post("/{camera_id}/stop")
+@router.post(
+    "/{camera_id}/stop",
+    response_model=ApiEnvelope[CameraLifecycleResponse],
+)
 async def stop_camera(request: Request, camera_id: str):
     """Stop a running camera."""
     if not require_role(request, "admin", "operator", "engineer"):
@@ -546,7 +809,12 @@ async def stop_camera(request: Request, camera_id: str):
         await asyncio.to_thread(orchestrator.stop, camera_id)
     else:
         await asyncio.to_thread(camera_manager.stop_camera, camera_id)
-    return api_success({}, headers=htmx_toast_headers("摄像头已停止"))
+    payload = _manager_camera_status_payload(camera_manager, camera_id)
+    return api_typed_success(
+        payload or {"camera_id": camera_id},
+        CameraLifecycleResponse,
+        headers=htmx_toast_headers("摄像头已停止"),
+    )
 
 
 @router.post("/{camera_id}/test-connection")
@@ -653,12 +921,12 @@ async def usb_devices(request: Request):
     return api_success({"devices": devices})
 
 
-@router.get("/json")
+@router.get("/json", response_model=ApiEnvelope[CameraListResponse])
 def cameras_json(request: Request):
     """JSON API for camera status."""
     camera_manager = request.app.state.camera_manager
     if not camera_manager:
-        return api_success({"cameras": []})
+        return api_typed_success({"cameras": []}, CameraListResponse)
 
     health_monitor = getattr(request.app.state, "health_monitor", None)
 
@@ -669,6 +937,21 @@ def cameras_json(request: Request):
             health_monitor.get_camera_health(s.camera_id)
             if health_monitor is not None else None
         )
+        canonical = _manager_camera_status_payload(
+            camera_manager,
+            s.camera_id,
+            status=s,
+        )
+        if canonical is not None:
+            canonical["health"] = health
+            return {
+                **canonical,
+                **_get_region_info(
+                    request,
+                    getattr(_find_camera_config(request, s.camera_id), "region_id", None),
+                ),
+            }
+
         pipeline_mode = camera_manager.get_pipeline_mode(s.camera_id)
         if not isinstance(pipeline_mode, str):
             pipeline_mode = None
@@ -690,10 +973,16 @@ def cameras_json(request: Request):
             } if s.stats else None,
         }
 
-    return api_success({"cameras": [_row(s) for s in camera_manager.get_status()]})
+    return api_typed_success(
+        {"cameras": [_row(s) for s in camera_manager.get_status()]},
+        CameraListResponse,
+    )
 
 
-@router.get("/{camera_id}/detail/json")
+@router.get(
+    "/{camera_id}/detail/json",
+    response_model=ApiEnvelope[CameraDetailResponse],
+)
 def camera_detail_json(request: Request, camera_id: str):
     """Return a detailed camera payload for the detail page."""
     camera_manager = request.app.state.camera_manager
@@ -710,12 +999,73 @@ def camera_detail_json(request: Request, camera_id: str):
     learning = camera_manager.get_learning_progress(camera_id) if camera_manager else None
     pipeline_mode = camera_manager.get_pipeline_mode(camera_id) if camera_manager else None
     anomaly_locked = camera_manager.is_anomaly_locked(camera_id) if camera_manager else False
+    scene_guard = None
+    get_scene_guard_status = (
+        getattr(camera_manager, "get_scene_guard_status", None)
+        if camera_manager is not None
+        else None
+    )
+    if callable(get_scene_guard_status):
+        try:
+            maybe_scene_guard = get_scene_guard_status(camera_id)
+            if isinstance(maybe_scene_guard, dict):
+                scene_guard = _public_scene_guard_status(maybe_scene_guard)
+        except Exception:
+            logger.debug(
+                "camera.scene_guard_status_failed",
+                camera_id=camera_id,
+                exc_info=True,
+            )
+    model_backend, expected_model_backend = _manager_anomaly_backend_status(
+        camera_manager,
+        camera_id,
+    )
 
     health_monitor = getattr(request.app.state, "health_monitor", None)
     health = health_monitor.get_camera_health(camera_id) if health_monitor is not None else None
+    candidate_diagnostics = _recent_camera_diagnostics(
+        camera_manager,
+        camera_id,
+        limit=10,
+    )
+
+    identity_status = None
+    get_identity_status = (
+        getattr(camera_manager, "get_frame_identity_status", None)
+        if camera_manager is not None
+        else None
+    )
+    if callable(get_identity_status):
+        try:
+            maybe_identity_status = get_identity_status(camera_id)
+            if isinstance(maybe_identity_status, dict):
+                identity_status = maybe_identity_status
+        except Exception:
+            logger.debug(
+                "camera.frame_identity_status_failed",
+                camera_id=camera_id,
+                exc_info=True,
+            )
+    stream_resolution = _stream_resolution_for(request, camera_id)
+    declared_source = str(
+        (identity_status or {}).get("declared_source")
+        or getattr(stream_resolution, "original_source", None)
+        or camera_config.source
+    )
+    runtime_source = str(
+        (identity_status or {}).get("runtime_source")
+        or getattr(stream_resolution, "runtime_source", None)
+        or camera_config.source
+    )
+    go2rtc_stream = (
+        (identity_status or {}).get("go2rtc_stream")
+        or getattr(stream_resolution, "stream_name", None)
+    )
 
     stats = None
+    fps_observed = None
     if status is not None and status.stats is not None:
+        fps_observed = getattr(status.stats, "current_fps", None) or None
         stats = {
             "frames_captured": status.stats.frames_captured,
             "frames_analyzed": status.stats.frames_analyzed,
@@ -723,16 +1073,86 @@ def camera_detail_json(request: Request, camera_id: str):
             "alerts_emitted": status.stats.alerts_emitted,
             "avg_latency_ms": round(status.stats.avg_latency_ms, 1),
         }
+    capture_status = getattr(status, "capture_status", None) if status is not None else None
+    if not fps_observed and capture_status:
+        fps_observed = capture_status.get("actual_fps") or capture_status.get("reported_fps")
+
+    dropped_frames = 0
+    get_backpressure_stats = (
+        getattr(camera_manager, "get_backpressure_stats", None)
+        if camera_manager is not None
+        else None
+    )
+    if callable(get_backpressure_stats):
+        try:
+            backpressure = get_backpressure_stats()
+            if isinstance(backpressure, dict):
+                dropped_frames = int(
+                    backpressure.get(camera_id, {}).get("dropped", 0)
+                )
+        except Exception:
+            dropped_frames = 0
+
+    source_status = _source_consistency_status(
+        declared_source=declared_source,
+        runtime_source=runtime_source,
+        go2rtc_stream=str(go2rtc_stream) if go2rtc_stream else None,
+    )
+    latest_identity = (identity_status or {}).get("latest")
+    source_diagnostics = {
+        "camera_id": camera_id,
+        "declared_source": declared_source,
+        "runtime_source": runtime_source,
+        "go2rtc_stream": go2rtc_stream,
+        "last_frame_index": (identity_status or {}).get("last_frame_index"),
+        "last_capture_ts": (identity_status or {}).get("last_capture_ts"),
+        "last_pipeline_ts": (identity_status or {}).get("last_pipeline_ts"),
+        "last_snapshot_frame_index": (
+            (identity_status or {}).get("last_snapshot_frame_index")
+        ),
+        "last_snapshot_ts": (identity_status or {}).get("last_snapshot_ts"),
+        "last_snapshot_identity": (identity_status or {}).get("last_snapshot"),
+        "last_preview_stream_frame_index": (
+            (identity_status or {}).get("last_preview_stream_frame_index")
+        ),
+        "last_preview_stream_ts": (identity_status or {}).get("last_preview_stream_ts"),
+        "last_preview_stream_identity": (
+            (identity_status or {}).get("last_preview_stream")
+        ),
+        "fps_observed": fps_observed,
+        "dropped_frames": dropped_frames,
+        "source_consistency": source_status,
+        "latest_frame_identity": latest_identity,
+    }
 
     # Lifecycle stages for pipeline stepper
     stages = _get_lifecycle_stages(request, camera_id, cam_status=status)
 
-    return api_success({
+    return api_typed_success({
         "camera_id": camera_id,
+        "declared_source": declared_source,
+        "runtime_source": runtime_source,
+        "go2rtc_stream": go2rtc_stream,
+        "last_frame_index": source_diagnostics["last_frame_index"],
+        "last_capture_ts": source_diagnostics["last_capture_ts"],
+        "last_pipeline_ts": source_diagnostics["last_pipeline_ts"],
+        "last_snapshot_frame_index": source_diagnostics["last_snapshot_frame_index"],
+        "last_snapshot_ts": source_diagnostics["last_snapshot_ts"],
+        "last_preview_stream_frame_index": source_diagnostics["last_preview_stream_frame_index"],
+        "last_preview_stream_ts": source_diagnostics["last_preview_stream_ts"],
+        "fps_observed": fps_observed,
+        "dropped_frames": dropped_frames,
+        "source_consistency": source_status,
+        "source_diagnostics": source_diagnostics,
         "name": camera_config.name,
         **_get_region_info(request, getattr(camera_config, "region_id", None)),
         "connected": status.connected if status is not None else False,
         "running": status.running if status is not None else False,
+        "model_backend": model_backend,
+        "expected_model_backend": expected_model_backend,
+        # Public safety contract.  Keep the nested runtime copy during the
+        # frontend migration, but new clients should read this top-level field.
+        "scene_guard": scene_guard,
         "stats": stats,
         "stages": stages,
         "config": camera_config.model_dump(mode="json"),
@@ -740,7 +1160,8 @@ def camera_detail_json(request: Request, camera_id: str):
             "pipeline_mode": pipeline_mode,
             "anomaly_locked": anomaly_locked,
             "learning_progress": learning,
-            "capture_status": getattr(status, "capture_status", None) if status is not None else None,
+            "capture_status": capture_status,
+            "scene_guard": scene_guard,
         },
         "runner": {
             "model_ref": runner.model_ref,
@@ -751,9 +1172,31 @@ def camera_detail_json(request: Request, camera_id: str):
             "version_tag": runner.version_tag,
             "degradation_state": runner.degradation_state.value,
             "consecutive_failures": runner.consecutive_failures,
+            "latest_frame_identity": getattr(runner, "latest_frame_identity", None),
         } if runner is not None else None,
         "detector": detector,
+        "candidate_diagnostics": candidate_diagnostics,
         "health": health,
+    }, CameraDetailResponse)
+
+
+@router.get("/{camera_id}/diagnostics")
+def camera_diagnostics(request: Request, camera_id: str, limit: int = 50):
+    """Get recent frame diagnostics with candidate evidence for a camera."""
+    camera_manager = request.app.state.camera_manager
+    if not camera_manager:
+        return api_unavailable("摄像头管理器未运行")
+    camera_config = _find_camera_config(request, camera_id)
+    if camera_config is None:
+        return api_not_found(f"摄像头 {camera_id} 不存在")
+    limit = max(1, min(int(limit), 200))
+    return api_success({
+        "camera_id": camera_id,
+        "diagnostics": _recent_camera_diagnostics(
+            camera_manager,
+            camera_id,
+            limit=limit,
+        ),
     })
 
 
@@ -768,6 +1211,12 @@ def camera_runner_snapshot(request: Request, camera_id: str):
     if snapshot is None:
         return api_not_found(f"摄像头 {camera_id} 不存在")
 
+    candidate_diagnostics = _recent_camera_diagnostics(
+        camera_manager,
+        camera_id,
+        limit=10,
+    )
+
     return api_success({
         "camera_id": snapshot.camera_id,
         "model_ref": snapshot.model_ref,
@@ -778,6 +1227,7 @@ def camera_runner_snapshot(request: Request, camera_id: str):
         "version_tag": snapshot.version_tag,
         "degradation_state": snapshot.degradation_state.value,
         "consecutive_failures": snapshot.consecutive_failures,
+        "latest_frame_identity": getattr(snapshot, "latest_frame_identity", None),
         "stats": {
             "frames_captured": snapshot.stats.frames_captured,
             "frames_analyzed": snapshot.stats.frames_analyzed,
@@ -785,6 +1235,7 @@ def camera_runner_snapshot(request: Request, camera_id: str):
             "alerts_emitted": snapshot.stats.alerts_emitted,
             "avg_latency_ms": round(snapshot.stats.avg_latency_ms, 1),
         },
+        "candidate_diagnostics": candidate_diagnostics,
     })
 
 
@@ -869,11 +1320,29 @@ async def wall_status(request: Request):
                 "degradation": None,
             }
 
-            pipeline = camera_manager.get_pipeline(cam_id)
-            if pipeline is not None and hasattr(pipeline, "get_wall_status"):
-                wall_data = pipeline.get_wall_status()
+            get_wall_status = getattr(camera_manager, "get_wall_status", None)
+            wall_data = get_wall_status(cam_id) if callable(get_wall_status) else None
+            if isinstance(wall_data, dict):
                 tile["current_score"] = wall_data.get("current_score", 0.0)
                 tile["score_sparkline"] = wall_data.get("score_sparkline", [])
+                actual_backend, expected_backend = _manager_anomaly_backend_status(
+                    camera_manager,
+                    cam_id,
+                )
+                if actual_backend is not None:
+                    tile["model_backend"] = actual_backend
+                    tile["expected_model_backend"] = expected_backend
+                    if (
+                        tile["degradation"] is None
+                        and expected_backend != "auto"
+                        and actual_backend != expected_backend
+                    ):
+                        tile["degradation"] = "model_backend_mismatch"
+                    elif (
+                        tile["degradation"] is None
+                        and actual_backend in {"ssim-fallback", "none", "disabled"}
+                    ):
+                        tile["degradation"] = "model_fallback"
 
             # FPS from pipeline stats (computed every 2s in process_frame)
             stats = getattr(cam_status, "stats", None)

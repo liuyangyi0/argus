@@ -8,7 +8,6 @@ import {
   BellOutlined,
   DashboardOutlined,
   DatabaseOutlined,
-  InboxOutlined,
   RightOutlined,
   SettingOutlined,
   VideoCameraOutlined,
@@ -35,6 +34,15 @@ const isExact = (path: string) => route.path === path || route.path.startsWith(p
 // these are also the public/all-role pages). Backend RBAC remains the source
 // of truth; this list only hides nav entries to reduce wandering.
 type NavChild = { path: string; label: string; roles?: string[] }
+
+interface SystemErrorWsPayload {
+  severity?: 'info' | 'warning' | 'error' | 'critical'
+  source?: string
+  code?: string | number
+  message?: string
+  context?: Record<string, unknown>
+  timestamp?: string
+}
 
 const modelsChildren: NavChild[] = [
   { path: '/models/baseline', label: '基线管理', roles: ['admin', 'engineer'] },
@@ -109,6 +117,8 @@ async function onMenuClick({ key }: { key: string }) {
 
 const modelsOpen = ref(isActive('/models'))
 const systemOpen = ref(isActive('/system'))
+const viewportWidth = ref(typeof window === 'undefined' ? 1280 : window.innerWidth)
+const compactSidebar = computed(() => viewportWidth.value >= 768 && viewportWidth.value < 1280)
 
 // Auto-open the parent group whose route is active
 watch(
@@ -120,9 +130,17 @@ watch(
 )
 
 function toggleModels() {
+  if (compactSidebar.value) {
+    void router.push('/models')
+    return
+  }
   modelsOpen.value = !modelsOpen.value
 }
 function toggleSystem() {
+  if (compactSidebar.value) {
+    void router.push('/system')
+    return
+  }
   systemOpen.value = !systemOpen.value
 }
 
@@ -131,7 +149,7 @@ function toggleSystem() {
 // also drives the disconnect banner via the `health` topic so we keep a single
 // long-lived subscriber on the layout.
 const errorStore = useErrorStore()
-const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFallbackMode, retryCount: wsRetryCount, nextRetryIn: wsNextRetryIn } = useWebSocket({
+const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFallbackMode, retryCount: wsRetryCount, nextRetryIn: wsNextRetryIn } = useWebSocket<SystemErrorWsPayload>({
   topics: ['health', 'system_errors'],
   onMessage: (topic, payload) => {
     if (topic !== 'system_errors') return
@@ -168,7 +186,6 @@ const navKeys: Record<string, string> = {
   '2': '/cameras',
   '3': '/alerts',
   '4': '/reports',
-  '5': '/warehouse3D',
   '6': '/models',
   '7': '/system',
 }
@@ -192,8 +209,13 @@ function handleKeyDown(e: KeyboardEvent) {
   }
 }
 
+function handleResize() {
+  viewportWidth.value = window.innerWidth
+}
+
 onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
+  window.addEventListener('resize', handleResize, { passive: true })
   // Hydrate the dropdown when landing on a public page (e.g. /overview).
   // The router guard skips /api/me for public routes, so currentUser may be
   // null even though a session cookie is set. fetchCurrentUser() is cached
@@ -205,6 +227,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeyDown)
+  window.removeEventListener('resize', handleResize)
 })
 </script>
 
@@ -221,23 +244,19 @@ onUnmounted(() => {
           <div class="nav-label">工作台</div>
 
           <router-link to="/overview" :class="{ active: isActive('/overview') }">
-            <DashboardOutlined />总览
+            <DashboardOutlined /><span class="nav-text">总览</span>
           </router-link>
 
           <router-link to="/cameras" :class="{ active: isActive('/cameras') }">
-            <VideoCameraOutlined />摄像头
+            <VideoCameraOutlined /><span class="nav-text">摄像头</span>
           </router-link>
 
           <router-link to="/alerts" :class="{ active: isActive('/alerts') }">
-            <AlertOutlined />告警中心
+            <AlertOutlined /><span class="nav-text">告警中心</span>
           </router-link>
 
           <router-link to="/reports" :class="{ active: isActive('/reports') }">
-            <BarChartOutlined />报表
-          </router-link>
-
-          <router-link to="/warehouse3D" :class="{ active: isActive('/warehouse3D') }">
-            <InboxOutlined />3D仓库
+            <BarChartOutlined /><span class="nav-text">报表</span>
           </router-link>
 
           <div class="nav-label">系统</div>
@@ -249,6 +268,8 @@ onUnmounted(() => {
               class="sub-toggle"
               :class="{ active: isActive('/models') }"
               :aria-expanded="modelsOpen"
+              aria-label="模型管理"
+              title="模型管理"
               @click="toggleModels"
             >
               <DatabaseOutlined />
@@ -275,6 +296,8 @@ onUnmounted(() => {
               class="sub-toggle"
               :class="{ active: isActive('/system') }"
               :aria-expanded="systemOpen"
+              aria-label="系统设置"
+              title="系统设置"
               @click="toggleSystem"
             >
               <SettingOutlined />
@@ -312,11 +335,11 @@ onUnmounted(() => {
           </a-button>
         </a-badge>
         <a-dropdown placement="bottomRight" :trigger="['click']">
-          <span class="user-trigger" tabindex="0">
+          <button type="button" class="user-trigger" aria-label="打开用户菜单">
             <a-avatar size="small">{{ avatarLetter }}</a-avatar>
             <span class="user-name">{{ auth.currentUser.display_name || auth.currentUser.username }}</span>
             <a-tag :color="roleColor" class="role-tag">{{ roleLabel }}</a-tag>
-          </span>
+          </button>
           <template #overlay>
             <a-menu @click="onMenuClick">
               <a-menu-item key="profile" disabled>
@@ -332,36 +355,16 @@ onUnmounted(() => {
       <!-- WebSocket disconnect banner (inline in column) -->
       <div
         v-if="!wsConnected && (wsReconnecting || wsFallbackMode)"
+        class="connection-banner"
+        :class="{ 'connection-banner-fallback': wsFallbackMode }"
         role="alert"
         aria-live="polite"
-        :style="{
-          background: wsFallbackMode ? 'rgba(217,119,6,.08)' : 'rgba(229,72,77,.06)',
-          borderBottom: '0.5px solid ' + (wsFallbackMode ? 'rgba(217,119,6,.22)' : 'rgba(229,72,77,.18)'),
-          color: wsFallbackMode ? '#d97706' : '#b01e22',
-          textAlign: 'center',
-          padding: '8px 16px',
-          fontSize: '12px',
-          fontWeight: 600,
-          display: 'flex',
-          justifyContent: 'center',
-          alignItems: 'center',
-          gap: '8px'
-        }"
       >
-        <span
-          class="d"
-          :style="{
-            width: '6px',
-            height: '6px',
-            borderRadius: '50%',
-            background: wsFallbackMode ? '#d97706' : '#e5484d',
-            boxShadow: '0 0 0 3px ' + (wsFallbackMode ? 'rgba(217,119,6,.18)' : 'rgba(229,72,77,.18)')
-          }"
-        ></span>
+        <span class="connection-dot"></span>
         <template v-if="wsFallbackMode">WebSocket 连接断开，已切换到受限模式</template>
         <template v-else>
           正在重新连接实时数据流... ({{ wsRetryCount }}/3)
-          <span v-if="wsNextRetryIn > 0" style="margin-left: 8px; opacity: 0.8; font-weight: 500;">
+          <span v-if="wsNextRetryIn > 0" class="connection-countdown">
             {{ wsNextRetryIn }}s 后重试
           </span>
         </template>
@@ -401,7 +404,6 @@ onUnmounted(() => {
         <li><kbd>2</kbd><span>摄像头</span></li>
         <li><kbd>3</kbd><span>告警中心</span></li>
         <li><kbd>4</kbd><span>报表</span></li>
-        <li><kbd>5</kbd><span>3D 仓库</span></li>
         <li><kbd>6</kbd><span>模型管理</span></li>
         <li><kbd>7</kbd><span>系统设置</span></li>
         <li><kbd>Esc</kbd><span>关闭</span></li>
@@ -631,6 +633,9 @@ onUnmounted(() => {
   cursor: pointer;
   transition: background 0.15s;
   user-select: none;
+  border: 0;
+  background: transparent;
+  font: inherit;
 }
 .user-trigger:hover { background: rgba(10, 10, 15, 0.05); }
 .user-trigger:focus-visible {
@@ -651,5 +656,135 @@ onUnmounted(() => {
   font-size: 11px;
   line-height: 18px;
   padding: 0 6px;
+}
+
+.connection-banner {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 0.5px solid rgba(229, 72, 77, 0.18);
+  background: rgba(229, 72, 77, 0.06);
+  color: #b01e22;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+}
+.connection-banner-fallback {
+  border-bottom-color: rgba(217, 119, 6, 0.22);
+  background: rgba(217, 119, 6, 0.08);
+  color: var(--status-warning);
+}
+.connection-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: var(--status-danger);
+  box-shadow: 0 0 0 3px rgba(229, 72, 77, 0.18);
+}
+.connection-banner-fallback .connection-dot {
+  background: var(--status-warning);
+  box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.18);
+}
+.connection-countdown {
+  margin-left: 8px;
+  opacity: 0.8;
+  font-weight: 500;
+}
+
+@media (min-width: 768px) and (max-width: 1279px) {
+  .sidebar {
+    width: 76px;
+    padding: 16px 8px;
+  }
+  .brand {
+    justify-content: center;
+    padding: 4px 0 18px;
+  }
+  .brand-text,
+  .nav-label,
+  .nav-text,
+  .sub-label,
+  .sub-toggle .caret,
+  .sub-list,
+  .side-foot {
+    display: none;
+  }
+  .nav a,
+  .sub-toggle {
+    justify-content: center;
+    padding: 11px;
+  }
+  .nav a svg,
+  .sub-toggle svg {
+    width: 19px;
+    height: 19px;
+  }
+}
+
+@media (max-width: 767px) {
+  .app {
+    padding: 8px;
+    gap: 8px;
+  }
+  .content-shell {
+    padding-bottom: 66px;
+  }
+  .sidebar {
+    position: fixed;
+    z-index: 100;
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
+    width: auto;
+    height: 58px;
+    padding: 6px;
+    overflow: hidden;
+  }
+  .sidebar > div:first-child,
+  .nav {
+    width: 100%;
+    height: 100%;
+  }
+  .brand,
+  .nav-label,
+  .sub-group,
+  .side-foot {
+    display: none;
+  }
+  .nav {
+    flex-direction: row;
+    justify-content: space-around;
+    gap: 2px;
+  }
+  .nav a {
+    flex: 1;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    padding: 4px 2px;
+    font-size: 10px;
+  }
+  .nav a svg {
+    width: 18px;
+    height: 18px;
+  }
+  .topbar {
+    height: 40px;
+    padding: 0 8px;
+  }
+  .user-trigger .user-name,
+  .user-trigger .role-tag {
+    display: none;
+  }
+  .connection-banner {
+    padding: 7px 10px;
+    font-size: 11px;
+  }
+  .route-shell {
+    overflow: auto;
+  }
 }
 </style>

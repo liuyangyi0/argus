@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import numpy as np
 
 from argus.core.pipeline import DetectionPipeline, PipelineMode
+from argus.core.runtime import FrameOutcomeKind
 
 
 def _make_config():
@@ -17,6 +18,7 @@ def _make_config():
         CameraConfig,
         MOG2Config,
         PersonFilterConfig,
+        SceneGuardConfig,
         SeverityThresholds,
         SuppressionConfig,
         TemporalConfirmation,
@@ -29,6 +31,7 @@ def _make_config():
         protocol="file",
         fps_target=5,
         resolution=(640, 480),
+        scene_guard=SceneGuardConfig(enabled=False),
         mog2=MOG2Config(history=500, heartbeat_frames=30),
         person_filter=PersonFilterConfig(model_name="yolo11n.pt"),
         anomaly=AnomalyConfig(threshold=0.7),
@@ -240,6 +243,8 @@ def test_collection_mode_skips_detection_stages():
     # Raw frame must remain available for capture threads
     assert pipeline._latest_raw_frame is not None
     assert pipeline._latest_frame is not None
+    assert pipeline.last_frame_outcome_kind is FrameOutcomeKind.BLOCKED
+    assert "collection" in (pipeline.last_frame_outcome_reason or "")
 
 
 def test_training_mode_skips_detection_stages():
@@ -252,6 +257,19 @@ def test_training_mode_skips_detection_stages():
 
     assert pipeline.process_frame(_make_frame_data()) is None
     pipeline._prefilter.process.assert_not_called()
+    assert pipeline.last_frame_outcome_kind is FrameOutcomeKind.BLOCKED
+
+
+def test_process_frame_exception_is_not_reported_as_normal():
+    cam_config, alert_config = _make_config()
+    pipeline = DetectionPipeline(camera_config=cam_config, alert_config=alert_config)
+    pipeline._process_frame_inner = MagicMock(
+        side_effect=RuntimeError("inference graph exploded")
+    )
+
+    assert pipeline.process_frame(_make_frame_data()) is None
+    assert pipeline.last_frame_outcome_kind is FrameOutcomeKind.FAILED
+    assert "inference graph exploded" in (pipeline.last_frame_outcome_reason or "")
 
 
 def test_maintenance_mode_still_runs_prefilter():

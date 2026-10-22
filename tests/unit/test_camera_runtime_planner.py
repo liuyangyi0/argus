@@ -69,6 +69,26 @@ def test_usb_planner_uses_configured_device_name_for_go2rtc_source():
     assert "video=0" not in plan.go2rtc_stream.source
 
 
+def test_usb_planner_keeps_operator_nvenc_exec_source_in_initial_config():
+    exec_source = (
+        "exec:ffmpeg -f v4l2 -i /dev/video0 -c:v h264_nvenc "
+        "-f rtsp {output}#video=h264"
+    )
+    config = CameraConfig(
+        camera_id="obsbot",
+        name="OBSBOT",
+        source="/dev/video0",
+        protocol="usb",
+        usb=USBCaptureConfig(go2rtc_source=exec_source, pixel_format="mjpeg"),
+    )
+
+    plan = _plan(config)
+
+    assert plan.go2rtc_stream is not None
+    assert plan.go2rtc_stream.source == exec_source
+    assert plan.go2rtc_stream.registration == "initial_config"
+
+
 def test_rtsp_detection_reads_original_source_while_preview_uses_go2rtc():
     source = "rtsp://192.0.2.10:554/stream1"
     config = CameraConfig(camera_id="rtsp_01", name="RTSP", source=source, protocol="rtsp")

@@ -42,9 +42,12 @@ router = APIRouter()
 
 
 def _deny_without_training_permission(request: Request) -> JSONResponse | None:
-    if require_permission(request, "manage_training"):
-        return None
-    return api_forbidden("权限不足")
+    if not require_permission(request, "manage_training"):
+        return api_forbidden("权限不足")
+    actor = current_username(request)
+    if not isinstance(actor, str) or not actor.strip() or actor.strip().lower() == "unknown":
+        return api_forbidden("训练操作需要可审计的已认证用户身份")
+    return None
 
 
 def _get_db(request: Request):
@@ -211,7 +214,6 @@ async def create_training_job(request: Request):
         zone_id?: str,       (default: "default")
         model_type?: str,
         trigger_type?: str,  (default: "manual")
-        triggered_by?: str,
         hyperparameters?: dict,
     }
     """
@@ -227,6 +229,8 @@ async def create_training_job(request: Request):
         body = await request.json()
     except Exception:
         return api_validation_error("无效的JSON请求")
+    if not isinstance(body, dict):
+        return api_validation_error("JSON请求必须是对象")
 
     valid_types = {t.value for t in TrainingJobType}
     job_type = body.get("job_type")
@@ -250,6 +254,8 @@ async def create_training_job(request: Request):
             )
 
     hyperparams = body.get("hyperparameters")
+    if isinstance(hyperparams, dict) and "scene_workflow" in hyperparams:
+        return api_validation_error("场景训练必须从受控场景工作流提交，不能直接指定 lineage")
     if hyperparams and isinstance(hyperparams, dict):
         param_errors = validate_hyperparameters(hyperparams)
         if param_errors:
@@ -289,7 +295,7 @@ async def create_training_job(request: Request):
         zone_id=body.get("zone_id", "default"),
         model_type=body.get("model_type"),
         trigger_type=body.get("trigger_type", TrainingTriggerType.MANUAL.value),
-        triggered_by=body.get("triggered_by") or current_username(request),
+        triggered_by=current_username(request),
         confirmation_required=True,
         status=TrainingJobStatus.PENDING_CONFIRMATION.value,
         base_model_version=base_model_version,
@@ -324,12 +330,8 @@ async def confirm_training_job(request: Request, job_id: str):
     if err:
         return err
 
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    confirmed_by = body.get("confirmed_by") or current_username(request)
+    # Approval identity belongs to the authenticated session, never JSON input.
+    confirmed_by = current_username(request)
     now = datetime.now(timezone.utc)
 
     # Atomic compare-and-swap: only transition if still pending_confirmation
@@ -371,9 +373,13 @@ async def reject_training_job(request: Request, job_id: str):
         body = await request.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        return api_validation_error("JSON请求必须是对象")
 
-    rejected_by = body.get("rejected_by") or current_username(request)
+    rejected_by = current_username(request)
     reason = body.get("reason", "")
+    if not isinstance(reason, str):
+        return api_validation_error("拒绝原因必须是字符串")
 
     updated = db.update_training_job(
         job_id,

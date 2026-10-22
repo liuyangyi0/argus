@@ -1,16 +1,19 @@
 """Tests for AlertRecordingStore disk persistence with H.264 MP4 (FR-033)."""
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from argus.core.alert_ring_buffer import (
     FrameSnapshot,
     RecordingStatus,
     SolidifiedRecording,
 )
+from argus.core.frame_identity import FrameIdentity
 from argus.storage.alert_recording import (
     AlertRecordingStore,
     _aggregate_trajectories,
@@ -76,6 +79,31 @@ class TestAlertRecordingStore:
         assert metadata["codec"] == "h264"
         assert metadata["video_file"] == "pre.mp4"  # status=RECORDING
 
+    def test_save_metadata_includes_frame_identity_summary(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording(frame_count=3)
+        for idx, frame in enumerate(recording.frames):
+            frame.identity = FrameIdentity(
+                camera_id="cam_01",
+                source_declared="0",
+                source_runtime="rtsp://127.0.0.1:8554/cam_01",
+                stream_id="cam_01",
+                frame_index=idx + 10,
+                capture_wall_ts=1710000000.0 + idx,
+                capture_monotonic_ts=100.0 + idx,
+                pipeline_ingest_ts=1710000000.1 + idx,
+            )
+
+        store.save(recording)
+
+        metadata = store.load_metadata("ALT-TEST-001")
+        assert metadata is not None
+        frame_identity = metadata["frame_identity"]
+        assert frame_identity["first"]["frame_index"] == 10
+        assert frame_identity["trigger"]["frame_index"] == 12
+        assert frame_identity["last"]["stream_id"] == "cam_01"
+        assert "runtime_source_hash" in frame_identity["trigger"]
+
     def test_save_complete_recording(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
         recording = _make_recording(status=RecordingStatus.COMPLETE)
@@ -104,8 +132,72 @@ class TestAlertRecordingStore:
         signals = store.load_signals("ALT-TEST-001")
         assert signals is not None
         assert len(signals["timestamps"]) == 10
+        assert signals["frame_numbers"] == list(range(10))
+        assert signals["frame_identities"] == [None] * 10
+        assert signals["candidate_records"] == [[] for _ in range(10)]
+        assert signals["candidate_events"] == []
         assert len(signals["anomaly_scores"]) == 10
         assert "cam_01:default" in signals["cusum_evidence"]
+
+    def test_signals_include_candidate_records_for_replay_evidence(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording(frame_count=3)
+        recording.frames[1].candidate_records = [
+            {
+                "candidate_id": "cam_01:1:1",
+                "candidate_type": "persistent_change",
+                "decision": "candidate",
+                "stage": "persistent_change",
+                "evidence": {
+                    "score": 0.87,
+                    "candidates": [
+                        {
+                            "track_id": 7,
+                            "bbox": [50, 40, 32, 24],
+                            "area_px": 768,
+                            "persistence_seconds": 3.2,
+                        },
+                    ],
+                },
+                "suppression_reason": None,
+            }
+        ]
+
+        store.save(recording)
+
+        signals = store.load_signals("ALT-TEST-001")
+        assert signals is not None
+        assert signals["candidate_records"][0] == []
+        assert signals["candidate_records"][1][0]["candidate_type"] == "persistent_change"
+        assert signals["candidate_records"][1][0]["evidence"]["score"] == 0.87
+        assert signals["candidate_events"][0]["frame_index"] == 1
+        assert signals["candidate_events"][0]["frame_number"] == 1
+        assert signals["candidate_events"][0]["timestamp"] == recording.frames[1].timestamp
+        assert signals["candidate_events"][0]["candidate_type"] == "persistent_change"
+
+    def test_signals_include_frame_identity_for_replay_alignment(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording(frame_count=3)
+        for idx, frame in enumerate(recording.frames):
+            frame.identity = FrameIdentity(
+                camera_id="cam_01",
+                source_declared="0",
+                source_runtime="rtsp://127.0.0.1:8554/cam_01",
+                stream_id="cam_01",
+                frame_index=idx + 20,
+                capture_wall_ts=1710000100.0 + idx,
+                capture_monotonic_ts=200.0 + idx,
+                pipeline_ingest_ts=1710000100.2 + idx,
+            )
+
+        store.save(recording)
+
+        signals = store.load_signals("ALT-TEST-001")
+        assert signals is not None
+        assert signals["frame_numbers"] == [0, 1, 2]
+        assert [item["frame_index"] for item in signals["frame_identities"]] == [20, 21, 22]
+        assert signals["frame_identities"][0]["source_declared"] == "0"
+        assert signals["frame_identities"][2]["stream_id"] == "cam_01"
 
     def test_load_frame_from_mp4(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
@@ -221,6 +313,16 @@ class TestAlertRecordingStore:
                 frame_number=3 + i,
                 active_tracks=[{"track_id": 1, "centroid_x": 3.0 + i,
                                 "centroid_y": 0.0, "max_score": 0.5, "area_px": 1}],
+                candidate_records=[
+                    {
+                        "candidate_id": f"cam_01:{3 + i}:1",
+                        "candidate_type": "frame_anomaly",
+                        "decision": "info",
+                        "stage": "decision",
+                        "evidence": {"anomaly_score": 0.7 + i * 0.1},
+                        "suppression_reason": "grader_no_alert",
+                    },
+                ] if i == 1 else [],
             )
             for i in range(2)
         ]
@@ -229,6 +331,10 @@ class TestAlertRecordingStore:
         signals = store.load_signals("ALT-APPEND-001")
         indices = [p["frame_index"] for p in signals["trajectory_points"]["1"]]
         assert indices == [0, 1, 2, 3, 4]
+        assert signals["frame_numbers"] == [0, 1, 2, 3, 4]
+        assert signals["candidate_records"][4][0]["candidate_type"] == "frame_anomaly"
+        assert signals["candidate_events"][0]["frame_index"] == 4
+        assert signals["candidate_events"][0]["frame_number"] == 4
 
     def test_has_recording(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
@@ -236,6 +342,32 @@ class TestAlertRecordingStore:
 
         store.save(_make_recording())
         assert store.has_recording("ALT-TEST-001")
+
+    def test_save_json_failure_does_not_publish_partial_recording(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        recording = _make_recording(alert_id="ALT-BAD-JSON", frame_count=2)
+        recording.frames[0].candidate_records = [{"bad": object()}]
+
+        with pytest.raises(TypeError):
+            store.save(recording)
+
+        assert store._find_recording_dir("ALT-BAD-JSON") is None
+        assert not list(Path(tmp_path).rglob("ALT-BAD-JSON"))
+        assert not list(Path(tmp_path).rglob(".ALT-BAD-JSON.tmp-*"))
+
+    def test_pre_only_directory_is_not_replay_ready(self, tmp_path):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        rec_dir = tmp_path / "2026-06-13" / "cam_01" / "ALT-PRE-ONLY"
+        rec_dir.mkdir(parents=True)
+        (rec_dir / "pre.mp4").write_bytes(b"partial")
+
+        availability = store.get_availability("ALT-PRE-ONLY")
+
+        assert availability.has_recording is False
+        assert availability.replay_ready is False
+        assert availability.status == "incomplete"
+        assert availability.unavailable_reason == "missing_metadata"
+        assert store.has_recording("ALT-PRE-ONLY") is False
 
     def test_append_post_frames(self, tmp_path):
         store = AlertRecordingStore(archive_dir=str(tmp_path))
@@ -378,3 +510,56 @@ class TestAlertRecordingStore:
         assert clips[0]["label"] == "peak"
         assert clips[0]["start_index"] == 2
         assert clips[0]["end_index"] == 7
+
+    def test_concurrent_clip_updates_are_not_lost_across_store_instances(
+        self,
+        tmp_path,
+    ):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        store.save(_make_recording(status=RecordingStatus.COMPLETE))
+        stores = [store, AlertRecordingStore(archive_dir=str(tmp_path))]
+
+        def add_clip(index: int):
+            return stores[index % len(stores)].add_clip(
+                "ALT-TEST-001",
+                index,
+                index + 1,
+                f"clip-{index}",
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(add_clip, range(32)))
+
+        assert all(result is not None for result in results)
+        clips = store.list_clips("ALT-TEST-001")
+        assert clips is not None
+        assert len(clips) == 32
+        assert {clip["label"] for clip in clips} == {
+            f"clip-{index}" for index in range(32)
+        }
+
+    def test_atomic_clip_replace_failure_preserves_previous_signals(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        store = AlertRecordingStore(archive_dir=str(tmp_path))
+        rec_path, _ = store.save(
+            _make_recording(status=RecordingStatus.COMPLETE)
+        )
+        signals_path = Path(rec_path) / "signals.json"
+        original = signals_path.read_bytes()
+
+        def reject_replace(_source, _destination):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(
+            "argus.storage.alert_recording.os.replace",
+            reject_replace,
+        )
+
+        with pytest.raises(OSError, match="simulated replace failure"):
+            store.add_clip("ALT-TEST-001", 1, 2, "must-not-persist")
+
+        assert signals_path.read_bytes() == original
+        assert list(Path(rec_path).glob(".signals.json.tmp-*")) == []

@@ -6,13 +6,55 @@ into a single tabbed interface.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict
 
 from argus.core.metrics import METRICS
-from argus.dashboard.api_response import api_success
+from argus.dashboard.api_response import ApiEnvelope, api_error, api_success, api_typed_success
 
 router = APIRouter()
+
+
+class LivenessResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    alive: bool
+    status: Literal["alive"]
+    uptime_seconds: float | None
+
+
+class CameraReadinessResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    camera_id: str
+    connected: bool
+    frames_captured: int
+    avg_latency_ms: float
+    reconnect_count: int
+    last_frame_time: float
+    observed_since: float
+    error: str | None
+    capture_state: Literal["receiving", "waiting", "stale", "disconnected"]
+    scene_guard_usable: bool | None
+    scene_guard_state: str | None
+    scene_guard_reason: str | None
+    model_ready: bool | None
+    model_error: str | None
+    pipeline_mode: str | None
+    detection_state: Literal["ready", "blocked", "failed", "waiting"]
+    detection_reason: str | None
+
+
+class DetectionReadinessResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ready: bool
+    status: Literal["ready", "not_ready"]
+    reasons: list[str]
+    cameras: list[CameraReadinessResponse]
 
 
 @router.get("/mode_summary")
@@ -59,6 +101,10 @@ def health(request: Request):
                 "connected": c.connected,
                 "frames_captured": c.frames_captured,
                 "avg_latency_ms": round(c.avg_latency_ms, 1),
+                "capture_state": c.capture_state,
+                "detection_state": c.detection_state,
+                "detection_reason": c.detection_reason,
+                "pipeline_mode": c.pipeline_mode,
             }
             for c in h.cameras
         ],
@@ -67,19 +113,63 @@ def health(request: Request):
     })
 
 
-def _collect_from_pipelines(camera_manager, attr_name: str, extractor, default_fn):
-    """Iterate pipelines and collect per-camera data with fallback defaults."""
-    result = []
-    for cam_id, pipeline in camera_manager._pipelines.items():
-        component = getattr(pipeline, attr_name, None)
-        extracted = extractor(component) if component else None
-        if extracted is not None:
-            extracted["camera_id"] = cam_id
-            result.append(extracted)
-        else:
-            d = default_fn()
-            d["camera_id"] = cam_id
-            result.append(d)
+@router.get("/health/live", response_model=ApiEnvelope[LivenessResponse])
+def liveness(request: Request):
+    """Process liveness; scene blocking must never trigger restart loops."""
+    monitor = getattr(request.app.state, "health_monitor", None)
+    uptime = monitor.get_health().uptime_seconds if monitor is not None else None
+    return api_typed_success({
+        "alive": True,
+        "status": "alive",
+        "uptime_seconds": round(uptime, 1) if uptime is not None else None,
+    }, LivenessResponse, headers={"Cache-Control": "no-store"})
+
+
+@router.get(
+    "/health/ready",
+    response_model=ApiEnvelope[DetectionReadinessResponse],
+    responses={503: {"model": ApiEnvelope[DetectionReadinessResponse]}},
+)
+def detection_readiness(request: Request):
+    """Detection readiness, including capture freshness and safety gates."""
+    monitor = getattr(request.app.state, "health_monitor", None)
+    payload = monitor.get_detection_readiness() if monitor is not None else {
+        "ready": False,
+        "status": "not_ready",
+        "reasons": ["health_monitor_unavailable"],
+        "cameras": [],
+    }
+    validated = DetectionReadinessResponse.model_validate(payload).model_dump(mode="json")
+    if not validated["ready"]:
+        return api_error(
+            50300, "检测尚未就绪", 503, data=validated,
+            headers={"Cache-Control": "no-store"},
+        )
+    return api_typed_success(
+        validated, DetectionReadinessResponse, headers={"Cache-Control": "no-store"},
+    )
+
+
+def _system_snapshots(camera_manager) -> list[dict]:
+    """Read detached per-camera status through CameraManager's public API."""
+    getter = getattr(camera_manager, "get_system_status_snapshots", None)
+    if not callable(getter):
+        return []
+    snapshots = getter()
+    return (
+        [item for item in snapshots if isinstance(item, dict)]
+        if isinstance(snapshots, list)
+        else []
+    )
+
+
+def _snapshot_section(camera_manager, section: str) -> list[dict]:
+    result: list[dict] = []
+    for snapshot in _system_snapshots(camera_manager):
+        payload = snapshot.get(section)
+        if not isinstance(payload, dict):
+            continue
+        result.append({"camera_id": snapshot.get("camera_id"), **payload})
     return result
 
 
@@ -90,26 +180,7 @@ async def drift_status(request: Request):
     if not camera_manager:
         return api_success({"cameras": []})
 
-    def _extract_drift(detector):
-        if not hasattr(detector, "get_status"):
-            return None
-        st = detector.get_status()
-        return {
-            "is_drifted": st.is_drifted,
-            "ks_statistic": round(st.ks_statistic, 4),
-            "p_value": round(st.p_value, 6),
-            "reference_mean": round(st.reference_mean, 4),
-            "current_mean": round(st.current_mean, 4),
-            "samples_collected": st.samples_collected,
-            "last_check_time": st.last_check_time,
-        }
-
-    result = _collect_from_pipelines(
-        camera_manager, "_drift_detector", _extract_drift,
-        lambda: {"is_drifted": False, "ks_statistic": 0, "p_value": 1,
-                 "reference_mean": 0, "current_mean": 0, "samples_collected": 0,
-                 "last_check_time": 0},
-    )
+    result = _snapshot_section(camera_manager, "drift")
     return api_success({"cameras": result})
 
 
@@ -120,26 +191,7 @@ async def camera_health(request: Request):
     if not camera_manager:
         return api_success({"cameras": []})
 
-    def _extract_health(analyzer):
-        hr = getattr(analyzer, "last_result", None)
-        if not hr:
-            return None
-        return {
-            "is_frozen": hr.is_frozen,
-            "sharpness_score": round(hr.sharpness_score, 2),
-            "displacement_px": round(hr.displacement_px, 1),
-            "is_flash": hr.is_flash,
-            "gain_drift_pct": round(hr.gain_drift_pct, 1),
-            "suppress_detection": hr.suppress_detection,
-            "warnings": hr.warnings,
-        }
-
-    result = _collect_from_pipelines(
-        camera_manager, "_health_analyzer", _extract_health,
-        lambda: {"is_frozen": False, "sharpness_score": 0, "displacement_px": 0,
-                 "is_flash": False, "gain_drift_pct": 0, "suppress_detection": False,
-                 "warnings": []},
-    )
+    result = _snapshot_section(camera_manager, "camera_health")
     return api_success({"cameras": result})
 
 
@@ -150,16 +202,7 @@ async def ensemble_status(request: Request):
     if not camera_manager:
         return api_success({"cameras": []})
 
-    def _extract_ensemble(detector):
-        if not hasattr(detector, "get_status"):
-            return None
-        return detector.get_status()
-
-    result = _collect_from_pipelines(
-        camera_manager, "_ensemble_detector", _extract_ensemble,
-        lambda: {"model_count": 0, "loaded": False, "method": "none",
-                 "model_paths": []},
-    )
+    result = _snapshot_section(camera_manager, "ensemble")
     return api_success({"cameras": result})
 
 
@@ -186,7 +229,8 @@ def anomaly_degradation(request: Request):
     list lets the system overview page surface details.
     """
     camera_manager = getattr(request.app.state, "camera_manager", None)
-    if camera_manager is None or not getattr(camera_manager, "_pipelines", None):
+    snapshots = _system_snapshots(camera_manager) if camera_manager is not None else []
+    if not snapshots:
         return api_success({
             "anomaly": {
                 "degraded": False,
@@ -200,16 +244,14 @@ def anomaly_degradation(request: Request):
     aggregate_degraded = False
     aggregate_reason: str | None = None
     aggregate_since: float | None = None
-    for cam_id, pipeline in camera_manager._pipelines.items():
-        try:
-            is_degraded = pipeline.is_anomaly_degraded()
-            reason = pipeline.get_anomaly_degradation_reason()
-            since = pipeline.get_anomaly_degradation_started_at()
-        except AttributeError:
-            # Older pipeline (no degradation accessors) — treat as nominal.
-            is_degraded = False
-            reason = None
-            since = None
+    for snapshot in snapshots:
+        cam_id = snapshot.get("camera_id")
+        degradation = snapshot.get("anomaly_degradation")
+        if not isinstance(degradation, dict):
+            degradation = {}
+        is_degraded = degradation.get("degraded") is True
+        reason = degradation.get("reason")
+        since = degradation.get("since")
         cameras_status.append({
             "camera_id": cam_id,
             "degraded": bool(is_degraded),

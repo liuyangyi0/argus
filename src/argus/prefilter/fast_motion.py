@@ -24,6 +24,8 @@ class FastMotionCandidate:
     area_px: int
     streak_length_px: float
     confidence: float
+    mean_motion: float = 0.0
+    fragment_count: int = 1
     track_id: int | None = None
     speed_px_per_sec: float | None = None
     trajectory: list[tuple[float, float, float]] = field(default_factory=list)
@@ -37,6 +39,8 @@ class FastMotionCandidate:
             "centroid": [round(self.centroid[0], 1), round(self.centroid[1], 1)],
             "area_px": int(self.area_px),
             "streak_length_px": round(float(self.streak_length_px), 1),
+            "mean_motion": round(float(self.mean_motion), 3),
+            "fragment_count": int(self.fragment_count),
             "speed_px_per_sec": (
                 round(float(self.speed_px_per_sec), 1)
                 if self.speed_px_per_sec is not None
@@ -57,6 +61,8 @@ class FastMotionResult:
     candidates: list[FastMotionCandidate] = field(default_factory=list)
     anomaly_map: np.ndarray | None = None
     max_confidence: float = 0.0
+    motion_fraction: float = 0.0
+    suppression_reason: str | None = None
 
 
 class FastMotionDetector:
@@ -74,6 +80,7 @@ class FastMotionDetector:
         min_confidence: float = 0.6,
         max_motion_fraction: float = 0.015,
         max_streak_frame_fraction: float = 0.25,
+        streak_gap_px: int = 4,
         max_candidates_per_frame: int = 5,
         fps_hint: float | None = None,
         trajectory_history_length: int = 16,
@@ -87,6 +94,7 @@ class FastMotionDetector:
         self._min_confidence = min_confidence
         self._max_motion_fraction = max_motion_fraction
         self._max_streak_frame_fraction = max_streak_frame_fraction
+        self._streak_gap_px = max(1, int(streak_gap_px))
         self._max_candidates = max_candidates_per_frame
         self._fps_hint = fps_hint
         self._trajectory_history_length = trajectory_history_length
@@ -124,23 +132,52 @@ class FastMotionDetector:
         bg_u8 = cv2.convertScaleAbs(self._background)
         bg_diff = cv2.absdiff(small, bg_u8)
         motion = cv2.max(frame_diff, bg_diff)
-        _, mask = cv2.threshold(motion, self._diff_threshold, 255, cv2.THRESH_BINARY)
+        _, raw_mask = cv2.threshold(motion, self._diff_threshold, 255, cv2.THRESH_BINARY)
+        _, current_raw_mask = cv2.threshold(
+            bg_diff,
+            self._diff_threshold,
+            255,
+            cv2.THRESH_BINARY,
+        )
 
-        # Close one-pixel gaps in motion streaks without erasing tiny objects.
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        # Close short gaps in dashed motion streaks without erasing tiny objects.
+        if self._streak_gap_px > 1:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (self._streak_gap_px, self._streak_gap_px),
+            )
+            mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel)
+            current_mask = cv2.morphologyEx(
+                current_raw_mask,
+                cv2.MORPH_CLOSE,
+                kernel,
+            )
+        else:
+            mask = raw_mask
+            current_mask = current_raw_mask
 
         motion_fraction = float(np.count_nonzero(mask)) / float(mask.size)
         if self._max_motion_fraction > 0 and motion_fraction > self._max_motion_fraction:
             cv2.accumulateWeighted(small, self._background, self._background_alpha)
             self._prev_gray = small
             self._prev_candidates = []
+            self._prune_inactive_track_histories([])
             self._prev_timestamp = ts
-            return FastMotionResult()
+            return FastMotionResult(
+                motion_fraction=motion_fraction,
+                suppression_reason="global_motion",
+            )
 
         candidates, accepted_mask = self._extract_candidates(
-            motion=motion,
-            mask=mask,
+            # Frame differencing contains both the object's new position and a
+            # disappearance ghost at its old position.  Candidate geometry
+            # must therefore come from current-vs-background evidence only.
+            # The union mask above remains useful for camera/global-motion
+            # suppression, but must never create a trackable old-position
+            # candidate.
+            motion=bg_diff,
+            mask=current_mask,
+            raw_mask=current_raw_mask,
             frame_shape=(frame_h, frame_w),
             scale=scale,
             timestamp=ts,
@@ -152,7 +189,7 @@ class FastMotionDetector:
         self._prev_timestamp = ts
 
         if not candidates:
-            return FastMotionResult()
+            return FastMotionResult(motion_fraction=motion_fraction)
 
         anomaly_map = cv2.resize(
             accepted_mask.astype(np.float32) / 255.0,
@@ -165,6 +202,7 @@ class FastMotionDetector:
             candidates=candidates,
             anomaly_map=anomaly_map,
             max_confidence=max_conf,
+            motion_fraction=motion_fraction,
         )
 
     def reset(self) -> None:
@@ -179,6 +217,7 @@ class FastMotionDetector:
         *,
         motion: np.ndarray,
         mask: np.ndarray,
+        raw_mask: np.ndarray,
         frame_shape: tuple[int, int],
         scale: float,
         timestamp: float,
@@ -188,6 +227,7 @@ class FastMotionDetector:
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             mask, connectivity=8,
         )
+        _raw_count, raw_labels = cv2.connectedComponents(raw_mask, connectivity=8)
         accepted: list[FastMotionCandidate] = []
         accepted_mask = np.zeros_like(mask)
 
@@ -200,15 +240,27 @@ class FastMotionDetector:
             full_area = int(round(area * inv_scale * inv_scale))
             max_scene_streak = self._max_streak_frame_fraction * max(frame_w, frame_h)
             if self._max_streak_frame_fraction > 0 and streak > max_scene_streak:
+                # This frame deliberately breaks all fast-motion tracks.  The
+                # next frame can only match against ``_prev_candidates`` and
+                # process() replaces that list with this empty result, so no
+                # trajectory history remains reconnectable.
+                self._prune_inactive_track_histories([])
                 return [], np.zeros_like(mask)
             if streak < self._min_streak_length_px and full_area < self._min_area_px * 4:
                 continue
 
             label_mask = labels == label
-            mean_motion = float(motion[label_mask].mean()) / 255.0
+            raw_support = label_mask & (raw_mask > 0)
+            motion_support = raw_support if np.any(raw_support) else label_mask
+            mean_motion = float(motion[motion_support].mean()) / 255.0
+            raw_components = np.unique(raw_labels[raw_support])
+            fragment_count = int(np.count_nonzero(raw_components))
             streak_score = min(1.0, streak / max(self._min_streak_length_px, 1))
             area_score = min(1.0, full_area / max(self._min_area_px * 16, 1))
-            confidence = min(1.0, 0.20 + mean_motion * 0.55 + streak_score * 0.20 + area_score * 0.05)
+            confidence = min(
+                1.0,
+                0.20 + mean_motion * 0.55 + streak_score * 0.20 + area_score * 0.05,
+            )
             if confidence < self._min_confidence:
                 continue
 
@@ -225,8 +277,9 @@ class FastMotionDetector:
                 area_px=full_area,
                 streak_length_px=streak,
                 confidence=confidence,
+                mean_motion=mean_motion,
+                fragment_count=max(1, fragment_count),
             )
-            self._assign_track(candidate, timestamp)
             accepted.append(candidate)
             accepted_mask[label_mask] = 255
 
@@ -245,31 +298,81 @@ class FastMotionDetector:
                     accepted_mask[sy1:sy2, sx1:sx2] = mask[sy1:sy2, sx1:sx2]
                     keep_ids.discard(id(item))
             accepted = keep
+        self._assign_tracks(accepted, timestamp)
         return accepted, accepted_mask
 
-    def _assign_track(self, candidate: FastMotionCandidate, timestamp: float) -> None:
-        best: FastMotionCandidate | None = None
-        best_dist = 120.0
-        for previous in self._prev_candidates:
-            dx = candidate.centroid[0] - previous.centroid[0]
-            dy = candidate.centroid[1] - previous.centroid[1]
-            dist = math.hypot(dx, dy)
-            if dist < best_dist:
-                best = previous
-                best_dist = dist
+    def _assign_tracks(
+        self,
+        candidates: list[FastMotionCandidate],
+        timestamp: float,
+    ) -> None:
+        """Assign previous tracks to this frame's candidates one-to-one."""
+        max_match_distance = 120.0
+        match_options: list[tuple[float, int, int]] = []
+        if self._prev_timestamp is not None:
+            for candidate_index, candidate in enumerate(candidates):
+                for previous_index, previous in enumerate(self._prev_candidates):
+                    if previous.track_id is None:
+                        continue
+                    dx = candidate.centroid[0] - previous.centroid[0]
+                    dy = candidate.centroid[1] - previous.centroid[1]
+                    distance = math.hypot(dx, dy)
+                    if distance < max_match_distance:
+                        match_options.append((distance, candidate_index, previous_index))
 
-        if best is not None and best.track_id is not None and self._prev_timestamp is not None:
-            candidate.track_id = best.track_id
-            dt = max(timestamp - self._prev_timestamp, 1e-6)
-            candidate.speed_px_per_sec = best_dist / dt
+        matched_candidates: set[int] = set()
+        consumed_previous_tracks: set[int] = set()
+        dt = (
+            max(timestamp - self._prev_timestamp, 1e-6)
+            if self._prev_timestamp is not None
+            else None
+        )
+        for distance, candidate_index, previous_index in sorted(match_options):
+            previous = self._prev_candidates[previous_index]
+            track_id = previous.track_id
+            if (
+                candidate_index in matched_candidates
+                or track_id is None
+                or track_id in consumed_previous_tracks
+            ):
+                continue
+
+            candidate = candidates[candidate_index]
+            candidate.track_id = track_id
+            if dt is not None:
+                candidate.speed_px_per_sec = distance / dt
             self._append_history(candidate, timestamp)
-            return
+            matched_candidates.add(candidate_index)
+            consumed_previous_tracks.add(track_id)
 
-        candidate.track_id = self._next_track_id
-        self._next_track_id += 1
-        if self._fps_hint and self._fps_hint > 0:
-            candidate.speed_px_per_sec = candidate.streak_length_px * float(self._fps_hint)
-        self._append_history(candidate, timestamp)
+        for candidate_index, candidate in enumerate(candidates):
+            if candidate_index in matched_candidates:
+                continue
+            candidate.track_id = self._next_track_id
+            self._next_track_id += 1
+            if self._fps_hint and self._fps_hint > 0:
+                candidate.speed_px_per_sec = candidate.streak_length_px * float(self._fps_hint)
+            self._append_history(candidate, timestamp)
+
+        # Matching is intentionally one-frame only: the next invocation can
+        # reconnect a track only through a candidate present in this invocation.
+        # Keeping histories for anything else cannot improve continuity and
+        # would leak one bounded list for every short-lived projectile forever.
+        self._prune_inactive_track_histories(candidates)
+
+    def _prune_inactive_track_histories(
+        self,
+        candidates: list[FastMotionCandidate],
+    ) -> None:
+        """Keep trajectory history in lock-step with current active tracks."""
+        active_track_ids = {
+            candidate.track_id
+            for candidate in candidates
+            if candidate.track_id is not None
+        }
+        for track_id in list(self._track_histories):
+            if track_id not in active_track_ids:
+                self._track_histories.pop(track_id, None)
 
     def _append_history(self, candidate: FastMotionCandidate, timestamp: float) -> None:
         if candidate.track_id is None:

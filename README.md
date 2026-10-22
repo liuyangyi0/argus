@@ -1,73 +1,57 @@
 # Argus
 
-Argus 是一个面向固定摄像头场景的视觉异常检测系统。仓库当前实现聚焦于单节点边缘部署：后端负责视频采集、检测管线、告警与模型生命周期，前端提供 Vue 3 仪表盘用于监控、回放、基线采集和训练管理。
+固定摄像头的视觉异常监测与证据复核工作台。
 
-## 当前实现概览
+Argus 将视频接入、场景校验、异常检测、告警处置和模型管理放在同一套边缘应用中。它关注的不只是“画面里有什么”，还包括“相机是否仍在原来的位置”“当前模型是否适用于这个场景”“这条告警能否通过录像和记录复核”。
 
-- 多源采集：支持 RTSP、USB、视频文件输入，带重连与健康检查。
-- 分阶段检测：区域掩码、MOG2 预筛、人员过滤、异常检测、安全通道、后处理、告警分级。
-- 双通道异常判断：主异常检测通道配合 Simplex 安全通道，降低单点失效风险。
-- 告警闭环：SQLite 持久化、Webhook / 邮件 / WebSocket 分发、工作流状态管理、回放取证。
-- 模型与基线：基线版本管理、训练作业、模型注册、发布阶段切换、批量推理。
-- Dashboard：Vue 3 + Ant Design Vue 单页应用，提供总览、摄像头、告警、模型、系统管理等页面。
+项目采用 Python / FastAPI 后端和 Vue 3 / TypeScript 前端，面向单节点、多摄像头部署。适用于固定视角下的异常变化与异物监测研究，不是任意场景通用识别器，也不替代人工巡检或独立安全保护系统。
 
-## 当前系统架构
+> 当前处于工程验证阶段。普通功能和模拟测试通过，不等于真实模型精度、GPU 性能、外部标注服务或生产发布已经验收通过。
+
+## 能做什么
+
+| 能力 | 当前范围与边界 |
+| --- | --- |
+| 视频接入与预览 | RTSP、USB 和视频文件输入；通过 go2rtc 与浏览器播放链路提供预览、重连和运行状态。 |
+| 场景与机位校验 | SceneGuard 关联参考场景、基线和模型；机位不匹配时保留预览，阻断受保护检测链的评分与告警放行。选择新场景不等于自动批准或切换模型。 |
+| 异常检测 | 主异常模型结合区域、运动、时序证据和辅助检测通道；具体可检测对象、误报率与延迟必须用目标场景的独立视频验收。 |
+| 告警处置与取证 | 告警查询、确认与误报处理，关联录像、关键帧、轨迹和诊断信号，支持实时状态更新与审计。 |
+| 基线与模型管理 | 场景草稿、基线构建、人工确认训练、独立校准、候选登记、受控发布与回滚；不以训练完成代替发布批准。 |
+| 视频人工复核 | 独立 CLI 对接 CVAT / FiftyOne，保留源摘要、原始帧号和时间映射；可将 LightGlue 旁路分歧报告送入复核。 |
+
+分类器、分割器、跨摄像头关联和自动重训练属于可选能力，默认配置下关闭。LightGlue 只用于离线旁路比较，不参与现有 SceneGuard 放行或恢复。VFR 视频的受控图片复核保留原始帧号、PTS、图片和报告摘要，不改写源视频。
+
+这些集成的真实 SDK、数据库、播放器对齐和故障恢复仍需在独立复核环境验收，不能仅凭模拟测试认定可交付。
+
+## 工作方式
 
 ```text
-Camera Source (RTSP / USB / File)
-  -> CameraManager
-  -> DetectionPipeline
-     -> Zone Mask
-     -> MOG2 Prefilter
-     -> Person Filter
-     -> Anomaly Detector
-     -> Simplex Safety Channel
-     -> Postprocess / Temporal Logic
-     -> AlertGrader
-     -> AlertDispatcher + Storage
+视频源 → 采集与质量检查 → 场景安全门 → 检测与时序判断 → 告警与证据
+                             ↑                        ↓
+                      场景 / 基线 / 模型绑定      Dashboard 处置与回放
 
-FastAPI Backend
-  -> JSON API
-  -> WebSocket
-  -> Replay / Streaming / Task APIs
-
-Vue Dashboard
-  -> Overview
-  -> Cameras / Camera Detail
-  -> Alerts
-  -> Models
-  -> System
+离线视频 → CVAT 人工标注 / FiftyOne 复核 → 独立回归报告 → 发布证据
+                   LightGlue 仅作旁路对比，不提供发布许可
 ```
 
-## 与旧文档相比的校正
+Web 工作台提供总览、摄像头与详情、告警、报表、模型和系统管理；回放从告警进入。3D 页面标记为演示，不属于已完成的现场空间管理能力。
 
-- 本仓库当前前端主路由为 7 个：总览、摄像头、摄像头详情、告警、报表、模型、系统。另有两个从告警跳转的参数化子路由（`/replay/:alertId` 和 `/replay/:alertId/storyboard`），由 ReplayView 和 StoryboardReplay 视图渲染，不在侧栏出现。
-- 用户、审计、备份等能力目前主要以后端 API 和系统页子标签形式暴露；训练作业入口位于模型页标签中，而不是独立前端路由。
-- YOLO-World 分类、SAM2 分割、跨摄像头关联、自动重训练等能力在配置层和后端代码中已预留，但默认配置下通常关闭，不应视为默认启用能力。
-- 项目版本信息以代码为准：Python 包版本当前为 0.1.0，运行时指标与 FastAPI 应用内部版本使用 0.2.0。
+## 开发环境
 
-## 快速开始
+- Python 3.11+；仓库开发环境使用 `.venv`，不要求 conda。
+- Node.js / npm 用于前端开发；具体依赖以 [web/package.json](web/package.json) 为准。
+- 实际运行还需要按配置准备视频源、模型工件及相应推理后端。NVIDIA GPU 部署显式使用 `torch-cuda` 与 `.pt` 工件，加载失败不能静默改走 CPU / OpenVINO / SSIM。
+- 模型权重、视频素材、部署凭据和运行数据库不作为公开源码的一部分提交。
 
-### 后端
+在 PowerShell 中安装后端开发依赖：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-python -m argus --config configs/default.yaml
+python -m pip install -e ".[dev]"
 ```
 
-默认情况下 Dashboard 运行在 http://127.0.0.1:8080。
-如果本机没有 USB / RTSP 摄像头，可用同一份默认配置启动可复现的本地视频源：
-
-```powershell
-python -m argus --config configs/default.yaml --dev-video
-```
-
-这会生成 `data/dev/demo_camera.avi`，并在本次进程中把摄像头切到 `file` 输入，便于验证 Cameras → Alerts → Replay → Models → System → Reports 闭环。
-需要在本机快速验证训练/导出 UI 链路时，可额外加 `--dev-fast-training`；它会生成可被 OpenVINO 加载的确定性开发模型工件，不会替代正常 anomalib 训练。
-
-### 前端开发模式
+前端开发：
 
 ```powershell
 cd web
@@ -75,130 +59,49 @@ npm install
 npm run dev
 ```
 
-### 测试
+在具备所需视频源与推理环境的机器上启动完整应用：
 
 ```powershell
-python -m pytest tests/ -v
-
-# 核心业务闭环：Cameras -> Alerts -> Replay -> Models -> System -> Reports
-python scripts/smoke_core_loop.py --timeout 75 --recording-timeout 45
-
-# 后端实际托管的 Dashboard 路由与媒体入口
-python scripts/smoke_dashboard_routes.py --timeout 75
-
-# 真实业务数据 + 浏览器页面：Camera detail -> Alerts -> Replay -> Models -> System -> Reports
-python scripts/smoke_dashboard_business_flow.py --timeout 90 --recording-timeout 90 --browser required
-python scripts/smoke_dashboard_business_flow.py --dev-video-motion projectile --expect-alert-category projectile --expect-detection-type projectile --timeout 120 --recording-timeout 120 --browser required
-
-# 同一条业务路径也可指向真实 USB/RTSP 源；先 preflight，确认摄像头/go2rtc 能读到帧
-# USB preflight 会在 Windows 上附带系统识别到的 Camera 设备清单，便于定位设备枚举问题
-python scripts/smoke_dashboard_business_flow.py --preflight --camera-source 0 --camera-protocol usb --require-go2rtc
-python scripts/smoke_dashboard_business_flow.py --preflight --camera-source 0 --camera-protocol usb --camera-resolution 1920,1080 --usb-device-name "OBSBOT Meet 2 StreamCamera" --require-go2rtc --preflight-measure-seconds 30
-
-# 无 RTSP 硬件时，可用本地 go2rtc 夹具把生成视频发布成 RTSP，再验证 RTSP + go2rtc 路径
-python scripts/smoke_dashboard_business_flow.py --preflight --rtsp-fixture --require-go2rtc
-python scripts/smoke_dashboard_business_flow.py --rtsp-fixture --require-go2rtc --browser required
-python scripts/smoke_dashboard_business_flow.py --rtsp-fixture --dev-video-motion projectile --expect-alert-category projectile --expect-detection-type projectile --require-go2rtc --browser required
-
-# preflight 通过后再跑完整业务闭环；activation-delay 留给操作员放入测试目标
-python scripts/smoke_dashboard_business_flow.py --camera-source 0 --camera-protocol usb --require-go2rtc --activation-delay 10 --browser required
-python scripts/smoke_dashboard_business_flow.py --camera-source rtsp://user:pass@host/stream --camera-protocol rtsp --require-go2rtc --activation-delay 10 --browser required
-
-# 真实物理场景验收：默认先做 OBSBOT/go2rtc/FPS preflight，再提示现场操作。
-# stable 要求固定画面不误报；桌面放书应是 scene_change/静态异物，小物体飞过应是 projectile。
-python scripts/smoke_physical_scenarios.py --preflight-only --work-dir C:\tmp\argus-physical-smoke --keep-work-dir
-python scripts/smoke_physical_scenarios.py --scenario stable
-python scripts/smoke_physical_scenarios.py --scenario book
-python scripts/smoke_physical_scenarios.py --scenario projectile
-python scripts/smoke_physical_scenarios.py --scenario all
-python scripts/smoke_physical_scenarios.py --scenario all --work-dir C:\tmp\argus-physical-smoke --keep-work-dir
-
-# 真实 anomalib 训练链路（比 dev-fast 慢；会先在临时目录生成 baseline）
-python scripts/smoke_dashboard_business_flow.py --training-mode normal --training-timeout 420 --browser off
-
-# Ubuntu/GPU 测试机 CUDA 验收：实际执行 Torch CUDA、OpenCV CUDA CLAHE/MOG2，可选串联真实训练 smoke
-python scripts/smoke_cuda.py
-python scripts/smoke_cuda.py --business-smoke --business-training-timeout 420
+python -m argus --config configs/default.yaml
 ```
 
-`smoke_dashboard_routes.py` 在本机找到 Chrome / Edge / Chromium 时，会额外以 headless 浏览器执行前端 JS 并检查核心页面 DOM；需要强制浏览器检查时可加 `--browser required`。
-`smoke_dashboard_business_flow.py` 会派生临时配置和数据目录，启动真实 Dashboard 服务，通过 WebSocket 验证告警实时推送，生成 Replay 证据，并默认用 `--dev-fast-training` 完成可复现的训练任务、导出、模型发布 / 回滚 API 和浏览器页面检查。需要验证真实训练时改用 `--training-mode normal`；需要验证硬件时先跑 `--preflight --camera-source ...`，USB preflight 会输出 Windows 摄像头设备清单、OpenCV 运行时包信息和排查提示，完整业务运行会同时检查 snapshot JPEG、Streaming/go2rtc 合同和业务页面 DOM。没有 RTSP 设备时可加 `--rtsp-fixture`，脚本会启动一个本地 go2rtc，把生成视频以 RTSP 发布，再让 Argus 以真实 RTSP 输入和独立 go2rtc 浏览器代理路径消费它。
-合成无告警场景请显式使用 `--dev-video-motion stable --expect-no-alert`；`settle` 会在基线后放入一个稳定异物，适合验证静态异物告警，不适合当空场景。
-`active` / `maintenance` 模式下的 `--expect-no-alert` 会要求检测链真实可用；如果低光照或输入质量门控导致 `detection_limited`、SSIM 未校准或 fast-motion 被抑制，smoke 会失败，避免把“检测停了所以没告警”误当成通过。只想记录这种受限状态时可显式加 `--allow-detection-limited-no-alert`。
-真实物理场景 smoke 可用 `--expect-alert-category` / `--expect-detection-type` / `--forbid-alert-category` / `--forbid-detection-type` 明确声明验收语义；脚本会在实际告警语义不匹配时失败。
-`smoke_physical_scenarios.py` 是上述语义断言的现场包装入口，默认使用 OBSBOT `1920x1080@60` + go2rtc + 浏览器检查，并在现场动作前先跑同配置 preflight；`stable` 会保持画面不变并要求观察窗口内无告警，`book/projectile` 会按提示在 `activation-delay` 内放书或让小物体快速经过画面。最终 JSON 会提炼 preflight 的实测 FPS/go2rtc 状态、场景告警语义、检测对象类别和分类标签，便于现场验收留档；需要先确认硬件链路但暂不做人工动作时可用 `--preflight-only`；需要保留数据库、截图、热力图和 Replay 证据时传 `--work-dir <dir> --keep-work-dir`，脚本会为 preflight/stable/book/projectile 分配独立子目录，并把总结果写到 `<work-dir>/physical_smoke_summary.json`；需要指定总结果位置时可传 `--summary-path <file>`；调试时可用 `--no-preflight` 跳过预检。
-`smoke_cuda.py` 面向 Ubuntu/GPU 测试机，默认要求 PyTorch CUDA 与 OpenCV CUDA 都可用，并实际执行矩阵乘、CLAHE 和 MOG2；CPU-only Windows 开发机只做诊断时可加 `--allow-missing-cuda`。
+默认 Dashboard 地址为 `http://127.0.0.1:8080`。后端托管前端时，先在 `web/` 执行 `npm run build`。默认配置不是可直接对外暴露的生产配置。
 
-## 默认配置要点
+## 无 GPU 的普通功能验证
 
-默认配置文件位于 `configs/default.yaml`，当前主要特征如下：
+只验证 API、权限、数据库、任务状态、前端和模拟业务时，使用受控入口。它们阻断真实训练、模型识别和相机 / 源视频读写；不要用全量 pytest 或完整应用启动代替这组命令。
 
-- 默认示例摄像头使用 USB 输入。
-- Dashboard 默认开启 go2rtc 集成。
-- 本地无硬件时可用 `--dev-video` 显式切到可循环的视频文件输入，不修改 `configs/default.yaml`。
-- Simplex 安全通道、健康检查、漂移检测、环形缓冲默认开启。
-- 分类器、分割器、跨摄像头、自动重训练默认关闭。
+```powershell
+.\.venv\Scripts\python.exe scripts/run_local_functional_tests.py --suite lint
+.\.venv\Scripts\python.exe scripts/run_local_functional_tests.py --suite core
+.\.venv\Scripts\python.exe scripts/run_local_functional_tests.py --suite dashboard
+.\.venv\Scripts\python.exe scripts/run_local_functional_tests.py --suite review
+.\.venv\Scripts\python.exe scripts/run_local_functional_tests.py --suite auxiliary
+.\.venv\Scripts\python.exe scripts/run_local_frontend_tests.py unit
+.\.venv\Scripts\python.exe scripts/run_local_frontend_tests.py build
+```
 
-## 目录结构
+隔离浏览器测试服务与 E2E 的启动方法见 [普通功能验证说明](docs/runbooks/video-review-integrations.md#本机普通功能验证禁训练和识别)。真实模型、相机、CUDA、完整视频回归和长稳测试应在专用环境另行执行。
+
+## 发布与安全边界
+
+- 固定机位是模型适用性的前提。移动、旋转、变焦或更换场景后，必须重新核对场景与模型绑定，不能直接沿用旧模型的验收结论。
+- production 保持严格 NO-GO，直到该候选的全部发布门通过。严格 baseline v3 解码证据、独立数据 / session、完整校准、模型与 profile 身份、独立人工审批、完整回归和可信的至少 72 小时 soak 均不能省略。
+- 当前发布指标包括 SceneGuard coverage ≥ 99%、FP ≤ 2/h、overall / static / projectile recall ≥ 95%、P95 delay ≤ 10 秒；完整约束以 [验收契约](docs/acceptance.md#当前-production-发布契约沿用严格门禁不作能力分档) 和服务端校验为准。这些是门槛，不是已达成结果。
+- 默认配置仅绑定回环地址且关闭认证。远程访问前必须开启认证、设置独立强随机 token、替换首次启动的默认管理员密码，并配置 TLS 与网络访问控制。
+- 真实主机、账号、地址和密钥只保存在仓库外私有配置。历史清理后的旧克隆不得直接合并或推回远端，见 [公开仓库信息卫生](docs/runbooks/publication-hygiene.md)。
+
+## 代码与文档
 
 ```text
-src/argus/
-  alerts/         告警分级、分发、反馈、校准
-  anomaly/        异常检测、基线、训练、模型生命周期
-  capture/        摄像头采集、质量过滤、基线采样
-  config/         YAML + Pydantic 配置模型
-  contracts/      数据契约与边界校验
-  core/           检测编排、阈值、时序、健康、降级、指标
-  dashboard/      FastAPI 应用、认证、中间件、API 路由
-  imaging/        采集后处理、偏振与多模态融合
-  person/         人员检测与过滤
-  physics/        相机标定、跨摄像头几何、轨迹与速度估计
-  prefilter/      MOG2 与 Simplex 预筛相关能力
-  preprocessing/  帧对齐与稳定化预处理
-  runtime/        日志初始化、训练任务热加载等运行时装配
-  sensors/        多传感器融合接入
-  storage/        SQLite、ORM、备份、模型注册、推理记录
-  streaming/      go2rtc 集成与流媒体代理
-  validation/     合成验证与评估工具
-
-web/
-  src/views/      7 个主路由视图 + 2 个参数化子路由视图（ReplayView / StoryboardReplay）
-  src/components/ 模型管理、图表与页面组件
-  src/composables/ WebSocket、模型状态、流播放逻辑
-
-tests/
-  integration/    集成测试
-  unit/           单元测试
+src/argus/       视频采集、检测、场景工作流、API、存储与流媒体
+web/src/         Vue 工作台、播放器、状态管理与前后端契约
+scripts/         普通功能验证、离线复核、回归与运维入口
+configs/         配置示例，不存放真实部署身份
+tests/           单元、模拟集成与静态守门测试
+docs/            架构、验收约束、设计与操作手册
 ```
 
-## 运行时组件
-
-- FastAPI 后端负责 API、认证、WebSocket、配置重载和静态资源托管。
-- CameraManager 为每个摄像头维护独立运行上下文，避免单路故障拖垮全局。
-- TaskScheduler 负责周期维护任务与训练作业处理；TaskManager 负责前端可见的长任务状态与进度管理。
-- Database、ModelRegistry、InferenceRecordStore、AlertRecordingStore 提供持久化能力。
-- go2rtc 用于浏览器播放和 USB / RTSP 流重定向；不可用时回退到 MJPEG 路径。
-
-## 当前前端页面
-
-- Overview：系统总览、状态、摄像头概况。
-- Cameras：摄像头列表与控制。
-- CameraDetail：单摄像头详情、画面和诊断。
-- Alerts：告警列表、筛选、工作流处理。
-- Reports：报表与统计分析。
-- Models：基线、训练、模型、A/B 对比、标注、阈值预览。
-- System：系统概览、配置管理、用户、审计、降级历史、音频配置、备份与清理。
-- ReplayView / StoryboardReplay：从告警跳转进入的单机位 / 多机位录像回放，参数化子路由，不在侧栏。
-
-> 注意：本节描述当前实现（v1）。完整 UX v2（值班台 Video Wall）设计见 `docs/argus_ux_v2_enhancements_5.md`，实现仍在分阶段进行。
-
-## 远程部署
-
-部署连接信息、账号、凭据和主机清单应保存在仓库外的私有配置中，不写入公开文档。
-
-## 相关文档
-
-- `docs/architecture.md`：当前实现架构与运行边界。
-- `docs/requirements.md`：当前产品目标与已落地范围说明。
-- `CLAUDE.md`：本仓库开发环境、命令和踩坑记录。
-- `web/README.md`：前端子项目开发说明。
+- [文档入口](docs/index.md) · [架构](docs/architecture.md) · [API 参考](docs/api-reference.md)
+- [CVAT / FiftyOne 复核](docs/runbooks/video-review-integrations.md) · [LightGlue 旁路对比](docs/runbooks/scene-guard-lightglue-shadow.md)
+- [开发约定](AGENTS.md) · [前端开发](web/README.md) · [检测质量验收](docs/acceptance.md)

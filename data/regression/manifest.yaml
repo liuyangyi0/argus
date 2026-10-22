@@ -1,0 +1,63 @@
+version: 1
+suite_id: argus-phase1-20260613-gpu-validation
+description: Real OBSBOT Meet 2 regression capture on gpu-validation for Phase 1 detection-quality baseline.
+default_camera_id: validation_camera_01
+source_host: gpu-validation
+source_dir: /srv/argus-regression-capture
+capture_device:
+  name: OBSBOT Meet 2
+  linux_device: /dev/video0
+  format: mjpeg
+  resolution: 1920x1080
+  fps: 30
+physical_boundaries_draft:
+  camera_mount: fixed during clips except intentional slight vibration in negative sample
+  min_lux: TBD from site measurement; current clips cover normal indoor light, low light, and lights on/off transitions
+  min_static_object_size_px: TBD after visual review
+  projectile_requirement: provisional; record only if retained as product requirement
+
+clips:
+  - id: neg_scene_001_30min_20260613_095718
+    kind: negative
+    camera_id: validation_camera_01
+    video: clips/negative/neg_scene_001_30min_20260613_095718.mp4
+    description: 30 minute negative sample with stable scene, lights on/off, people walk-through, reflections, low light, slight vibration, and stable periods.
+    tags: [negative, lights_on_off, people, reflection, low_light, slight_vibration, stable_scene]
+    capture_started_at: '2026-06-13T09:57:18+08:00'
+    duration_seconds: 1800
+    expected_video:
+      resolution: 1920x1080
+      fps: 30
+      frames: 54000
+
+  - id: pos_static_foreign_10events_wide_20260613_103042
+    kind: static_foreign
+    camera_id: validation_camera_01
+    video: clips/positive/pos_static_foreign_10events_wide_20260613_103042.mp4
+    annotations: annotations/pos_static_foreign_10events_wide_20260613_103042.labels.json
+    expected_detection_types: [new_object, persistent_change, anomaly, scene_change]
+    description: 10 static foreign-object placement events with visually tightened stable-object windows.
+    tags: [positive, static_foreign, timing_approx, visual_reviewed, stable_windows]
+    capture_started_at: '2026-06-13T10:30:42+08:00'
+    duration_seconds: 1199.966667
+    expected_video:
+      resolution: 1920x1080
+      fps: 30
+      frames: 35999
+    operator_timing_note: Event windows were tightened from 1 FPS visual review on 2026-06-13. They are stable-object seconds, not frame-exact boundaries.
+
+  - id: pos_projectile_10events_wide_20260613_105301
+    kind: projectile
+    camera_id: validation_camera_01
+    video: clips/positive/pos_projectile_10events_wide_20260613_105301.mp4
+    annotations: annotations/pos_projectile_10events_wide_20260613_105301.labels.json
+    expected_detection_types: [projectile, fast_motion]
+    description: 10 safe fast small-object pass/slide events with wide timing windows.
+    tags: [positive, projectile, fast_motion, small_object, timing_approx, wide_windows]
+    capture_started_at: '2026-06-13T10:53:01+08:00'
+    duration_seconds: 779.933333
+    expected_video:
+      resolution: 1920x1080
+      fps: 30
+      frames: 23398
+    operator_timing_note: Event windows are approximate; each window should contain one safe fast object pass, slide, or throw-through.

@@ -6,13 +6,24 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from argus.dashboard.api_response import api_not_found, api_success
+from argus.dashboard.api_contracts import AlertTrajectoryResponse
+from argus.dashboard.api_response import (
+    ApiEnvelope,
+    api_forbidden,
+    api_not_found,
+    api_success,
+    api_typed_success,
+)
+from argus.dashboard.auth import require_permission
 
 logger = structlog.get_logger()
 router = APIRouter()
 
 
-@router.get("/{alert_id}/trajectory")
+@router.get(
+    "/{alert_id}/trajectory",
+    response_model=ApiEnvelope[AlertTrajectoryResponse],
+)
 async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
     """Get trajectory data for a specific alert.
 
@@ -21,6 +32,9 @@ async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
     frontend can overlay them on video). ``trajectories`` is always a list and
     is empty when no fit was persisted.
     """
+    if not require_permission(request, "view_replay"):
+        return api_forbidden("权限不足")
+
     db = getattr(request.app.state, "database", None)
     if db is None:
         return api_not_found("Database not available")
@@ -70,31 +84,34 @@ async def get_alert_trajectory(request: Request, alert_id: str) -> JSONResponse:
                 } if alert.landing_x_mm is not None else None,
             }
 
-        return api_success({
-            "alert_id": alert_id,
-            # Legacy flat fields — kept so older clients do not break
-            "speed_ms": alert.speed_ms,
-            "speed_px_per_sec": alert.speed_px_per_sec,
-            "trajectory_model": alert.trajectory_model,
-            "points": points,
-            "origin": {
-                "x_mm": alert.origin_x_mm,
-                "y_mm": alert.origin_y_mm,
-                "z_mm": alert.origin_z_mm,
-            } if alert.origin_x_mm is not None else None,
-            "landing": {
-                "x_mm": alert.landing_x_mm,
-                "y_mm": alert.landing_y_mm,
-                "z_mm": alert.landing_z_mm,
-            } if alert.landing_x_mm is not None else None,
-            # New multi-track view
-            "primary": primary,
-            "trajectories": trajectories,
-            "classification": {
-                "label": alert.classification_label,
-                "confidence": alert.classification_confidence,
-            } if alert.classification_label else None,
-        })
+        return api_typed_success(
+            {
+                "alert_id": alert_id,
+                # Legacy flat fields — kept so older clients do not break
+                "speed_ms": alert.speed_ms,
+                "speed_px_per_sec": alert.speed_px_per_sec,
+                "trajectory_model": alert.trajectory_model,
+                "points": points,
+                "origin": {
+                    "x_mm": alert.origin_x_mm,
+                    "y_mm": alert.origin_y_mm,
+                    "z_mm": alert.origin_z_mm,
+                } if alert.origin_x_mm is not None else None,
+                "landing": {
+                    "x_mm": alert.landing_x_mm,
+                    "y_mm": alert.landing_y_mm,
+                    "z_mm": alert.landing_z_mm,
+                } if alert.landing_x_mm is not None else None,
+                # New multi-track view
+                "primary": primary,
+                "trajectories": trajectories,
+                "classification": {
+                    "label": alert.classification_label,
+                    "confidence": alert.classification_confidence,
+                } if alert.classification_label else None,
+            },
+            AlertTrajectoryResponse,
+        )
 
 
 @router.get("/{camera_id}/active-tracks")
@@ -104,30 +121,14 @@ async def get_active_tracks(request: Request, camera_id: str) -> JSONResponse:
     if manager is None:
         return api_not_found("Camera manager not available")
 
-    runner = manager.get_runner(camera_id) if hasattr(manager, "get_runner") else None
-    if runner is None:
+    get_tracks = getattr(manager, "get_active_tracks_snapshot", None)
+    if not callable(get_tracks):
+        logger.error("physics.camera_runtime_contract_missing", camera_id=camera_id)
         return api_not_found(f"Camera {camera_id} not found")
 
-    # Get the pipeline's temporal tracker state
-    pipeline = getattr(runner, "_pipeline", None)
-    if pipeline is None:
-        return api_success({"camera_id": camera_id, "tracks": []})
-
-    tracker = getattr(pipeline, "_physics_tracker", None)
-    if tracker is None:
-        return api_success({"camera_id": camera_id, "tracks": []})
-
-    tracks = []
-    for tid, state in tracker._tracks.items():
-        tracks.append({
-            "track_id": state.track_id,
-            "centroid_x": round(state.centroid_x, 1),
-            "centroid_y": round(state.centroid_y, 1),
-            "consecutive_frames": state.consecutive_frames,
-            "max_score": round(state.max_score, 3),
-            "area_px": state.area_px,
-            "trajectory_length": len(state.trajectory_history),
-        })
+    tracks = get_tracks(camera_id)
+    if tracks is None:
+        return api_not_found(f"Camera {camera_id} not found")
 
     return api_success({"camera_id": camera_id, "tracks": tracks})
 

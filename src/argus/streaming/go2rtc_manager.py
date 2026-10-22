@@ -170,6 +170,8 @@ class Go2RTCManager:
         RTSP listener port (default 8554).
     webrtc_port:
         WebRTC ICE/UDP port (default 8555).
+    webrtc_listen_host:
+        IPv4 binding for WebRTC ICE media.  API and RTSP remain loopback-only.
     binary_path:
         Explicit path to the go2rtc executable.  When *None* the manager
         searches ``bin/`` and ``$PATH``.
@@ -184,12 +186,15 @@ class Go2RTCManager:
         api_port: int = _DEFAULT_API_PORT,
         rtsp_port: int = _DEFAULT_RTSP_PORT,
         webrtc_port: int = _DEFAULT_WEBRTC_PORT,
+        webrtc_listen_host: str = "0.0.0.0",
         binary_path: str | Path | None = None,
         config_dir: str | Path | None = None,
+        replace_stale_process: bool = False,
     ) -> None:
         self.api_port = api_port
         self.rtsp_port = rtsp_port
         self.webrtc_port = webrtc_port
+        self.webrtc_listen_host = webrtc_listen_host
         self._base_url = f"http://127.0.0.1:{api_port}"
 
         if binary_path:
@@ -201,10 +206,12 @@ class Go2RTCManager:
             self._config_dir = Path(config_dir)
         else:
             self._config_dir = Path(tempfile.mkdtemp(prefix="go2rtc_"))
+        self._config_dir.mkdir(parents=True, exist_ok=True)
 
         self._process: subprocess.Popen | None = None
         self._stdout_thread: threading.Thread | None = None
         self._auto_config_dir = config_dir is None  # track for cleanup
+        self._replace_stale_process = replace_stale_process
         self._http = httpx.Client(base_url=self._base_url, timeout=5.0)
 
         # Safety net: ensure cleanup even on unexpected interpreter shutdown
@@ -218,14 +225,14 @@ class Go2RTCManager:
         """Write a minimal ``go2rtc.json`` and return its path."""
         cfg: dict[str, Any] = {
             "api": {
-                "listen": f":{self.api_port}",
-                "origin": "*",
+                "listen": f"127.0.0.1:{self.api_port}",
+                "origin": "http://127.0.0.1",
             },
             "rtsp": {
-                "listen": f":{self.rtsp_port}",
+                "listen": f"127.0.0.1:{self.rtsp_port}",
             },
             "webrtc": {
-                "listen": f":{self.webrtc_port}",
+                "listen": f"{self.webrtc_listen_host}:{self.webrtc_port}",
             },
         }
         if streams:
@@ -252,6 +259,12 @@ class Go2RTCManager:
         """Kill any orphaned go2rtc still occupying our API port."""
         try:
             resp = self._http.get("/api", timeout=2)
+            if not self._replace_stale_process:
+                raise RuntimeError(
+                    "go2rtc API port "
+                    f"{self.api_port} is already in use; refusing to terminate "
+                    "an unowned process"
+                )
             if resp.status_code == 200:
                 logger.warning("go2rtc.killing_stale", port=self.api_port)
                 # Try graceful exit via API first
@@ -288,6 +301,10 @@ class Go2RTCManager:
                     except Exception:
                         logger.debug("go2rtc.unix_fuser_kill_failed", exc_info=True)
                 time.sleep(0.5)
+            else:
+                raise RuntimeError(
+                    f"port {self.api_port} is occupied by an unknown HTTP service"
+                )
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException):
             pass  # No stale process — port is free
 
@@ -334,15 +351,20 @@ class Go2RTCManager:
             stderr=subprocess.STDOUT,
             text=True,
         )
+        try:
+            # Drain stdout in a background thread to prevent pipe buffer deadlock
+            self._stdout_thread = threading.Thread(
+                target=self._drain_stdout, daemon=True, name="go2rtc-stdout",
+            )
+            self._stdout_thread.start()
 
-        # Drain stdout in a background thread to prevent pipe buffer deadlock
-        self._stdout_thread = threading.Thread(
-            target=self._drain_stdout, daemon=True, name="go2rtc-stdout",
-        )
-        self._stdout_thread.start()
-
-        # Wait for the API to become reachable
-        self._wait_for_ready()
+            # Wait for the API and RTSP listener to become reachable. Any
+            # failure must reap the exact child we just spawned.
+            self._wait_for_ready()
+        except BaseException:
+            logger.error("go2rtc.start_cleanup", pid=self._process.pid, exc_info=True)
+            self.stop()
+            raise
         logger.info("go2rtc.started", pid=self._process.pid, api_port=self.api_port)
 
     def stop(self) -> None:

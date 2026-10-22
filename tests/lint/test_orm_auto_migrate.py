@@ -18,7 +18,11 @@ import sqlalchemy as sa
 
 from argus.storage import models as m
 from argus.storage import database as db_module
-from argus.storage.database import _AUTO_MIGRATIONS, Database
+from argus.storage.database import (
+    _AUTO_INDEX_MIGRATIONS,
+    _AUTO_MIGRATIONS,
+    Database,
+)
 
 
 def _table_columns(table_name: str) -> set[str]:
@@ -162,3 +166,79 @@ class TestRoundTripMigrations:
         inspector = sa.inspect(db._engine)
         after = {c["name"] for c in inspector.get_columns("alerts")}
         assert "workflow_status" in after, "_auto_migrate did not restore dropped column"
+
+    @pytest.mark.parametrize(
+        "column",
+        ["release_evidence_json", "release_evidence_sha256", "release_revision"],
+    )
+    def test_auto_migrate_recovers_release_evidence_columns(
+        self,
+        tmp_path,
+        column,
+    ) -> None:
+        """Existing model registries gain both canonical evidence columns."""
+
+        db_path = tmp_path / f"argus_{column}.db"
+        db = Database(database_url=f"sqlite:///{db_path}")
+        db.initialize()
+        with db._engine.connect() as conn:
+            try:
+                conn.execute(sa.text(f"ALTER TABLE models DROP COLUMN {column}"))
+                conn.commit()
+            except Exception as exc:
+                pytest.skip(f"this SQLite cannot DROP COLUMN: {exc}")
+
+        db._auto_migrate()
+
+        columns = {c["name"] for c in sa.inspect(db._engine).get_columns("models")}
+        assert column in columns
+
+    def test_required_partial_indexes_are_created_and_idempotent(self, tmp_path) -> None:
+        db_path = tmp_path / "argus_indexes.db"
+        db = Database(database_url=f"sqlite:///{db_path}")
+        db.initialize()
+        db._auto_migrate_indexes()
+
+        indexes = {
+            item["name"]
+            for item in sa.inspect(db._engine).get_indexes("models")
+        }
+        expected = {name for name, _ in _AUTO_INDEX_MIGRATIONS}
+        assert expected <= indexes
+
+    def test_active_production_index_rejects_duplicates(self, tmp_path) -> None:
+        db_path = tmp_path / "argus_unique_production.db"
+        db = Database(database_url=f"sqlite:///{db_path}")
+        db.initialize()
+
+        values = {
+            "camera_id": "cam-index",
+            "model_type": "patchcore",
+            "model_hash": "a" * 64,
+            "data_hash": "b" * 64,
+            "stage": "production",
+            "is_active": True,
+        }
+        with db._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO models "
+                    "(model_version_id, camera_id, model_type, model_hash, data_hash, "
+                    "is_active, stage, component_type, release_revision) "
+                    "VALUES (:version, :camera_id, :model_type, :model_hash, :data_hash, "
+                    ":is_active, :stage, 'full', 0)"
+                ),
+                {**values, "version": "model-a"},
+            )
+        with pytest.raises(sa.exc.IntegrityError):
+            with db._engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO models "
+                        "(model_version_id, camera_id, model_type, model_hash, data_hash, "
+                        "is_active, stage, component_type, release_revision) "
+                        "VALUES (:version, :camera_id, :model_type, :model_hash, :data_hash, "
+                        ":is_active, :stage, 'full', 0)"
+                    ),
+                    {**values, "version": "model-b"},
+                )

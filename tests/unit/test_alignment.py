@@ -127,6 +127,19 @@ class TestPhaseCorrelatorReferenceRefresh:
         assert dx == pytest.approx(1.5, abs=0.6)
         assert dy == pytest.approx(1.0, abs=0.6)
 
+    def test_pinned_reference_never_refreshes_from_runtime_frame(self):
+        pc = PhaseCorrelator(downsample=2, ref_update_interval_s=1.0)
+        approved = _textured_frame(seed=1)
+        pc.set_reference(approved, now=0.0, pinned=True)
+
+        unrelated = _textured_frame(seed=7)
+        pc.align(unrelated, now=10.0)
+        shifted_approved = _shift_frame(approved, dx=2.0, dy=0.0)
+        _aligned, (dx, dy) = pc.align(shifted_approved, now=11.0)
+
+        assert dx == pytest.approx(2.0, abs=0.6)
+        assert dy == pytest.approx(0.0, abs=0.6)
+
 
 class TestPhaseCorrelatorValidation:
     def test_rejects_invalid_params(self):
@@ -153,6 +166,21 @@ class TestPhaseCorrelatorValidation:
         # Different shape → adopt new reference, zero shift
         assert shift_b == (0.0, 0.0)
         assert aligned is large
+
+    def test_shape_change_never_replaces_pinned_reference(self):
+        pc = PhaseCorrelator(downsample=2)
+        approved = _textured_frame(size=(120, 160))
+        pc.set_reference(approved, now=0.0, pinned=True)
+
+        large = _textured_frame(size=(240, 320))
+        aligned, shift = pc.align(large, now=0.1)
+
+        assert aligned is large
+        assert shift == (float("inf"), float("inf"))
+        shifted = _shift_frame(approved, dx=2.0, dy=0.0)
+        _aligned, (dx, dy) = pc.align(shifted, now=0.2)
+        assert dx == pytest.approx(2.0, abs=0.6)
+        assert dy == pytest.approx(0.0, abs=0.6)
 
 
 class TestCreateFromConfig:

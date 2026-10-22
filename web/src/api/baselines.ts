@@ -1,8 +1,44 @@
-import type { ApiResponse, BaselineCollection } from '../types/api'
+import type {
+  ApiResponse,
+  BaselineCollection,
+  BaselineInfo,
+  BaselineVersionInfo,
+} from '../types/api'
 import { api, u, unwrap } from './client'
 
+export interface CameraGroupInfo {
+  group_id: string
+  name: string
+  camera_ids: string[]
+  image_count: number
+  current_version: string | null
+}
+
+export interface BaselineOptimizePreview {
+  total: number
+  keep: number
+  move: number
+}
+
+export interface BaselineOptimizeResult {
+  selected: number
+  moved: number
+  backup_dir?: string
+}
+
+export interface FalsePositiveMergeResult {
+  version: string
+  fp_included: number
+}
+
+export interface GroupBaselineMergeResult {
+  version: string
+  image_count: number
+}
+
 // ── Baselines ──
-export const getBaselines = () => api.get('/baseline/list/json').then(u)
+export const getBaselines = () =>
+  api.get<ApiResponse<{ baselines: BaselineInfo[] }>>('/baseline/list/json').then(unwrap)
 
 // 痛点 5: full collections inventory (incl. failed_* dirs and acceptance_rate)
 export const getBaselineCollections = () =>
@@ -25,9 +61,13 @@ export const deleteCollection = (
     { params: opts?.confirm ? { confirm: true } : undefined },
   ).then(u)
 export const optimizeBaseline = (data: { camera_id: string; zone_id?: string; target_ratio?: number }) =>
-  api.post('/baseline/optimize/json', data).then(u)
+  api
+    .post<ApiResponse<BaselineOptimizeResult>>('/baseline/optimize/json', data)
+    .then(unwrap)
 export const previewOptimize = (params: { camera_id: string; zone_id?: string; target_ratio?: number }) =>
-  api.get('/baseline/optimize/preview', { params }).then(u)
+  api
+    .get<ApiResponse<BaselineOptimizePreview>>('/baseline/optimize/preview', { params })
+    .then(unwrap)
 
 // ── Capture Jobs ──
 export const startCaptureJob = (data: FormData) => api.post('/baseline/job', data).then(u)
@@ -39,16 +79,25 @@ export const abortCaptureJob = (taskId: string) => api.post(`/baseline/job/${tas
 
 // ── False Positive Merge ──
 export const mergeFalsePositives = (data: { camera_id: string; zone_id?: string; max_fp_images?: number }) =>
-  api.post('/baseline/merge-fp', data).then(u)
+  api
+    .post<ApiResponse<FalsePositiveMergeResult>>('/baseline/merge-fp', data)
+    .then(unwrap)
 
 // ── Camera Groups ──
-export const getCameraGroups = () => api.get('/baseline/groups/json').then(u)
+export const getCameraGroups = () =>
+  api
+    .get<ApiResponse<{ groups: CameraGroupInfo[] }>>('/baseline/groups/json')
+    .then(unwrap)
 export const mergeGroupBaseline = (data: { group_id: string; zone_id?: string; target_count?: number }) =>
-  api.post('/baseline/groups/merge', data).then(u)
+  api
+    .post<ApiResponse<GroupBaselineMergeResult>>('/baseline/groups/merge', data)
+    .then(unwrap)
 
 // ── Baseline Lifecycle ──
 export const getBaselineVersions = (params: { camera_id: string; zone_id?: string }) =>
-  api.get('/baseline/versions/json', { params }).then(u)
+  api
+    .get<ApiResponse<{ versions: BaselineVersionInfo[] }>>('/baseline/versions/json', { params })
+    .then(unwrap)
 export const verifyBaseline = (data: { camera_id: string; zone_id?: string; version: string; verified_by: string; verified_by_secondary?: string }) =>
   api.post('/baseline/verify', data).then(u)
 export const activateBaseline = (data: { camera_id: string; zone_id?: string; version: string; user?: string }) =>
@@ -81,9 +130,12 @@ export const listBaselineImages = (
   version: string,
   zoneId: string = 'default',
 ): Promise<BaselineImageListResponse> =>
-  api.get(`/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images`, {
-    params: { zone_id: zoneId },
-  }).then(u)
+  api
+    .get<ApiResponse<BaselineImageListResponse>>(
+      `/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images`,
+      { params: { zone_id: zoneId } },
+    )
+    .then(unwrap)
 
 export const deleteBaselineImage = (
   cameraId: string,
@@ -91,10 +143,12 @@ export const deleteBaselineImage = (
   filename: string,
   zoneId: string = 'default',
 ): Promise<{ filename: string }> =>
-  api.delete(
-    `/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images/${encodeURIComponent(filename)}`,
-    { params: { zone_id: zoneId } },
-  ).then(u)
+  api
+    .delete<ApiResponse<{ filename: string }>>(
+      `/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images/${encodeURIComponent(filename)}`,
+      { params: { zone_id: zoneId } },
+    )
+    .then(unwrap)
 
 export const uploadBaselineImage = (
   cameraId: string,
@@ -104,11 +158,13 @@ export const uploadBaselineImage = (
 ): Promise<{ filename: string; size_bytes: number }> => {
   const form = new FormData()
   form.append('file', file)
-  return api.post(
-    `/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images`,
-    form,
-    { params: { zone_id: zoneId }, headers: { 'Content-Type': 'multipart/form-data' } },
-  ).then(u)
+  return api
+    .post<ApiResponse<{ filename: string; size_bytes: number }>>(
+      `/baseline/${encodeURIComponent(cameraId)}/${encodeURIComponent(version)}/images`,
+      form,
+      { params: { zone_id: zoneId }, headers: { 'Content-Type': 'multipart/form-data' } },
+    )
+    .then(unwrap)
 }
 
 /**

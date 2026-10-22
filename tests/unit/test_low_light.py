@@ -14,11 +14,13 @@ from argus.config.schema import (
     LowLightConfig,
     MOG2Config,
     PersonFilterConfig,
+    SceneGuardConfig,
     SeverityThresholds,
     SuppressionConfig,
     TemporalConfirmation,
 )
 from argus.core.pipeline import DetectionPipeline
+from argus.core.runtime import FrameOutcomeKind
 
 
 def _make_config(
@@ -35,6 +37,7 @@ def _make_config(
         protocol="file",
         fps_target=5,
         resolution=(640, 480),
+        scene_guard=SceneGuardConfig(enabled=False),
         mog2=MOG2Config(history=500, heartbeat_frames=heartbeat_frames),
         person_filter=PersonFilterConfig(model_name="yolo11n.pt"),
         anomaly=AnomalyConfig(threshold=0.5),
@@ -185,6 +188,8 @@ def test_dark_frame_does_not_calibrate_ssim_baseline():
             and stage.skip_reason == "unstable_light_calibration"
             for stage in diag.stages
         )
+        assert pipeline.last_frame_outcome_kind is FrameOutcomeKind.BLOCKED
+        assert "unstable light" in (pipeline.last_frame_outcome_reason or "")
 
 
 def test_bright_frame_does_not_trigger_low_light():

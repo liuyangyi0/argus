@@ -25,15 +25,12 @@ from argus.dashboard.api_response import (
     api_validation_error,
 )
 from argus.capture.baseline_job import run_baseline_capture_job, BaselineCaptureJobConfig
-from argus.core.model_discovery import resolve_runtime_model_path
 from argus.dashboard.auth import current_username, require_role
-from argus.dashboard.forms import htmx_toast_headers, parse_request_form
+from argus.dashboard.forms import parse_request_form
 from argus.dashboard.model_runtime import (
-    activate_model_version,
     find_registered_model_by_path,
     get_registry,
 )
-from argus.storage.models import ModelStage
 
 logger = structlog.get_logger()
 
@@ -521,84 +518,38 @@ async def delete_baseline_version_post(request: Request):
 
 @router.post("/deploy")
 async def deploy_model(request: Request):
-    """Deploy a trained model to a camera (hot-reload)."""
-    camera_manager = request.app.state.camera_manager
-    if not camera_manager:
-        return api_unavailable("服务不可用")
+    """Reject the legacy path-based hot-deploy command.
 
-    data = await request.json()
+    Model artifacts are selected by immutable registry identity, not by a path
+    supplied by the browser.  The only supported mutation path is the
+    two-phase model release endpoint in ``routes.models``.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return api_validation_error("无效的JSON请求")
+    if not isinstance(data, dict):
+        return api_validation_error("JSON请求必须是对象")
     camera_id = data.get("camera_id", "")
     model_path = data.get("model_path", "")
 
     if not camera_id or not model_path:
         return api_validation_error("缺少参数")
 
-    # Path safety
-    allowed_roots = [Path("data/models").resolve(), Path("data/exports").resolve()]
-    resolved = Path(model_path).resolve()
-    if not any(str(resolved).startswith(str(root)) for root in allowed_roots):
-        return api_validation_error("模型路径无效")
-    if not resolved.exists():
-        return api_not_found("模型文件不存在")
-
-    if camera_id not in camera_manager._pipelines:
-        return api_not_found(f"摄像头 {camera_id} 不存在")
-
-    resolved_runtime_model = resolve_runtime_model_path(resolved, camera_id)
-    if resolved_runtime_model is None:
-        return api_not_found("模型目录中未找到可部署的模型文件 (.xml/.pt)")
-    resolved = resolved_runtime_model
-    logger.info("deploy.resolved_model_file", path=str(resolved))
-
     registry_record = find_registered_model_by_path(
         request,
         Path(model_path),
         camera_id=camera_id,
     )
-    if registry_record is None:
-        registry_record = find_registered_model_by_path(
-            request,
-            resolved,
-            camera_id=camera_id,
-        )
     if get_registry(request) is None:
         return api_unavailable("数据库不可用")
     if registry_record is None:
         return api_validation_error("模型未注册，无法直接部署。请先完成模型注册与发布流程。")
-    if registry_record.stage != ModelStage.PRODUCTION.value:
-        return api_validation_error(
-            f"模型仍处于 {registry_record.stage} 阶段，无法直接部署。"
-            "请先通过 shadow → canary → production 发布流程晋升。"
-        )
-
-    try:
-        _, success = activate_model_version(
-            request,
-            registry_record.model_version_id,
-            triggered_by="dashboard",
-        )
-    except ValueError as e:
-        return api_validation_error(str(e))
-
-    if success:
-        audit = getattr(request.app.state, "audit_logger", None)
-        client_ip = request.client.host if request.client else ""
-        if audit:
-            audit.log(
-                user=current_username(request),
-                action="deploy_model",
-                target_type="camera",
-                target_id=camera_id,
-                detail=model_path,
-                ip_address=client_ip,
-            )
-        return api_success(
-            {
-                "model_version_id": registry_record.model_version_id if registry_record else None,
-            },
-            headers=htmx_toast_headers("模型已部署"),
-        )
-    return api_internal_error("模型部署失败")
+    return api_conflict(
+        "路径部署入口已关闭，未修改 registry 或运行时。请在模型页对版本 "
+        f"{registry_record.model_version_id} 使用受控 promote 流程；production "
+        "必须通过 baseline v3 与可信 72 小时 soak 门禁。"
+    )
 
 
 # ── Advanced Baseline Capture Job Endpoints ──
@@ -839,13 +790,17 @@ def _train_model_task(
 
     # Save training record to database
     if database_url:
+        db = None
         try:
+            from argus.anomaly.artifacts import artifact_metadata
             from argus.storage.database import Database
             from argus.storage.model_registry import ModelRegistry
             from argus.storage.models import TrainingRecord
 
             db = Database(database_url=database_url)
             db.initialize()
+            actual_format = getattr(result, "actual_export_format", None) or fmt
+            actual_quantization = getattr(result, "actual_quantization", None) or quantization
 
             # Get baseline version
             baseline_dir = bm.get_baseline_dir(camera_id, "default")
@@ -875,7 +830,7 @@ def _train_model_task(
                 camera_id=camera_id,
                 zone_id="default",
                 model_type=model_type,
-                export_format=fmt,
+                export_format=actual_format,
                 baseline_version=baseline_version,
                 baseline_count=result.image_count,
                 train_count=result.train_count,
@@ -900,7 +855,7 @@ def _train_model_task(
                 val_scores_json=val_scores_json_str,
                 val_labels_json=val_labels_json_str,
                 model_path=result.model_path,
-                export_path=str(Path(models_dir).parent / "exports" / camera_id / "default") if fmt else None,
+                export_path=getattr(result, "export_dir", None),
                 checkpoint_valid=output_val.get("checkpoint_valid"),
                 export_valid=output_val.get("export_valid"),
                 smoke_test_passed=output_val.get("smoke_test_passed"),
@@ -910,8 +865,6 @@ def _train_model_task(
                 duration_seconds=result.duration_seconds,
                 trained_at=datetime.now(timezone.utc),
             )
-            db.save_training_record(record)
-
             if result.model_path and not result.model_version_id:
                 registry = ModelRegistry(session_factory=db.get_session)
                 result.model_version_id = registry.register(
@@ -920,16 +873,25 @@ def _train_model_task(
                     camera_id=camera_id,
                     model_type=model_type,
                     training_params={
-                        "export_format": fmt,
-                        "quantization": quantization,
+                        "export_format": actual_format,
+                        "quantization": actual_quantization,
                         "train_count": result.train_count,
                         "val_count": result.val_count,
                         "quality_grade": result.quality_report.grade if result.quality_report else None,
+                        "zone_id": "default",
+                        "run_id": getattr(result, "run_id", None),
+                        "training_dir": getattr(result, "training_dir", None),
+                        "export_dir": getattr(result, "export_dir", None),
+                        "artifact_manifest": artifact_metadata(Path(result.model_path)),
                     },
                 )
-            db.close()
+            db.save_training_record(record)
         except Exception as e:
             logger.warning("training.record_save_failed", error=str(e))
+            raise RuntimeError(f"训练产物登记失败: {e}") from e
+        finally:
+            if db is not None:
+                db.close()
 
     grade_str = f" | 质量: {result.quality_report.grade}" if result.quality_report else ""
     threshold_str = f" | 推荐阈值: {result.threshold_recommended:.3f}" if result.threshold_recommended else ""
@@ -938,6 +900,9 @@ def _train_model_task(
     return {
         "model_path": result.model_path,
         "model_version_id": result.model_version_id,
+        "training_dir": getattr(result, "training_dir", None),
+        "export_dir": getattr(result, "export_dir", None),
+        "run_id": getattr(result, "run_id", None),
         "status": result.status.value,
         "duration": result.duration_seconds,
         "image_count": result.image_count,

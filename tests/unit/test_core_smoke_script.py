@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from importlib import metadata as importlib_metadata
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.smoke_core_loop import (
+    SmokeFailure,
+    _expect_legacy_model_command_closed,
     _infer_camera_protocol,
     _inspect_usb_video_devices,
     _inspect_windows_camera_privacy,
@@ -13,9 +16,58 @@ from scripts.smoke_core_loop import (
     _opencv_runtime_info,
     _parse_resolution,
     _prepare_config,
+    _production_release_gate_satisfied,
     parse_args,
     run_preflight,
 )
+
+
+def test_legacy_model_smoke_requires_explicit_409_fail_closed():
+    response = SimpleNamespace(
+        status_code=409,
+        text="",
+        json=lambda: {
+            "code": 409,
+            "msg": "回滚入口已安全关闭，未修改 registry 或运行时",
+            "data": None,
+        },
+    )
+
+    result = _expect_legacy_model_command_closed(
+        response,
+        label="rollback",
+        message_fragment="回滚入口已安全关闭",
+    )
+
+    assert result["status"] == "fail_closed"
+    assert result["http_status"] == 409
+
+
+def test_legacy_model_smoke_rejects_false_success():
+    response = SimpleNamespace(
+        status_code=200,
+        text="",
+        json=lambda: {"code": 0, "msg": "ok", "data": {}},
+    )
+
+    with pytest.raises(SmokeFailure, match="HTTP 409"):
+        _expect_legacy_model_command_closed(
+            response,
+            label="activate",
+            message_fragment="直接激活入口已关闭",
+        )
+
+
+def test_core_smoke_does_not_report_production_no_go_as_success():
+    assert _production_release_gate_satisfied({
+        "production": {
+            "status": "blocked_by_release_evidence",
+            "production_ready": False,
+        }
+    }) is False
+    assert _production_release_gate_satisfied({
+        "production": {"status": "released", "production_ready": True}
+    }) is True
 
 
 def test_infer_camera_protocol_from_source_shape():

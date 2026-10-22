@@ -54,6 +54,7 @@ npm run build
 - 前端当前是 7 个主路由（Overview / Cameras / Alerts / Reports / Models / System / Replay），很多管理能力集中在模型页和系统页的标签中。
 - go2rtc 是当前流媒体链路的重要组成部分，USB 摄像头路径尤其依赖它的重定向逻辑。
 - 默认配置中分类器、分割器、跨摄像头和自动重训练通常关闭。
+- gpu-validation 测试机运行细节记录在 `docs/runbooks/gpu-validation-runtime.md`：OBSBOT `/dev/video0`、MJPEG 1920x1080 60 FPS、go2rtc exec+NVENC、Argus 启停、隧道和模型 symlink 切换。
 
 ## Testing
 
@@ -98,3 +99,11 @@ npm run build
 anomalib 默认导出可能产生动态 batch/spatial 维度的 IR，CPU 推理时直接 `Broadcast Check failed, Value -1 not in range`。`ModelTrainer.export()` 必须传 `input_size=(H, W)` + `onnx_kwargs={'dynamo': False, 'dynamic_axes': {}}`。
 
 **守门测试**：`tests/unit/test_trainer_export.py::TestAssertOpenvinoStatic` —— `_assert_openvino_static()` 在导出后立刻校验 `partial_shape.is_static`，失败时点名 trainer 而不是把锅甩给后续推理。
+
+### ❌ NVIDIA GPU 部署不能用 OpenVINO `.xml` 伪装 CUDA 主模型
+
+`model.xml` 表示 OpenVINO artifact，不等于 NVIDIA CUDA。测试机或正式 GPU 部署如果要求主模型走 GPU，必须配置 `anomaly.inference_backend: torch-cuda` 并发布 `model.pt`；只发现 `model.xml`、CUDA 不可用或加载失败时，不能静默回退 CPU/OpenVINO/SSIM fallback。
+
+gpu-validation 默认强制 `torch-cuda`，OpenVINO v002 只保留为 rollback/reference。Torch/CUDA 质量没过回归时，应该继续修模型和报表，不要把测试机默认运行偷偷切回 OpenVINO。每次切换默认运行模型都必须跑回归报表并记录 FP/hour、recall、P95 delay。
+
+**守门测试**：`tests/unit/test_model_backend_policy.py`；Web 可见性覆盖 `web/src/components/system/__tests__/ModelStatusPanel.test.ts`、`web/src/components/__tests__/DegradationBar.test.ts`、`web/src/views/__tests__/CameraDetailStream.test.ts`。

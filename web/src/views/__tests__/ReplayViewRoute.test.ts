@@ -1,5 +1,5 @@
 import { mount } from '@vue/test-utils'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 
 import ReplayView from '../ReplayView.vue'
@@ -26,47 +26,25 @@ vi.mock('../../components/ReplayPlayer.vue', () => ({
   },
 }))
 
-vi.mock('../../components/ContentSkeleton.vue', () => ({
-  default: {
-    name: 'ContentSkeleton',
-    props: ['type', 'rows'],
-    template: '<div data-test="replay-skeleton">{{ type }} {{ rows }}</div>',
-  },
-}))
-
 describe('ReplayView route contract', () => {
   beforeEach(() => {
-    vi.useFakeTimers()
     routeFixture.routerBack.mockReset()
     routeFixture.route!.params.alertId = 'ALT-live-001'
   })
 
-  afterEach(() => {
-    vi.useRealTimers()
-  })
-
-  it('passes the route alert id to ReplayPlayer after the route-entry skeleton', async () => {
+  it('passes the route alert id to ReplayPlayer immediately', async () => {
     const wrapper = mount(ReplayView)
 
     expect(wrapper.text()).toContain('录像回放')
     expect(wrapper.text()).toContain('ALT-live-001')
-    expect(wrapper.find('[data-test="replay-skeleton"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="replay-player"]').exists()).toBe(false)
-
-    vi.advanceTimersByTime(400)
-    await nextTick()
 
     const player = wrapper.find('[data-test="replay-player"]')
     expect(player.exists()).toBe(true)
     expect(player.attributes('data-alert-id')).toBe('ALT-live-001')
-    expect(wrapper.find('[data-test="replay-skeleton"]').exists()).toBe(false)
   })
 
   it('updates the replay player when the route alert id changes on the same page', async () => {
     const wrapper = mount(ReplayView)
-
-    vi.advanceTimersByTime(400)
-    await nextTick()
 
     expect(wrapper.find('[data-test="replay-player"]').attributes('data-alert-id')).toBe('ALT-live-001')
 
@@ -80,7 +58,7 @@ describe('ReplayView route contract', () => {
   it('uses router history for the back button', async () => {
     const wrapper = mount(ReplayView)
 
-    await wrapper.find('button[title="返回"]').trigger('click')
+    await wrapper.find('button[aria-label="返回上一页"]').trigger('click')
 
     expect(routeFixture.routerBack).toHaveBeenCalledTimes(1)
   })

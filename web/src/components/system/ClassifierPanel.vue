@@ -13,7 +13,8 @@ import {
   type ClassifierConfigPayload,
 } from '../../api'
 import { extractErrorMessage } from '../../utils/error'
-import { notifyModuleToggleResult } from '../../utils/moduleToggleFeedback'
+import { notifyModuleToggleResult, type ModuleToggleFeedback } from '../../utils/moduleToggleFeedback'
+import AuxiliaryRuntimeStatus from './AuxiliaryRuntimeStatus.vue'
 
 defineOptions({ name: 'ClassifierPanel' })
 
@@ -29,6 +30,7 @@ const loading = ref(false)
 const toggling = ref(false)
 const saving = ref(false)
 const error = ref<string | null>(null)
+const toggleFeedback = ref<ModuleToggleFeedback | null>(null)
 
 // Edit mode state
 const editing = ref(false)
@@ -49,17 +51,19 @@ async function load() {
 }
 
 async function handleToggle(checked: string | number | boolean) {
-  if (!cfg.value) return
+  if (!cfg.value || toggling.value || loading.value) return
   const next = Boolean(checked)
   toggling.value = true
   try {
     const result = await toggleModule('classifier.enabled', next)
     cfg.value.enabled = next
-    notifyModuleToggleResult('分类器', next, result)
+    toggleFeedback.value = notifyModuleToggleResult('分类器', next, result)
     // Re-fetch so runtime counters reflect the new state.
     await load()
   } catch (e) {
     message.error(extractErrorMessage(e, '切换失败'))
+    toggleFeedback.value = { type: 'warning', message: '切换请求失败，运行时状态尚未确认；请刷新后核验，不要将当前开关视为实际加载状态。' }
+    await load()
   } finally {
     toggling.value = false
   }
@@ -101,20 +105,6 @@ const buckets = computed<LabelBucket[]>(() => {
     { key: 'suppress', label: '抑制区域', color: 'purple', labels: suppressList },
     { key: 'neutral', label: '中性识别', color: 'default', labels: neutral },
   ]
-})
-
-const runtimeSummary = computed(() => {
-  const r = cfg.value?.runtime
-  if (!r) return null
-  if (!cfg.value?.enabled) return '分类器已关闭，管线未加载模型'
-  if (r.total_pipelines === 0) return '无运行中的摄像头管线，无法判断加载状态'
-  if (r.pipelines_loaded === r.total_pipelines) {
-    return `已在全部 ${r.total_pipelines} 路管线就绪`
-  }
-  if (r.pipelines_loaded > 0) {
-    return `${r.pipelines_loaded} / ${r.total_pipelines} 路管线已加载模型（首次推理后懒加载）`
-  }
-  return `${r.total_pipelines} 路管线已附加分类器，尚未触发首次加载`
 })
 
 const BUCKET_OPTIONS: { label: string; value: Bucket }[] = [
@@ -201,18 +191,19 @@ onMounted(load)
       <Space>
         <span>AI 异物分类器</span>
         <Tag v-if="cfg" :color="cfg.enabled ? 'green' : 'default'">
-          {{ cfg.enabled ? '已启用' : '已关闭' }}
+          {{ cfg.enabled ? '配置已启用' : '配置已关闭' }}
         </Tag>
       </Space>
     </template>
     <template #extra>
-      <Button size="small" :loading="loading" @click="load">
+      <Button size="small" :loading="loading" :disabled="toggling" @click="load">
         <template #icon><ReloadOutlined /></template>
         刷新
       </Button>
     </template>
 
     <Alert v-if="error" type="error" :message="error" show-icon style="margin-bottom: 16px" />
+    <Alert v-if="toggleFeedback" :type="toggleFeedback.type" :message="toggleFeedback.message" show-icon style="margin-bottom: 16px" />
 
     <div v-if="cfg" class="classifier-panel">
       <!-- Master toggle + runtime status -->
@@ -227,12 +218,11 @@ onMounted(load)
           <Switch
             :checked="cfg.enabled"
             :loading="toggling"
+            :disabled="loading || saving"
             @update:checked="handleToggle"
           />
         </div>
-        <Typography.Text v-if="runtimeSummary" type="secondary" style="font-size: 12px">
-          {{ runtimeSummary }}
-        </Typography.Text>
+        <AuxiliaryRuntimeStatus label="分类器" :enabled="cfg.enabled" :runtime="cfg.runtime" />
       </div>
 
       <!-- Model + threshold summary -->

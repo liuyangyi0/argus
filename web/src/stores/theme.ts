@@ -6,17 +6,6 @@ export type ThemeMode = 'dark' | 'light'
 
 const STORAGE_KEY = 'argus-theme'
 
-const DARK_TOKENS = {
-  colorPrimary: '#ffffff', // 极致极简白
-  colorBgContainer: '#121217', // 高级墨黑
-  colorBgElevated: '#1a1a24',
-  colorBgLayout: '#0a0a0c', 
-  colorTextBase: '#f1f5f9',
-  borderRadius: 8,
-  fontSize: 14,
-  wireframe: false,
-}
-
 const LIGHT_TOKENS = {
   colorPrimary: '#0a0a0c', // SaaS极简黑
   colorBgContainer: '#ffffff',
@@ -27,27 +16,26 @@ const LIGHT_TOKENS = {
   wireframe: false,
 }
 
-function detectSystemTheme(): ThemeMode {
-  return 'light' // Lock to light for Glassmorphism UI
-}
-
-function loadSaved(): ThemeMode | null {
-  if (typeof localStorage === 'undefined') return null
-  const v = localStorage.getItem(STORAGE_KEY)
-  if (v === 'dark' || v === 'light') return v
-  return null
+function applyLightTheme(): void {
+  if (typeof document !== 'undefined') {
+    document.documentElement.classList.add('light-theme')
+    document.documentElement.classList.remove('dark-theme')
+    document.documentElement.style.colorScheme = 'light'
+  }
+  if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, 'light')
 }
 
 export const useThemeStore = defineStore('theme', () => {
-  const mode = ref<ThemeMode>(loadSaved() ?? detectSystemTheme())
+  // Dark mode is intentionally suspended until every non-Ant surface is
+  // tokenized. Coerce stale persisted preferences to light to prevent a mixed
+  // dark-Ant/light-page UI after upgrades.
+  const mode = ref<ThemeMode>('light')
 
-  const isDark = computed(() => mode.value === 'dark')
+  const isDark = computed(() => false)
 
-  const algorithm = computed(() =>
-    isDark.value ? theme.darkAlgorithm : theme.defaultAlgorithm
-  )
+  const algorithm = computed(() => theme.defaultAlgorithm)
 
-  const tokens = computed(() => isDark.value ? DARK_TOKENS : LIGHT_TOKENS)
+  const tokens = computed(() => LIGHT_TOKENS)
 
   const themeConfig = computed(() => ({
     algorithm: algorithm.value,
@@ -55,25 +43,16 @@ export const useThemeStore = defineStore('theme', () => {
   }))
 
   function toggle() {
-    mode.value = isDark.value ? 'light' : 'dark'
-    localStorage.setItem(STORAGE_KEY, mode.value)
-    // Update <html> class for non-Ant components
-    document.documentElement.classList.toggle('light-theme', !isDark.value)
-    document.documentElement.classList.toggle('dark-theme', isDark.value)
+    mode.value = 'light'
+    applyLightTheme()
   }
 
-  function setTheme(t: ThemeMode) {
-    mode.value = t
-    localStorage.setItem(STORAGE_KEY, t)
-    document.documentElement.classList.toggle('light-theme', t === 'light')
-    document.documentElement.classList.toggle('dark-theme', t === 'dark')
+  function setTheme(_requested: ThemeMode) {
+    mode.value = 'light'
+    applyLightTheme()
   }
 
-  // Initialize HTML class on load
-  if (typeof document !== 'undefined') {
-    document.documentElement.classList.toggle('light-theme', !isDark.value)
-    document.documentElement.classList.toggle('dark-theme', isDark.value)
-  }
+  applyLightTheme()
 
   return { mode, isDark, algorithm, tokens, themeConfig, toggle, setTheme }
 })

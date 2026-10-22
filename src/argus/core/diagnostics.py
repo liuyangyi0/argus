@@ -22,6 +22,39 @@ class StageResult:
     skip_reason: str = ""
     metadata: dict = field(default_factory=dict)
 
+    def to_dict(self) -> dict:
+        """Return a JSON-safe representation."""
+        return {
+            "stage_name": self.stage_name,
+            "duration_ms": self.duration_ms,
+            "skipped": self.skipped,
+            "skip_reason": self.skip_reason,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class CandidateRecord:
+    """Candidate-level evidence and decision record for one frame."""
+
+    candidate_id: str
+    candidate_type: str
+    decision: str
+    stage: str = ""
+    evidence: dict = field(default_factory=dict)
+    suppression_reason: str | None = None
+
+    def to_dict(self) -> dict:
+        """Return a JSON-safe representation."""
+        return {
+            "candidate_id": self.candidate_id,
+            "candidate_type": self.candidate_type,
+            "decision": self.decision,
+            "stage": self.stage,
+            "evidence": self.evidence,
+            "suppression_reason": self.suppression_reason,
+        }
+
 
 @dataclass
 class FrameDiagnostics:
@@ -39,6 +72,60 @@ class FrameDiagnostics:
     low_light: bool = False
     frame_id: str = ""  # uuid hex, populated by pipeline for audit linkage
     alignment_shift_px: tuple[float, float] = (0.0, 0.0)
+    scene_guard_state: str = "disabled"
+    final_decision: str = "normal"
+    suppression_reason: str | None = None
+    candidate_records: list[CandidateRecord] = field(default_factory=list)
+
+    def add_candidate(
+        self,
+        *,
+        candidate_type: str,
+        decision: str,
+        stage: str = "",
+        evidence: dict | None = None,
+        suppression_reason: str | None = None,
+        candidate_id: str | None = None,
+    ) -> CandidateRecord:
+        """Append and return a candidate diagnostic record."""
+        record = CandidateRecord(
+            candidate_id=(
+                candidate_id
+                or f"{self.camera_id}:{self.frame_number}:{len(self.candidate_records) + 1}"
+            ),
+            candidate_type=candidate_type,
+            decision=decision,
+            stage=stage,
+            evidence=evidence or {},
+            suppression_reason=suppression_reason,
+        )
+        self.candidate_records.append(record)
+        if suppression_reason:
+            self.suppression_reason = suppression_reason
+        return record
+
+    def to_dict(self) -> dict:
+        """Return a JSON-safe representation."""
+        return {
+            "frame_number": self.frame_number,
+            "timestamp": self.timestamp,
+            "camera_id": self.camera_id,
+            "total_duration_ms": self.total_duration_ms,
+            "stages": [stage.to_dict() for stage in self.stages],
+            "anomaly_score": self.anomaly_score,
+            "is_anomalous": self.is_anomalous,
+            "alert_emitted": self.alert_emitted,
+            "pipeline_mode": self.pipeline_mode,
+            "low_light": self.low_light,
+            "frame_id": self.frame_id,
+            "alignment_shift_px": list(self.alignment_shift_px),
+            "scene_guard_state": self.scene_guard_state,
+            "final_decision": self.final_decision,
+            "suppression_reason": self.suppression_reason,
+            "candidate_records": [
+                record.to_dict() for record in self.candidate_records
+            ],
+        }
 
 
 @dataclass
@@ -49,6 +136,15 @@ class FrameScoreRecord:
     timestamp: float
     anomaly_score: float
     was_alert: bool
+
+    def to_dict(self) -> dict:
+        """Return a JSON-safe representation."""
+        return {
+            "frame_number": self.frame_number,
+            "timestamp": self.timestamp,
+            "anomaly_score": self.anomaly_score,
+            "was_alert": self.was_alert,
+        }
 
 
 class DiagnosticsBuffer:

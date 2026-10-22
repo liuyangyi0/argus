@@ -20,6 +20,7 @@ from argus.storage.models import (
     InferenceRecord,
     LabelingQueueRecord,
     LabelingQueueStatus,
+    OutboxEvent,
     Region,
     TrainingJobRecord,
     TrainingRecord,
@@ -79,11 +80,19 @@ _AUTO_MIGRATIONS: list[tuple[str, str, str]] = [
     ("models", "component_type", "VARCHAR(20) DEFAULT 'full'"),
     ("models", "model_path", "VARCHAR(500)"),
     ("models", "canary_camera_id", "VARCHAR(50)"),
+    ("models", "release_evidence_json", "TEXT"),
+    ("models", "release_evidence_sha256", "VARCHAR(64)"),
+    ("models", "release_revision", "INTEGER DEFAULT 0 NOT NULL"),
+    ("model_release_operations", "desired_state_json", "TEXT"),
     # Alert recording MP4 migration (d47d70f)
     ("alert_recordings", "video_codec", "VARCHAR(10) DEFAULT 'h264'"),
     ("alert_recordings", "width", "INTEGER"),
     ("alert_recordings", "height", "INTEGER"),
     # Alert aggregation
+    ("alerts", "detection_type", "VARCHAR(50)"),
+    ("alerts", "evidence_summary", "TEXT"),
+    ("alerts", "evidence_json", "TEXT"),
+    ("alerts", "suppression_reason", "VARCHAR(100)"),
     ("alerts", "event_group_id", "VARCHAR(64)"),
     ("alerts", "event_group_count", "INTEGER DEFAULT 1"),
     # Physics enrichment (speed, trajectory, localization)
@@ -126,6 +135,18 @@ _AUTO_MIGRATIONS: list[tuple[str, str, str]] = [
     # along with the entire email-notification surface. Existing SQLite databases
     # retain the column harmlessly — SQLite cannot DROP COLUMN, so the legacy
     # data stays in the file but is no longer mapped or read by the ORM.
+]
+
+# Index migrations are deliberately separate from column migrations.  SQLite
+# partial indexes cannot be represented as an ``ALTER TABLE`` column addition,
+# and existing installations need the same invariant as a fresh database.
+_AUTO_INDEX_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "uq_models_active_production_per_camera",
+        "CREATE UNIQUE INDEX uq_models_active_production_per_camera "
+        "ON models(camera_id) "
+        "WHERE stage = 'production' AND is_active = 1",
+    ),
 ]
 
 # Tables that were dropped in code and should be removed from any pre-existing
@@ -186,6 +207,7 @@ class Database:
 
         # Auto-migrate: add missing columns + drop deprecated tables
         self._auto_migrate()
+        self._auto_migrate_indexes()
         self._drop_deprecated_tables()
 
         logger.info("database.initialized", url=self._database_url)
@@ -290,6 +312,36 @@ class Database:
                             f"backup before restarting."
                         ) from e
 
+    def _auto_migrate_indexes(self) -> None:
+        """Create required indexes and fail closed on invariant violations."""
+
+        with self._engine.connect() as conn:
+            existing = {
+                item["name"]
+                for table in sa_inspect(conn).get_table_names()
+                for item in sa_inspect(conn).get_indexes(table)
+                if item.get("name")
+            }
+            for name, sql in _AUTO_INDEX_MIGRATIONS:
+                if name in existing:
+                    continue
+                try:
+                    conn.execute(text(sql))
+                    conn.commit()
+                    existing.add(name)
+                    logger.info("database.index_migration", index=name)
+                except Exception as exc:
+                    logger.error(
+                        "database.index_migration_failed",
+                        index=name,
+                        error=str(exc),
+                        exc_info=True,
+                    )
+                    raise RuntimeError(
+                        f"Auto-index migration failed for {name}: {exc}. "
+                        "Resolve duplicate active production rows before restart."
+                    ) from exc
+
     @staticmethod
     def _is_already_exists_error(err_msg: str) -> bool:
         """保守判定一条 ALTER 失败是否属于"幂等成功"。
@@ -328,6 +380,10 @@ class Database:
         anomaly_score: float,
         snapshot_path: str | None = None,
         heatmap_path: str | None = None,
+        detection_type: str | None = None,
+        evidence_summary: str | None = None,
+        evidence_json: dict | str | None = None,
+        suppression_reason: str | None = None,
         event_group_id: str | None = None,
         event_group_count: int = 1,
         # Physics enrichment (phase 1/2)
@@ -364,6 +420,7 @@ class Database:
         # Model lineage — supplied by the dispatcher from alert.model_version_id
         # so every alert row points at the model that produced it.
         model_version_id: str | None = None,
+        outbox_event: dict | None = None,
         _max_retries: int = 3,
     ) -> AlertRecord:
         """Save an alert to the database with retry on transient failures.
@@ -385,12 +442,53 @@ class Database:
                     exc_info=True,
                 )
                 seg_objects_json = None
+        evidence_json_text: str | None = None
+        if isinstance(evidence_json, str):
+            evidence_json_text = evidence_json
+        elif evidence_json is not None:
+            try:
+                evidence_json_text = _json.dumps(evidence_json, ensure_ascii=False)
+            except Exception:
+                logger.warning(
+                    "database.evidence_json_failed",
+                    alert_id=alert_id,
+                    exc_info=True,
+                )
+                evidence_json_text = None
+
+        outbox_values: dict[str, str] | None = None
+        if outbox_event is not None:
+            payload = outbox_event.get("payload", {})
+            if not isinstance(payload, dict):
+                raise ValueError("outbox_event.payload must be an object")
+            try:
+                event_id = str(outbox_event["event_id"])
+            except KeyError as exc:
+                raise ValueError("outbox_event.event_id is required") from exc
+            if not event_id:
+                raise ValueError("outbox_event.event_id must not be empty")
+            resource_id = str(outbox_event.get("resource_id", alert_id))
+            if resource_id != alert_id:
+                raise ValueError("outbox_event.resource_id must match alert_id")
+            outbox_values = {
+                "event_id": event_id,
+                "topic": str(outbox_event.get("topic", "alerts")),
+                "event_type": str(outbox_event.get("event_type", "created")),
+                "resource_id": resource_id,
+                "payload_json": _json.dumps(payload, ensure_ascii=False),
+            }
 
         last_error = None
         retry_event = threading.Event()
-        for attempt in range(_max_retries):
+        max_retries = max(1, _max_retries)
+        for attempt in range(max_retries):
+            commit_started = False
             try:
                 with self.get_session() as session:
+                    # Keep the inserted ORM values usable after commit without a
+                    # post-commit refresh.  A refresh failure must never make the
+                    # write loop insert the same alert/outbox pair again.
+                    session.expire_on_commit = False
                     record = AlertRecord(
                         alert_id=alert_id,
                         timestamp=timestamp,
@@ -400,6 +498,10 @@ class Database:
                         anomaly_score=anomaly_score,
                         snapshot_path=snapshot_path,
                         heatmap_path=heatmap_path,
+                        detection_type=detection_type,
+                        evidence_summary=evidence_summary,
+                        evidence_json=evidence_json_text,
+                        suppression_reason=suppression_reason,
                         event_group_id=event_group_id,
                         event_group_count=event_group_count,
                         speed_ms=speed_ms,
@@ -425,13 +527,97 @@ class Database:
                         model_version_id=model_version_id,
                     )
                     session.add(record)
-                    session.commit()
+                    if outbox_values is not None:
+                        session.add(OutboxEvent(**outbox_values))
+
+                    # Flush all deterministic constraint/serialization failures
+                    # before entering the ambiguous commit boundary.
+                    session.flush()
                     session.refresh(record)
+                    commit_started = True
+                    session.commit()
                     logger.debug("database.alert_saved", alert_id=alert_id)
                     return record
             except Exception as e:
                 last_error = e
-                if attempt < _max_retries - 1:
+
+                if commit_started:
+                    # commit() may raise after the database has durably committed
+                    # (for example, a lost acknowledgement).  Resolve that state
+                    # by the two idempotency keys before considering another
+                    # insert.  A failed recovery read is retried as a read only;
+                    # it never falls through to a blind write.
+                    committed_alert: AlertRecord | None = None
+                    committed_event: OutboxEvent | None = None
+                    recovery_error: Exception | None = None
+                    for recovery_attempt in range(max_retries):
+                        try:
+                            committed_alert, committed_event = (
+                                self._lookup_alert_commit_outcome(
+                                    alert_id,
+                                    outbox_values["event_id"] if outbox_values else None,
+                                )
+                            )
+                            recovery_error = None
+                            break
+                        except Exception as lookup_error:
+                            recovery_error = lookup_error
+                            if recovery_attempt < max_retries - 1:
+                                logger.warning(
+                                    "database.save_commit_recovery_retry",
+                                    alert_id=alert_id,
+                                    event_id=(
+                                        outbox_values["event_id"]
+                                        if outbox_values
+                                        else None
+                                    ),
+                                    attempt=recovery_attempt + 1,
+                                    error=str(lookup_error),
+                                )
+                                retry_event.wait(timeout=0.5)
+
+                    if recovery_error is not None:
+                        raise RuntimeError(
+                            "Unable to determine alert commit outcome; refusing "
+                            f"to reinsert alert_id={alert_id!r}"
+                        ) from recovery_error
+
+                    if outbox_values is None:
+                        if committed_alert is not None:
+                            logger.warning(
+                                "database.alert_commit_recovered",
+                                alert_id=alert_id,
+                                event_id=None,
+                            )
+                            return committed_alert
+                    elif committed_alert is not None and committed_event is not None:
+                        if (
+                            committed_event.resource_id != outbox_values["resource_id"]
+                            or committed_event.topic != outbox_values["topic"]
+                            or committed_event.event_type != outbox_values["event_type"]
+                        ):
+                            raise RuntimeError(
+                                "Recovered outbox event does not match requested alert "
+                                f"write: alert_id={alert_id!r}, "
+                                f"event_id={outbox_values['event_id']!r}"
+                            ) from e
+                        logger.warning(
+                            "database.alert_commit_recovered",
+                            alert_id=alert_id,
+                            event_id=outbox_values["event_id"],
+                        )
+                        return committed_alert
+                    elif committed_alert is not None or committed_event is not None:
+                        raise RuntimeError(
+                            "Alert/outbox atomicity invariant violated while recovering "
+                            f"alert_id={alert_id!r}, "
+                            f"event_id={outbox_values['event_id']!r}"
+                        ) from e
+
+                    # A successful lookup found neither id, so the failed commit
+                    # is known not to have persisted and a fresh write is safe.
+
+                if attempt < max_retries - 1:
                     logger.warning(
                         "database.save_retry",
                         alert_id=alert_id,
@@ -467,6 +653,92 @@ class Database:
                 select(AlertRecord).where(AlertRecord.alert_id == alert_id)
             )
 
+    def _lookup_alert_commit_outcome(
+        self,
+        alert_id: str,
+        event_id: str | None,
+    ) -> tuple[AlertRecord | None, OutboxEvent | None]:
+        """Read both idempotency keys after an ambiguous alert commit.
+
+        This method deliberately performs no writes.  Callers may retry this
+        lookup if the database is temporarily unavailable without risking a
+        duplicate alert or an orphaned outbox event.
+        """
+        with self.get_session() as session:
+            record = session.scalar(
+                select(AlertRecord).where(AlertRecord.alert_id == alert_id)
+            )
+            event = None
+            if event_id is not None:
+                event = session.scalar(
+                    select(OutboxEvent).where(OutboxEvent.event_id == event_id)
+                )
+            return record, event
+
+    @staticmethod
+    def _append_alert_outbox(
+        session: Session,
+        record: AlertRecord,
+        event_type: str,
+    ) -> OutboxEvent:
+        """Append an alert event to the caller's still-open transaction."""
+        import json as _json
+        import uuid
+
+        payload = {
+            "type": event_type,
+            "resource_id": record.alert_id,
+            **record.to_dict(),
+        }
+        event = OutboxEvent(
+            event_id=str(uuid.uuid4()),
+            topic="alerts",
+            event_type=event_type,
+            resource_id=record.alert_id,
+            payload_json=_json.dumps(payload, ensure_ascii=False),
+        )
+        session.add(event)
+        return event
+
+    def get_pending_outbox_events(self, limit: int = 100) -> list[OutboxEvent]:
+        """Return durable events awaiting delivery, oldest first."""
+        with self.get_session() as session:
+            stmt = (
+                select(OutboxEvent)
+                .where(OutboxEvent.status == "pending")
+                .order_by(OutboxEvent.id.asc())
+                .limit(max(1, min(limit, 1000)))
+            )
+            return list(session.scalars(stmt).all())
+
+    def mark_outbox_published(self, event_id: str) -> bool:
+        """Mark an event delivered after the broadcaster accepted it."""
+        with self.get_session() as session:
+            event = session.scalar(
+                select(OutboxEvent).where(OutboxEvent.event_id == event_id)
+            )
+            if event is None:
+                return False
+            event.status = "published"
+            event.attempts += 1
+            event.last_error = None
+            event.published_at = datetime.now(timezone.utc)
+            session.commit()
+            return True
+
+    def mark_outbox_failed(self, event_id: str, error: str) -> bool:
+        """Record a failed delivery while keeping the event replayable."""
+        with self.get_session() as session:
+            event = session.scalar(
+                select(OutboxEvent).where(OutboxEvent.event_id == event_id)
+            )
+            if event is None:
+                return False
+            event.attempts += 1
+            event.last_error = error[:2000]
+            session.commit()
+            return True
+
     def acknowledge_alert(self, alert_id: str, acknowledged_by: str) -> bool:
         """Mark an alert as acknowledged."""
         with self.get_session() as session:
@@ -477,6 +749,8 @@ class Database:
                 return False
             record.acknowledged = True
             record.acknowledged_by = acknowledged_by
+            record.workflow_status = AlertWorkflowStatus.ACKNOWLEDGED.value
+            self._append_alert_outbox(session, record, "acknowledged")
             session.commit()
             return True
 
@@ -489,8 +763,10 @@ class Database:
             if record is None:
                 return False
             record.false_positive = True
+            record.workflow_status = AlertWorkflowStatus.FALSE_POSITIVE.value
             if notes:
                 record.notes = notes
+            self._append_alert_outbox(session, record, "false_positive")
             session.commit()
             return True
 
@@ -522,6 +798,7 @@ class Database:
                 record.false_positive = True
             if workflow_status == "acknowledged":
                 record.acknowledged = True
+            self._append_alert_outbox(session, record, "workflow_changed")
             session.commit()
             return True
 
@@ -657,6 +934,7 @@ class Database:
                 image_paths.append(record.heatmap_path)
             if recording is not None:
                 session.delete(recording)
+            self._append_alert_outbox(session, record, "deleted")
             session.delete(record)
             session.commit()
             logger.info("database.alert_deleted", alert_id=alert_id)
@@ -714,6 +992,7 @@ class Database:
             for recording in recording_records:
                 session.delete(recording)
             for alert in old_alerts:
+                self._append_alert_outbox(session, alert, "deleted")
                 session.delete(alert)
             session.commit()
 
@@ -823,17 +1102,24 @@ class Database:
         semantics for status transitions.
         """
         with self.get_session() as session:
-            stmt = select(TrainingJobRecord).where(TrainingJobRecord.job_id == job_id)
+            # The status predicate must belong to the UPDATE itself. Selecting
+            # first and then flushing an ORM instance allows two readers to
+            # both observe the old state and both claim/approve the same job.
+            values = {
+                key: value for key, value in kwargs.items()
+                if key in TrainingJobRecord.__mapper__.column_attrs
+            }
+            stmt = update(TrainingJobRecord).where(TrainingJobRecord.job_id == job_id)
             if expected_status is not None:
                 stmt = stmt.where(TrainingJobRecord.status == expected_status)
-            record = session.scalar(stmt)
-            if record is None:
-                return False
-            for key, value in kwargs.items():
-                if hasattr(record, key):
-                    setattr(record, key, value)
+            if not values:
+                query = select(TrainingJobRecord.job_id).where(TrainingJobRecord.job_id == job_id)
+                if expected_status is not None:
+                    query = query.where(TrainingJobRecord.status == expected_status)
+                return session.scalar(query) is not None
+            result = session.execute(stmt.values(**values).execution_options(synchronize_session=False))
             session.commit()
-            return True
+            return result.rowcount == 1
 
     def count_pending_jobs(self) -> int:
         """Count training jobs pending confirmation."""
@@ -844,6 +1130,37 @@ class Database:
             ) or 0
 
     # ── Backbones ──
+
+    def complete_backbone_training_job(
+        self, record: BackboneRecord, *, job_id: str, completed_at: datetime,
+        duration_seconds: float, metrics: str, artifacts_path: str,
+    ) -> bool:
+        """Fence all backbone side effects with the RUNNING job in one commit."""
+        if record.training_job_id != job_id:
+            raise ValueError("backbone training job identity does not match")
+        with self.get_session() as session:
+            completed = session.execute(
+                update(TrainingJobRecord).where(
+                    TrainingJobRecord.job_id == job_id,
+                    TrainingJobRecord.job_type == "ssl_backbone",
+                    TrainingJobRecord.status == "running",
+                ).values(
+                    status="complete", error=None, completed_at=completed_at,
+                    duration_seconds=duration_seconds, metrics=metrics,
+                    artifacts_path=artifacts_path,
+                ).execution_options(synchronize_session=False)
+            )
+            if completed.rowcount != 1:
+                session.rollback()
+                return False
+            session.execute(
+                update(BackboneRecord).where(BackboneRecord.is_active.is_(True))
+                .values(is_active=False).execution_options(synchronize_session=False)
+            )
+            record.is_active = True
+            session.add(record)
+            session.commit()
+            return True
 
     def save_backbone(self, record: BackboneRecord) -> BackboneRecord:
         """Save a backbone record."""

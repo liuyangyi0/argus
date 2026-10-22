@@ -1,5 +1,5 @@
-import { api, u } from './client'
-import type { UserRole } from '../types/api'
+import { api, u, unwrap } from './client'
+import type { ApiResponse, AuditEntry, UserRole } from '../types/api'
 
 export interface UserItem {
   username: string
@@ -47,4 +47,6 @@ export const toggleUserActive = (username: string) =>
   api.post(`/users/${username}/toggle-active/json`).then(u) as Promise<{ username: string; active: boolean }>
 
 export const getAuditLogs = (params?: { page?: number; page_size?: number; user?: string; action?: string }) =>
-  api.get('/audit/json', { params }).then(u)
+  api
+    .get<ApiResponse<{ entries: AuditEntry[]; total: number }>>('/audit/json', { params })
+    .then(unwrap)

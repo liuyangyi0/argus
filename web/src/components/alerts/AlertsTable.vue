@@ -2,8 +2,8 @@
 import { ref, computed, reactive, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import {
-  Table, Tag, Button, Space, Typography, Tooltip,
-  Popover, List, Spin, message, Modal,
+  Tag, Button, Space, Typography, Tooltip,
+  Popover, List, Spin, message,
 } from 'ant-design-vue'
 import {
   CheckCircleOutlined,
@@ -15,6 +15,8 @@ import { useAlertStore } from '../../stores/useAlertStore'
 import { formatRelativeTime, formatTimestamp } from '../../utils/time'
 import { scoreColor } from '../../utils/colors'
 import { extractErrorMessage } from '../../utils/error'
+import ResponsiveTable from '../common/ResponsiveTable.vue'
+import DangerousActionConfirm from '../common/DangerousActionConfirm.vue'
 
 defineOptions({ name: 'AlertsTable' })
 
@@ -50,7 +52,7 @@ function currentPageParams() {
 }
 
 async function fetchCurrentPage() {
-  await store.fetchData(currentPageParams())
+  await store.fetchAlerts(currentPageParams())
 }
 
 // Event group popover state
@@ -108,31 +110,22 @@ async function handleConfirmAnomaly(id: string) {
   try {
     await confirmRealAnomaly(id)
     message.success('已确认真异常，已加入正样本训练集')
-    await store.fetchData()
+    await store.fetchAlerts()
   } catch (e) {
     message.error(extractErrorMessage(e, '确认失败'))
   }
 }
 
-function handleBulkDelete() {
+async function handleBulkDelete() {
   if (!selectedRowKeys.value.length) return
-  Modal.confirm({
-    title: '批量删除',
-    content: `确定要删除选中的 ${selectedRowKeys.value.length} 条告警吗？删除后无法恢复。`,
-    okText: '删除',
-    okType: 'danger',
-    cancelText: '取消',
-    async onOk() {
-      try {
-        const keys = selectedRowKeys.value as string[]
-        const res = await store.bulkDel(keys)
-        message.success(res.message || `已删除 ${res.count} 条`)
-        selectedRowKeys.value = []
-      } catch (e) {
-        message.error(extractErrorMessage(e, '批量删除失败'))
-      }
-    },
-  })
+  try {
+    const keys = selectedRowKeys.value as string[]
+    const res = await store.bulkDel(keys)
+    message.success(res.message || `已删除 ${res.count} 条`)
+    selectedRowKeys.value = []
+  } catch (e) {
+    message.error(extractErrorMessage(e, '批量删除失败'))
+  }
 }
 
 async function handleBulkAcknowledge() {
@@ -186,6 +179,31 @@ function rowClassName(record: any) {
   if (record.severity === 'high' && record.workflow_status === 'new') return 'alert-row-high'
   if (record.severity === 'medium' && record.workflow_status === 'new') return 'alert-row-medium'
   return ''
+}
+
+function tableRowProps(record: any) {
+  return {
+    class: rowClassName(record),
+    role: 'button',
+    tabindex: 0,
+    'data-alert-id': record.alert_id,
+    'aria-label': `查看告警 ${record.alert_id} 详情`,
+    onClick: () => handleRowClick(record),
+    onKeydown: (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      const interactiveTarget = target?.closest(
+        'button, a, input, select, textarea, [role="button"]',
+      )
+      // The row itself deliberately has role="button". Only suppress events
+      // coming from a nested control; otherwise the row's own Enter/Space
+      // activation would always be discarded by the selector above.
+      if (interactiveTarget && interactiveTarget !== event.currentTarget) return
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        handleRowClick(record)
+      }
+    },
+  }
 }
 
 const tablePaginationConfig = computed(() => {
@@ -289,16 +307,22 @@ const columns = computed(() => {
         <template #icon><StopOutlined /></template>
         批量误报
       </Button>
-      <Button size="small" danger @click="handleBulkDelete">
+      <DangerousActionConfirm
+        title="批量删除告警"
+        :description="`确定要删除选中的 ${selectedRowKeys.length} 条告警吗？删除后无法恢复。`"
+        action-label="批量删除"
+        aria-label="批量删除所选告警"
+        confirm-text="删除"
+        @confirm="handleBulkDelete"
+      >
         <template #icon><DeleteOutlined /></template>
-        批量删除
-      </Button>
+      </DangerousActionConfirm>
       <Button size="small" type="text" style="color: #9ca3af" @click="selectedRowKeys = []">
         取消选择
       </Button>
     </div>
 
-    <Table
+    <ResponsiveTable
       :columns="columns"
       :data-source="alerts"
       :loading="loading"
@@ -306,11 +330,10 @@ const columns = computed(() => {
       size="small"
       :row-selection="{ selectedRowKeys, onChange: (keys: (string | number)[]) => { selectedRowKeys = keys } }"
       :pagination="tablePaginationConfig"
-      :custom-row="(record: any) => ({
-        onClick: () => handleRowClick(record),
-        class: rowClassName(record),
-      })"
+      :custom-row="tableRowProps"
       :scroll="{ x: 800, y: selectedAlert ? 'calc(100vh - 160px)' : undefined }"
+      :min-width="800"
+      accessible-label="告警列表，可横向滚动；使用上下方向键切换详情"
       style="cursor: pointer"
       @change="handleTableChange"
     >
@@ -320,6 +343,7 @@ const columns = computed(() => {
             <img
               v-if="record.snapshot_path"
               :src="`/api/alerts/${record.alert_id}/image/snapshot`"
+              :alt="`告警 ${record.alert_id} 快照`"
               class="alert-thumb-img"
               loading="lazy"
             />
@@ -368,7 +392,12 @@ const columns = computed(() => {
               <Tag
                 color="default"
                 style="margin: 0; font-size: 10px; cursor: pointer"
+                role="button"
+                tabindex="0"
+                :aria-label="`查看同组的 ${record.event_group_count} 条告警`"
                 @click.stop="toggleGroupPopover(record.event_group_id)"
+                @keydown.enter.stop="toggleGroupPopover(record.event_group_id)"
+                @keydown.space.prevent.stop="toggleGroupPopover(record.event_group_id)"
               >
                 x{{ record.event_group_count }}
               </Tag>
@@ -426,7 +455,7 @@ const columns = computed(() => {
           </Space>
         </template>
       </template>
-    </Table>
+    </ResponsiveTable>
   </div>
 </template>
 
@@ -518,7 +547,12 @@ const columns = computed(() => {
   padding: 6px 8px !important;
 }
 
-.ant-table-tbody > tr {
+.alert-list-body .ant-table-tbody > tr {
   transition: background .15s ease;
+}
+
+.alert-list-body .ant-table-tbody > tr:focus-visible {
+  outline: 3px solid rgba(22, 119, 255, 0.45);
+  outline-offset: -3px;
 }
 </style>

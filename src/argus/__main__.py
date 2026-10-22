@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
 import signal
 import sys
@@ -17,7 +18,7 @@ from argus.alerts.grader import Alert
 from argus.capture.manager import CameraManager
 from argus.config.loader import load_config
 from argus.core.event_bus import EventBus
-from argus.core.health import HealthMonitor
+from argus.core.health import HealthMonitor, runtime_detection_health
 from argus.core.metrics import METRICS
 from argus.core.scheduler import (
     TaskScheduler,
@@ -45,6 +46,48 @@ from argus.storage.inference_buffer import InferenceBuffer
 from argus.storage.inference_store import InferenceRecordStore
 
 logger = structlog.get_logger()
+
+
+def _is_loopback_dashboard_host(host: str | None) -> bool:
+    """Return True only for explicit local-only dashboard bind addresses."""
+    value = (host or "").strip().lower()
+    if value == "localhost":
+        return True
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _dashboard_exposed_without_auth(config: object) -> bool:
+    """Return whether Dashboard is externally reachable while auth is disabled."""
+    dashboard = getattr(config, "dashboard", None)
+    if dashboard is None:
+        return False
+
+    auth = getattr(config, "auth", None)
+    auth_enabled = bool(getattr(auth, "enabled", False))
+    host = getattr(dashboard, "host", "")
+    return not auth_enabled and not _is_loopback_dashboard_host(str(host))
+
+
+def _warn_if_dashboard_exposed_without_auth(config: object) -> None:
+    """Log a non-blocking warning for unsafe production-facing auth config."""
+    if not _dashboard_exposed_without_auth(config):
+        return
+
+    dashboard = getattr(config, "dashboard", None)
+    logger.warning(
+        "dashboard.auth_disabled_external_bind",
+        host=getattr(dashboard, "host", ""),
+        port=getattr(dashboard, "port", ""),
+        msg=(
+            "Dashboard is bound to a non-loopback address while auth is disabled; "
+            "enable auth before external or production exposure."
+        ),
+    )
 
 
 def _dashboard_thread_alive(dashboard_thread: threading.Thread | None) -> bool:
@@ -185,6 +228,7 @@ def main():
 
     # Set up file logging with rotation (after config is loaded)
     _setup_file_logging(config, log_level)
+    _warn_if_dashboard_exposed_without_auth(config)
 
     # Filter cameras if specified
     cameras = config.cameras
@@ -334,7 +378,10 @@ def main():
             api_port=dashboard_cfg.go2rtc_api_port,
             rtsp_port=dashboard_cfg.go2rtc_rtsp_port,
             webrtc_port=dashboard_cfg.go2rtc_webrtc_port,
+            webrtc_listen_host=dashboard_cfg.go2rtc_webrtc_listen_host,
             binary_path=dashboard_cfg.go2rtc_binary,
+            config_dir=dashboard_cfg.go2rtc_config_dir,
+            replace_stale_process=dashboard_cfg.go2rtc_replace_stale_process,
         )
         _stream_registry = StreamRegistry(_go2rtc)
         setattr(_go2rtc, "_stream_registry", _stream_registry)
@@ -342,11 +389,25 @@ def main():
             _stream_registry.reconcile(cameras)
         except Exception as exc:
             logger.warning("go2rtc.start_failed", error=str(exc))
+            try:
+                _go2rtc.close()
+            except Exception:
+                logger.debug("go2rtc.start_cleanup_failed", exc_info=True)
             _go2rtc = None
             _stream_registry = None
+            if any(getattr(camera, "protocol", None) == "usb" for camera in cameras):
+                raise RuntimeError(
+                    "go2rtc is required for configured USB cameras; refusing "
+                    "to compete for the device through direct capture"
+                ) from exc
 
     def _resolve_camera_source(cam_config):
+        usb_camera = getattr(cam_config, "protocol", None) == "usb"
         if _go2rtc is None or not _go2rtc.running:
+            if usb_camera:
+                raise RuntimeError(
+                    "USB camera requires the owned go2rtc capture path"
+                )
             return cam_config
         try:
             if _camera_orchestrator is not None:
@@ -363,9 +424,17 @@ def main():
                 camera_id=getattr(cam_config, "camera_id", None),
                 error=str(exc),
             )
+            if usb_camera:
+                raise RuntimeError(
+                    "USB runtime source resolution failed closed"
+                ) from exc
             return cam_config
         if resolution is None:
+            if usb_camera:
+                raise RuntimeError("USB camera has no go2rtc source resolution")
             return cam_config
+        if usb_camera and getattr(resolution, "go2rtc_managed", False) is not True:
+            raise RuntimeError("USB camera go2rtc registration is not active")
         return _stream_registry.runtime_camera_config(cam_config, resolution)
 
     # Active learning sampler — subscribes to FrameAnalyzed events and
@@ -382,11 +451,12 @@ def main():
     # External sensor fusion — shared between CameraManager (for grader)
     # and create_app (for HTTP API). Build it here so both sides point at
     # the same in-memory store.
-    from argus.sensors.fusion import SensorFusion
+    from argus.sensors.fusion import SensorFusion, SensorFusionHead
     fusion_cfg = getattr(config, "sensor_fusion", None)
     sensor_fusion = SensorFusion(
         enabled=bool(getattr(fusion_cfg, "enabled", False)),
         default_valid_for_s=float(getattr(fusion_cfg, "default_valid_for_s", 60.0)),
+        head=SensorFusionHead.from_config(fusion_cfg),
     )
 
     # Start camera manager with all cameras
@@ -408,6 +478,7 @@ def main():
         sensor_fusion=sensor_fusion,
         inference_buffer=inference_buffer,
         source_resolver=_resolve_camera_source if _go2rtc is not None else None,
+        baselines_dir=config.storage.baselines_dir,
     )
     if _stream_registry is not None:
         from argus.camera.orchestrator import CameraOrchestrator
@@ -620,15 +691,15 @@ def main():
                     payload,
                 )
 
-            for cam_id, pipeline in manager._pipelines.items():
-                try:
-                    pipeline.set_degradation_publisher(_publish_pipeline_degradation)
-                except Exception as exc:
-                    logger.warning(
-                        "main.degradation_publisher_wire_failed",
-                        camera_id=cam_id,
-                        error=str(exc),
-                    )
+            failures = manager.set_degradation_publisher(
+                _publish_pipeline_degradation
+            )
+            for cam_id, error in failures.items():
+                logger.warning(
+                    "main.degradation_publisher_wire_failed",
+                    camera_id=cam_id,
+                    error=error,
+                )
 
             # Wire the unified error channel publisher: any logger.error site
             # that also calls ErrorChannel.emit() will surface to the
@@ -652,12 +723,28 @@ def main():
             time.sleep(1.0)
 
             # Update health and Prometheus metrics for each camera
-            for status in manager.get_status():
+            camera_statuses = manager.get_status()
+            health.retain_cameras(status.camera_id for status in camera_statuses)
+            for status in camera_statuses:
+                try:
+                    runtime_health = runtime_detection_health(
+                        manager.get_scene_guard_status(status.camera_id),
+                        manager.get_model_statuses_snapshot(status.camera_id),
+                        pipeline_mode=manager.get_pipeline_mode(status.camera_id),
+                    )
+                except Exception:
+                    logger.debug(
+                        "health.runtime_snapshot_failed",
+                        camera_id=status.camera_id,
+                        exc_info=True,
+                    )
+                    runtime_health = runtime_detection_health(None, [])
                 health.update_camera(
                     camera_id=status.camera_id,
                     connected=status.connected,
                     frames_captured=status.stats.frames_captured if status.stats else 0,
                     avg_latency_ms=status.stats.avg_latency_ms if status.stats else 0,
+                    **runtime_health,
                 )
                 METRICS.camera_status.labels(camera_id=status.camera_id).set(
                     1.0 if status.connected else 0.0,

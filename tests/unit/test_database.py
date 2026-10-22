@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy.orm import Session
 
 from argus.storage.database import Database
 from argus.storage.models import AlertRecordingRecord
@@ -75,6 +76,11 @@ class TestDatabase:
         alerts = db.get_alerts()
         assert alerts[0].acknowledged is True
         assert alerts[0].acknowledged_by == "operator_wang"
+        assert alerts[0].workflow_status == "acknowledged"
+        pending = db.get_pending_outbox_events()
+        assert len(pending) == 1
+        assert pending[0].event_type == "acknowledged"
+        assert pending[0].to_dict()["payload"]["acknowledged"] is True
 
     def test_acknowledge_nonexistent_alert(self, db):
         """Should return False for nonexistent alert."""
@@ -92,6 +98,91 @@ class TestDatabase:
         alerts = db.get_alerts()
         assert alerts[0].false_positive is True
         assert alerts[0].notes == "Light reflection"
+        assert alerts[0].workflow_status == "false_positive"
+
+    def test_alert_and_created_event_commit_to_same_outbox_transaction(self, db):
+        """A created notification is durable before any broadcaster sees it."""
+        event_id = "f6b00b2a-8074-4b6d-b704-087f27d17d37"
+        db.save_alert(
+            "ALT-OUTBOX",
+            datetime.now(tz=timezone.utc),
+            "cam_01",
+            "z1",
+            "high",
+            0.97,
+            outbox_event={
+                "event_id": event_id,
+                "topic": "alerts",
+                "event_type": "created",
+                "resource_id": "ALT-OUTBOX",
+                "payload": {"alert_id": "ALT-OUTBOX", "type": "created"},
+            },
+        )
+
+        assert db.get_alert("ALT-OUTBOX") is not None
+        pending = db.get_pending_outbox_events()
+        assert [event.event_id for event in pending] == [event_id]
+        assert db.mark_outbox_failed(event_id, "queue full") is True
+        assert db.get_pending_outbox_events()[0].attempts == 1
+        assert db.mark_outbox_published(event_id) is True
+        assert db.get_pending_outbox_events() == []
+
+    def test_save_alert_recovers_unknown_commit_without_reinserting(
+        self, db, monkeypatch
+    ):
+        """A lost commit acknowledgement is resolved by alert/event IDs."""
+        event_id = "48bd5425-451a-484b-a9db-9e20a9026d45"
+        real_commit = Session.commit
+        commit_calls = 0
+
+        def commit_then_lose_ack(session):
+            nonlocal commit_calls
+            real_commit(session)
+            commit_calls += 1
+            if commit_calls == 1:
+                raise RuntimeError("connection lost after server commit")
+
+        monkeypatch.setattr(Session, "commit", commit_then_lose_ack)
+
+        record = db.save_alert(
+            "ALT-COMMIT-UNKNOWN",
+            datetime.now(tz=timezone.utc),
+            "cam_01",
+            "z1",
+            "high",
+            0.98,
+            outbox_event={
+                "event_id": event_id,
+                "topic": "alerts",
+                "event_type": "created",
+                "resource_id": "ALT-COMMIT-UNKNOWN",
+                "payload": {
+                    "alert_id": "ALT-COMMIT-UNKNOWN",
+                    "type": "created",
+                },
+            },
+        )
+
+        assert record.alert_id == "ALT-COMMIT-UNKNOWN"
+        assert record.id is not None
+        assert commit_calls == 1
+        assert db.get_alert_count() == 1
+        pending = db.get_pending_outbox_events()
+        assert [event.event_id for event in pending] == [event_id]
+        assert pending[0].resource_id == "ALT-COMMIT-UNKNOWN"
+
+    def test_confirmed_anomaly_is_a_valid_workflow_transition(self, db):
+        db.save_alert(
+            "ALT-CONFIRMED",
+            datetime.now(tz=timezone.utc),
+            "cam_01",
+            "z1",
+            "medium",
+            0.88,
+        )
+
+        assert db.update_alert_workflow("ALT-CONFIRMED", "confirmed_anomaly") is True
+        assert db.get_alert("ALT-CONFIRMED").workflow_status == "confirmed_anomaly"
 
     def test_get_alert_count(self, db):
         """Should return correct alert count."""
@@ -326,6 +417,18 @@ class TestDatabase:
         assert len(remaining) == 1
         assert remaining[0].alert_id == "ALT-NEW"
 
+        tombstones = db.get_pending_outbox_events()
+        assert {event.resource_id for event in tombstones} == {
+            "ALT-OLD-1",
+            "ALT-OLD-2",
+        }
+        assert {event.event_type for event in tombstones} == {"deleted"}
+        for event in tombstones:
+            payload = event.to_dict()["payload"]
+            assert payload["type"] == "deleted"
+            assert payload["resource_id"] == event.resource_id
+            assert payload["alert_id"] == event.resource_id
+
     def test_delete_alert_removes_recording_metadata(self, db):
         """Deleting one alert should not leave stale alert_recordings rows."""
         now = datetime.now(tz=timezone.utc)
@@ -351,6 +454,28 @@ class TestDatabase:
         assert paths == []
         assert db.get_alert("ALT-REC") is None
         assert db.get_alert_recording("ALT-REC") is None
+        tombstones = db.get_pending_outbox_events()
+        assert len(tombstones) == 1
+        assert tombstones[0].event_type == "deleted"
+        assert tombstones[0].resource_id == "ALT-REC"
+        assert tombstones[0].to_dict()["payload"]["alert_id"] == "ALT-REC"
+
+    def test_delete_alert_rolls_back_when_tombstone_cannot_be_written(
+        self, db, monkeypatch
+    ):
+        now = datetime.now(tz=timezone.utc)
+        db.save_alert("ALT-DELETE-ROLLBACK", now, "cam_01", "z1", "high", 0.96)
+
+        def reject_tombstone(_session, _record, _event_type):
+            raise RuntimeError("outbox unavailable")
+
+        monkeypatch.setattr(db, "_append_alert_outbox", reject_tombstone)
+
+        with pytest.raises(RuntimeError, match="outbox unavailable"):
+            db.delete_alert("ALT-DELETE-ROLLBACK")
+
+        assert db.get_alert("ALT-DELETE-ROLLBACK") is not None
+        assert db.get_pending_outbox_events() == []
 
     def test_delete_old_alerts_can_return_recording_paths(self, db):
         """Scheduled cleanup can request recording dirs while old callers cannot."""
@@ -398,6 +523,34 @@ class TestDatabase:
         assert recording_paths == ["/tmp/recordings/2020-01-01/cam_01/ALT-OLD-REC"]
         assert db.get_alert_recording("ALT-OLD-REC") is None
         assert db.get_alert_recording("ALT-NEW-REC") is not None
+
+    def test_delete_old_alerts_rolls_back_deletes_and_tombstones_together(
+        self, db, monkeypatch
+    ):
+        old_time = datetime.now(tz=timezone.utc) - timedelta(days=100)
+        db.save_alert("ALT-OLD-ROLLBACK-1", old_time, "cam_01", "z1", "low", 0.72)
+        db.save_alert("ALT-OLD-ROLLBACK-2", old_time, "cam_01", "z1", "low", 0.73)
+
+        append_tombstone = db._append_alert_outbox
+        append_calls = 0
+
+        def fail_second_tombstone(session, record, event_type):
+            nonlocal append_calls
+            append_calls += 1
+            if append_calls == 2:
+                raise RuntimeError("second tombstone failed")
+            return append_tombstone(session, record, event_type)
+
+        monkeypatch.setattr(db, "_append_alert_outbox", fail_second_tombstone)
+
+        with pytest.raises(RuntimeError, match="second tombstone failed"):
+            db.delete_old_alerts(days=90)
+
+        assert {alert.alert_id for alert in db.get_alerts()} == {
+            "ALT-OLD-ROLLBACK-1",
+            "ALT-OLD-ROLLBACK-2",
+        }
+        assert db.get_pending_outbox_events() == []
 
     def test_delete_old_alerts_none_to_delete(self, db):
         """Should handle case where no alerts are old enough."""

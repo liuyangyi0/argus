@@ -233,6 +233,149 @@ class TestHeatmapMerge:
         top_left = result.anomaly_map[0:256, 0:256]
         assert top_left.max() > 0.5
 
+    def test_model_map_drops_mixed_output_spaces(self, mock_base_detector):
+        """One incompatible tile makes the composite model map unavailable."""
+        call_idx = 0
+
+        def mock_predict(frame):
+            nonlocal call_idx
+            call_idx += 1
+            h, _w = frame.shape[:2]
+            if h > 512:  # Full-frame inference, same space as the winning tile.
+                return AnomalyResult(
+                    anomaly_score=0.2,
+                    anomaly_map=np.zeros((8, 8), dtype=np.float32),
+                    is_anomalous=False,
+                    threshold=0.7,
+                    model_score=1.0,
+                    model_anomaly_map=np.ones((8, 8), dtype=np.float32),
+                    model_output_space="space-a",
+                    model_output_comparable=True,
+                )
+            if call_idx == 1:
+                return AnomalyResult(
+                    anomaly_score=0.9,
+                    anomaly_map=np.zeros((8, 8), dtype=np.float32),
+                    is_anomalous=True,
+                    threshold=0.7,
+                    detection_failed=False,
+                    raw_score=0.87,
+                    model_score=12.5,
+                    model_anomaly_map=np.full((8, 8), 2.0, dtype=np.float32),
+                    model_output_space="space-a",
+                    model_output_comparable=True,
+                )
+            return AnomalyResult(
+                anomaly_score=0.1,
+                anomaly_map=np.zeros((8, 8), dtype=np.float32),
+                is_anomalous=False,
+                threshold=0.7,
+                model_score=99.0,
+                model_anomaly_map=np.full((8, 8), 99.0, dtype=np.float32),
+                model_output_space="space-b",
+                model_output_comparable=True,
+            )
+
+        mock_base_detector.predict.side_effect = mock_predict
+        ms = MultiScaleDetector(mock_base_detector, tile_size=512, tile_overlap=0.25)
+
+        result = ms.predict(np.zeros((1080, 1920, 3), dtype=np.uint8))
+
+        assert result.model_score == 12.5
+        assert result.raw_score == 0.87
+        assert result.detection_failed is False
+        assert result.model_output_space == "space-a"
+        assert result.model_output_comparable is False
+        assert result.model_anomaly_map is None
+
+    def test_model_map_merges_when_every_result_uses_same_space(
+        self, mock_base_detector
+    ):
+        call_idx = 0
+
+        def mock_predict(frame):
+            nonlocal call_idx
+            call_idx += 1
+            h, _w = frame.shape[:2]
+            score = 0.9 if call_idx == 1 else 0.2
+            value = 2.0 if call_idx == 1 else 1.0
+            return AnomalyResult(
+                anomaly_score=score,
+                anomaly_map=np.zeros((8, 8), dtype=np.float32),
+                is_anomalous=score >= 0.7,
+                threshold=0.7,
+                model_score=value,
+                model_anomaly_map=np.full((8, 8), value, dtype=np.float32),
+                model_output_space="space-a",
+                model_output_comparable=True,
+            )
+
+        mock_base_detector.predict.side_effect = mock_predict
+        ms = MultiScaleDetector(mock_base_detector, tile_size=512, tile_overlap=0.25)
+
+        result = ms.predict(np.zeros((1080, 1920, 3), dtype=np.uint8))
+
+        assert result.model_output_space == "space-a"
+        assert result.model_output_comparable is True
+        assert result.model_anomaly_map is not None
+        assert float(result.model_anomaly_map.max()) == pytest.approx(2.0)
+
+    def test_model_map_is_dropped_when_winning_output_is_not_comparable(
+        self, mock_base_detector
+    ):
+        """A raw/minmax-broken winning result must not become calibrated by tiling."""
+        mock_base_detector.predict.return_value = AnomalyResult(
+            anomaly_score=0.8,
+            anomaly_map=np.ones((8, 8), dtype=np.float32),
+            is_anomalous=True,
+            threshold=0.7,
+            model_score=42.0,
+            model_anomaly_map=np.full((8, 8), 42.0, dtype=np.float32),
+            model_output_space="anomalib_inner_raw",
+            model_output_comparable=False,
+        )
+        ms = MultiScaleDetector(mock_base_detector, tile_size=512, tile_overlap=0.25)
+
+        result = ms.predict(np.zeros((1080, 1920, 3), dtype=np.uint8))
+
+        assert result.model_score == 42.0
+        assert result.model_output_space == "anomalib_inner_raw"
+        assert result.model_output_comparable is False
+        assert result.model_anomaly_map is None
+
+    def test_partial_tile_failure_drops_model_map_instead_of_zero_filling(
+        self, mock_base_detector
+    ):
+        call_idx = 0
+
+        def mock_predict(_frame):
+            nonlocal call_idx
+            call_idx += 1
+            return AnomalyResult(
+                anomaly_score=0.8 if call_idx == 1 else 0.1,
+                anomaly_map=np.ones((8, 8), dtype=np.float32),
+                is_anomalous=call_idx == 1,
+                threshold=0.7,
+                detection_failed=call_idx == 2,
+                model_score=0.8,
+                model_anomaly_map=np.ones((8, 8), dtype=np.float32),
+                model_output_space="space-a",
+                model_output_comparable=True,
+            )
+
+        mock_base_detector.predict.side_effect = mock_predict
+        detector = MultiScaleDetector(
+            mock_base_detector,
+            tile_size=512,
+            tile_overlap=0.25,
+        )
+
+        result = detector.predict(np.zeros((720, 1280, 3), dtype=np.uint8))
+
+        assert result.detection_failed is True
+        assert result.model_output_comparable is False
+        assert result.model_anomaly_map is None
+
 
 class TestMultiScaleInterface:
     def test_same_interface_as_base(self, mock_base_detector):

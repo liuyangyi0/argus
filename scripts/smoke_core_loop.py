@@ -57,6 +57,11 @@ from argus.runtime.dev_video import DEV_VIDEO_MOTIONS, create_dev_video
 from argus.streaming.preview_gateway import PreviewGateway
 from argus.storage.alert_recording import AlertRecordingStore
 from argus.storage.database import Database
+from argus.storage.model_release_service import (
+    RuntimeReleaseCommit,
+    RuntimeReleaseIdentity,
+    RuntimeReleasePreparation,
+)
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.release_pipeline import ReleasePipeline
 
@@ -167,6 +172,55 @@ class _FakeRuntimeManager:
         self.reload_calls.append((camera_id, model_path, version_tag))
         return True
 
+    def prepare_model_release(self, plan) -> RuntimeReleasePreparation:
+        """Prove the release API contract without loading a fake model file."""
+
+        manager = self
+
+        class Transaction:
+            committed = False
+
+            def commit(self) -> RuntimeReleaseCommit:
+                if self.committed:
+                    return RuntimeReleaseCommit(False, error="already committed")
+                self.committed = True
+                manager.release_state_calls.append(plan.target_stage)
+                primary_version = (
+                    plan.model_version_id
+                    if plan.target_stage in {"canary", "production"}
+                    else None
+                )
+                return RuntimeReleaseCommit(
+                    True,
+                    state={
+                        "camera_id": plan.camera_id,
+                        "primary_model_version": primary_version,
+                        "primary_model_stage": (
+                            plan.target_stage if primary_version else None
+                        ),
+                        "errors": [],
+                    },
+                )
+
+            def abort(self) -> RuntimeReleaseCommit:
+                self.committed = False
+                return RuntimeReleaseCommit(True, state={"restored": True})
+
+            def finalize(self) -> RuntimeReleaseCommit:
+                return RuntimeReleaseCommit(True, state={"released": True})
+
+        return RuntimeReleasePreparation(
+            success=True,
+            identity=RuntimeReleaseIdentity(
+                camera_id=plan.camera_id,
+                model_version_id=plan.model_version_id,
+                target_stage=plan.target_stage,
+                runtime_artifact_sha256=plan.runtime_artifact_sha256,
+            ),
+            transaction=Transaction(),
+            state={"smoke_runtime": "prepared"},
+        )
+
 
 def _api_data(response, *, label: str) -> Any:
     if response.status_code >= 400:
@@ -177,6 +231,77 @@ def _api_data(response, *, label: str) -> Any:
     if payload.get("code") != 0:
         raise SmokeFailure(f"{label} failed: {payload}")
     return payload.get("data")
+
+
+def _wait_release_applied(client, submitted: dict, *, timeout_s: float = 60) -> dict:
+    operation_id = submitted.get("operation_id") or (
+        submitted.get("operation") or {}
+    ).get("operation_id")
+    if not operation_id:
+        raise SmokeFailure("release acceptance has no operation_id")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        operation = _api_data(
+            client.get(f"/api/models/release-operations/{operation_id}"),
+            label="release operation",
+        ).get("operation") or {}
+        if operation.get("status") == "failed":
+            raise SmokeFailure(f"release operation failed: {operation.get('error')}")
+        if operation.get("status") == "applied":
+            models = _api_data(client.get("/api/models/json"), label="applied models")
+            model = next((row for row in models.get("models", []) if
+                          row.get("model_version_id") == operation.get("model_version_id")), None)
+            if model is None:
+                raise SmokeFailure("applied release model is missing")
+            return {
+                **submitted,
+                "operation": operation,
+                "model": model,
+                "runtime_synced": True,
+                "runtime_state": operation.get("runtime_state"),
+            }
+        time.sleep(0.1)
+    raise SmokeFailure(f"release operation {operation_id} timed out")
+
+
+def _expect_legacy_model_command_closed(
+    response,
+    *,
+    label: str,
+    message_fragment: str,
+) -> dict[str, Any]:
+    """Require a legacy model mutation endpoint to fail closed with 409."""
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise SmokeFailure(
+            f"{label} did not return the JSON error envelope: {response.text[:500]}"
+        ) from exc
+    message = str(payload.get("msg") or payload.get("message") or "")
+    if response.status_code != 409 or payload.get("code") == 0:
+        raise SmokeFailure(
+            f"{label} did not fail closed with HTTP 409: "
+            f"status={response.status_code}, body={payload}"
+        )
+    if message_fragment not in message:
+        raise SmokeFailure(f"{label} returned an unexpected reason: {payload}")
+    return {
+        "status": "fail_closed",
+        "http_status": response.status_code,
+        "message": message,
+        "data": payload.get("data"),
+    }
+
+
+def _production_release_gate_satisfied(model_system_flow: dict[str, Any]) -> bool:
+    """Only a literal applied production release may make the smoke succeed."""
+
+    production = model_system_flow.get("production") or {}
+    return bool(
+        production.get("status") == "released"
+        and production.get("production_ready") is True
+    )
 
 
 def _wait_for(
@@ -1344,25 +1469,6 @@ def _run_models_and_system_smoke(
     (baseline_dir / "baseline.png").write_bytes(b"png")
 
     registry = ModelRegistry(session_factory=database.get_session)
-    pipeline = app.state._release_pipeline
-
-    previous_model_dir = work_dir / "models" / camera_id / "default" / "smoke-previous"
-    previous_model_dir.mkdir(parents=True, exist_ok=True)
-    (previous_model_dir / "model.xml").write_text("<xml/>", encoding="utf-8")
-    previous_version_id = registry.register(
-        previous_model_dir,
-        baseline_dir,
-        camera_id,
-        "patchcore",
-        training_params={"seed": "previous-production"},
-    )
-    for target_stage in ("shadow", "canary", "production"):
-        pipeline.transition(
-            model_version_id=previous_version_id,
-            target_stage=target_stage,
-            triggered_by="smoke",
-            canary_camera_id=camera_id if target_stage == "canary" else None,
-        )
 
     job = _api_data(
         client.post(
@@ -1419,7 +1525,6 @@ def _run_models_and_system_smoke(
             "triggered_by": "smoke",
             "canary_camera_id": camera_id,
         },
-        {"target_stage": "production", "triggered_by": "smoke"},
     ]
     release_states = []
     for body in stages:
@@ -1427,16 +1532,90 @@ def _run_models_and_system_smoke(
             client.post(f"/api/models/{version_id}/promote", json=body),
             label=f"promote model to {body['target_stage']}",
         )
+        result = _wait_release_applied(client, result)
         release_states.append(result.get("model", {}).get("stage"))
         if result.get("runtime_synced") is not True:
             raise SmokeFailure(f"runtime did not sync on promotion: {result}")
 
-    rollback = _api_data(
-        client.post(f"/api/models/{version_id}/rollback"),
-        label="rollback model",
+    production_response = client.post(
+        f"/api/models/{version_id}/promote",
+        json={
+            "target_stage": "production",
+            "triggered_by": "smoke",
+            "reason": "verify production release evidence gate",
+        },
     )
-    if rollback.get("runtime_synced") is not True:
-        raise SmokeFailure(f"rollback runtime did not sync: {rollback}")
+    try:
+        production_payload = production_response.json()
+    except Exception as exc:
+        raise SmokeFailure(
+            "production NO-GO did not return a JSON error envelope"
+        ) from exc
+    production_message = str(
+        production_payload.get("msg")
+        or production_payload.get("message")
+        or production_payload
+    )
+    if (
+        not 400 <= production_response.status_code < 500
+        or "release_evidence_sources" not in production_message
+    ):
+        raise SmokeFailure(
+            "production promotion without trusted evidence did not fail closed: "
+            f"HTTP {production_response.status_code} {production_payload}"
+        )
+
+    legacy_commands = {
+        "activate": _expect_legacy_model_command_closed(
+            client.post(f"/api/models/{version_id}/activate"),
+            label="legacy direct model activation",
+            message_fragment="直接激活入口已关闭",
+        ),
+        "rollback": _expect_legacy_model_command_closed(
+            client.post(f"/api/models/{version_id}/rollback"),
+            label="legacy model rollback",
+            message_fragment="回滚入口已安全关闭",
+        ),
+        "reload": _expect_legacy_model_command_closed(
+            client.post(
+                "/api/config/reload-model",
+                json={
+                    "camera_id": camera_id,
+                    "model_path": f"registry://{version_id}",
+                },
+            ),
+            label="legacy path model reload",
+            message_fragment="按路径直接热加载模型的入口已关闭",
+        ),
+    }
+    if (legacy_commands["reload"].get("data") or {}).get("runtime_changed") is not False:
+        raise SmokeFailure(
+            "legacy path model reload did not explicitly prove runtime_changed=false"
+        )
+
+    models = _api_data(
+        client.get("/api/models/json", params={"camera_id": camera_id}),
+        label="models after blocked release commands",
+    )
+    rows = {
+        row.get("model_version_id"): row
+        for row in models.get("models", [])
+    }
+    candidate = rows.get(version_id)
+    if (
+        candidate is None
+        or candidate.get("stage") != "canary"
+        or candidate.get("is_active") is True
+    ):
+        raise SmokeFailure(
+            f"blocked model commands changed the candidate state: {candidate}"
+        )
+    if any(row.get("is_active") is True for row in rows.values()):
+        raise SmokeFailure("unapproved smoke model unexpectedly became active")
+    if fake_runtime.reload_calls:
+        raise SmokeFailure(
+            f"legacy model command touched runtime reload: {fake_runtime.reload_calls}"
+        )
 
     config_patch = _api_data(
         client.post(
@@ -1473,7 +1652,15 @@ def _run_models_and_system_smoke(
         "model_version_id": version_id,
         "reexport": reexport,
         "release_stages": release_states,
-        "rollback_activated": rollback.get("activated"),
+        "production": {
+            "status": "blocked_by_release_evidence",
+            "production_ready": False,
+            "http_status": production_response.status_code,
+            "message": production_message,
+            "candidate_stage_after_rejection": candidate.get("stage"),
+        },
+        "legacy_commands": legacy_commands,
+        "rollback_activated": None,
         "config_patch": config_patch,
         "module_toggle": module_toggle,
         "degradation": degradation.get("anomaly"),
@@ -1788,6 +1975,8 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     manager: CameraManager | None = None
     dispatcher: AlertDispatcher | None = None
     go2rtc = None
+    client = None
+    client_entered = False
     try:
         video_path = work_dir / "dev_camera.avi"
         camera_resolution = _parse_resolution(args.camera_resolution)
@@ -1857,7 +2046,12 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             stream_registry=stream_registry,
         )
         app.state.recording_store = recording_store
+        app.state._release_pipeline = ReleasePipeline(
+            database.get_session, min_shadow_days=0, min_canary_days=0,
+        )
         client = TestClient(app)
+        client.__enter__()
+        client_entered = True
 
         if args.expect_no_alert:
             camera_flow = _run_camera_no_alert(
@@ -1916,9 +2110,15 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             work_dir=work_dir,
             camera_id=camera_id,
         )
+        production_gate = model_system_flow.get("production") or {}
 
         return {
-            "ok": True,
+            # This smoke proves that the functional loop works and that unsafe
+            # commands are closed.  It must still return non-success while the
+            # v3 regression + trusted-soak production evidence is absent.
+            "ok": _production_release_gate_satisfied(model_system_flow),
+            "functional_checks_ok": True,
+            "release_gate_status": production_gate.get("status"),
             "work_dir": str(work_dir),
             "config": str(config_path),
             "video": str(video_path) if args.camera_source is None else None,
@@ -1939,6 +2139,8 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "models_system": model_system_flow,
         }
     finally:
+        if client_entered:
+            client.__exit__(None, None, None)
         if manager is not None:
             manager.stop_all()
         if dispatcher is not None:

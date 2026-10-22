@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from argus.prefilter.fast_motion import FastMotionDetector
+from argus.prefilter.fast_motion import FastMotionCandidate, FastMotionDetector
 
 
 def _blank_frame() -> np.ndarray:
@@ -13,6 +13,16 @@ def _blank_frame() -> np.ndarray:
 
 def _gray_frame(value: int) -> np.ndarray:
     return np.full((1080, 1920, 3), value, dtype=np.uint8)
+
+
+def _candidate_at(x: float, y: float = 300.0) -> FastMotionCandidate:
+    return FastMotionCandidate(
+        bbox=(int(x) - 2, int(y) - 2, int(x) + 2, int(y) + 2),
+        centroid=(x, y),
+        area_px=16,
+        streak_length_px=4.0,
+        confidence=0.9,
+    )
 
 
 def test_tiny_1080p_dot_generates_fast_projectile_candidate():
@@ -131,6 +141,54 @@ def test_short_bright_streak_triggers_fast_projectile():
     assert result.candidates[0].streak_length_px >= 4
 
 
+def test_fragmented_streak_is_grouped_as_one_projectile_candidate():
+    detector = FastMotionDetector(
+        process_width=960,
+        diff_threshold=18,
+        min_area_px=8,
+        min_streak_length_px=8,
+        min_confidence=0.55,
+        streak_gap_px=5,
+    )
+    detector.process(_blank_frame(), timestamp=1.0)
+
+    frame = _blank_frame()
+    frame[500:504, 700:704] = 255
+    frame[500:504, 710:714] = 255
+    frame[500:504, 720:724] = 255
+    result = detector.process(frame, timestamp=1.0 + 1 / 60)
+
+    assert result.has_detection is True
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    detected = candidate.to_detected_object()
+    assert detected["class_name"] == "fast_projectile"
+    assert detected["fragment_count"] == 3
+    assert candidate.streak_length_px >= 20
+    assert candidate.mean_motion > 0.9
+
+
+def test_fragmented_streak_respects_gap_limit():
+    detector = FastMotionDetector(
+        process_width=960,
+        diff_threshold=18,
+        min_area_px=8,
+        min_streak_length_px=8,
+        min_confidence=0.55,
+        streak_gap_px=2,
+    )
+    detector.process(_blank_frame(), timestamp=1.0)
+
+    frame = _blank_frame()
+    frame[500:504, 700:704] = 255
+    frame[500:504, 710:714] = 255
+    frame[500:504, 720:724] = 255
+    result = detector.process(frame, timestamp=1.0 + 1 / 60)
+
+    assert result.has_detection is False
+    assert result.candidates == []
+
+
 def test_broad_scene_change_is_left_to_anomaly_path():
     detector = FastMotionDetector(
         process_width=960,
@@ -148,6 +206,8 @@ def test_broad_scene_change_is_left_to_anomaly_path():
 
     assert result.has_detection is False
     assert result.candidates == []
+    assert result.suppression_reason == "global_motion"
+    assert result.motion_fraction > 0.015
 
 
 def test_long_structural_edge_is_left_to_anomaly_path():
@@ -217,14 +277,116 @@ def test_speed_is_estimated_for_matched_candidates():
 
     first = _blank_frame()
     first[300:306, 600:606] = 255
-    detector.process(first, timestamp=1.0 + 1 / 60)
+    first_result = detector.process(first, timestamp=1.0 + 1 / 60)
+    first_track_id = first_result.candidates[0].track_id
 
     second = _blank_frame()
     second[300:306, 640:646] = 255
     result = detector.process(second, timestamp=1.0 + 2 / 60)
 
     assert result.has_detection is True
-    assert any(c.speed_px_per_sec is not None and c.speed_px_per_sec > 0 for c in result.candidates)
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.bbox[0] >= 638
+    assert candidate.track_id == first_track_id
+    assert candidate.speed_px_per_sec is not None
+    assert candidate.speed_px_per_sec > 0
+
+
+def test_adjacent_projectiles_keep_distinct_stable_tracks_across_frames():
+    detector = FastMotionDetector(process_width=960, diff_threshold=18)
+
+    first_frame = [_candidate_at(100.0), _candidate_at(140.0)]
+    detector._assign_tracks(first_frame, timestamp=1.0)
+    first_ids = [candidate.track_id for candidate in first_frame]
+    assert first_ids == [1, 2]
+
+    detector._prev_candidates = first_frame
+    detector._prev_timestamp = 1.0
+    second_frame = [_candidate_at(105.0), _candidate_at(118.0)]
+    detector._assign_tracks(second_frame, timestamp=1.0 + 1 / 60)
+    second_ids = [candidate.track_id for candidate in second_frame]
+
+    # Both current candidates are closest to the first previous candidate.
+    # The previous track must still be consumed by only one current candidate.
+    assert second_ids == first_ids
+    assert len(set(second_ids)) == 2
+
+    detector._prev_candidates = second_frame
+    detector._prev_timestamp = 1.0 + 1 / 60
+    third_frame = [_candidate_at(110.0), _candidate_at(123.0)]
+    detector._assign_tracks(third_frame, timestamp=1.0 + 2 / 60)
+
+    assert [candidate.track_id for candidate in third_frame] == first_ids
+    assert all(len(candidate.trajectory) == 3 for candidate in third_frame)
+
+
+def test_many_short_lived_tracks_do_not_leave_permanent_histories():
+    detector = FastMotionDetector(
+        process_width=960,
+        diff_threshold=18,
+        trajectory_history_length=8,
+    )
+
+    seen_track_ids: set[int] = set()
+    for frame_index in range(250):
+        # Each candidate is farther than the one-frame association radius, so
+        # this models a long-running stream of unrelated one-frame projectiles.
+        candidate = _candidate_at(float(frame_index * 1000))
+        timestamp = 1.0 + frame_index / 60
+        detector._assign_tracks([candidate], timestamp=timestamp)
+        assert candidate.track_id is not None
+        seen_track_ids.add(candidate.track_id)
+
+        assert set(detector._track_histories) == {candidate.track_id}
+        assert len(detector._track_histories[candidate.track_id]) == 1
+
+        detector._prev_candidates = [candidate]
+        detector._prev_timestamp = timestamp
+
+    assert len(seen_track_ids) == 250
+    assert len(detector._track_histories) == 1
+
+    # Once the current frame has no candidate, the previous track cannot be
+    # re-associated by this detector and its history is released immediately.
+    detector._assign_tracks([], timestamp=6.0)
+    assert detector._track_histories == {}
+
+
+def test_history_cleanup_preserves_active_track_continuity():
+    detector = FastMotionDetector(
+        process_width=960,
+        diff_threshold=18,
+        trajectory_history_length=8,
+    )
+
+    first = _candidate_at(100.0)
+    detector._assign_tracks([first], timestamp=1.0)
+    active_track_id = first.track_id
+    detector._prev_candidates = [first]
+    detector._prev_timestamp = 1.0
+
+    second = _candidate_at(110.0)
+    transient = _candidate_at(1000.0)
+    detector._assign_tracks([second, transient], timestamp=1.0 + 1 / 60)
+    transient_track_id = transient.track_id
+    assert second.track_id == active_track_id
+    assert transient_track_id != active_track_id
+    assert len(second.trajectory) == 2
+    assert set(detector._track_histories) == {
+        active_track_id,
+        transient_track_id,
+    }
+    detector._prev_candidates = [second, transient]
+    detector._prev_timestamp = 1.0 + 1 / 60
+
+    third = _candidate_at(120.0)
+    detector._assign_tracks([third], timestamp=1.0 + 2 / 60)
+
+    assert third.track_id == active_track_id
+    assert len(third.trajectory) == 3
+    assert [point[1] for point in third.trajectory] == [100.0, 110.0, 120.0]
+    assert set(detector._track_histories) == {active_track_id}
 
 
 def test_single_frame_speed_uses_streak_and_fps_hint():

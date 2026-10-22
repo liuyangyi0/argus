@@ -3,7 +3,8 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
-const backendHost = '127.0.0.1'
+const backendUrl = process.env.ARGUS_BACKEND_URL || 'http://127.0.0.1:8080'
+const backendWsUrl = backendUrl.replace(/^http/, 'ws')
 
 export default defineConfig({
   plugins: [vue()],
@@ -29,11 +30,19 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: `http://${backendHost}:8080`,
+        target: backendUrl,
+        changeOrigin: true,
+      },
+      '/login': {
+        target: backendUrl,
+        changeOrigin: true,
+      },
+      '/logout': {
+        target: backendUrl,
         changeOrigin: true,
       },
       '/ws': {
-        target: `ws://${backendHost}:8080`,
+        target: backendWsUrl,
         ws: true,
       },
     },

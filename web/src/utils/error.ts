@@ -43,8 +43,8 @@ export function extractErrorMessage(e: unknown, fallback = '操作失败'): stri
 
 /**
  * Wrap an arbitrary thrown value into an `ApiError` so call sites can rely on
- * a consistent shape without using `any`. HTTP status is preserved on the
- * `code` field when available; otherwise `-1` (transport/unknown).
+ * a consistent shape without using `any`. HTTP status and business code stay
+ * separate while the deprecated `code` compatibility field remains usable.
  */
 export function toApiError(e: unknown, fallback = '请求失败'): ApiError {
   if (e instanceof ApiError) return e
@@ -52,8 +52,17 @@ export function toApiError(e: unknown, fallback = '请求失败'): ApiError {
     const status = e.response?.status ?? -1
     const msg = extractErrorMessage(e, fallback)
     const data = e.response?.data
-    return new ApiError(status, msg, data)
+    const record = data && typeof data === 'object'
+      ? data as Record<string, unknown>
+      : null
+    return new ApiError({
+      httpStatus: status > 0 ? status : null,
+      businessCode: typeof record?.code === 'number' ? record.code : null,
+      message: msg,
+      details: record?.data ?? record?.details ?? record?.detail,
+      raw: data,
+    })
   }
-  if (e instanceof Error) return new ApiError(-1, e.message || fallback)
-  return new ApiError(-1, fallback)
+  if (e instanceof Error) return new ApiError({ message: e.message || fallback })
+  return new ApiError({ message: fallback })
 }

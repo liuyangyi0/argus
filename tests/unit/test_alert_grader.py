@@ -164,6 +164,716 @@ class TestAlertGrader:
         )
         assert alert2 is None
 
+    def test_same_zone_detection_types_do_not_share_temporal_evidence(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.99,
+                evidence_threshold=1.0,
+                spatial_continuity_enabled=False,
+            ),
+        )
+        grader = AlertGrader(config)
+
+        first_anomaly = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.6,
+            frame_number=1,
+            detection_type="anomaly",
+        )
+        first_water = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.6,
+            frame_number=1,
+            detection_type="water_leak",
+            detected_objects=[{
+                "class_name": "visible_water_leak",
+                "bbox": [10, 10, 30, 30],
+            }],
+        )
+
+        assert first_anomaly is None
+        assert first_water is None
+        assert np.isclose(grader._trackers["cam1:z1"].evidence, 0.6)
+        assert np.isclose(
+            grader._trackers["cam1:z1:water_leak"].evidence,
+            0.6,
+        )
+
+        second_anomaly = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.6,
+            frame_number=2,
+            detection_type="anomaly",
+        )
+        assert second_anomaly is not None
+        assert second_anomaly.detection_type == "anomaly"
+
+    def test_same_zone_type_incidents_do_not_share_temporal_evidence(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.99,
+                evidence_threshold=1.0,
+                spatial_continuity_enabled=False,
+            ),
+        )
+        grader = AlertGrader(config)
+
+        first_a = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.6,
+            frame_number=1,
+            detection_type="projectile",
+            detected_objects=[{"bbox": [10, 10, 30, 30]}],
+            incident_key="track-a",
+        )
+        first_b = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.6,
+            frame_number=1,
+            detection_type="projectile",
+            detected_objects=[{"bbox": [10, 10, 30, 30]}],
+            incident_key="track-b",
+        )
+
+        tracker_a = grader._tracker_key(
+            "cam1:z1", "projectile", "track-a",
+        )
+        tracker_b = grader._tracker_key(
+            "cam1:z1", "projectile", "track-b",
+        )
+        assert first_a is None
+        assert first_b is None
+        assert np.isclose(grader._trackers[tracker_a].evidence, 0.6)
+        assert np.isclose(grader._trackers[tracker_b].evidence, 0.6)
+        assert np.isclose(
+            grader.get_cusum_state("cam1:z1").evidence,
+            0.6,
+        )
+
+        second_a = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.6,
+            frame_number=2,
+            detection_type="projectile",
+            detected_objects=[{"bbox": [10, 10, 30, 30]}],
+            incident_key="track-a",
+        )
+
+        assert second_a is not None
+        assert np.isclose(grader._trackers[tracker_b].evidence, 0.6)
+
+        grader.reset("cam1:z1")
+        assert grader.get_cusum_state("cam1:z1") is None
+        assert not any(
+            key.startswith("cam1:z1") for key in grader._trackers
+        )
+
+    def test_consecutive_projectile_tracks_do_not_cross_suppress(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80,
+                evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+            ),
+        )
+        grader = AlertGrader(config)
+
+        with patch("argus.alerts.grader.time.monotonic", return_value=4000.0):
+            first = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=1,
+                detection_type="projectile",
+                detected_objects=[{"bbox": [100, 100, 200, 200]}],
+                incident_key="track-a",
+            )
+            second = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=2,
+                detection_type="projectile",
+                detected_objects=[{"bbox": [100, 100, 200, 200]}],
+                incident_key="track-b",
+            )
+            repeated_first = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=3,
+                detection_type="projectile",
+                detected_objects=[{"bbox": [500, 500, 600, 600]}],
+                incident_key="track-a",
+            )
+
+        assert first is not None
+        assert second is not None
+        assert repeated_first is None
+
+    def test_water_only_frame_decays_unobserved_plume_and_anomaly(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.8,
+                evidence_threshold=10.0,
+                spatial_continuity_enabled=False,
+            ),
+        )
+        grader = AlertGrader(config)
+
+        grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8,
+            frame_number=1,
+            detection_type="anomaly",
+        )
+        grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8,
+            frame_number=1,
+            detection_type="plume",
+            detected_objects=[{"bbox": [10, 10, 30, 30]}],
+            incident_key="plume-1",
+        )
+        grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8,
+            frame_number=1,
+            detection_type="water_leak",
+            detected_objects=[{"bbox": [40, 40, 60, 60]}],
+            incident_key="water-1",
+        )
+
+        anomaly_tracker = grader._tracker_key("cam1:z1", "anomaly")
+        plume_tracker = grader._tracker_key(
+            "cam1:z1", "plume", "plume-1",
+        )
+        water_tracker = grader._tracker_key(
+            "cam1:z1", "water_leak", "water-1",
+        )
+        grader.decay_unobserved(
+            "cam1",
+            "z1",
+            {("water_leak", "water-1")},
+        )
+
+        assert np.isclose(grader._trackers[anomaly_tracker].evidence, 0.64)
+        assert np.isclose(grader._trackers[plume_tracker].evidence, 0.64)
+        assert np.isclose(grader._trackers[water_tracker].evidence, 0.8)
+
+    def test_selective_decay_preserves_unavailable_channel_evidence(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.8,
+                evidence_threshold=10.0,
+                spatial_continuity_enabled=False,
+            ),
+        )
+        grader = AlertGrader(config)
+        appearance_incident = "anomaly:appearance_anomaly:runtime:7"
+
+        grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8,
+            frame_number=1,
+            detection_type="anomaly",
+            incident_key=appearance_incident,
+        )
+        grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8,
+            frame_number=1,
+            detection_type="plume",
+            detected_objects=[{"bbox": [10, 10, 30, 30]}],
+            incident_key="plume-1",
+        )
+
+        appearance_tracker = grader._tracker_key(
+            "cam1:z1",
+            "anomaly",
+            appearance_incident,
+        )
+        plume_tracker = grader._tracker_key(
+            "cam1:z1",
+            "plume",
+            "plume-1",
+        )
+        grader.decay_unobserved(
+            "cam1",
+            "z1",
+            set(),
+            decay_detection_types={"plume"},
+        )
+
+        assert np.isclose(grader._trackers[appearance_tracker].evidence, 0.8)
+        assert np.isclose(grader._trackers[plume_tracker].evidence, 0.64)
+
+    def test_appearance_anomaly_and_hybrid_share_temporal_identity(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.99,
+                evidence_threshold=1.0,
+                spatial_continuity_enabled=False,
+            ),
+        )
+        grader = AlertGrader(config)
+        incident_key = "anomaly:appearance_anomaly:runtime:11"
+
+        first = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.6,
+            frame_number=1,
+            detection_type="anomaly",
+            incident_key=incident_key,
+        )
+        second = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.6,
+            frame_number=2,
+            detection_type="hybrid",
+            detected_objects=[{
+                "class_name": "tool",
+                "bbox": [10, 10, 30, 30],
+                "confidence": 0.9,
+            }],
+            incident_key=incident_key,
+        )
+
+        assert first is None
+        assert second is not None
+        assert second.detection_type == "hybrid"
+        tracker_key = grader._tracker_key(
+            "cam1:z1",
+            "hybrid",
+            incident_key,
+        )
+        assert tracker_key == grader._tracker_key(
+            "cam1:z1",
+            "anomaly",
+            incident_key,
+        )
+
+    def test_appearance_type_transition_keeps_incident_cooldown(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.8,
+                evidence_threshold=0.5,
+                spatial_continuity_enabled=False,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+            ),
+        )
+        grader = AlertGrader(config)
+        incident_key = "anomaly:appearance_anomaly:runtime:12"
+
+        with patch("argus.alerts.grader.time.monotonic", return_value=1000.0):
+            first = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=1,
+                detection_type="anomaly",
+                incident_key=incident_key,
+            )
+            repeated = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=2,
+                detection_type="hybrid",
+                detected_objects=[{
+                    "class_name": "tool",
+                    "bbox": [10, 10, 30, 30],
+                    "confidence": 0.9,
+                }],
+                incident_key=incident_key,
+            )
+
+        assert first is not None
+        assert repeated is None
+
+    def test_subthreshold_incident_does_not_leave_empty_tracker(self):
+        config = make_config()
+        grader = AlertGrader(config)
+
+        alert = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.LOW_PRIORITY,
+            anomaly_score=0.5,
+            frame_number=1,
+            detection_type="water_leak",
+            detected_objects=[{"bbox": [10, 10, 30, 30]}],
+            incident_key="transient-1",
+        )
+
+        assert alert is None
+        assert not any(
+            ":incident:transient-1" in key for key in grader._trackers
+        )
+
+    def test_explicit_continuity_map_isolated_from_display_heatmap(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.99,
+                evidence_threshold=1.5,
+                spatial_continuity_enabled=True,
+                spatial_continuity_iou_threshold=0.5,
+                spatial_continuity_mode="reset",
+            ),
+        )
+        grader = AlertGrader(config)
+        stable_display = np.ones((40, 40), dtype=np.float32) * 0.9
+        first_mask = np.zeros((40, 40), dtype=np.uint8)
+        first_mask[2:12, 2:12] = 1
+        moved_mask = np.zeros((40, 40), dtype=np.uint8)
+        moved_mask[25:35, 25:35] = 1
+
+        first = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8,
+            frame_number=1,
+            anomaly_map=stable_display,
+            continuity_map=first_mask,
+            detection_type="water_leak",
+            detected_objects=[{
+                "class_name": "visible_water_leak",
+                "bbox": [2, 2, 12, 12],
+            }],
+        )
+        second = grader.evaluate(
+            camera_id="cam1",
+            zone_id="z1",
+            zone_priority=ZonePriority.STANDARD,
+            anomaly_score=0.8,
+            frame_number=2,
+            anomaly_map=stable_display,
+            continuity_map=moved_mask,
+            detection_type="water_leak",
+            detected_objects=[{
+                "class_name": "visible_water_leak",
+                "bbox": [25, 25, 35, 35],
+            }],
+        )
+
+        assert first is None
+        assert second is None
+        assert np.isclose(
+            grader._trackers["cam1:z1:water_leak"].evidence,
+            0.8,
+        )
+
+    def test_persistent_change_deduplicates_same_incident_bbox(self):
+        """Spatial IoU still deduplicates after the short interval expires."""
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80,
+                evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+            ),
+        )
+        grader = AlertGrader(config)
+        detected_objects = [{
+            "class_name": "static_foreign",
+            "bbox": [100, 100, 200, 200],
+        }]
+
+        with patch("argus.alerts.grader.time.monotonic", side_effect=[1000.0, 1050.0]):
+            first = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=1,
+                detection_type="persistent_change",
+                detected_objects=detected_objects,
+            )
+            second = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=2,
+                detection_type="persistent_change",
+                detected_objects=[{
+                    "class_name": "static_foreign",
+                    "bbox": [105, 105, 205, 205],
+                }],
+            )
+
+        assert first is not None
+        assert second is None
+
+    def test_localized_hazards_same_timestamp_do_not_cross_suppress_zones(self):
+        """Every localized channel may alert independently in another zone."""
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80,
+                evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+                localized_alert_min_interval_seconds=45,
+            ),
+        )
+        localized_types = (
+            "persistent_change",
+            "water_leak",
+            "plume",
+            "object",
+            "projectile",
+            "hybrid",
+        )
+
+        for detection_type in localized_types:
+            grader = AlertGrader(config)
+            with patch("argus.alerts.grader.time.monotonic", return_value=1000.0):
+                first = grader.evaluate(
+                    camera_id="cam1",
+                    zone_id="z1",
+                    zone_priority=ZonePriority.STANDARD,
+                    anomaly_score=0.9,
+                    frame_number=1,
+                    detection_type=detection_type,
+                    detected_objects=[{"bbox": [100, 100, 200, 200]}],
+                )
+                second = grader.evaluate(
+                    camera_id="cam1",
+                    zone_id="z2",
+                    zone_priority=ZonePriority.STANDARD,
+                    anomaly_score=0.9,
+                    frame_number=1,
+                    detection_type=detection_type,
+                    detected_objects=[{"bbox": [100, 100, 200, 200]}],
+                )
+
+            assert first is not None, detection_type
+            assert second is not None, detection_type
+
+    def test_localized_hazards_same_timestamp_do_not_cross_suppress_types(self):
+        """Different localized detection channels in one zone are independent."""
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80,
+                evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+                localized_alert_min_interval_seconds=45,
+            ),
+        )
+
+        for detection_type in ("water_leak", "plume", "object", "projectile", "hybrid"):
+            grader = AlertGrader(config)
+            with patch("argus.alerts.grader.time.monotonic", return_value=2000.0):
+                first = grader.evaluate(
+                    camera_id="cam1",
+                    zone_id="z1",
+                    zone_priority=ZonePriority.STANDARD,
+                    anomaly_score=0.9,
+                    frame_number=1,
+                    detection_type="persistent_change",
+                    detected_objects=[{"bbox": [100, 100, 200, 200]}],
+                )
+                second = grader.evaluate(
+                    camera_id="cam1",
+                    zone_id="z1",
+                    zone_priority=ZonePriority.STANDARD,
+                    anomaly_score=0.9,
+                    frame_number=1,
+                    detection_type=detection_type,
+                    detected_objects=[{"bbox": [100, 100, 200, 200]}],
+                )
+
+            assert first is not None, detection_type
+            assert second is not None, detection_type
+
+    def test_distinct_same_zone_type_localized_bboxes_alert_independently(self):
+        """The deprecated 45-second guard cannot hide a distinct incident."""
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80,
+                evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+                localized_alert_min_interval_seconds=45,
+            ),
+        )
+        localized_types = (
+            "persistent_change",
+            "water_leak",
+            "plume",
+            "object",
+            "projectile",
+            "hybrid",
+        )
+
+        for detection_type in localized_types:
+            grader = AlertGrader(config)
+            with patch("argus.alerts.grader.time.monotonic", return_value=3000.0):
+                first = grader.evaluate(
+                    camera_id="cam1",
+                    zone_id="z1",
+                    zone_priority=ZonePriority.STANDARD,
+                    anomaly_score=0.9,
+                    frame_number=1,
+                    detection_type=detection_type,
+                    detected_objects=[{"bbox": [100, 100, 200, 200]}],
+                )
+                second = grader.evaluate(
+                    camera_id="cam1",
+                    zone_id="z1",
+                    zone_priority=ZonePriority.STANDARD,
+                    anomaly_score=0.9,
+                    frame_number=1,
+                    detection_type=detection_type,
+                    detected_objects=[{"bbox": [500, 500, 600, 600]}],
+                )
+
+            assert first is not None, detection_type
+            assert second is not None, detection_type
+
+    def test_distinct_persistent_change_bypasses_coarse_zone_suppression(self):
+        """A new object elsewhere in a broad zone is a separate incident."""
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80,
+                evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+            ),
+        )
+        grader = AlertGrader(config)
+
+        with patch("argus.alerts.grader.time.monotonic", side_effect=[1000.0, 1050.0]):
+            first = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=1,
+                detection_type="persistent_change",
+                detected_objects=[{
+                    "class_name": "static_foreign",
+                    "bbox": [1500, 500, 1650, 650],
+                }],
+            )
+            second = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=2,
+                detection_type="persistent_change",
+                detected_objects=[{
+                    "class_name": "static_foreign",
+                    "bbox": [900, 200, 1000, 400],
+                }],
+            )
+
+        assert first is not None
+        assert second is not None
+
+    def test_same_incident_key_keeps_long_cooldown_when_bbox_moves(self):
+        config = make_config(
+            temporal=TemporalConfirmation(
+                max_gap_seconds=10.0,
+                evidence_lambda=0.80,
+                evidence_threshold=0.5,
+            ),
+            suppression=SuppressionConfig(
+                same_zone_window_seconds=300,
+                same_camera_window_seconds=60,
+                localized_alert_min_interval_seconds=45,
+            ),
+        )
+        grader = AlertGrader(config)
+
+        with patch("argus.alerts.grader.time.monotonic", side_effect=[1000.0, 1030.0]):
+            first = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=1,
+                detection_type="persistent_change",
+                detected_objects=[{"bbox": [100, 100, 200, 200]}],
+                incident_key="candidate-42",
+            )
+            second = grader.evaluate(
+                camera_id="cam1",
+                zone_id="z1",
+                zone_priority=ZonePriority.STANDARD,
+                anomaly_score=0.9,
+                frame_number=2,
+                detection_type="persistent_change",
+                detected_objects=[{"bbox": [500, 500, 600, 600]}],
+                incident_key="candidate-42",
+            )
+
+        assert first is not None
+        assert second is None
+
     def test_reset_clears_state(self):
         """Reset should allow new alerts from the same zone."""
         config = make_config(

@@ -24,6 +24,8 @@ import cv2
 import numpy as np
 import structlog
 
+from argus.core.frame_identity import FrameIdentity
+
 logger = structlog.get_logger()
 
 
@@ -46,6 +48,8 @@ class FrameSnapshot:
     # Each dict: {"track_id": int, "centroid_x": float, "centroid_y": float,
     #             "max_score": float, "area_px": int}
     active_tracks: list[dict] = field(default_factory=list)
+    identity: FrameIdentity | None = None
+    candidate_records: list[dict] = field(default_factory=list)
 
 
 class RecordingStatus(str, Enum):

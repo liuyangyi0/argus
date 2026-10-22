@@ -6,6 +6,7 @@ fusion store during severity computation.
 
 Endpoints:
 - ``POST   /api/sensors/signal``  — upsert an entry
+- ``POST   /api/sensors/reading`` — evaluate a typed sensor reading
 - ``GET    /api/sensors/signals`` — list currently active (non-expired) entries
 - ``DELETE /api/sensors/signal``  — remove an entry
 """
@@ -34,6 +35,23 @@ class SensorSignalRequest(BaseModel):
     camera_id: str = Field(description="Camera ID or '*' for a global signal")
     zone_id: str = Field(description="Zone ID or '*' for a camera-wide signal")
     multiplier: float = Field(description="Severity bias (0.1-5.0, 1.0 = neutral)")
+    valid_for_s: float | None = Field(
+        default=None,
+        description="Signal TTL in seconds. Falls back to sensor_fusion.default_valid_for_s",
+    )
+
+
+class SensorReadingRequest(BaseModel):
+    """Payload for ``POST /api/sensors/reading``."""
+
+    camera_id: str = Field(description="Camera ID or '*' for a global signal")
+    zone_id: str = Field(description="Zone ID or '*' for a camera-wide signal")
+    sensor_type: str = Field(
+        description="gas_ppm, pressure_drop_kpa, humidity, or temperature_c",
+    )
+    value: float = Field(description="Raw sensor value")
+    unit: str | None = Field(default=None, description="Optional display unit")
+    source: str | None = Field(default=None, description="Sensor identifier")
     valid_for_s: float | None = Field(
         default=None,
         description="Signal TTL in seconds. Falls back to sensor_fusion.default_valid_for_s",
@@ -81,6 +99,44 @@ async def set_signal(request: Request, payload: SensorSignalRequest) -> JSONResp
         valid_for_s=payload.valid_for_s,
     )
     return api_success({"applied": True})
+
+
+@router.post("/reading")
+async def set_reading(request: Request, payload: SensorReadingRequest) -> JSONResponse:
+    """Evaluate and upsert a typed external sensor reading."""
+    fusion = _get_fusion(request)
+    if fusion is None:
+        return api_unavailable("传感器融合未配置")
+
+    try:
+        decision = fusion.set_reading(
+            camera_id=payload.camera_id,
+            zone_id=payload.zone_id,
+            sensor_type=payload.sensor_type,
+            value=payload.value,
+            unit=payload.unit,
+            source=payload.source,
+            valid_for_s=payload.valid_for_s,
+        )
+    except ValueError as exc:
+        return api_validation_error(str(exc))
+
+    logger.info(
+        "sensors.reading_set",
+        camera_id=payload.camera_id,
+        zone_id=payload.zone_id,
+        sensor_type=payload.sensor_type,
+        value=payload.value,
+        unit=payload.unit,
+        source=payload.source,
+        multiplier=decision.multiplier,
+        severity=decision.severity,
+        reason=decision.reason,
+    )
+    return api_success({
+        "applied": decision.active,
+        "decision": decision.to_dict(),
+    })
 
 
 @router.get("/signals")

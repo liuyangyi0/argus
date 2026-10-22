@@ -1,19 +1,23 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Badge, Button, Form, Input, InputNumber, Modal, Select, Space, Table, Typography, message } from 'ant-design-vue'
+import { Badge, Button, Form, Input, InputNumber, Modal, Select, Space, Typography, message } from 'ant-design-vue'
 import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons-vue'
 
 import { addCamera, deleteCamera, getCameraConfig, getCameras, getRegions, getUsbDevices, startCamera, stopCamera, updateCamera } from '../api'
 import { testCameraConnection, testCameraConnectionDraft } from '../api/cameras'
 import { useWebSocket } from '../composables/useWebSocket'
 import { useAuthStore } from '../stores/useAuthStore'
-import { extractErrorMessage } from '../utils/error'
+import { extractErrorMessage, toApiError } from '../utils/error'
 import HealthBadge from '../components/common/HealthBadge.vue'
 import ModeBadge from '../components/common/ModeBadge.vue'
 import ConnectionTestResult from '../components/common/ConnectionTestResult.vue'
-import ContentSkeleton from '../components/ContentSkeleton.vue'
-import type { ConnectionTestResult as ConnTestResult } from '../types/api'
+import PageShell from '../components/common/PageShell.vue'
+import AsyncState from '../components/common/AsyncState.vue'
+import StatusBanner from '../components/common/StatusBanner.vue'
+import ResponsiveTable from '../components/common/ResponsiveTable.vue'
+import DangerousActionConfirm from '../components/common/DangerousActionConfirm.vue'
+import type { CameraSummary, ConnectionTestResult as ConnTestResult } from '../types/api'
 
 // initialLoading distinguishes the very-first fetch (where the table is empty
 // and we want a skeleton instead of the bare ant Table loading spinner over an
@@ -27,8 +31,26 @@ const auth = useAuthStore()
 const canManageCameraConfig = computed(() => auth.hasRole(['admin', 'engineer']))
 const canOperateCamera = computed(() => auth.hasRole(['admin', 'operator', 'engineer']))
 const canDeleteCamera = computed(() => auth.hasRole(['admin']))
-const cameras = ref<any[]>([])
-const loading = ref(true)
+const cameras = ref<CameraSummary[]>([])
+const loading = ref(false)
+const loadError = ref('')
+const loadErrorStatus = ref<number | null>(null)
+const operatingCameraId = ref<string | null>(null)
+const deletingCameraId = ref<string | null>(null)
+const initialError = computed(() => (
+  loadError.value
+    && cameras.value.length === 0
+    && ![403, 404].includes(loadErrorStatus.value ?? 0)
+    ? loadError.value
+    : ''
+))
+const refreshError = computed(() => (
+  loadError.value
+    && cameras.value.length > 0
+    && ![403, 404].includes(loadErrorStatus.value ?? 0)
+    ? loadError.value
+    : ''
+))
 
 const modalVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -61,7 +83,7 @@ watch(() => cameraForm.value.protocol, async (proto) => {
   usbLoading.value = true
   try {
     const res = await getUsbDevices()
-    usbDevices.value = res.devices ?? res
+    usbDevices.value = res.devices
     if (usbDevices.value.length > 0 && !editingId.value) {
       cameraForm.value.source = String(usbDevices.value[0].index)
     }
@@ -86,10 +108,17 @@ function sourcePlaceholder(): string {
 }
 
 async function fetchData() {
+  loading.value = true
   try {
     const res = await getCameras()
     cameras.value = res.cameras || []
-  } catch {
+    loadError.value = ''
+    loadErrorStatus.value = null
+  } catch (e) {
+    const apiError = toApiError(e, '摄像头列表加载失败')
+    loadError.value = apiError.message
+    loadErrorStatus.value = apiError.httpStatus
+    if ([403, 404].includes(apiError.httpStatus ?? 0)) cameras.value = []
   } finally {
     loading.value = false
     initialLoading.value = false
@@ -111,7 +140,7 @@ async function fetchRegions() {
   }
 }
 
-const {} = useWebSocket({
+const {} = useWebSocket<CameraSummary | CameraSummary[]>({
   topics: ['cameras'],
   onMessage(topic, data) {
     if (topic !== 'cameras') return
@@ -140,32 +169,40 @@ onMounted(() => {
 })
 
 async function handleStart(id: string) {
-  await startCamera(id)
-  fetchData()
+  operatingCameraId.value = id
+  try {
+    await startCamera(id)
+    await fetchData()
+  } catch (e) {
+    message.error(extractErrorMessage(e, '摄像头启动失败'))
+  } finally {
+    operatingCameraId.value = null
+  }
 }
 
 async function handleStop(id: string) {
-  await stopCamera(id)
-  fetchData()
+  operatingCameraId.value = id
+  try {
+    await stopCamera(id)
+    await fetchData()
+  } catch (e) {
+    message.error(extractErrorMessage(e, '摄像头停止失败'))
+  } finally {
+    operatingCameraId.value = null
+  }
 }
 
-function handleDelete(id: string) {
-  Modal.confirm({
-    title: '确认删除',
-    content: `确定要删除摄像头 "${id}" 吗？删除后需重新添加。`,
-    okText: '删除',
-    okType: 'danger',
-    cancelText: '取消',
-    async onOk() {
-      try {
-        await deleteCamera(id)
-        message.success('摄像头已删除')
-        fetchData()
-      } catch (e) {
-        message.error(extractErrorMessage(e, '删除失败'))
-      }
-    },
-  })
+async function handleDelete(id: string) {
+  deletingCameraId.value = id
+  try {
+    await deleteCamera(id)
+    message.success('摄像头已删除')
+    await fetchData()
+  } catch (e) {
+    message.error(extractErrorMessage(e, '删除失败'))
+  } finally {
+    deletingCameraId.value = null
+  }
 }
 
 function openAddModal() {
@@ -308,16 +345,41 @@ const columns = [
   },
   { title: '操作', key: 'action', width: 260 },
 ]
+
+function openCameraDetail(cameraId: string) {
+  router.push(`/cameras/${cameraId}`)
+}
+
+function cameraRowProps(record: CameraSummary) {
+  return {
+    role: 'link',
+    tabindex: 0,
+    'aria-label': `查看摄像头 ${record.name || record.camera_id} 详情`,
+    onClick: () => openCameraDetail(record.camera_id),
+    onKeydown: (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      if (target?.closest('button, a, input, select, textarea, [role="button"]')) return
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        openCameraDetail(record.camera_id)
+      }
+    },
+  }
+}
 </script>
 
 <template>
-  <main class="glass" style=" padding: 24px; border-radius: var(--r-lg); min-width: 0; display: flex; flex-direction: column; flex: 1;">
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px">
-      <Typography.Title :level="3" style="margin: 0">摄像头</Typography.Title>
+  <PageShell
+    class="cameras-page"
+    title="摄像头"
+    description="查看视频源、运行健康度和检测链状态。"
+    :busy="loading"
+  >
+    <template #actions>
       <Button v-if="canManageCameraConfig" type="primary" @click="openAddModal">
         <PlusOutlined /> 新增摄像头
       </Button>
-    </div>
+    </template>
 
     <Modal
       v-model:open="modalVisible"
@@ -338,7 +400,7 @@ const columns = [
           <Input v-model:value="cameraForm.camera_id" placeholder="cam_02" :disabled="!!editingId" />
         </Form.Item>
         <Form.Item label="名称" required>
-          <Input v-model:value="cameraForm.name" placeholder="反应堆厂房入口" />
+          <Input v-model:value="cameraForm.name" placeholder="仓库入口摄像头" />
         </Form.Item>
         <Form.Item label="区域">
           <Select
@@ -424,18 +486,53 @@ const columns = [
       </Form>
     </Modal>
 
-    <ContentSkeleton v-if="initialLoading" type="table" :rows="6" />
-    <Table
-      v-else
-      :columns="columns"
-      :data-source="cameras"
-      :loading="loading"
-      :pagination="false"
-      row-key="camera_id"
-      :row-class-name="() => 'camera-row'"
-      :custom-row="(record: any) => ({ onClick: () => router.push(`/cameras/${record.camera_id}`) })"
-      style="cursor: pointer"
+    <StatusBanner
+      v-if="refreshError"
+      class="cameras-page__refresh-error"
+      status="error"
+      title="刷新失败，当前显示上次成功获取的数据"
+      :description="refreshError"
     >
+      <template #action>
+        <Button
+          size="small"
+          aria-label="重试摄像头列表"
+          @click="fetchData"
+        >
+          重试
+        </Button>
+      </template>
+    </StatusBanner>
+
+    <AsyncState
+      :loading="initialLoading"
+      :refreshing="loading && !initialLoading"
+      :error="initialError"
+      :forbidden="loadErrorStatus === 403"
+      :not-found="loadErrorStatus === 404"
+      :forbidden-description="loadError || undefined"
+      :not-found-description="loadError || undefined"
+      :empty="!initialLoading && !loadError && cameras.length === 0"
+      skeleton-type="table"
+      :skeleton-rows="6"
+      empty-title="尚未配置摄像头"
+      empty-description="添加视频源后，才能开始预览和检测。"
+      :empty-action-text="canManageCameraConfig ? '新增摄像头' : ''"
+      @retry="fetchData"
+      @empty-action="openAddModal"
+    >
+      <ResponsiveTable
+        :columns="columns"
+        :data-source="cameras"
+        :loading="loading"
+        :pagination="false"
+        row-key="camera_id"
+        :row-class-name="() => 'camera-row'"
+        :custom-row="cameraRowProps"
+        :min-width="1040"
+        accessible-label="摄像头列表，可横向滚动"
+        style="cursor: pointer"
+      >
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'status'">
           <Badge :status="record.connected ? 'success' : 'default'" />
@@ -453,24 +550,64 @@ const columns = [
         </template>
         <template v-else-if="column.key === 'action'">
           <Space @click.stop>
-            <Button v-if="!record.connected && canOperateCamera" type="primary" size="small" @click="handleStart(record.camera_id)">
+            <Button
+              v-if="!record.connected && canOperateCamera"
+              type="primary"
+              size="small"
+              :loading="operatingCameraId === record.camera_id"
+              :aria-label="`启动摄像头 ${record.name || record.camera_id}`"
+              @click="handleStart(record.camera_id)"
+            >
               启动
             </Button>
-            <Button v-else-if="record.connected && canOperateCamera" danger size="small" @click="handleStop(record.camera_id)">
+            <Button
+              v-else-if="record.connected && canOperateCamera"
+              danger
+              size="small"
+              :loading="operatingCameraId === record.camera_id"
+              :aria-label="`停止摄像头 ${record.name || record.camera_id}`"
+              @click="handleStop(record.camera_id)"
+            >
               停止
             </Button>
-            <Button v-if="canManageCameraConfig" size="small" @click="openEditModal(record.camera_id)">
+            <Button
+              v-if="canManageCameraConfig"
+              size="small"
+              :aria-label="`编辑摄像头 ${record.name || record.camera_id}`"
+              @click="openEditModal(record.camera_id)"
+            >
               <template #icon><EditOutlined /></template>
             </Button>
-            <Button size="small" @click="router.push(`/cameras/${record.camera_id}`)">
+            <Button size="small" :aria-label="`查看摄像头 ${record.name || record.camera_id} 详情`" @click="openCameraDetail(record.camera_id)">
               详情
             </Button>
-            <Button v-if="canDeleteCamera" size="small" danger @click="handleDelete(record.camera_id)">
+            <DangerousActionConfirm
+              v-if="canDeleteCamera"
+              title="确认删除摄像头"
+              :description="`确定要删除摄像头 ${record.name || record.camera_id} 吗？删除后需重新添加。`"
+              action-label="删除"
+              :aria-label="`删除摄像头 ${record.name || record.camera_id}`"
+              :loading="deletingCameraId === record.camera_id"
+              confirm-text="删除"
+              @confirm="handleDelete(record.camera_id)"
+            >
               <template #icon><DeleteOutlined /></template>
-            </Button>
+            </DangerousActionConfirm>
           </Space>
         </template>
       </template>
-    </Table>
-  </main>
+      </ResponsiveTable>
+    </AsyncState>
+  </PageShell>
 </template>
+
+<style scoped>
+.cameras-page__refresh-error {
+  margin-bottom: 12px;
+}
+
+:deep(.camera-row:focus-visible) {
+  outline: 3px solid rgba(22, 119, 255, 0.45);
+  outline-offset: -3px;
+}
+</style>

@@ -1,12 +1,15 @@
-import { mount, flushPromises } from '@vue/test-utils'
+import { mount, flushPromises, enableAutoUnmount } from '@vue/test-utils'
 import { createPinia, setActivePinia, storeToRefs } from 'pinia'
 import { computed, defineComponent, nextTick } from 'vue'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import Alerts from '../Alerts.vue'
 import { getAlerts, getCameras } from '../../api'
 import { getAlert } from '../../api/alerts'
 import { useAlertStore } from '../../stores/useAlertStore'
+import { ApiError } from '../../types/api'
+
+enableAutoUnmount(afterEach)
 
 const wsHarness = vi.hoisted(() => ({
   routerReplace: vi.fn(),
@@ -18,6 +21,8 @@ const wsHarness = vi.hoisted(() => ({
     fallbackInterval?: number
   },
 }))
+
+let pinia: ReturnType<typeof createPinia>
 
 vi.mock('vue-router', async () => {
   const vue = await vi.importActual<typeof import('vue')>('vue')
@@ -54,7 +59,7 @@ const AlertsTableStub = defineComponent({
   name: 'AlertsTable',
   emits: ['select'],
   setup() {
-    const store = useAlertStore()
+    const store = useAlertStore(pinia)
     const { alerts } = storeToRefs(store)
     return { alerts }
   },
@@ -77,7 +82,7 @@ const AlertDetailPanelStub = defineComponent({
   name: 'AlertDetailPanel',
   emits: ['close'],
   setup() {
-    const store = useAlertStore()
+    const store = useAlertStore(pinia)
     const { selectedAlert } = storeToRefs(store)
     const recordingState = computed(() => {
       if (!selectedAlert.value) return ''
@@ -116,7 +121,8 @@ function realtimeAlert(overrides: Record<string, any> = {}) {
 
 describe('Alerts page realtime flow', () => {
   beforeEach(() => {
-    setActivePinia(createPinia())
+    pinia = createPinia()
+    setActivePinia(pinia)
     wsHarness.routerReplace.mockReset()
     wsHarness.route!.query = {}
     wsHarness.options = undefined
@@ -130,7 +136,7 @@ describe('Alerts page realtime flow', () => {
   it('renders websocket alerts in the page list and opens their evidence detail', async () => {
     const wrapper = mount(Alerts, {
       global: {
-        plugins: [createPinia()],
+        plugins: [pinia],
         stubs: {
           AlertsToolbar: { template: '<div data-test="alerts-toolbar" />' },
           AlertsTable: AlertsTableStub,
@@ -169,6 +175,39 @@ describe('Alerts page realtime flow', () => {
     expect(wrapper.find('[data-test="alert-detail"]').text()).toContain('true:complete')
   })
 
+  it('refreshes a clicked row with the alert detail payload', async () => {
+    vi.mocked(getAlerts).mockResolvedValue({
+      alerts: [realtimeAlert({
+        alert_id: 'row-alert',
+        recording_status: 'recording',
+      })],
+      total: 1,
+    } as any)
+    vi.mocked(getAlert).mockResolvedValue(realtimeAlert({
+      alert_id: 'row-alert',
+      recording_status: 'complete',
+    }) as any)
+
+    const wrapper = mount(Alerts, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          AlertsToolbar: { template: '<div data-test="alerts-toolbar" />' },
+          AlertsTable: AlertsTableStub,
+          AlertDetailPanel: AlertDetailPanelStub,
+          ContentSkeleton: { template: '<div data-test="skeleton" />' },
+        },
+      },
+    })
+    await flushPromises()
+
+    await wrapper.find('.alert-row').trigger('click')
+    await flushPromises()
+
+    expect(getAlert).toHaveBeenCalledWith('row-alert')
+    expect(wrapper.find('[data-test="alert-detail"]').text()).toContain('true:complete')
+  })
+
   it('opens alert detail from query id even when the alert is outside the current list', async () => {
     wsHarness.route!.query = { id: 'deep-linked-alert' }
     vi.mocked(getAlert).mockResolvedValue(realtimeAlert({
@@ -178,7 +217,7 @@ describe('Alerts page realtime flow', () => {
 
     const wrapper = mount(Alerts, {
       global: {
-        plugins: [createPinia()],
+        plugins: [pinia],
         stubs: {
           AlertsToolbar: { template: '<div data-test="alerts-toolbar" />' },
           AlertsTable: AlertsTableStub,
@@ -204,7 +243,7 @@ describe('Alerts page realtime flow', () => {
 
     const wrapper = mount(Alerts, {
       global: {
-        plugins: [createPinia()],
+        plugins: [pinia],
         stubs: {
           AlertsToolbar: { template: '<div data-test="alerts-toolbar" />' },
           AlertsTable: AlertsTableStub,
@@ -215,7 +254,7 @@ describe('Alerts page realtime flow', () => {
     })
     await flushPromises()
 
-    const store = useAlertStore()
+    const store = useAlertStore(pinia)
     store.filters.severity = 'high'
     expect(wrapper.find('[data-test="alert-detail"]').text()).toContain('true:recording')
 
@@ -234,7 +273,7 @@ describe('Alerts page realtime flow', () => {
   it('selects a websocket alert that matches a changed query id on the same page', async () => {
     const wrapper = mount(Alerts, {
       global: {
-        plugins: [createPinia()],
+        plugins: [pinia],
         stubs: {
           AlertsToolbar: { template: '<div data-test="alerts-toolbar" />' },
           AlertsTable: AlertsTableStub,
@@ -256,5 +295,129 @@ describe('Alerts page realtime flow', () => {
     const detail = wrapper.find('[data-test="alert-detail"]')
     expect(detail.text()).toContain('ws-target')
     expect(detail.text()).toContain('true:recording')
+  })
+
+  it('does not disguise an alert query failure as an empty result', async () => {
+    vi.mocked(getAlerts).mockRejectedValue(new Error('alert database unavailable'))
+
+    const wrapper = mount(Alerts, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          AlertsToolbar: { template: '<div data-test="alerts-toolbar" />' },
+          AlertsTable: AlertsTableStub,
+          AlertDetailPanel: AlertDetailPanelStub,
+          ContentSkeleton: { template: '<div data-test="skeleton" />' },
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('数据加载失败')
+    expect(wrapper.text()).toContain('alert database unavailable')
+    expect(wrapper.text()).not.toContain('没有符合条件的告警')
+  })
+
+  it('announces a missing deep-linked alert as not found', async () => {
+    wsHarness.route!.query = { id: 'deleted-alert' }
+    vi.mocked(getAlert).mockRejectedValue(new ApiError({
+      httpStatus: 404,
+      businessCode: 40400,
+      message: 'alert not found',
+    }))
+
+    const wrapper = mount(Alerts, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          AlertsToolbar: { template: '<div data-test="alerts-toolbar" />' },
+          AlertsTable: AlertsTableStub,
+          AlertDetailPanel: AlertDetailPanelStub,
+          ContentSkeleton: { template: '<div data-test="skeleton" />' },
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('告警不存在或已被删除')
+    expect(wrapper.text()).toContain('alert not found')
+  })
+
+  it('does not overwrite a newer websocket detail state with an older detail response', async () => {
+    let finishDetail!: (value: any) => void
+    vi.mocked(getAlert).mockReturnValue(new Promise(resolve => { finishDetail = resolve }))
+    vi.mocked(getAlerts).mockResolvedValue({ alerts: [realtimeAlert()], total: 1 } as any)
+    const wrapper = mount(Alerts, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          AlertsToolbar: true, AlertsTable: AlertsTableStub,
+          AlertDetailPanel: AlertDetailPanelStub,
+        },
+      },
+    })
+    await flushPromises()
+    await wrapper.find('.alert-row').trigger('click')
+
+    wsHarness.options!.onMessage('alerts', {
+      alert_id: 'live-alert-1', has_recording: true, recording_status: 'complete',
+    })
+    finishDetail(realtimeAlert({ recording_status: 'recording' }))
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="alert-detail"]').text()).toContain('true:complete')
+    wrapper.unmount()
+  })
+
+  it('reconciles a selected off-page detail when websocket requests a REST resync', async () => {
+    wsHarness.route!.query = { id: 'off-page' }
+    vi.mocked(getAlert)
+      .mockResolvedValueOnce(realtimeAlert({ alert_id: 'off-page', recording_status: 'recording' }) as any)
+      .mockResolvedValueOnce(realtimeAlert({ alert_id: 'off-page', recording_status: 'complete' }) as any)
+    const wrapper = mount(Alerts, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          AlertsToolbar: true, AlertsTable: AlertsTableStub,
+          AlertDetailPanel: AlertDetailPanelStub,
+        },
+      },
+    })
+    await flushPromises()
+
+    await wsHarness.options!.fallbackPoll?.()
+    await flushPromises()
+
+    expect(getAlert).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('[data-test="alert-detail"]').text()).toContain('true:complete')
+    wrapper.unmount()
+  })
+
+  it('removes a selected detail when REST reconciliation discovers a lost deletion event', async () => {
+    wsHarness.route!.query = { id: 'deleted-off-page' }
+    vi.mocked(getAlert)
+      .mockResolvedValueOnce(realtimeAlert({ alert_id: 'deleted-off-page' }) as any)
+      .mockRejectedValueOnce(new ApiError({
+        httpStatus: 404, businessCode: 40400, message: 'alert was deleted',
+      }))
+    const wrapper = mount(Alerts, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          AlertsToolbar: true, AlertsTable: AlertsTableStub,
+          AlertDetailPanel: AlertDetailPanelStub,
+        },
+      },
+    })
+    await flushPromises()
+    expect(wrapper.find('[data-test="alert-detail"]').exists()).toBe(true)
+
+    await wsHarness.options!.fallbackPoll?.()
+    await flushPromises()
+
+    expect(useAlertStore(pinia).selectedAlert).toBeNull()
+    expect(wrapper.find('[data-test="alert-detail"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('告警不存在或已被删除')
+    wrapper.unmount()
   })
 })

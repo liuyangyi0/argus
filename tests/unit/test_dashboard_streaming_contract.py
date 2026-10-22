@@ -10,6 +10,8 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from argus.config.schema import ArgusConfig, CameraConfig
+from argus.core.diagnostics import FrameDiagnostics
+from argus.core.frame_identity import FrameIdentity
 from argus.dashboard.app import create_app
 from argus.streaming.go2rtc_manager import gige_to_go2rtc_source, usb_to_go2rtc_source
 
@@ -24,6 +26,7 @@ class _FakeGo2RTC:
     ) -> None:
         self.running = running
         self.api_port = api_port
+        self.rtsp_port = 8554
         self.register_camera = MagicMock(return_value=rtsp_url)
         self.start = MagicMock(side_effect=self._start)
         self.close = MagicMock()
@@ -83,8 +86,30 @@ def _camera_manager(camera: CameraConfig) -> MagicMock:
     manager.get_detector_status.return_value = None
     manager.get_learning_progress.return_value = None
     manager.get_pipeline_mode.return_value = None
+    manager.get_pipeline.return_value = None
     manager.is_anomaly_locked.return_value = False
+    manager.get_diagnostics.return_value = []
+    manager.get_scene_guard_status.return_value = None
     return manager
+
+
+def _candidate_diagnostic(camera_id: str = "cam_01") -> FrameDiagnostics:
+    diag = FrameDiagnostics(
+        frame_number=5,
+        timestamp=1710000000.0,
+        camera_id=camera_id,
+        anomaly_score=0.82,
+        is_anomalous=True,
+        final_decision="info",
+    )
+    diag.add_candidate(
+        candidate_type="frame_anomaly",
+        decision="info",
+        stage="decision",
+        evidence={"anomaly_score": 0.82},
+        suppression_reason="grader_no_alert",
+    )
+    return diag
 
 
 def _expected_usb_source(camera: CameraConfig) -> str:
@@ -120,11 +145,8 @@ def test_streaming_info_contract_returns_go2rtc_urls():
     assert body["data"] == {
         "camera_id": "cam_01",
         "go2rtc": True,
-        "webrtc_ws": "ws://edge.local:11984/api/ws?src=cam_01",
-        "mse_ws": "ws://edge.local:11984/api/ws?src=cam_01&mode=mse",
-        "hls": "http://edge.local:11984/api/stream.m3u8?src=cam_01",
-        "mjpeg": "http://edge.local:11984/api/frame.jpeg?src=cam_01",
-        "player": "http://edge.local:11984/stream.html?src=cam_01",
+        "webrtc_ws": "ws://edge.local:8080/ws/stream/cam_01?mode=webrtc",
+        "mse_ws": "ws://edge.local:8080/ws/stream/cam_01?mode=mse",
         "fallback": "/api/cameras/cam_01/stream",
     }
     go2rtc.register_camera.assert_called_once_with(
@@ -230,12 +252,222 @@ def test_usb_go2rtc_runtime_rtsp_does_not_leak_to_config_or_detail_api():
 
     config_payload = config_response.json()["data"]
     detail_config = detail_response.json()["data"]["config"]
+    detail_payload = detail_response.json()["data"]
     assert config_payload["source"] == "0"
     assert config_payload["protocol"] == "usb"
     assert detail_config["source"] == "0"
     assert detail_config["protocol"] == "usb"
+    assert detail_payload["declared_source"] == "0"
+    assert detail_payload["runtime_source"] == runtime_rtsp
+    assert detail_payload["go2rtc_stream"] == "usb_cam"
+    assert detail_payload["source_consistency"] == "go2rtc_redirect"
+    assert detail_payload["source_diagnostics"]["declared_source"] == "0"
+    assert detail_payload["source_diagnostics"]["runtime_source"] == runtime_rtsp
     assert runtime_rtsp not in json.dumps(config_payload)
     assert runtime_rtsp not in json.dumps(detail_config)
+
+
+def test_runner_snapshot_api_returns_latest_frame_identity():
+    camera = CameraConfig(
+        camera_id="cam_01",
+        name="Camera 01",
+        source="rtsp://camera.local/stream",
+        protocol="rtsp",
+    )
+    identity = {
+        "camera_id": "cam_01",
+        "source_declared": "rtsp://camera.local/stream",
+        "source_runtime": "rtsp://camera.local/stream",
+        "stream_id": None,
+        "frame_index": 42,
+        "capture_wall_ts": 1710000000.1,
+        "capture_monotonic_ts": 10.0,
+        "pipeline_ingest_ts": 1710000000.2,
+        "preview_stream_ts": None,
+        "snapshot_id": None,
+        "runtime_source_hash": "abc123",
+    }
+    manager = MagicMock()
+    manager.get_runner_snapshot.return_value = SimpleNamespace(
+        camera_id="cam_01",
+        model_ref="patchcore:v1",
+        health_status="healthy",
+        cusum_state={},
+        lock_state=SimpleNamespace(value="unlocked"),
+        last_heartbeat=0.0,
+        version_tag="patchcore:v1",
+        degradation_state=SimpleNamespace(value="nominal"),
+        consecutive_failures=0,
+        latest_frame_identity=identity,
+        stats=SimpleNamespace(
+            frames_captured=42,
+            frames_analyzed=40,
+            anomalies_detected=1,
+            alerts_emitted=0,
+            avg_latency_ms=12.3,
+        ),
+    )
+    manager.get_diagnostics.return_value = [_candidate_diagnostic()]
+    client = _client(camera, camera_manager=manager)
+
+    response = client.get("/api/cameras/cam_01/runner")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 0
+    assert body["data"]["latest_frame_identity"] == identity
+    assert body["data"]["stats"]["frames_captured"] == 42
+    assert body["data"]["candidate_diagnostics"][0]["candidate_records"][0][
+        "suppression_reason"
+    ] == "grader_no_alert"
+
+
+def test_camera_detail_and_diagnostics_api_return_candidate_records():
+    camera = CameraConfig(
+        camera_id="cam_01",
+        name="Camera 01",
+        source="rtsp://camera.local/stream",
+        protocol="rtsp",
+    )
+    manager = _camera_manager(camera)
+    diagnostic = _candidate_diagnostic()
+    diagnostic.scene_guard_state = "moved"
+    manager.get_diagnostics.return_value = [diagnostic]
+    manager.get_scene_guard_status.return_value = {
+        "enabled": True,
+        "state": "moved",
+        "reason": "pose_out_of_policy",
+    }
+    client = _client(camera, camera_manager=manager)
+
+    detail_response = client.get("/api/cameras/cam_01/detail/json")
+    diagnostics_response = client.get("/api/cameras/cam_01/diagnostics?limit=5")
+
+    assert detail_response.status_code == 200
+    detail = detail_response.json()["data"]
+    assert detail["candidate_diagnostics"][0]["final_decision"] == "info"
+    assert detail["candidate_diagnostics"][0]["candidate_records"][0]["evidence"] == {
+        "anomaly_score": 0.82,
+    }
+    assert detail["candidate_diagnostics"][0]["scene_guard_state"] == "moved"
+    scene_guard = detail["runtime"]["scene_guard"]
+    assert scene_guard["enabled"] is True
+    assert scene_guard["usable"] is False
+    assert scene_guard["state"] == "moved"
+    assert scene_guard["reason"] == "pose_out_of_policy"
+    assert "recovery_progress" in scene_guard
+
+    assert diagnostics_response.status_code == 200
+    diagnostics = diagnostics_response.json()["data"]
+    assert diagnostics["camera_id"] == "cam_01"
+    assert diagnostics["diagnostics"][0]["candidate_records"][0]["decision"] == "info"
+    assert diagnostics["diagnostics"][0]["scene_guard_state"] == "moved"
+
+
+def test_snapshot_identity_is_visible_in_camera_detail_api():
+    camera = CameraConfig(
+        camera_id="cam_01",
+        name="Camera 01",
+        source="rtsp://camera.local/stream",
+        protocol="rtsp",
+    )
+
+    class _IdentityCameraManager:
+        def __init__(self) -> None:
+            self._cameras = [camera]
+            self.frame = np.zeros((32, 48, 3), dtype=np.uint8)
+            self.identity = FrameIdentity(
+                camera_id="cam_01",
+                source_declared="rtsp://camera.local/stream",
+                source_runtime="rtsp://camera.local/stream",
+                stream_id=None,
+                frame_index=77,
+                capture_wall_ts=1710000200.1,
+                capture_monotonic_ts=20.0,
+                pipeline_ingest_ts=1710000200.2,
+            )
+            self.last_snapshot = None
+
+        def get_latest_frame_with_identity(self, camera_id: str):
+            return self.frame, self.identity
+
+        def record_snapshot_access(self, camera_id: str, snapshot_id: str):
+            self.last_snapshot = self.identity.with_updates(snapshot_id=snapshot_id)
+            return self.last_snapshot
+
+        def get_frame_identity_status(self, camera_id: str):
+            return {
+                "declared_source": self.identity.source_declared,
+                "runtime_source": self.identity.source_runtime,
+                "go2rtc_stream": self.identity.stream_id,
+                "latest": self.identity.to_dict(),
+                "last_frame_index": self.identity.frame_index,
+                "last_capture_ts": self.identity.capture_wall_ts,
+                "last_pipeline_ts": self.identity.pipeline_ingest_ts,
+                "last_snapshot": self.last_snapshot.to_dict() if self.last_snapshot else None,
+                "last_snapshot_frame_index": (
+                    self.last_snapshot.frame_index if self.last_snapshot else None
+                ),
+                "last_snapshot_ts": 1710000200.3 if self.last_snapshot else None,
+                "last_preview_stream": None,
+                "last_preview_stream_frame_index": None,
+                "last_preview_stream_ts": None,
+            }
+
+        def get_status(self):
+            return [
+                SimpleNamespace(
+                    camera_id="cam_01",
+                    name="Camera 01",
+                    connected=True,
+                    running=True,
+                    stats=SimpleNamespace(
+                        frames_captured=77,
+                        frames_analyzed=77,
+                        anomalies_detected=0,
+                        alerts_emitted=0,
+                        avg_latency_ms=1.0,
+                        current_fps=24.8,
+                    ),
+                    capture_status={},
+                )
+            ]
+
+        def get_runner_snapshot(self, camera_id: str):
+            return None
+
+        def get_detector_status(self, camera_id: str):
+            return None
+
+        def get_learning_progress(self, camera_id: str):
+            return None
+
+        def get_pipeline_mode(self, camera_id: str):
+            return "active"
+
+        def is_anomaly_locked(self, camera_id: str):
+            return False
+
+        def get_backpressure_stats(self):
+            return {"cam_01": {"dropped": 3}}
+
+    manager = _IdentityCameraManager()
+    client = _client(camera, camera_manager=manager)
+
+    snapshot = client.get("/api/cameras/cam_01/snapshot")
+    detail = client.get("/api/cameras/cam_01/detail/json")
+
+    assert snapshot.status_code == 200
+    assert snapshot.headers["x-argus-frame-index"] == "77"
+    assert detail.status_code == 200
+    data = detail.json()["data"]
+    assert data["last_frame_index"] == 77
+    assert data["last_snapshot_frame_index"] == 77
+    assert data["source_diagnostics"]["last_snapshot_identity"]["snapshot_id"] == (
+        snapshot.headers["x-argus-snapshot-id"]
+    )
+    assert data["fps_observed"] == 24.8
+    assert data["dropped_frames"] == 3
 
 
 def test_running_usb_connection_probe_uses_latest_frame_not_physical_source(
@@ -379,8 +611,6 @@ def test_dashboard_lifespan_preloads_gige_go2rtc_initial_stream():
             "gige_cam": gige_to_go2rtc_source("scripts/gige_capture.ps1"),
         },
     )
-    go2rtc.register_camera.assert_called_once_with(
-        "gige_cam",
-        "192.0.2.20",
-        "gige",
-    )
+    # Exec-backed GigE streams are already in the owned initial config;
+    # dynamic registration would replace the producer that was just started.
+    go2rtc.register_camera.assert_not_called()

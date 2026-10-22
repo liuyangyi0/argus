@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 from fastapi.testclient import TestClient
 
 from argus.config.schema import ArgusConfig, AuthConfig, CameraConfig
@@ -13,6 +14,8 @@ class _Pipeline:
     def __init__(self) -> None:
         self.camera_config = SimpleNamespace(zones=[])
         self.updated_zones: list[object] | None = None
+        self.latest_frame = None
+        self.latest_frame_requests = 0
 
     def update_zones(self, zones: list[object]) -> None:
         self.updated_zones = zones
@@ -23,8 +26,22 @@ class _CameraManager:
     def __init__(self, pipeline: _Pipeline) -> None:
         self.pipeline = pipeline
 
-    def get_pipeline(self, camera_id: str):
-        return self.pipeline if camera_id == "cam_01" else None
+    def get_camera_zones_snapshot(self, camera_id: str):
+        if camera_id != "cam_01":
+            return None
+        return list(self.pipeline.camera_config.zones)
+
+    def update_camera_zones(self, camera_id: str, zones: list[object]) -> bool:
+        if camera_id != "cam_01":
+            return False
+        self.pipeline.update_zones(zones)
+        return True
+
+    def get_latest_frame(self, camera_id: str):
+        self.pipeline.latest_frame_requests += 1
+        if camera_id != "cam_01":
+            return None
+        return self.pipeline.latest_frame
 
 
 def _client_for_role(role: str, tmp_path):
@@ -95,3 +112,30 @@ def test_engineer_can_update_zones(tmp_path):
     assert response.json()["data"]["count"] == 1
     assert pipeline.updated_zones is not None
     assert pipeline.updated_zones[0].zone_id == "zone_a"
+
+
+def test_zone_snapshot_uses_latest_frame_cache(tmp_path):
+    client, pipeline = _client_for_role("engineer", tmp_path)
+    pipeline.latest_frame = np.full((24, 32, 3), 127, dtype=np.uint8)
+
+    response = client.get("/api/zones/snapshot/cam_01")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.content.startswith(b"\xff\xd8")
+    assert pipeline.latest_frame_requests == 1
+
+
+def test_zone_snapshot_without_cached_frame_is_explicitly_unavailable(tmp_path):
+    client, pipeline = _client_for_role("engineer", tmp_path)
+
+    response = client.get("/api/zones/snapshot/cam_01")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": 50300,
+        "msg": "暂无可用的最新画面",
+        "data": None,
+    }
+    assert pipeline.latest_frame_requests == 1

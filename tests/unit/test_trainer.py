@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -53,6 +56,103 @@ def _create_baseline_images(bm, camera_id="cam_01", zone_id="default", count=50,
 
     bm.set_current_version(camera_id, zone_id, version_dir.name)
     return version_dir
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _scene_profile_baseline(
+    root: Path,
+    *,
+    camera_id: str = "cam_01",
+) -> tuple[Path, Path, dict]:
+    images_dir = root / "images"
+    images_dir.mkdir(parents=True)
+    source_specs = [
+        (0, "/recordings/session-a.mp4", "a" * 64, "session-a", "train"),
+        (
+            1,
+            "/recordings/session-b.mp4",
+            "b" * 64,
+            "session-b",
+            "calibration",
+        ),
+    ]
+    sources = []
+    samples = []
+    for source_index, source_path, source_hash, session_id, role in source_specs:
+        sources.append({
+            "source_index": source_index,
+            "path": source_path,
+            "sha256": source_hash,
+            "split_role": role,
+            "annotation_review_evidence": {
+                "complete": True,
+                "source_video_sha256": source_hash,
+                "source_video_sha256_matches": True,
+                "source_session_id": session_id,
+                "camera_id": camera_id,
+                "camera_id_matches": True,
+            },
+        })
+        for local_index in range(2):
+            name = f"{role}_{local_index}.png"
+            image = images_dir / name
+            image.write_bytes(
+                f"{session_id}:{local_index}:normal-image".encode()
+            )
+            samples.append({
+                "sample_index": len(samples),
+                "path": f"images/{name}",
+                "sha256": _sha256(image),
+                "source_index": source_index,
+                "source_path": source_path,
+                "source_sha256": source_hash,
+                "split_role": role,
+            })
+    payload = {
+        "schema_version": "argus.scene-profile-baseline.v2",
+        "camera_id": camera_id,
+        "scene_profile_id": "scene-profile-01",
+        "training_ready": True,
+        "release_eligible": False,
+        "corpus_evidence_complete": True,
+        "split_contract": {
+            "policy": "complete_operator_declared_source_session_grouping",
+            "assignment": (
+                "lexicographically_greatest_declared_session_id_is_calibration; "
+                "all_other_declared_sessions_are_train"
+            ),
+            "random_frame_split_allowed": False,
+            "single_session_policy": "diagnostic_only",
+            "declared_session_ids": ["session-a", "session-b"],
+            "declared_independent_session_count": 2,
+            "source_counts": {
+                "train": 1,
+                "calibration": 1,
+                "diagnostic_only": 0,
+            },
+            "sample_counts": {
+                "train": 2,
+                "calibration": 2,
+                "diagnostic_only": 0,
+            },
+        },
+        "selection": {"accepted_images": 4},
+        "sources": sources,
+        "samples": samples,
+    }
+    manifest_path = root / "manifest.json"
+    _write_manifest(manifest_path, payload)
+    return images_dir, manifest_path, payload
+
+
+def _write_manifest(path: Path, payload: dict) -> None:
+    path.write_text(
+        json.dumps(payload, sort_keys=True, allow_nan=False),
+        encoding="utf-8",
+    )
 
 
 # ── TRN-001: Pre-training Validation ──
@@ -194,6 +294,213 @@ class TestTrainValSplit:
 
         assert train1 != train2
 
+    def test_scene_profile_manifest_uses_complete_session_roles(
+        self,
+        trainer,
+        tmp_path,
+    ):
+        baseline_dir, _, _ = _scene_profile_baseline(tmp_path / "baseline")
+        output_dir = tmp_path / "model"
+
+        with patch(
+            "argus.anomaly.trainer.random.Random.shuffle",
+            side_effect=AssertionError("manifest split must not shuffle"),
+        ):
+            train_dir, val_dir, train_count, val_count = trainer._split_train_val(
+                baseline_dir,
+                output_dir,
+                seed=999,
+                expected_camera_id="cam_01",
+            )
+
+        assert train_count == 2
+        assert val_count == 2
+        assert {path.name for path in (train_dir / "normal").iterdir()} == {
+            "train_0.png",
+            "train_1.png",
+        }
+        assert {path.name for path in (val_dir / "normal").iterdir()} == {
+            "calibration_0.png",
+            "calibration_1.png",
+        }
+
+    def test_scene_profile_v3_manifest_preserves_same_offline_split_contract(
+        self,
+        trainer,
+        tmp_path,
+    ):
+        baseline_dir, manifest_path, payload = _scene_profile_baseline(
+            tmp_path / "baseline"
+        )
+        payload["schema_version"] = "argus.scene-profile-baseline.v3"
+        _write_manifest(manifest_path, payload)
+
+        with patch(
+            "argus.anomaly.trainer.random.Random.shuffle",
+            side_effect=AssertionError("v3 manifest split must not shuffle"),
+        ):
+            train_dir, val_dir, train_count, val_count = trainer._split_train_val(
+                baseline_dir,
+                tmp_path / "model",
+                expected_camera_id="cam_01",
+            )
+
+        assert (train_count, val_count) == (2, 2)
+        assert {path.name for path in (train_dir / "normal").iterdir()} == {
+            "train_0.png",
+            "train_1.png",
+        }
+        assert {path.name for path in (val_dir / "normal").iterdir()} == {
+            "calibration_0.png",
+            "calibration_1.png",
+        }
+
+    @pytest.mark.parametrize(
+        ("field", "unsafe_value", "error"),
+        [
+            ("training_ready", False, "not ready"),
+            ("release_eligible", True, "literal false"),
+            ("schema_version", "unknown", "unsupported"),
+        ],
+    )
+    def test_scene_profile_manifest_top_level_contract_fails_closed(
+        self,
+        trainer,
+        tmp_path,
+        field,
+        unsafe_value,
+        error,
+    ):
+        baseline_dir, manifest_path, payload = _scene_profile_baseline(
+            tmp_path / "baseline"
+        )
+        payload[field] = unsafe_value
+        _write_manifest(manifest_path, payload)
+
+        with pytest.raises(ValueError, match=error):
+            trainer._split_train_val(baseline_dir, tmp_path / "model")
+
+    @pytest.mark.parametrize(
+        ("field", "unsafe_value", "error"),
+        [
+            ("policy", "random", "policy"),
+            ("random_frame_split_allowed", True, "forbid random"),
+            ("single_session_policy", "temporal_random", "single-session"),
+        ],
+    )
+    def test_scene_profile_manifest_split_contract_fails_closed(
+        self,
+        trainer,
+        tmp_path,
+        field,
+        unsafe_value,
+        error,
+    ):
+        baseline_dir, manifest_path, payload = _scene_profile_baseline(
+            tmp_path / "baseline"
+        )
+        payload["split_contract"][field] = unsafe_value
+        _write_manifest(manifest_path, payload)
+
+        with pytest.raises(ValueError, match=error):
+            trainer._split_train_val(baseline_dir, tmp_path / "model")
+
+    def test_scene_profile_manifest_rejects_tampered_sample_hash(
+        self,
+        trainer,
+        tmp_path,
+    ):
+        baseline_dir, manifest_path, payload = _scene_profile_baseline(
+            tmp_path / "baseline"
+        )
+        payload["samples"][0]["sha256"] = "0" * 64
+        _write_manifest(manifest_path, payload)
+
+        with pytest.raises(ValueError, match="sample sha256 mismatch"):
+            trainer._split_train_val(baseline_dir, tmp_path / "model")
+
+    def test_scene_profile_manifest_rejects_file_changed_after_manifest(
+        self,
+        trainer,
+        tmp_path,
+    ):
+        baseline_dir, _, payload = _scene_profile_baseline(tmp_path / "baseline")
+        changed = baseline_dir.parent / payload["samples"][0]["path"]
+        changed.write_bytes(b"tampered-after-manifest")
+
+        with pytest.raises(ValueError, match="sample sha256 mismatch"):
+            trainer._split_train_val(baseline_dir, tmp_path / "model")
+
+    def test_scene_profile_manifest_rejects_path_escape(
+        self,
+        trainer,
+        tmp_path,
+    ):
+        baseline_dir, manifest_path, payload = _scene_profile_baseline(
+            tmp_path / "baseline"
+        )
+        payload["samples"][0]["path"] = "../outside.png"
+        _write_manifest(manifest_path, payload)
+
+        with pytest.raises(ValueError, match="escapes"):
+            trainer._split_train_val(baseline_dir, tmp_path / "model")
+
+    @pytest.mark.parametrize(
+        ("field", "unsafe_value", "error"),
+        [
+            ("split_role", "calibration", "split role mismatch"),
+            ("source_path", "/recordings/other.mp4", "source path mismatch"),
+            ("source_sha256", "f" * 64, "source sha256 mismatch"),
+            ("source_index", 99, "unknown source"),
+        ],
+    )
+    def test_scene_profile_manifest_rejects_sample_source_inconsistency(
+        self,
+        trainer,
+        tmp_path,
+        field,
+        unsafe_value,
+        error,
+    ):
+        baseline_dir, manifest_path, payload = _scene_profile_baseline(
+            tmp_path / "baseline"
+        )
+        payload["samples"][0][field] = unsafe_value
+        _write_manifest(manifest_path, payload)
+
+        with pytest.raises(ValueError, match=error):
+            trainer._split_train_val(baseline_dir, tmp_path / "model")
+
+    def test_scene_profile_manifest_rejects_camera_mismatch(
+        self,
+        trainer,
+        tmp_path,
+    ):
+        baseline_dir, _, _ = _scene_profile_baseline(tmp_path / "baseline")
+
+        with pytest.raises(ValueError, match="camera_id does not match"):
+            trainer._split_train_val(
+                baseline_dir,
+                tmp_path / "model",
+                expected_camera_id="other-camera",
+            )
+
+    def test_scene_profile_manifest_rejects_session_split_across_roles(
+        self,
+        trainer,
+        tmp_path,
+    ):
+        baseline_dir, manifest_path, payload = _scene_profile_baseline(
+            tmp_path / "baseline"
+        )
+        payload["sources"][1]["annotation_review_evidence"][
+            "source_session_id"
+        ] = "session-a"
+        _write_manifest(manifest_path, payload)
+
+        with pytest.raises(ValueError, match="across roles"):
+            trainer._split_train_val(baseline_dir, tmp_path / "model")
+
 
 # ── TRN-005: Threshold Recommendation ──
 
@@ -224,13 +531,16 @@ class TestExportModel:
         """OpenVINO export should force the stable non-dynamo ONNX path."""
         engine = MagicMock()
         model = MagicMock()
+        (tmp_path / "model.xml").write_bytes(b"mock xml")
+        (tmp_path / "model.bin").write_bytes(b"mock weights")
 
-        ModelTrainer._export_model(
-            engine=engine,
-            model=model,
-            export_format="openvino",
-            export_path=str(tmp_path),
-        )
+        with patch("argus.anomaly._trainer_export.assert_openvino_static"):
+            ModelTrainer._export_model(
+                engine=engine,
+                model=model,
+                export_format="openvino",
+                export_path=str(tmp_path),
+            )
 
         engine.export.assert_called_once_with(
             model=model,
@@ -244,6 +554,7 @@ class TestExportModel:
         """Torch export should not receive ONNX-specific kwargs."""
         engine = MagicMock()
         model = MagicMock()
+        (tmp_path / "model.pt").write_bytes(b"mock torch model")
 
         ModelTrainer._export_model(
             engine=engine,
@@ -546,6 +857,29 @@ class TestDinomaly2BackboneMapping:
 
 class TestDinomaly2ConfigPassedToModel:
     """Verify that _train_anomalib passes AnomalyConfig params to Dinomaly constructor."""
+
+    @pytest.mark.parametrize("failure", ["read", "state_dict"])
+    def test_selected_backbone_failure_does_not_fit_default_backbone(self, trainer, tmp_path, failure):
+        model = MagicMock()
+        engine = MagicMock()
+        load_kwargs = {"side_effect": OSError("bad checkpoint")} if failure == "read" else {
+            "return_value": {"weight": object()},
+        }
+        if failure == "state_dict":
+            model.model.encoder.load_state_dict.side_effect = RuntimeError("missing encoder keys")
+        with patch("anomalib.data.Folder", MagicMock(), create=True), \
+             patch("anomalib.engine.Engine", return_value=engine, create=True), \
+             patch("anomalib.models.Dinomaly", return_value=model, create=True), \
+             patch("torch.cuda.is_available", return_value=False), \
+             patch("torch.load", **load_kwargs):
+            with pytest.raises(RuntimeError, match="Selected backbone"):
+                trainer._train_anomalib(
+                    tmp_path / "train", tmp_path / "output", "dinomaly2", 256,
+                    backbone_checkpoint=str(tmp_path / "selected.pt"),
+                )
+        engine.fit.assert_not_called()
+        if failure == "state_dict":
+            assert model.model.encoder.load_state_dict.call_args.kwargs["strict"] is True
 
     def test_dinomaly2_receives_config_params(self, trainer, tmp_path):
         """Mock Dinomaly class and verify constructor receives correct params."""

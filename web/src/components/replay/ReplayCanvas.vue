@@ -87,7 +87,7 @@ onBeforeUnmount(() => {
 /* ── Video event handlers ── */
 
 function onVideoCanPlay() {
-  ctrl.videoError.value = ''
+  ctrl.markVideoReady()
   if (ctrl.pendingSeekIndex.value !== null && videoRef.value) {
     const seekTime = ctrl.pendingSeekIndex.value / ctrl.fps.value
     videoRef.value.currentTime = seekTime
@@ -100,7 +100,7 @@ function onVideoCanPlay() {
 
 function onVideoPlay() {
   compositor.playing.value = true
-  ctrl.videoError.value = ''
+  ctrl.markVideoReady()
   // Re-start RVFC / RAF loop
   compositor.start()
 }
@@ -118,7 +118,7 @@ function onVideoEnded() {
 function onVideoError() {
   const el = videoRef.value
   if (!el?.error) return
-  ctrl.videoError.value = `视频错误 (code=${el.error.code})`
+  ctrl.markVideoError(`视频错误 (code=${el.error.code})`)
 }
 
 function onLoadedMetadata() {
@@ -146,6 +146,7 @@ watch(() => ctrl.currentIndex.value, (idx) => {
       preload="auto"
       playsinline
       style="display: none"
+      @loadstart="ctrl.markVideoLoading"
       @canplay="onVideoCanPlay"
       @play="onVideoPlay"
       @pause="onVideoPause"

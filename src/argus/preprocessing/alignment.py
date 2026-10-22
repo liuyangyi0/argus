@@ -68,12 +68,38 @@ class PhaseCorrelator:
         self._ref_small: np.ndarray | None = None
         self._hanning: np.ndarray | None = None
         self._ref_timestamp: float = 0.0
+        self._reference_pinned = False
 
     def reset(self) -> None:
         """Drop the current reference so the next call establishes a fresh one."""
         self._ref_small = None
         self._hanning = None
         self._ref_timestamp = 0.0
+        self._reference_pinned = False
+
+    def set_reference(
+        self,
+        frame: np.ndarray,
+        *,
+        now: float | None = None,
+        pinned: bool = False,
+    ) -> None:
+        """Explicitly install a reference, optionally preventing live refresh.
+
+        A pinned reference is used when a fixed-scene model is bound to an
+        operator-approved image.  Runtime frames must then never drift into the
+        role of normal reference merely because the refresh interval elapsed.
+        """
+        if frame is None or frame.size == 0:
+            raise ValueError("frame must be a non-empty ndarray")
+        small = self._downsample_gray(frame)
+        self._ref_small = small
+        self._ref_timestamp = time.monotonic() if now is None else float(now)
+        self._hanning = cv2.createHanningWindow(
+            (small.shape[1], small.shape[0]),
+            cv2.CV_32F,
+        )
+        self._reference_pinned = bool(pinned)
 
     def align(
         self, frame: np.ndarray, *, now: float | None = None,
@@ -97,23 +123,22 @@ class PhaseCorrelator:
 
         ref_stale = (
             self._ref_small is not None
+            and not self._reference_pinned
             and (t - self._ref_timestamp) >= self.ref_update_interval_s
         )
         if self._ref_small is None or ref_stale:
-            self._ref_small = small
-            self._ref_timestamp = t
-            if self._hanning is None or self._hanning.shape != small.shape:
-                self._hanning = cv2.createHanningWindow(
-                    (small.shape[1], small.shape[0]), cv2.CV_32F,
-                )
+            self.set_reference(frame, now=t, pinned=False)
             return frame, (0.0, 0.0)
 
         if self._ref_small.shape != small.shape:
-            self._ref_small = small
-            self._ref_timestamp = t
-            self._hanning = cv2.createHanningWindow(
-                (small.shape[1], small.shape[0]), cv2.CV_32F,
-            )
+            if self._reference_pinned:
+                logger.warning(
+                    "alignment.pinned_reference_shape_mismatch",
+                    reference_shape=self._ref_small.shape,
+                    frame_shape=small.shape,
+                )
+                return frame, (float("inf"), float("inf"))
+            self.set_reference(frame, now=t, pinned=False)
             return frame, (0.0, 0.0)
 
         (dx_small, dy_small), _response = cv2.phaseCorrelate(

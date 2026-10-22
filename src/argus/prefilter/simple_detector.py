@@ -11,6 +11,7 @@ The invariant it guarantees:
 
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass, field
 
@@ -19,6 +20,11 @@ import numpy as np
 import structlog
 
 logger = structlog.get_logger()
+
+
+# A process-wide sequence prevents a detector reset/recreation from reusing an
+# incident identity that may still be covered by AlertGrader's cooldown window.
+_TRACK_ID_SEQUENCE = itertools.count(1)
 
 
 @dataclass
@@ -30,6 +36,9 @@ class StaticRegion:
     first_seen: float
     last_seen: float
     bbox: tuple[int, int, int, int]  # x, y, w, h
+    # Optional for backwards compatibility with callers that construct
+    # StaticRegion evidence manually. Detector-created regions always have one.
+    track_id: int | None = None
 
 
 @dataclass
@@ -126,6 +135,7 @@ class SimplexDetector:
 
         # Step 9: Match with tracked regions
         matched_indices: set[int] = set()
+        observed_regions: list[StaticRegion] = []
         for cx, cy, area, bbox in current_regions:
             best_match = None
             best_dist = float("inf")
@@ -138,21 +148,30 @@ class SimplexDetector:
                     best_dist = dist
 
             if best_match is not None:
-                self._tracked[best_match].centroid = (cx, cy)
-                self._tracked[best_match].area_px = area
-                self._tracked[best_match].last_seen = now
-                self._tracked[best_match].bbox = bbox
+                tracked = self._tracked[best_match]
+                tracked.centroid = (cx, cy)
+                tracked.area_px = area
+                tracked.last_seen = now
+                tracked.bbox = bbox
+                if tracked.track_id is None:
+                    tracked.track_id = next(_TRACK_ID_SEQUENCE)
                 matched_indices.add(best_match)
+                observed_regions.append(tracked)
             else:
-                self._tracked.append(
-                    StaticRegion(
-                        centroid=(cx, cy),
-                        area_px=area,
-                        first_seen=now,
-                        last_seen=now,
-                        bbox=bbox,
-                    )
+                tracked = StaticRegion(
+                    centroid=(cx, cy),
+                    area_px=area,
+                    first_seen=now,
+                    last_seen=now,
+                    bbox=bbox,
+                    track_id=next(_TRACK_ID_SEQUENCE),
                 )
+                new_index = len(self._tracked)
+                self._tracked.append(tracked)
+                # A second nearby component in this same frame must not match
+                # the track that was just created for the first component.
+                matched_indices.add(new_index)
+                observed_regions.append(tracked)
 
         # Prune regions not seen in this frame (gone)
         self._tracked = [
@@ -162,11 +181,18 @@ class SimplexDetector:
         ]
 
         # Check for static detections
+        # Unmatched tracks stay alive briefly for reconnection, but they are not
+        # evidence for the current frame and must never produce a stale alert.
         static = [
-            t for t in self._tracked if (now - t.first_seen) >= self._min_static_seconds
+            region
+            for region in observed_regions
+            if (now - region.first_seen) >= self._min_static_seconds
         ]
 
-        max_static = max((now - t.first_seen for t in self._tracked), default=0.0)
+        max_static = max(
+            (now - region.first_seen for region in observed_regions),
+            default=0.0,
+        )
 
         return SimplexResult(
             has_detection=len(static) > 0,

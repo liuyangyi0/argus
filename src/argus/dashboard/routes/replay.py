@@ -8,18 +8,34 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response, StreamingResponse
 
+from argus.dashboard.api_contracts import (
+    ReplayClipListResponse,
+    ReplayClipMutationResponse,
+    ReplayClipRequest,
+    ReplayMetadataResponse,
+    ReplayPinFrameRequest,
+    ReplayPinFrameResponse,
+    ReplaySignalsResponse,
+)
 from argus.dashboard.api_response import (
-    api_success,
+    ApiEnvelope,
+    api_error,
+    api_forbidden,
     api_not_found,
+    api_success,
+    api_typed_success,
     api_unavailable,
     api_validation_error,
+    error_code_for_status,
 )
+from argus.dashboard.auth import require_permission
 from argus.storage.models import AlertRecord
 
 router = APIRouter()
@@ -29,6 +45,90 @@ _MAX_STORYBOARD_CAMERAS = 4
 # Window used to match a correlation-partner alert to the primary alert
 # when no event_group_id linkage exists.
 _CORRELATION_WINDOW_SECONDS = 5.0
+_PRIVATE_MEDIA_CACHE = "private, max-age=3600"
+_MUTABLE_MEDIA_CACHE = "private, no-store"
+_RANGE_CHUNK_SIZE = 64 * 1024
+
+
+def _video_cache_control(store, alert_id: str) -> str:
+    """Never cache the mutable pre-trigger artifact as a final MP4."""
+    try:
+        metadata = store.load_metadata(alert_id)
+    except Exception:
+        return _MUTABLE_MEDIA_CACHE
+    if isinstance(metadata, dict) and metadata.get("status") == "complete":
+        return _PRIVATE_MEDIA_CACHE
+    return _MUTABLE_MEDIA_CACHE
+
+
+def _parse_single_byte_range(
+    range_header: str,
+    file_size: int,
+) -> tuple[int, int] | None:
+    """Parse one RFC 7233 byte range, returning an inclusive ``(start, end)``.
+
+    Multi-range responses are intentionally unsupported.  Malformed,
+    unsatisfiable, and empty-file ranges return ``None`` so the caller can
+    produce a standards-compliant 416 response instead of silently serving a
+    different part of the file.
+    """
+    if file_size <= 0:
+        return None
+
+    unit, separator, raw_spec = range_header.strip().partition("=")
+    if separator != "=" or unit.strip().lower() != "bytes":
+        return None
+
+    spec = raw_spec.strip()
+    if not spec or "," in spec or spec.count("-") != 1:
+        return None
+
+    raw_start, raw_end = (part.strip() for part in spec.split("-", 1))
+    if not raw_start and not raw_end:
+        return None
+
+    try:
+        if not raw_start:
+            # Suffix range: the final N bytes.  A suffix longer than the file
+            # selects the complete representation; zero is unsatisfiable.
+            if not raw_end.isdigit():
+                return None
+            suffix_length = int(raw_end)
+            if suffix_length <= 0:
+                return None
+            return max(file_size - suffix_length, 0), file_size - 1
+
+        if not raw_start.isdigit():
+            return None
+        start = int(raw_start)
+        if start < 0 or start >= file_size:
+            return None
+
+        if not raw_end:
+            return start, file_size - 1
+
+        if not raw_end.isdigit():
+            return None
+        end = int(raw_end)
+        if end < start:
+            return None
+        return start, min(end, file_size - 1)
+    except ValueError:
+        return None
+
+
+def _range_not_satisfiable(file_size: int):
+    """Return a unified JSON error with RFC 7233 range metadata."""
+    return api_error(
+        error_code_for_status(416),
+        "请求的字节范围无效",
+        status_code=416,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes */{file_size}",
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 def _get_recording_store(request: Request):
@@ -41,12 +141,18 @@ def _get_db(request: Request):
     return getattr(request.app.state, "db", None)
 
 
-@router.get("/{alert_id}/metadata")
+@router.get(
+    "/{alert_id}/metadata",
+    response_model=ApiEnvelope[ReplayMetadataResponse],
+)
 def replay_metadata(request: Request, alert_id: str):
     """Return recording metadata for an alert.
 
     Response includes video_url for direct MP4 playback.
     """
+    if not require_permission(request, "view_replay"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
         return api_unavailable("录像存储未配置")
@@ -55,13 +161,22 @@ def replay_metadata(request: Request, alert_id: str):
     if metadata is None:
         return api_not_found("录像不存在")
 
-    # Enrich with video URL for frontend
+    # Normalize optional fields written by newer recorders so archived replay
+    # artifacts keep the same public DTO after an upgrade.
+    metadata.setdefault("linked_alert_id", None)
+    metadata.setdefault("frame_identity", None)
+    metadata.setdefault("pinned_frames", [])
+
+    # Enrich with video URL for frontend.
     metadata["video_url"] = f"/api/replay/{alert_id}/video"
 
-    return api_success(metadata)
+    return api_typed_success(metadata, ReplayMetadataResponse)
 
 
-@router.get("/{alert_id}/signals")
+@router.get(
+    "/{alert_id}/signals",
+    response_model=ApiEnvelope[ReplaySignalsResponse],
+)
 def replay_signals(request: Request, alert_id: str):
     """Return signal timeseries for the 5 replay tracks.
 
@@ -69,6 +184,9 @@ def replay_signals(request: Request, alert_id: str):
                cusum_evidence: {zone: float[]}, yolo_persons[],
                operator_actions[], key_frames[]}
     """
+    if not require_permission(request, "view_replay"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
         return api_unavailable("录像存储未配置")
@@ -76,6 +194,18 @@ def replay_signals(request: Request, alert_id: str):
     signals = store.load_signals(alert_id)
     if signals is None:
         return api_not_found("录像不存在")
+
+    # Backfill fields which did not exist in early replay artifacts.  Keeping
+    # list lengths aligned lets clients render each track independently
+    # without interpreting an absent key as a successful empty result.
+    frame_count = len(signals.get("timestamps", []))
+    signals.setdefault("frame_numbers", list(range(frame_count)))
+    signals.setdefault("frame_identities", [None] * frame_count)
+    signals.setdefault("yolo_boxes", [[] for _ in range(frame_count)])
+    signals.setdefault("candidate_records", [[] for _ in range(frame_count)])
+    signals.setdefault("candidate_events", [])
+    signals.setdefault("has_heatmaps", False)
+    signals.setdefault("trajectory_points", {})
 
     # Enrich with operator actions from alert workflow history
     db = _get_db(request)
@@ -101,7 +231,7 @@ def replay_signals(request: Request, alert_id: str):
     clips = store.list_clips(alert_id)
     signals["clips"] = clips if clips is not None else []
 
-    return api_success(signals)
+    return api_typed_success(signals, ReplaySignalsResponse)
 
 
 @router.get("/{alert_id}/video")
@@ -112,62 +242,83 @@ def replay_video(request: Request, alert_id: str):
     Proper 206 Partial Content responses are required for seeking and
     progressive loading (especially when moov atom is at end of file).
     """
+    if not require_permission(request, "view_replay"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
         return api_unavailable("录像存储未配置")
 
-    video_path = store.get_video_path(alert_id)
-    if video_path is None or not video_path.exists():
+    # Resolve mutable/complete state before opening the artifact. Store
+    # metadata access is locked with finalization, which avoids lock↔open
+    # inversion on platforms that prohibit renaming an open file.
+    cache_control = _video_cache_control(store, alert_id)
+    video_file = None
+    for _ in range(2):
+        video_path = store.get_video_path(alert_id)
+        if video_path is None:
+            break
+        try:
+            # Open before returning the response so a recording→complete
+            # rename cannot invalidate a lazily opened path.
+            video_file = video_path.open("rb")
+            break
+        except FileNotFoundError:
+            # Finalization may have renamed pre.mp4 after path resolution.
+            continue
+        except (IsADirectoryError, PermissionError):
+            break
+    if video_file is None:
         return api_not_found("视频文件不存在")
 
-    file_size = video_path.stat().st_size
+    try:
+        file_size = os.fstat(video_file.fileno()).st_size
+    except OSError:
+        video_file.close()
+        return api_not_found("视频文件不存在")
     range_header = request.headers.get("range")
 
-    if range_header:
-        # Parse Range: bytes=start-end
+    def stream_open_file(start: int, content_length: int):
         try:
-            range_spec = range_header.strip().replace("bytes=", "")
-            parts = range_spec.split("-", 1)
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else file_size - 1
-        except (ValueError, IndexError):
-            start, end = 0, file_size - 1
+            video_file.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = video_file.read(min(_RANGE_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+        finally:
+            video_file.close()
 
-        start = max(0, min(start, file_size - 1))
-        end = min(end, file_size - 1)
+    if range_header:
+        byte_range = _parse_single_byte_range(range_header, file_size)
+        if byte_range is None:
+            video_file.close()
+            return _range_not_satisfiable(file_size)
+        start, end = byte_range
         content_length = end - start + 1
 
-        def ranged_file():
-            with open(video_path, "rb") as f:
-                f.seek(start)
-                remaining = content_length
-                while remaining > 0:
-                    chunk = f.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    yield chunk
-
-        from starlette.responses import StreamingResponse
         return StreamingResponse(
-            ranged_file(),
+            stream_open_file(start, content_length),
             status_code=206,
             media_type="video/mp4",
             headers={
                 "Content-Range": f"bytes {start}-{end}/{file_size}",
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(content_length),
-                "Cache-Control": "public, max-age=3600",
+                "Cache-Control": cache_control,
             },
         )
 
-    # No Range header — return full file
-    return FileResponse(
-        path=str(video_path),
+    # No Range header — stream the already-open file descriptor.
+    return StreamingResponse(
+        stream_open_file(0, file_size),
         media_type="video/mp4",
         headers={
             "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=3600",
+            "Content-Length": str(file_size),
+            "Cache-Control": cache_control,
         },
     )
 
@@ -178,42 +329,48 @@ def replay_frame(request: Request, alert_id: str, index: int):
 
     Used for heatmap compositing, pin-frame thumbnails, and reference comparison.
     """
+    if not require_permission(request, "view_replay"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
-        return Response(status_code=503)
+        return api_unavailable("录像存储未配置")
 
     if index < 0:
-        return Response(status_code=400)
+        return api_validation_error("帧索引不能为负")
 
     frame_bytes = store.load_frame(alert_id, index)
     if frame_bytes is None:
-        return Response(status_code=404)
+        return api_not_found("录像帧不存在")
 
     return Response(
         content=frame_bytes,
         media_type="image/jpeg",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": _PRIVATE_MEDIA_CACHE},
     )
 
 
 @router.get("/{alert_id}/heatmap/{index}")
 def replay_heatmap_frame(request: Request, alert_id: str, index: int):
     """Return a single heatmap overlay JPEG by index."""
+    if not require_permission(request, "view_replay"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
-        return Response(status_code=503)
+        return api_unavailable("录像存储未配置")
 
     if index < 0:
-        return Response(status_code=400)
+        return api_validation_error("帧索引不能为负")
 
     heatmap_bytes = store.load_heatmap_frame(alert_id, index)
     if heatmap_bytes is None:
-        return Response(status_code=404)
+        return api_not_found("热力图帧不存在")
 
     return Response(
         content=heatmap_bytes,
         media_type="image/jpeg",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": _PRIVATE_MEDIA_CACHE},
     )
 
 
@@ -236,6 +393,9 @@ def replay_reference(
     2.5 seconds after trigger time).
     Returns {available: bool, frame_base64: str|null, source_date: str}.
     """
+    if not require_permission(request, "view_replay"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
         return api_success({"available": False, "frame_base64": None, "source_date": ""})
@@ -258,13 +418,29 @@ def replay_reference(
     else:
         ref_date = trigger_dt - timedelta(days=1)
 
-    # Build the reference timestamp (same time of day on reference date),
-    # then shift by the requested offset so operators can scrub ±30s.
+    # Build the reference timestamp. An explicit ``time`` query selects a
+    # wall-clock point; otherwise preserve the alert's trigger time of day.
+    if time_str:
+        try:
+            requested_time = datetime.strptime(time_str, "%H:%M:%S")
+        except ValueError:
+            return api_validation_error("时间格式无效，请使用 HH:MM:SS")
+        ref_hour = requested_time.hour
+        ref_minute = requested_time.minute
+        ref_second = requested_time.second
+        ref_microsecond = 0
+    else:
+        ref_hour = trigger_dt.hour
+        ref_minute = trigger_dt.minute
+        ref_second = trigger_dt.second
+        ref_microsecond = trigger_dt.microsecond
+
+    # Shift by the requested offset so operators can scrub around that point.
     ref_dt = ref_date.replace(
-        hour=trigger_dt.hour,
-        minute=trigger_dt.minute,
-        second=trigger_dt.second,
-        microsecond=trigger_dt.microsecond,
+        hour=ref_hour,
+        minute=ref_minute,
+        second=ref_second,
+        microsecond=ref_microsecond,
     )
     if frame_offset_seconds:
         ref_dt = ref_dt + timedelta(seconds=float(frame_offset_seconds))
@@ -357,52 +533,56 @@ def replay_reference(
     })
 
 
-@router.post("/{alert_id}/pin-frame")
-async def pin_frame(request: Request, alert_id: str):
+@router.post(
+    "/{alert_id}/pin-frame",
+    response_model=ApiEnvelope[ReplayPinFrameResponse],
+)
+async def pin_frame(
+    request: Request,
+    alert_id: str,
+    body: ReplayPinFrameRequest,
+):
     """Pin a frame as a key frame bookmark (operator action).
 
     Request body: {"index": int, "label": str}
     """
+    if not require_permission(request, "pin_frame"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
         return api_unavailable("录像存储未配置")
 
-    body = await request.json()
-    index = body.get("index", 0)
-    label = body.get("label", "")
-
-    if not store.pin_frame(alert_id, index, label):
+    if not store.pin_frame(alert_id, body.index, body.label):
         return api_not_found("录像不存在")
 
-    return api_success({"success": True})
+    return api_typed_success({"success": True}, ReplayPinFrameResponse)
 
 
-@router.post("/{alert_id}/clips")
-async def add_clip(request: Request, alert_id: str):
+@router.post(
+    "/{alert_id}/clips",
+    response_model=ApiEnvelope[ReplayClipMutationResponse],
+)
+async def add_clip(
+    request: Request,
+    alert_id: str,
+    body: ReplayClipRequest,
+):
     """Persist an operator-marked clip range for this recording.
 
     Request body: ``{"start_index": int, "end_index": int, "label"?: str}``.
     The clip is appended to ``signals.json`` so it survives page reload.
     """
+    if not require_permission(request, "pin_frame"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
         return api_unavailable("录像存储未配置")
 
-    try:
-        body = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return api_validation_error("请求体必须是合法 JSON")
-
-    start_index = body.get("start_index")
-    end_index = body.get("end_index")
-    label = body.get("label", "") or ""
-
-    if not isinstance(start_index, int) or not isinstance(end_index, int):
-        return api_validation_error("start_index 和 end_index 必须为整数")
-    if start_index < 0 or end_index < 0:
-        return api_validation_error("帧索引不能为负")
-    if end_index < start_index:
-        return api_validation_error("end_index 不能小于 start_index")
+    start_index = body.start_index
+    end_index = body.end_index
+    label = body.label
 
     metadata = store.load_metadata(alert_id)
     if metadata is None:
@@ -418,12 +598,21 @@ async def add_clip(request: Request, alert_id: str):
         return api_not_found("录像不存在")
 
     clips = store.list_clips(alert_id) or []
-    return api_success({"clip": clip, "clips": clips})
+    return api_typed_success(
+        {"clip": clip, "clips": clips},
+        ReplayClipMutationResponse,
+    )
 
 
-@router.delete("/{alert_id}/clips/{index}")
+@router.delete(
+    "/{alert_id}/clips/{index}",
+    response_model=ApiEnvelope[ReplayClipListResponse],
+)
 def delete_clip(request: Request, alert_id: str, index: int):
     """Remove a persisted clip by its array index."""
+    if not require_permission(request, "pin_frame"):
+        return api_forbidden("权限不足")
+
     store = _get_recording_store(request)
     if store is None:
         return api_unavailable("录像存储未配置")
@@ -435,7 +624,7 @@ def delete_clip(request: Request, alert_id: str, index: int):
         return api_not_found("clip 不存在")
 
     clips = store.list_clips(alert_id) or []
-    return api_success({"clips": clips})
+    return api_typed_success({"clips": clips}, ReplayClipListResponse)
 
 
 def _alert_trigger_timestamp(alert: AlertRecord) -> float:
@@ -485,6 +674,9 @@ def replay_storyboard(request: Request, alert_id: str):
     3. If ``event_group_id`` is set, all alerts in the same event group from
        cameras different from the primary's camera.
     """
+    if not require_permission(request, "view_replay"):
+        return api_forbidden("权限不足")
+
     db = _get_db(request)
     if db is None:
         return api_unavailable("数据库未配置")

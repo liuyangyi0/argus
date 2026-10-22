@@ -1,6 +1,7 @@
 """Tests for pipeline reliability fixes (CRIT/HIGH/MED issues)."""
 
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
@@ -9,6 +10,7 @@ import pytest
 
 from argus.anomaly.baseline import BaselineManager
 from argus.anomaly.detector import AnomalibDetector, AnomalyResult
+from argus.config.schema import SceneGuardConfig
 from argus.person.detector import PersonFilterResult, YOLOPersonDetector
 from argus.prefilter.mog2 import MOG2PreFilter
 
@@ -70,6 +72,37 @@ class TestAnomalyResultDetectionFailed:
         detector = AnomalibDetector(threshold=0.7)
         result = detector._safe_result()
         assert result.detection_failed is True
+
+    def test_raw_score_path_moves_input_to_model_device(self):
+        """Torch/CUDA models must not receive CPU tensors in raw-score mode."""
+        torch = pytest.importorskip("torch")
+
+        class FakeInner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(
+                    torch.empty((), device="meta"), requires_grad=False
+                )
+                self.seen_device = None
+
+            def forward(self, tensor):
+                self.seen_device = tensor.device.type
+                return SimpleNamespace(
+                    pred_score=torch.tensor([60.0]),
+                    anomaly_map=torch.zeros((1, 1, 4, 4)),
+                )
+
+        inner = FakeInner()
+        detector = AnomalibDetector(threshold=0.5, image_size=(4, 4))
+        detector._engine = SimpleNamespace(model=SimpleNamespace(model=inner))
+        detector._loaded = True
+        detector._minmax_broken = True
+
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        result = detector._predict_anomalib(frame)
+
+        assert result.detection_failed is False
+        assert inner.seen_device == "meta"
 
 
 class TestPersonFilterAvailable:
@@ -158,6 +191,7 @@ class TestLockHysteresis:
 
         config = CameraConfig(
             camera_id="test", name="test", source="0", protocol="file",
+            scene_guard=SceneGuardConfig(enabled=False),
         )
         # Lock threshold defaults to 0.85 from MOG2Config
         pipeline = DetectionPipeline(config, AlertConfig())
@@ -173,6 +207,7 @@ class TestLockHysteresis:
 
         config = CameraConfig(
             camera_id="test", name="test", source="0", protocol="file",
+            scene_guard=SceneGuardConfig(enabled=False),
         )
         pipeline = DetectionPipeline(config, AlertConfig())
 
@@ -188,6 +223,7 @@ class TestLockHysteresis:
 
         config = CameraConfig(
             camera_id="test", name="test", source="0", protocol="file",
+            scene_guard=SceneGuardConfig(enabled=False),
         )
         pipeline = DetectionPipeline(config, AlertConfig())
 
@@ -209,6 +245,7 @@ class TestLockHysteresis:
 
         config = CameraConfig(
             camera_id="test", name="test", source="0", protocol="file",
+            scene_guard=SceneGuardConfig(enabled=False),
         )
         pipeline = DetectionPipeline(config, AlertConfig())
 
@@ -237,6 +274,7 @@ class TestLockTimeBasedClear:
 
         config = CameraConfig(
             camera_id="test", name="test", source="0", protocol="file",
+            scene_guard=SceneGuardConfig(enabled=False),
         )
         pipeline = DetectionPipeline(config, AlertConfig())
 

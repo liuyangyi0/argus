@@ -9,6 +9,7 @@ foreign objects more aggressively.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -109,8 +110,14 @@ class TemporalAnomalyTracker:
         self._stationary_suppress_after_s = stationary_suppress_after_s
         self._tracks: dict[int, _TrackState] = {}
         self._next_id = 1
+        self._lock = threading.RLock()
 
     def update(self, regions: list, frame_number: int) -> TemporalAnalysis:
+        """Update tracks atomically and return the current analysis."""
+        with self._lock:
+            return self._update_locked(regions, frame_number)
+
+    def _update_locked(self, regions: list, frame_number: int) -> TemporalAnalysis:
         """Update tracks with new frame's anomaly regions.
 
         regions: list of objects with centroid_x, centroid_y, max_score attributes
@@ -297,8 +304,30 @@ class TemporalAnomalyTracker:
 
     def reset(self) -> None:
         """Clear all tracks."""
-        self._tracks.clear()
-        self._next_id = 1
+        with self._lock:
+            self._tracks.clear()
+            self._next_id = 1
+
+    def get_active_tracks_snapshot(self) -> list[dict]:
+        """Return an immutable, API-safe view of every active track.
+
+        The tracker is updated by a camera worker while Dashboard requests run
+        on separate threads.  Copying under the same lock prevents callers
+        from observing a partially-updated track or racing dictionary changes.
+        """
+        with self._lock:
+            return [
+                {
+                    "track_id": int(track.track_id),
+                    "centroid_x": round(float(track.centroid_x), 1),
+                    "centroid_y": round(float(track.centroid_y), 1),
+                    "consecutive_frames": int(track.consecutive_frames),
+                    "max_score": round(float(track.max_score), 3),
+                    "area_px": int(track.area_px),
+                    "trajectory_length": len(track.trajectory_history),
+                }
+                for track in self._tracks.values()
+            ]
 
     def get_trajectory_histories(self) -> list[list[tuple[float, float, float]]]:
         """Return a snapshot of every active track's trajectory history.
@@ -307,8 +336,9 @@ class TemporalAnomalyTracker:
         ``matched_this_frame``, or prune stale tracks. Use this when a
         caller needs trajectory points without recording a frame update.
         """
-        return [
-            list(track.trajectory_history)
-            for track in self._tracks.values()
-            if track.trajectory_history
-        ]
+        with self._lock:
+            return [
+                list(track.trajectory_history)
+                for track in self._tracks.values()
+                if track.trajectory_history
+            ]

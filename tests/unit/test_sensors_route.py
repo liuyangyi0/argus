@@ -107,6 +107,56 @@ class TestSensorSignalRoute:
         assert entries[0]["zone_id"] == "*"
         assert entries[0]["multiplier"] == pytest.approx(2.0)
 
+    def test_post_typed_gas_reading_sets_explainable_signal(
+        self,
+        client: TestClient,
+    ) -> None:
+        resp = client.post(
+            "/api/sensors/reading",
+            json={
+                "camera_id": "cam1",
+                "zone_id": "z1",
+                "sensor_type": "gas_ppm",
+                "value": 60.0,
+                "source": "gas-01",
+                "valid_for_s": 30.0,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert data["applied"] is True
+        assert data["decision"]["severity"] == "danger"
+        assert data["decision"]["reason"] == "gas_ppm_danger"
+
+        resp = client.get("/api/sensors/signals")
+        entries = resp.json()["data"]["signals"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["sensor_type"] == "gas_ppm"
+        assert entry["source"] == "gas-01"
+        assert entry["evidence"]["metric"] == "gas_ppm"
+
+    def test_neutral_typed_reading_does_not_leave_active_signal(
+        self,
+        client: TestClient,
+    ) -> None:
+        resp = client.post(
+            "/api/sensors/reading",
+            json={
+                "camera_id": "cam1",
+                "zone_id": "z1",
+                "sensor_type": "temperature_c",
+                "value": 25.0,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["applied"] is False
+        assert data["decision"]["severity"] == "neutral"
+
+        resp = client.get("/api/sensors/signals")
+        assert resp.json()["data"]["signals"] == []
+
     def test_default_valid_for_s_applied_when_omitted(self, client: TestClient) -> None:
         """Omitting valid_for_s uses the configured default (60s)."""
         resp = client.post(

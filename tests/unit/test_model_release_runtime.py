@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -11,8 +12,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from argus.capture.manager import CameraManager
-from argus.config.schema import AlertConfig, CameraConfig
-from argus.storage.models import Base, ModelRecord
+from argus.config.schema import AlertConfig, CameraConfig, SceneGuardConfig
+from argus.preprocessing.scene_profile import runtime_artifact_sha256
+from argus.storage.models import (
+    Base,
+    ModelRecord,
+    ModelReleaseOperation,
+    ReleaseOperationStatus,
+)
+from argus.storage.release_evidence import canonical_json, canonical_sha256
 
 
 @pytest.fixture()
@@ -26,6 +34,7 @@ def _model_dir(tmp_path: Path, name: str) -> Path:
     model_dir = tmp_path / name
     model_dir.mkdir()
     (model_dir / "model.xml").write_text("model", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"weights")
     return model_dir
 
 
@@ -38,7 +47,17 @@ def _add_model(
     model_dir: Path,
     is_active: bool = False,
     canary_camera_id: str | None = None,
+    release_evidence_factory=None,
+    authorize_runtime: bool = False,
 ) -> None:
+    evidence = None
+    if stage == "production" and release_evidence_factory is not None:
+        evidence = release_evidence_factory(
+            model_path=model_dir,
+            model_version_id=version,
+            registry_model_hash=f"hash-{version}",
+            camera_id=camera_id,
+        )
     with session_factory() as session:
         session.add(
             ModelRecord(
@@ -52,8 +71,40 @@ def _add_model(
                 model_path=str(model_dir),
                 is_active=is_active,
                 canary_camera_id=canary_camera_id,
+                release_evidence_json=(
+                    canonical_json(evidence) if evidence is not None else None
+                ),
+                release_evidence_sha256=(
+                    canonical_sha256(evidence) if evidence is not None else None
+                ),
+                release_revision=1 if authorize_runtime else 0,
             )
         )
+        if authorize_runtime:
+            artifact_sha256 = runtime_artifact_sha256(model_dir)
+            session.add(
+                ModelReleaseOperation(
+                    operation_id=f"release-{version}",
+                    model_version_id=version,
+                    camera_id=camera_id,
+                    from_stage="shadow",
+                    target_stage=stage,
+                    expected_revision=0,
+                    applied_revision=1,
+                    status=ReleaseOperationStatus.APPLIED.value,
+                    requested_by="test-fixture",
+                    runtime_state_json=json.dumps(
+                        {
+                            "identity": {
+                                "camera_id": camera_id,
+                                "model_version_id": version,
+                                "target_stage": stage,
+                                "runtime_artifact_sha256": artifact_sha256,
+                            },
+                        }
+                    ),
+                )
+            )
         session.commit()
 
 
@@ -111,6 +162,7 @@ def _manager(
         name="Camera 01",
         source="0",
         protocol="file",
+        scene_guard=SceneGuardConfig(enabled=False),
     )
     db = SimpleNamespace(get_session=session_factory)
     manager = CameraManager([cam_config], AlertConfig(), database=db)
@@ -122,7 +174,12 @@ def _manager(
     return manager, pipeline, runner, cam_config
 
 
-def test_startup_model_resolution_uses_canary_router(session_factory, tmp_path):
+def test_startup_model_resolution_uses_canary_router(
+    session_factory,
+    tmp_path,
+    release_evidence_factory,
+    monkeypatch,
+):
     prod_dir = _model_dir(tmp_path, "prod-v1")
     canary_dir = _model_dir(tmp_path, "canary-v2")
     _add_model(
@@ -131,6 +188,7 @@ def test_startup_model_resolution_uses_canary_router(session_factory, tmp_path):
         stage="production",
         model_dir=prod_dir,
         is_active=True,
+        release_evidence_factory=release_evidence_factory,
     )
     _add_model(
         session_factory,
@@ -138,9 +196,21 @@ def test_startup_model_resolution_uses_canary_router(session_factory, tmp_path):
         stage="canary",
         model_dir=canary_dir,
         canary_camera_id="cam-01",
+        authorize_runtime=True,
     )
+    unrelated_exports = tmp_path / "data" / "exports" / "cam-01"
+    unrelated_exports.mkdir(parents=True)
+    (unrelated_exports / "model.xml").write_text("unregistered", encoding="utf-8")
+    (unrelated_exports / "model.bin").write_bytes(b"unregistered")
+    monkeypatch.chdir(tmp_path)
 
     manager, _, _, cam_config = _manager(session_factory)
+    monkeypatch.setattr(
+        "argus.core.pipeline.DetectionPipeline._find_model_in_dir",
+        lambda *_args, **_kwargs: pytest.fail(
+            "registry-backed resolution must not scan exports or recurse"
+        ),
+    )
 
     resolved = manager._resolve_model_path(cam_config)
 
@@ -148,7 +218,91 @@ def test_startup_model_resolution_uses_canary_router(session_factory, tmp_path):
     assert manager._model_version_id(cam_config, resolved) == "canary-v2"
 
 
-def test_candidate_to_shadow_attaches_shadow_without_primary_reload(session_factory, tmp_path):
+def test_startup_model_resolution_rejects_canary_without_applied_digest(
+    session_factory,
+    tmp_path,
+):
+    canary_dir = _model_dir(tmp_path, "canary-without-operation")
+    _add_model(
+        session_factory,
+        version="canary-without-operation",
+        stage="canary",
+        model_dir=canary_dir,
+        canary_camera_id="cam-01",
+    )
+    manager, _, _, cam_config = _manager(session_factory)
+
+    assert manager._resolve_model_path(cam_config) is None
+    assert manager._model_version_id(cam_config) == "patchcore:ssim_fallback"
+
+
+def test_recovery_rejects_artifact_changed_after_applied_operation(
+    session_factory,
+    tmp_path,
+):
+    canary_dir = _model_dir(tmp_path, "canary-mutated")
+    _add_model(
+        session_factory,
+        version="canary-mutated",
+        stage="canary",
+        model_dir=canary_dir,
+        canary_camera_id="cam-01",
+        authorize_runtime=True,
+    )
+    (canary_dir / "model.bin").write_bytes(b"tampered-after-release")
+    manager, _, _, cam_config = _manager(session_factory)
+
+    assert manager._resolve_model_path(cam_config) is None
+    assert manager._resolve_authorized_model_identity("cam-01") is None
+
+
+def test_registry_directory_rejects_nested_runtime_artifacts(
+    session_factory,
+    tmp_path,
+):
+    canary_dir = _model_dir(tmp_path, "canary-ambiguous")
+    nested = canary_dir / "newer-export"
+    nested.mkdir()
+    (nested / "model.xml").write_text("unregistered", encoding="utf-8")
+    (nested / "model.bin").write_bytes(b"unregistered")
+    _add_model(
+        session_factory,
+        version="canary-ambiguous",
+        stage="canary",
+        model_dir=canary_dir,
+        canary_camera_id="cam-01",
+        authorize_runtime=True,
+    )
+    manager, _, _, cam_config = _manager(session_factory)
+
+    # The persisted directory digest includes the nested model while the exact
+    # root artifact digest does not, so ambiguity must fail closed.
+    assert manager._resolve_model_path(cam_config) is None
+
+
+def test_startup_model_resolution_rejects_legacy_active_production(
+    session_factory,
+    tmp_path,
+):
+    prod_dir = _model_dir(tmp_path, "legacy-prod")
+    _add_model(
+        session_factory,
+        version="legacy-prod",
+        stage="production",
+        model_dir=prod_dir,
+        is_active=True,
+    )
+    manager, _, _, cam_config = _manager(session_factory)
+
+    assert manager._resolve_model_path(cam_config) is None
+    assert manager._model_version_id(cam_config) == "patchcore:ssim_fallback"
+
+
+def test_legacy_release_sync_cannot_attach_shadow(
+    session_factory,
+    tmp_path,
+    release_evidence_factory,
+):
     prod_dir = _model_dir(tmp_path, "prod-v1")
     shadow_dir = _model_dir(tmp_path, "shadow-v2")
     _add_model(
@@ -157,6 +311,7 @@ def test_candidate_to_shadow_attaches_shadow_without_primary_reload(session_fact
         stage="production",
         model_dir=prod_dir,
         is_active=True,
+        release_evidence_factory=release_evidence_factory,
     )
     _add_model(
         session_factory,
@@ -168,18 +323,21 @@ def test_candidate_to_shadow_attaches_shadow_without_primary_reload(session_fact
 
     state = manager.apply_model_release_state("cam-01")
 
-    assert state["primary_model_version"] == "prod-v1"
-    assert state["primary_model_stage"] == "production"
+    assert state["applied"] is False
     assert state["primary_reloaded"] is False
-    assert state["shadow_model_version"] == "shadow-v2"
-    assert state["shadow_attached"] is True
+    assert state["shadow_model_version"] is None
+    assert state["shadow_attached"] is False
     assert state["shadow_detached"] is False
-    assert state["errors"] == []
+    assert state["errors"] == ["release_service_required"]
     pipeline.reload_anomaly_model.assert_not_called()
-    assert pipeline._shadow_runner.shadow_version_id == "shadow-v2"
+    assert pipeline._shadow_runner is None
 
 
-def test_shadow_to_canary_reloads_primary_and_detaches_shadow(session_factory, tmp_path):
+def test_legacy_release_sync_cannot_reload_canary_or_detach_shadow(
+    session_factory,
+    tmp_path,
+    release_evidence_factory,
+):
     prod_dir = _model_dir(tmp_path, "prod-v1")
     canary_dir = _model_dir(tmp_path, "canary-v2")
     _add_model(
@@ -188,6 +346,7 @@ def test_shadow_to_canary_reloads_primary_and_detaches_shadow(session_factory, t
         stage="production",
         model_dir=prod_dir,
         is_active=True,
+        release_evidence_factory=release_evidence_factory,
     )
     _add_model(
         session_factory,
@@ -206,18 +365,22 @@ def test_shadow_to_canary_reloads_primary_and_detaches_shadow(session_factory, t
 
     state = manager.apply_model_release_state("cam-01")
 
-    assert state["primary_model_version"] == "canary-v2"
-    assert state["primary_model_stage"] == "canary"
-    assert state["primary_reloaded"] is True
+    assert state["applied"] is False
+    assert state["primary_reloaded"] is False
     assert state["shadow_model_version"] is None
     assert state["shadow_attached"] is False
-    assert state["shadow_detached"] is True
-    assert state["errors"] == []
-    pipeline.reload_anomaly_model.assert_called_once_with(str(canary_dir / "model.xml"))
-    old_shadow.flush.assert_called_once_with()
+    assert state["shadow_detached"] is False
+    assert state["errors"] == ["release_service_required"]
+    pipeline.reload_anomaly_model.assert_not_called()
+    old_shadow.flush.assert_not_called()
+    assert pipeline._shadow_runner is old_shadow
 
 
-def test_canary_to_production_reloads_primary(session_factory, tmp_path):
+def test_legacy_release_sync_cannot_reload_production(
+    session_factory,
+    tmp_path,
+    release_evidence_factory,
+):
     prod_dir = _model_dir(tmp_path, "prod-v2")
     _add_model(
         session_factory,
@@ -225,21 +388,21 @@ def test_canary_to_production_reloads_primary(session_factory, tmp_path):
         stage="production",
         model_dir=prod_dir,
         is_active=True,
+        release_evidence_factory=release_evidence_factory,
     )
     manager, pipeline, _, _ = _manager(session_factory, current_version="prod-v1")
 
     state = manager.apply_model_release_state("cam-01")
 
-    assert state["primary_model_version"] == "prod-v2"
-    assert state["primary_model_stage"] == "production"
-    assert state["primary_reloaded"] is True
+    assert state["applied"] is False
+    assert state["primary_reloaded"] is False
     assert state["shadow_attached"] is False
     assert state["shadow_detached"] is False
-    assert state["errors"] == []
-    pipeline.reload_anomaly_model.assert_called_once_with(str(prod_dir / "model.xml"))
+    assert state["errors"] == ["release_service_required"]
+    pipeline.reload_anomaly_model.assert_not_called()
 
 
-def test_retire_without_production_reports_no_primary_and_detaches_shadow(
+def test_legacy_release_sync_cannot_detach_shadow_for_retired_model(
     session_factory, tmp_path
 ):
     retired_dir = _model_dir(tmp_path, "retired-v2")
@@ -259,12 +422,14 @@ def test_retire_without_production_reports_no_primary_and_detaches_shadow(
 
     state = manager.apply_model_release_state("cam-01")
 
+    assert state["applied"] is False
     assert state["primary_model_version"] is None
     assert state["primary_model_stage"] is None
     assert state["primary_reloaded"] is False
     assert state["shadow_model_version"] is None
     assert state["shadow_attached"] is False
-    assert state["shadow_detached"] is True
-    assert "primary_model_not_found" in state["errors"]
+    assert state["shadow_detached"] is False
+    assert state["errors"] == ["release_service_required"]
     pipeline.reload_anomaly_model.assert_not_called()
-    old_shadow.flush.assert_called_once_with()
+    old_shadow.flush.assert_not_called()
+    assert pipeline._shadow_runner is old_shadow

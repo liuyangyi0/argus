@@ -114,6 +114,7 @@ describe('Overview active alert links', () => {
           'a-alert': alertStub,
           'a-button': buttonStub,
           ContentSkeleton: true,
+          OverviewLiveStream: true,
         },
       },
     })
@@ -139,6 +140,7 @@ describe('Overview active alert links', () => {
           'a-alert': alertStub,
           'a-button': buttonStub,
           ContentSkeleton: true,
+          OverviewLiveStream: true,
         },
       },
     })
@@ -174,6 +176,7 @@ describe('Overview active alert links', () => {
           'a-alert': alertStub,
           'a-button': buttonStub,
           ContentSkeleton: true,
+          OverviewLiveStream: true,
         },
       },
     })

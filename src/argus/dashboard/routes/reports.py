@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from argus.dashboard.api_response import api_error, api_success, api_unavailable
 
@@ -26,7 +26,7 @@ async def reports_json(
     """JSON statistics API for external consumption."""
     db = request.app.state.db
     if not db:
-        return JSONResponse({"error": "数据库不可用"}, status_code=503)
+        return api_unavailable("数据库不可用")
 
     all_alerts = db.get_alerts(limit=50000)
     scoped_alerts = _filter_alerts_by_days(all_alerts, days)

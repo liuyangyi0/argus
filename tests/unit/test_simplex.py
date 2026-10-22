@@ -35,6 +35,71 @@ class TestSimplexDetector:
         assert result.has_detection is True
         assert len(result.static_regions) > 0
 
+    def test_region_track_ids_are_stable_unique_and_not_stale(self):
+        """当前帧只输出 observed 区域，并为重联区域保留稳定身份。"""
+        detector = SimplexDetector(
+            diff_threshold=20,
+            min_area_px=100,
+            min_static_seconds=0.0,
+            match_radius_px=100,
+        )
+        ref = self._make_gray(128)
+        detector.set_reference(ref)
+
+        frame = self._make_gray(128)
+        frame[50:100, 50:100] = 0
+        # Distinct contours whose centroids are still inside the association
+        # radius must receive two IDs, not match a track created earlier in
+        # this same frame.
+        frame[50:100, 130:180] = 0
+        first = detector.detect(frame)
+
+        assert len(first.static_regions) == 2
+        first_ids_by_centroid = {
+            region.centroid: region.track_id for region in first.static_regions
+        }
+        assert None not in first_ids_by_centroid.values()
+        assert len(set(first_ids_by_centroid.values())) == 2
+
+        second = detector.detect(frame.copy())
+        assert {
+            region.centroid: region.track_id for region in second.static_regions
+        } == first_ids_by_centroid
+
+        disappeared = detector.detect(ref.copy())
+        assert disappeared.has_detection is False
+        assert disappeared.static_regions == []
+        assert disappeared.max_static_seconds == 0.0
+        # Tracks remain internally for the two-second reconnection grace period.
+        assert len(detector._tracked) == 2
+
+        reconnected = detector.detect(frame.copy())
+        assert {
+            region.centroid: region.track_id for region in reconnected.static_regions
+        } == first_ids_by_centroid
+
+    def test_reset_and_reference_change_do_not_reuse_track_ids(self):
+        detector = SimplexDetector(
+            diff_threshold=20,
+            min_area_px=100,
+            min_static_seconds=0.0,
+        )
+        ref = self._make_gray(128)
+        frame = self._make_gray(128)
+        frame[100:200, 100:200] = 0
+
+        detector.set_reference(ref)
+        first_id = detector.detect(frame).static_regions[0].track_id
+        detector.reset()
+        second_id = detector.detect(frame).static_regions[0].track_id
+        detector.set_reference(ref)
+        third_id = detector.detect(frame).static_regions[0].track_id
+
+        assert first_id is not None
+        assert second_id is not None
+        assert third_id is not None
+        assert first_id < second_id < third_id
+
     def test_no_detection_on_reference(self):
         """参考帧 == 当前帧 → 无检测。"""
         detector = SimplexDetector(min_area_px=100, min_static_seconds=0.0)

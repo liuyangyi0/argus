@@ -10,6 +10,7 @@ import { getAnomalyDegradation, type AnomalyDegradationStatus } from '../api/sys
 import { useWebSocket } from '../composables/useWebSocket'
 import { useAuthStore } from '../stores/useAuthStore'
 import ContentSkeleton from '../components/ContentSkeleton.vue'
+import OverviewLiveStream from '../components/OverviewLiveStream.vue'
 
 defineOptions({ name: 'OverviewPage' })
 
@@ -45,6 +46,13 @@ function goToTrainingTab() {
 // WebSocket topic. Failure to load is silently treated as "not degraded" so
 // the banner never appears spuriously.
 const anomalyDegradation = ref<AnomalyDegradationStatus['anomaly'] | null>(null)
+interface AnomalyDegradationWsPayload {
+  type?: 'entered' | 'recovered' | string
+  component?: string
+  camera_id?: string
+  reason?: string | null
+  started_at?: number | null
+}
 async function fetchAnomalyDegradation() {
   try {
     const res = await getAnomalyDegradation()
@@ -54,7 +62,7 @@ async function fetchAnomalyDegradation() {
   }
 }
 
-useWebSocket({
+useWebSocket<AnomalyDegradationWsPayload>({
   topics: ['system_degradation'],
   onMessage: (_topic, data) => {
     // Backend payload shape: {type, component, camera_id, reason, started_at, ...}
@@ -77,6 +85,7 @@ useWebSocket({
       fetchAnomalyDegradation()
     }
   },
+  fallbackPoll: fetchAnomalyDegradation,
 })
 
 const anomalyDegradedReason = computed(() => anomalyDegradation.value?.reason ?? '未知')
@@ -102,6 +111,9 @@ const uptimeFormatted = computed(() => {
 
 const connectedCount = computed(() => health.value?.cameras?.filter((c: any) => c.connected).length ?? 0)
 const totalCameras = computed(() => health.value?.cameras?.length ?? 0)
+function isCameraConnected(cameraId: string) {
+  return Boolean(health.value?.cameras?.find((c: any) => c.camera_id === cameraId)?.connected)
+}
 
 const todayAlerts = computed(() => cameras.value.reduce((sum: number, c: any) => sum + (c.alert_count_today || 0), 0))
 
@@ -391,13 +403,11 @@ function sparklineFill(values: number[]): string {
         <!-- VIDEOS -->
         <div v-else class="videos" :class="gridClass">
           <template v-for="cam in cameras" :key="cam.camera_id">
-            <div class="feed" :class="{ 'live': health?.cameras?.find((c: any) => c.camera_id === cam.camera_id)?.connected }">
+            <div class="feed" :class="{ 'live': isCameraConnected(cam.camera_id) }">
               <div class="feed-bg"></div>
-              <img
-                :src="`/api/cameras/${cam.camera_id}/stream`"
-                class="feed-video"
-                loading="lazy"
-                @error="($event.target as HTMLImageElement).style.display = 'none'"
+              <OverviewLiveStream
+                :camera-id="cam.camera_id"
+                :online="isCameraConnected(cam.camera_id)"
               />
               <div v-if="cam.current_score && cam.current_score > 0.6 && cam.score_sparkline?.length >= 2" style="position: absolute; bottom: 0; left: 0; right: 0; height: 35%; z-index: 1; pointer-events: none; mix-blend-mode: multiply;">
                 <svg width="100%" height="100%" viewBox="0 0 100 40" preserveAspectRatio="none">

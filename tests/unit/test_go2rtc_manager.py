@@ -7,8 +7,12 @@ not need a go2rtc binary available on the test host.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from argus.config.schema import CameraConfig, USBCaptureConfig
 from argus.streaming import go2rtc_manager as go2rtc_mod
@@ -45,8 +49,98 @@ def _manager(
 ) -> MagicMock:
     m = MagicMock()
     type(m).running = property(lambda self: running)
+    m.rtsp_port = 8554
     m.register_camera.return_value = register_return
     return m
+
+
+def test_explicit_config_directory_is_created_and_inspectable(tmp_path: Path):
+    config_dir = tmp_path / "isolated" / "go2rtc"
+    manager = Go2RTCManager(
+        binary_path=tmp_path / "go2rtc",
+        config_dir=config_dir,
+        api_port=11984,
+        rtsp_port=18554,
+        webrtc_port=18555,
+        webrtc_listen_host="127.0.0.1",
+    )
+    try:
+        config_path = manager._write_config({"camera": "rtsp://example.invalid/camera"})
+        assert config_path.parent == config_dir
+        assert json.loads(config_path.read_text(encoding="utf-8")) == {
+            "api": {
+                "listen": "127.0.0.1:11984",
+                "origin": "http://127.0.0.1",
+            },
+            "rtsp": {"listen": "127.0.0.1:18554"},
+            "webrtc": {"listen": "127.0.0.1:18555"},
+            "streams": {"camera": ["rtsp://example.invalid/camera"]},
+        }
+    finally:
+        manager.close()
+
+
+def test_default_webrtc_binding_remains_remote_browser_capable(tmp_path: Path):
+    manager = Go2RTCManager(
+        binary_path=tmp_path / "go2rtc",
+        config_dir=tmp_path / "config",
+        api_port=11984,
+        rtsp_port=18554,
+        webrtc_port=18555,
+    )
+    try:
+        config = json.loads(manager._write_config().read_text(encoding="utf-8"))
+        assert config["api"]["listen"] == "127.0.0.1:11984"
+        assert config["rtsp"]["listen"] == "127.0.0.1:18554"
+        assert config["webrtc"]["listen"] == "0.0.0.0:18555"
+    finally:
+        manager.close()
+
+
+def test_startup_refuses_to_terminate_an_unowned_api_listener(tmp_path: Path):
+    manager = Go2RTCManager(
+        binary_path=tmp_path / "go2rtc",
+        config_dir=tmp_path / "config",
+        api_port=11984,
+    )
+    http = MagicMock()
+    http.get.return_value = SimpleNamespace(status_code=200)
+    manager._http.close()
+    manager._http = http
+    try:
+        with pytest.raises(RuntimeError, match="unowned process"):
+            manager._kill_stale_process()
+        http.post.assert_not_called()
+    finally:
+        manager.close()
+
+
+def test_readiness_failure_reaps_the_spawned_go2rtc_child(monkeypatch, tmp_path: Path):
+    manager = Go2RTCManager(
+        binary_path=tmp_path / "go2rtc",
+        config_dir=tmp_path / "config",
+        api_port=11984,
+    )
+    process = MagicMock()
+    process.pid = 4242
+    process.poll.return_value = None
+    process.stdout = []
+    monkeypatch.setattr(manager, "_kill_stale_process", lambda: None)
+    monkeypatch.setattr(
+        manager,
+        "_wait_for_ready",
+        MagicMock(side_effect=TimeoutError("rtsp listener missing")),
+    )
+    monkeypatch.setattr(go2rtc_mod.subprocess, "Popen", MagicMock(return_value=process))
+
+    try:
+        with pytest.raises(TimeoutError, match="rtsp listener missing"):
+            manager.start(initial_streams={"camera": "rtsp://camera.invalid/live"})
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5)
+        assert manager._process is None
+    finally:
+        manager.close()
 
 
 class TestStartAndRegisterCameras:
@@ -297,7 +391,7 @@ class TestStartAndRegisterCameras:
                 "gige_01": gige_to_go2rtc_source("scripts/gige_capture.ps1"),
             },
         )
-        mgr.register_camera.assert_called_once_with("gige_01", "192.0.2.20", "gige")
+        mgr.register_camera.assert_not_called()
         assert cam.source == "192.0.2.20"
         assert cam.protocol == "gige"
         assert resolutions["gige_01"].runtime_source == "192.0.2.20"

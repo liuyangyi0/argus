@@ -153,6 +153,7 @@ class TestAlertWorkflowStatusEnum:
         assert AlertWorkflowStatus.RESOLVED.value == "resolved"
         assert AlertWorkflowStatus.CLOSED.value == "closed"
         assert AlertWorkflowStatus.FALSE_POSITIVE.value == "false_positive"
+        assert AlertWorkflowStatus.CONFIRMED_ANOMALY.value == "confirmed_anomaly"
 
     def test_is_str_enum(self):
         """AlertWorkflowStatus should be usable as a string."""

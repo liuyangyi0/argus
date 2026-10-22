@@ -8,20 +8,28 @@ export const useWallStore = defineStore('wall', () => {
   const cameras = ref<CameraTileData[]>([])
   const health = ref<any>(null)
   const loading = ref(false)
+  let wallRequestRevision = 0
+  let healthRequestRevision = 0
+  let wallRefresh: Promise<void> | null = null
+  let wallRefreshRequested = false
 
   async function fetchWallStatus() {
+    const revision = ++wallRequestRevision
     loading.value = true
     try {
       const data = await getWallStatus()
+      if (revision !== wallRequestRevision) return
       cameras.value = data.cameras || []
     } finally {
-      loading.value = false
+      if (revision === wallRequestRevision) loading.value = false
     }
   }
 
   async function fetchHealth() {
+    const revision = ++healthRequestRevision
     try {
-      health.value = await getHealth()
+      const next = await getHealth()
+      if (revision === healthRequestRevision) health.value = next
     } catch { /* silent */ }
   }
 
@@ -29,18 +37,48 @@ export const useWallStore = defineStore('wall', () => {
     await Promise.all([fetchWallStatus(), fetchHealth()])
   }
 
-  useWebSocket({
+  function refreshWallAfterAlert() {
+    wallRequestRevision++
+    wallRefreshRequested = true
+    if (wallRefresh) return
+    wallRefresh = (async () => {
+      do {
+        wallRefreshRequested = false
+        try { await fetchWallStatus() } catch { /* The next reconciliation retries. */ }
+      } while (wallRefreshRequested)
+    })().finally(() => {
+      wallRefresh = null
+      if (wallRefreshRequested) refreshWallAfterAlert()
+    })
+  }
+
+  useWebSocket<{ cameras?: CameraTileData[] }>({
     topics: ['wall', 'alerts', 'health'],
     onMessage(topic, data) {
       if (topic === 'wall' && data?.cameras) {
-        data.cameras.forEach((update: any) => {
-          const idx = cameras.value.findIndex(c => c.camera_id === update.camera_id)
-          if (idx !== -1) {
-            cameras.value[idx] = { ...cameras.value[idx], ...update }
+        wallRequestRevision++
+        loading.value = false
+        const previous = new Map(cameras.value.map(camera => [camera.camera_id, camera]))
+        // CameraManager sends a full membership snapshot, with lightweight
+        // tile fields. Preserve richer REST fields only for cameras still in
+        // that snapshot; newly added and removed cameras must appear at once.
+        cameras.value = data.cameras.map(update => {
+          const merged = { ...previous.get(update.camera_id), ...update }
+          return {
+            ...merged,
+            alert_count_today: merged.alert_count_today ?? 0,
+            active_alert: merged.active_alert ?? null,
+            degradation: merged.degradation ?? null,
           }
         })
       }
+      if (topic === 'alerts') {
+        // Alert mutations change active_alert and daily totals, not just rows
+        // on the alerts page. Do not wait 60 seconds for the wall to reconcile.
+        refreshWallAfterAlert()
+      }
       if (topic === 'health') {
+        healthRequestRevision++
         health.value = data
       }
     },

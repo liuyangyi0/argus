@@ -19,6 +19,14 @@ class ModelStage(str, Enum):
     RETIRED = "retired"
 
 
+class ReleaseOperationStatus(str, Enum):
+    """Durable state of a requested model release transition."""
+
+    PENDING = "pending"
+    APPLIED = "applied"
+    FAILED = "failed"
+
+
 class AlertWorkflowStatus(str, Enum):
     """Workflow status for alert lifecycle management."""
 
@@ -29,6 +37,7 @@ class AlertWorkflowStatus(str, Enum):
     CLOSED = "closed"
     FALSE_POSITIVE = "false_positive"
     UNCERTAIN = "uncertain"
+    CONFIRMED_ANOMALY = "confirmed_anomaly"
 
 
 class FeedbackType(str, Enum):
@@ -82,6 +91,10 @@ class AlertRecord(Base):
     anomaly_score: Mapped[float] = mapped_column(Float, nullable=False)
     snapshot_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     heatmap_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    detection_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    evidence_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suppression_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
     acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
     acknowledged_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     false_positive: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -154,6 +167,12 @@ class AlertRecord(Base):
                 trajectories_parsed = _json.loads(self.trajectories_json)
             except Exception:
                 trajectories_parsed = None
+        evidence_parsed: dict | None = None
+        if self.evidence_json:
+            try:
+                evidence_parsed = _json.loads(self.evidence_json)
+            except Exception:
+                evidence_parsed = None
         return {
             "id": self.id,
             "alert_id": self.alert_id,
@@ -164,6 +183,10 @@ class AlertRecord(Base):
             "anomaly_score": self.anomaly_score,
             "snapshot_path": self.snapshot_path,
             "heatmap_path": self.heatmap_path,
+            "detection_type": self.detection_type,
+            "evidence_summary": self.evidence_summary,
+            "evidence_json": evidence_parsed,
+            "suppression_reason": self.suppression_reason,
             "acknowledged": self.acknowledged,
             "acknowledged_by": self.acknowledged_by,
             "false_positive": self.false_positive,
@@ -195,6 +218,57 @@ class AlertRecord(Base):
             "trajectory_points": _json.loads(self.trajectory_points) if self.trajectory_points else None,
             "model_version_id": self.model_version_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class OutboxEvent(Base):
+    """Event committed atomically with a business-state mutation.
+
+    Rows remain ``pending`` until the runtime broadcaster accepts them.  This
+    prevents clients from observing an alert that was later rolled back and
+    lets a restarted dispatcher replay events that could not be enqueued.
+    """
+
+    __tablename__ = "outbox_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True
+    )
+    topic: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending", server_default="pending", nullable=False, index=True
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, index=True
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    def to_dict(self) -> dict:
+        import json as _json
+
+        try:
+            payload = _json.loads(self.payload_json)
+        except (TypeError, ValueError):
+            payload = {}
+        return {
+            "event_id": self.event_id,
+            "topic": self.topic,
+            "event_type": self.event_type,
+            "resource_id": self.resource_id,
+            "payload": payload,
+            "status": self.status,
+            "attempts": self.attempts,
+            "last_error": self.last_error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
         }
 
 
@@ -538,8 +612,41 @@ class ModelRecord(Base):
     )
     model_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     canary_camera_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Canonical production-release evidence.  Both fields are written in the
+    # same transaction as a successful canary -> production transition.  The
+    # JSON is retained for audit/revalidation; the digest makes accidental or
+    # out-of-band mutation immediately visible.
+    release_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    release_evidence_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    # Monotonic compare-and-swap token for release transitions.  The database
+    # unique index protects the production invariant; this revision lets the
+    # API reject a stale operator action before it changes runtime state.
+    release_revision: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False,
+    )
 
     def to_dict(self) -> dict:
+        import hashlib as _hashlib
+        import json as _json
+
+        release_evidence: dict | None = None
+        release_evidence_integrity: bool | None = None
+        if self.release_evidence_json:
+            try:
+                parsed = _json.loads(self.release_evidence_json)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                release_evidence = parsed
+            release_evidence_integrity = bool(
+                self.release_evidence_sha256
+                and _hashlib.sha256(
+                    self.release_evidence_json.encode("utf-8")
+                ).hexdigest()
+                == self.release_evidence_sha256
+            )
         return {
             "id": self.id,
             "model_version_id": self.model_version_id,
@@ -557,6 +664,88 @@ class ModelRecord(Base):
             "component_type": self.component_type,
             "model_path": self.model_path,
             "canary_camera_id": self.canary_camera_id,
+            "release_evidence": release_evidence,
+            "release_evidence_sha256": self.release_evidence_sha256,
+            "release_evidence_integrity": release_evidence_integrity,
+            "release_revision": self.release_revision,
+        }
+
+
+class ModelReleaseOperation(Base):
+    """Auditable desired/observed state for one release command.
+
+    The applied model stage remains on :class:`ModelRecord`.  This row records
+    the requested target before runtime synchronization starts and is only
+    marked ``applied`` after the running camera reports the expected identity.
+    """
+
+    __tablename__ = "model_release_operations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operation_id: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True,
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128), unique=True, nullable=True, index=True,
+    )
+    model_version_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, index=True,
+    )
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    from_stage: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_stage: Mapped[str] = mapped_column(String(20), nullable=False)
+    expected_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    applied_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=ReleaseOperationStatus.PENDING.value,
+        server_default=ReleaseOperationStatus.PENDING.value, index=True,
+    )
+    requested_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Canonical desired command payload (canary binding + release evidence).
+    # Persisting it before runtime preparation allows an idempotent retry to
+    # resume an interrupted pending operation without reconstructing authority
+    # from mutable external files.
+    desired_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    runtime_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    def to_dict(self) -> dict:
+        import json as _json
+
+        runtime_state = None
+        if self.runtime_state_json:
+            try:
+                runtime_state = _json.loads(self.runtime_state_json)
+            except (TypeError, ValueError):
+                runtime_state = {"unparseable": True}
+        desired_state = None
+        if self.desired_state_json:
+            try:
+                desired_state = _json.loads(self.desired_state_json)
+            except (TypeError, ValueError):
+                desired_state = {"unparseable": True}
+        return {
+            "operation_id": self.operation_id,
+            "idempotency_key": self.idempotency_key,
+            "model_version_id": self.model_version_id,
+            "camera_id": self.camera_id,
+            "from_stage": self.from_stage,
+            "target_stage": self.target_stage,
+            "expected_revision": self.expected_revision,
+            "applied_revision": self.applied_revision,
+            "status": self.status,
+            "requested_by": self.requested_by,
+            "reason": self.reason,
+            "desired_state": desired_state,
+            "runtime_state": runtime_state,
+            "error": self.error,
+            "requested_at": self.requested_at.isoformat() if self.requested_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }
 
 

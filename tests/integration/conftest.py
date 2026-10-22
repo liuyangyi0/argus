@@ -17,6 +17,7 @@ from argus.config.schema import (
     CameraConfig,
     MOG2Config,
     PersonFilterConfig,
+    SceneGuardConfig,
     SeverityThresholds,
     SimplexConfig,
     SuppressionConfig,
@@ -81,6 +82,7 @@ def integration_camera_config():
         protocol="file",
         fps_target=5,
         resolution=(640, 480),
+        scene_guard=SceneGuardConfig(enabled=False),
         mog2=MOG2Config(
             history=50,
             heartbeat_frames=10,

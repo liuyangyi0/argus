@@ -89,19 +89,28 @@ class CameraRuntimePlanner:
             )
         if protocol == "usb":
             usb_cfg = config.usb
+            configured_source = usb_cfg.go2rtc_source
             return Go2RTCStreamSpec(
                 name=camera_id,
-                source=usb_to_go2rtc_source(
-                    source,
-                    device_name=usb_cfg.device_name,
-                    device_id=usb_cfg.device_id,
-                    resolution=config.resolution,
-                    fps=config.fps_target,
-                    pixel_format=usb_cfg.pixel_format,
+                source=(
+                    configured_source
+                    or usb_to_go2rtc_source(
+                        source,
+                        device_name=usb_cfg.device_name,
+                        device_id=usb_cfg.device_id,
+                        resolution=config.resolution,
+                        fps=config.fps_target,
+                        pixel_format=usb_cfg.pixel_format,
+                    )
                 ),
                 source_protocol=protocol,
                 runtime_rtsp_url=runtime_rtsp_url,
-                registration="rest_api",
+                registration=(
+                    "initial_config"
+                    if configured_source
+                    and configured_source.lstrip().startswith("exec:")
+                    else "rest_api"
+                ),
             )
         if protocol == "gige" and capture_script:
             return Go2RTCStreamSpec(

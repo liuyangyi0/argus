@@ -9,15 +9,9 @@ executor share the same on-disk state.
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import structlog
-
 from argus.capture.manager import CameraManager
 from argus.core.scheduler import TaskScheduler, create_job_processing_task
 from argus.storage.database import Database
-
-logger = structlog.get_logger()
 
 
 def register_training_job_processing(
@@ -36,45 +30,31 @@ def register_training_job_processing(
     entrypoint and shared with the scheduled retraining task so both paths
     point at the same on-disk state (and any future in-memory caches).
 
-    The ``on_model_trained`` callback hot-reloads the new model into the
-    running detection pipeline for the trained camera, so a successful
-    training job takes effect without restarting the process.
+    A successful training job only registers a candidate.  There is no model
+    path callback: even an apparently informational hook could reload runtime
+    out of band and bypass ModelReleaseService.
     """
     from argus.anomaly.backbone_trainer import BackboneTrainer
     from argus.anomaly.job_executor import TrainingJobExecutor
+    from argus.anomaly.trainer import ModelTrainer
     from argus.storage.model_registry import ModelRegistry
-
-    # P1 fix (2026-05): training completion no longer hot-reloads the new
-    # model into the running pipeline. Newly trained models are registered
-    # as CANDIDATE and must walk the candidate → shadow → canary → production
-    # release pipeline before activation. The dashboard's "activate model"
-    # button calls model_runtime.activate_model_version which then runs
-    # sync_model_record_runtime — that is the single supported path for
-    # putting a new model on the inference hot path.
-    def _on_model_trained(camera_id: str, model_path: Path) -> None:
-        logger.info(
-            "training.candidate_registered",
-            camera_id=camera_id,
-            model_path=str(model_path),
-            msg=(
-                "Training complete; candidate model registered. Promote via "
-                "the release pipeline (shadow → canary → production) to make "
-                "it the active inference model."
-            ),
-        )
 
     # Silence unused-import warnings — caller owns these lifecycles now.
     _ = baseline_manager
 
     backbone_trainer = BackboneTrainer(output_dir=config.storage.backbones_dir)
     model_registry = ModelRegistry(session_factory=database.get_session)
+    if isinstance(model_trainer, ModelTrainer):
+        # Registration must happen before a merged dataset's temporary
+        # directory is released. Both scheduled and queued jobs share this
+        # trainer and therefore this authoritative database identity.
+        model_trainer.bind_model_registry(model_registry)
     job_executor = TrainingJobExecutor(
         database=database,
         trainer=model_trainer,
         backbone_trainer=backbone_trainer,
         model_registry=model_registry,
         baselines_dir=config.storage.baselines_dir,
-        on_model_trained=_on_model_trained,
         camera_manager=camera_manager,
     )
     create_job_processing_task(

@@ -19,6 +19,7 @@ disabled.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import threading
 import time
 from typing import Iterable
@@ -28,6 +29,191 @@ _MAX_MULTIPLIER = 5.0
 _DEFAULT_VALID_FOR_S = 60.0
 
 
+@dataclass(frozen=True)
+class SensorFusionDecision:
+    """Rule output for a raw external sensor reading."""
+
+    sensor_type: str
+    value: float
+    unit: str | None
+    multiplier: float
+    severity: str
+    reason: str
+    evidence: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def active(self) -> bool:
+        return self.multiplier != 1.0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "sensor_type": self.sensor_type,
+            "value": self.value,
+            "unit": self.unit,
+            "multiplier": self.multiplier,
+            "severity": self.severity,
+            "reason": self.reason,
+            "active": self.active,
+            "evidence": self.evidence,
+        }
+
+
+@dataclass(frozen=True)
+class SensorFusionHead:
+    """Map typed sensor readings to bounded fusion multipliers."""
+
+    gas_warning_ppm: float = 10.0
+    gas_danger_ppm: float = 50.0
+    pressure_drop_warning_kpa: float = 5.0
+    pressure_drop_danger_kpa: float = 15.0
+    humidity_warning_rh: float = 85.0
+    humidity_danger_rh: float = 95.0
+    temperature_warning_c: float = 70.0
+    temperature_danger_c: float = 90.0
+    warning_multiplier: float = 1.5
+    danger_multiplier: float = 2.5
+
+    @classmethod
+    def from_config(cls, config: object | None) -> "SensorFusionHead":
+        if config is None:
+            return cls()
+        return cls(
+            gas_warning_ppm=float(getattr(config, "gas_warning_ppm", 10.0)),
+            gas_danger_ppm=float(getattr(config, "gas_danger_ppm", 50.0)),
+            pressure_drop_warning_kpa=float(
+                getattr(config, "pressure_drop_warning_kpa", 5.0),
+            ),
+            pressure_drop_danger_kpa=float(
+                getattr(config, "pressure_drop_danger_kpa", 15.0),
+            ),
+            humidity_warning_rh=float(getattr(config, "humidity_warning_rh", 85.0)),
+            humidity_danger_rh=float(getattr(config, "humidity_danger_rh", 95.0)),
+            temperature_warning_c=float(
+                getattr(config, "temperature_warning_c", 70.0),
+            ),
+            temperature_danger_c=float(getattr(config, "temperature_danger_c", 90.0)),
+            warning_multiplier=float(getattr(config, "warning_multiplier", 1.5)),
+            danger_multiplier=float(getattr(config, "danger_multiplier", 2.5)),
+        )
+
+    def evaluate(
+        self,
+        sensor_type: str,
+        value: float,
+        unit: str | None = None,
+    ) -> SensorFusionDecision:
+        """Evaluate one raw sensor reading.
+
+        Supported readings are intentionally explicit:
+        gas concentration in ppm, positive pressure drop in kPa, relative
+        humidity in percent, and temperature in Celsius.
+        """
+        normalized = sensor_type.strip().lower().replace("-", "_")
+        value_f = float(value)
+        if normalized in {
+            "gas",
+            "gas_ppm",
+            "combustible_gas",
+            "voc",
+            "h2s",
+            "co",
+        }:
+            return self._threshold_decision(
+                sensor_type=normalized,
+                value=value_f,
+                unit=unit or "ppm",
+                warning=self.gas_warning_ppm,
+                danger=self.gas_danger_ppm,
+                metric="gas_ppm",
+            )
+        if normalized in {
+            "pressure_drop",
+            "pressure_drop_kpa",
+            "pressure_delta",
+            "pressure_delta_kpa",
+        }:
+            drop = abs(value_f) if "delta" in normalized else value_f
+            return self._threshold_decision(
+                sensor_type=normalized,
+                value=drop,
+                unit=unit or "kPa",
+                warning=self.pressure_drop_warning_kpa,
+                danger=self.pressure_drop_danger_kpa,
+                metric="pressure_drop_kpa",
+            )
+        if normalized in {"humidity", "relative_humidity", "rh"}:
+            return self._threshold_decision(
+                sensor_type=normalized,
+                value=value_f,
+                unit=unit or "%RH",
+                warning=self.humidity_warning_rh,
+                danger=self.humidity_danger_rh,
+                metric="relative_humidity",
+            )
+        if normalized in {"temperature", "temperature_c", "temp_c"}:
+            return self._threshold_decision(
+                sensor_type=normalized,
+                value=value_f,
+                unit=unit or "C",
+                warning=self.temperature_warning_c,
+                danger=self.temperature_danger_c,
+                metric="temperature_c",
+            )
+        return SensorFusionDecision(
+            sensor_type=normalized,
+            value=value_f,
+            unit=unit,
+            multiplier=1.0,
+            severity="neutral",
+            reason="unsupported_sensor_type",
+            evidence={"supported": False},
+        )
+
+    def _threshold_decision(
+        self,
+        *,
+        sensor_type: str,
+        value: float,
+        unit: str,
+        warning: float,
+        danger: float,
+        metric: str,
+    ) -> SensorFusionDecision:
+        if value >= danger:
+            severity = "danger"
+            multiplier = self.danger_multiplier
+            threshold = danger
+        elif value >= warning:
+            severity = "warning"
+            multiplier = self.warning_multiplier
+            threshold = warning
+        else:
+            severity = "neutral"
+            multiplier = 1.0
+            threshold = warning
+        return SensorFusionDecision(
+            sensor_type=sensor_type,
+            value=value,
+            unit=unit,
+            multiplier=multiplier,
+            severity=severity,
+            reason=f"{metric}_{severity}",
+            evidence={
+                "metric": metric,
+                "threshold": threshold,
+                "warning_threshold": warning,
+                "danger_threshold": danger,
+            },
+        )
+
+
+@dataclass(frozen=True)
+class _SignalEntry:
+    multiplier: float
+    expires_at: float
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
 class SensorFusion:
     """Thread-safe TTL store mapping ``(camera_id, zone_id)`` to multipliers."""
 
@@ -35,10 +221,12 @@ class SensorFusion:
         self,
         enabled: bool = False,
         default_valid_for_s: float = _DEFAULT_VALID_FOR_S,
+        head: SensorFusionHead | None = None,
     ) -> None:
         self.enabled = enabled
         self._default_valid_for_s = float(default_valid_for_s)
-        self._signals: dict[tuple[str, str], tuple[float, float]] = {}
+        self._head = head or SensorFusionHead()
+        self._signals: dict[tuple[str, str], _SignalEntry] = {}
         self._lock = threading.Lock()
 
     # ── Public API ──
@@ -49,6 +237,7 @@ class SensorFusion:
         zone_id: str,
         multiplier: float,
         valid_for_s: float | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> None:
         """Upsert a signal. ``multiplier`` must lie in ``[0.1, 5.0]``.
 
@@ -67,7 +256,45 @@ class SensorFusion:
             raise ValueError(f"valid_for_s must be non-negative, got {valid_for_s!r}")
         expires_at = time.monotonic() + ttl
         with self._lock:
-            self._signals[(camera_id, zone_id)] = (mult, expires_at)
+            self._signals[(camera_id, zone_id)] = _SignalEntry(
+                multiplier=mult,
+                expires_at=expires_at,
+                metadata=dict(metadata or {}),
+            )
+
+    def set_reading(
+        self,
+        camera_id: str,
+        zone_id: str,
+        sensor_type: str,
+        value: float,
+        *,
+        unit: str | None = None,
+        source: str | None = None,
+        valid_for_s: float | None = None,
+    ) -> SensorFusionDecision:
+        """Evaluate a typed sensor reading and store an active fusion signal."""
+        decision = self._head.evaluate(sensor_type, value, unit)
+        if not decision.active:
+            self.remove_signal(camera_id, zone_id)
+            return decision
+        metadata = {
+            "source": source,
+            "sensor_type": decision.sensor_type,
+            "severity": decision.severity,
+            "reason": decision.reason,
+            "value": decision.value,
+            "unit": decision.unit,
+            "evidence": decision.evidence,
+        }
+        self.set_signal(
+            camera_id,
+            zone_id,
+            decision.multiplier,
+            valid_for_s=valid_for_s,
+            metadata=metadata,
+        )
+        return decision
 
     def get_multiplier(
         self,
@@ -93,9 +320,8 @@ class SensorFusion:
                 entry = self._signals.get(key)
                 if entry is None:
                     continue
-                mult, expires_at = entry
-                if current < expires_at:
-                    return mult
+                if current < entry.expires_at:
+                    return entry.multiplier
                 # Expired — drop lazily so the store self-heals without a sweeper thread
                 self._signals.pop(key, None)
         return 1.0
@@ -115,17 +341,19 @@ class SensorFusion:
         out: list[dict[str, object]] = []
         with self._lock:
             expired: list[tuple[str, str]] = []
-            for (cam, zone), (mult, expires_at) in self._signals.items():
-                remaining = expires_at - current
+            for (cam, zone), entry in self._signals.items():
+                remaining = entry.expires_at - current
                 if remaining <= 0:
                     expired.append((cam, zone))
                     continue
-                out.append({
+                payload: dict[str, object] = {
                     "camera_id": cam,
                     "zone_id": zone,
-                    "multiplier": mult,
+                    "multiplier": entry.multiplier,
                     "remaining_s": round(remaining, 3),
-                })
+                }
+                payload.update(entry.metadata)
+                out.append(payload)
             for key in expired:
                 self._signals.pop(key, None)
         return out

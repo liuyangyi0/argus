@@ -22,6 +22,11 @@ from argus.dashboard.app import create_app
 from argus.dashboard.tasks import TaskManager
 from argus.storage.database import Database
 from argus.storage.model_registry import ModelRegistry
+from argus.storage.model_release_service import (
+    RuntimeReleaseCommit,
+    RuntimeReleaseIdentity,
+    RuntimeReleasePreparation,
+)
 from argus.storage.models import ModelVersionEvent
 from argus.storage.release_pipeline import ReleasePipeline
 
@@ -370,14 +375,20 @@ class TestDashboardFeatureChain:
         integration_db,
         health_monitor,
         alerts_dir,
+        release_baseline_factory,
+        release_evidence_sources_factory,
+        running_release_client,
+        await_release_operation,
     ):
         """Exercise the dashboard chain from camera add to model activation."""
         config = ArgusConfig()
+        config.dashboard.go2rtc_enabled = False
         config_path = tmp_path / "config.yaml"
         save_config(config, config_path)
 
         camera_manager = MagicMock()
         camera_manager._cameras = []
+        camera_manager.get_camera_config.return_value = None
         camera_manager._pipelines = {"cam_01": MagicMock()}
         camera_manager.reload_model.return_value = True
 
@@ -398,7 +409,7 @@ class TestDashboardFeatureChain:
             min_shadow_days=0,
             min_canary_days=0,
         )
-        client = TestClient(app)
+        client = running_release_client(app)
 
         add_resp = client.post(
             "/api/cameras",
@@ -481,18 +492,70 @@ class TestDashboardFeatureChain:
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("model", encoding="utf-8")
+        (model_dir / "model.bin").write_bytes(b"weights")
         baseline_dir = tmp_path / "baseline"
         baseline_dir.mkdir()
         (baseline_dir / "img.png").write_bytes(b"img")
+        baseline_dir = release_baseline_factory(root=baseline_dir)
 
         registry = ModelRegistry(session_factory=integration_db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
+
+        def prepare_model_release(plan) -> RuntimeReleasePreparation:
+            class Transaction:
+                def commit(self) -> RuntimeReleaseCommit:
+                    return RuntimeReleaseCommit(
+                        True,
+                        state={
+                            "camera_id": plan.camera_id,
+                            "primary_model_version": (
+                                plan.model_version_id
+                                if plan.target_stage in {"canary", "production"}
+                                else None
+                            ),
+                            "primary_model_stage": plan.target_stage,
+                            "shadow_model_version": (
+                                plan.model_version_id
+                                if plan.target_stage == "shadow"
+                                else None
+                            ),
+                            "errors": [],
+                        },
+                    )
+
+                def abort(self) -> RuntimeReleaseCommit:
+                    return RuntimeReleaseCommit(True, state={"restored": True})
+
+                def finalize(self) -> RuntimeReleaseCommit:
+                    return RuntimeReleaseCommit(True, state={"released": True})
+
+            return RuntimeReleasePreparation(
+                True,
+                identity=RuntimeReleaseIdentity(
+                    camera_id=plan.camera_id,
+                    model_version_id=plan.model_version_id,
+                    target_stage=plan.target_stage,
+                    runtime_artifact_sha256=plan.runtime_artifact_sha256,
+                ),
+                transaction=Transaction(),
+            )
+
+        camera_manager.prepare_model_release = prepare_model_release
+        registered = registry.get_by_version_id(version_id)
+        release_evidence_sources = release_evidence_sources_factory(
+            root=tmp_path / "release-sources-chain",
+            model_path=model_dir,
+            model_version_id=version_id,
+            registry_model_hash=registered.model_hash,
+            baseline_path=baseline_dir,
+        )
 
         shadow_resp = client.post(
             f"/api/models/{version_id}/promote",
             json={"target_stage": "shadow", "triggered_by": "tester"},
         )
-        assert shadow_resp.status_code == 200
+        assert shadow_resp.status_code == 202
+        await_release_operation(client, shadow_resp)
         canary_resp = client.post(
             f"/api/models/{version_id}/promote",
             json={
@@ -501,45 +564,54 @@ class TestDashboardFeatureChain:
                 "canary_camera_id": "cam_01",
             },
         )
-        assert canary_resp.status_code == 200
+        assert canary_resp.status_code == 202
+        await_release_operation(client, canary_resp)
         publish_resp = client.post(
             f"/api/models/{version_id}/promote",
-            json={"target_stage": "production", "triggered_by": "tester"},
+            json={
+                "target_stage": "production",
+                "triggered_by": "tester",
+                "release_evidence_sources": release_evidence_sources,
+            },
         )
-        assert publish_resp.status_code == 200
-        assert publish_resp.json()["data"]["model"]["stage"] == "production"
-        assert publish_resp.json()["data"]["runtime_synced"] is True
-        camera_manager.reload_model.assert_called_with(
-            "cam_01",
-            str(model_dir / "model.xml"),
-            version_tag=version_id,
-        )
+        failed = await_release_operation(client, publish_resp, status="failed")
+        assert "decoder evidence is insufficient" in failed["operation"]["error"]
+        assert registry.get_by_version_id(version_id).stage == "canary"
 
-    def test_promote_registered_model_to_production_syncs_runtime(
+    def test_v2_baseline_cannot_promote_registered_model_to_production(
         self,
         tmp_path,
         integration_db,
         health_monitor,
         alerts_dir,
+        release_baseline_factory,
+        release_evidence_sources_factory,
+        running_release_client,
+        await_release_operation,
     ):
-        """Promotion to production should keep registry state and runtime in sync."""
+        """OpenCV-decoded v2 baselines remain offline-training-only evidence."""
         camera_manager = MagicMock()
         camera_manager.reload_model.return_value = True
+        config = ArgusConfig()
+        config.dashboard.go2rtc_enabled = False
 
         app = create_app(
             database=integration_db,
             camera_manager=camera_manager,
             health_monitor=health_monitor,
             alerts_dir=str(alerts_dir),
+            config=config,
         )
-        client = TestClient(app)
+        client = running_release_client(app)
 
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         (model_dir / "model.xml").write_text("model", encoding="utf-8")
+        (model_dir / "model.bin").write_bytes(b"weights")
         baseline_dir = tmp_path / "baseline"
         baseline_dir.mkdir()
         (baseline_dir / "img.png").write_bytes(b"img")
+        baseline_dir = release_baseline_factory(root=baseline_dir)
 
         registry = ModelRegistry(session_factory=integration_db.get_session)
         version_id = registry.register(model_dir, baseline_dir, "cam_01", "patchcore")
@@ -560,19 +632,25 @@ class TestDashboardFeatureChain:
             ))
             session.commit()
 
-        resp = client.post(
-            f"/api/models/{version_id}/promote",
-            json={"target_stage": "production", "triggered_by": "operator"},
+        registered = registry.get_by_version_id(version_id)
+        release_evidence_sources = release_evidence_sources_factory(
+            root=tmp_path / "release-sources-promotion",
+            model_path=model_dir,
+            model_version_id=version_id,
+            registry_model_hash=registered.model_hash,
+            baseline_path=baseline_dir,
         )
 
-        assert resp.status_code == 200
-        payload = resp.json()
-        assert payload["code"] == 0
-        data = payload["data"]
-        assert data["model"]["stage"] == "production"
-        assert data["runtime_synced"] is True
-        camera_manager.reload_model.assert_called_once_with(
-            "cam_01",
-            str(model_dir / "model.xml"),
-            version_tag=version_id,
+        resp = client.post(
+            f"/api/models/{version_id}/promote",
+            json={
+                "target_stage": "production",
+                "triggered_by": "operator",
+                "release_evidence_sources": release_evidence_sources,
+            },
         )
+
+        failed = await_release_operation(client, resp, status="failed")
+        assert "decoder evidence is insufficient" in failed["operation"]["error"]
+        assert registry.get_by_version_id(version_id).stage == "canary"
+        camera_manager.reload_model.assert_not_called()
