@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import {
   Card, Table, Button, Tag, Space, Select,
-  Popconfirm, message, Drawer, Descriptions, Typography,
+  Popconfirm, message, Drawer, Descriptions, Typography, Alert,
 } from 'ant-design-vue'
 import {
   CheckOutlined, CloseOutlined, ReloadOutlined,
@@ -28,6 +28,33 @@ const jobs = ref<TrainingJobInfo[]>([])
 const loading = ref(false)
 const detailDrawer = ref(false)
 const detailJob = ref<TrainingJobInfo | null>(null)
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'string') {
+    try { return asRecord(JSON.parse(value)) } catch { return null }
+  }
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : null
+}
+
+const baselineQuality = computed(() => {
+  const metrics = asRecord(detailJob.value?.metrics)
+  const report = asRecord(metrics?.baseline_quality)
+  const stringList = (value: unknown): string[] | null => Array.isArray(value)
+    && value.every(item => typeof item === 'string') ? value : null
+  const warnings = stringList(report?.warnings)
+  const errors = stringList(report?.errors)
+  const available = report?.report_status === 'available'
+    && typeof report?.passed === 'boolean' && warnings !== null && errors !== null
+    && !(report.passed && (errors.length || report.integrity_passed === false))
+    && !(report.passed && report.scope === 'observed_fixed_scene_only' && report.integrity_passed !== true)
+  return {
+    passed: available ? report.passed as boolean : null,
+    warnings: warnings || [], errors: errors || [],
+    policyVersion: typeof report?.policy_version === 'string' ? report.policy_version : '未记录',
+    fixedSceneOnly: report?.scope === 'observed_fixed_scene_only',
+  }
+})
 
 const filterStatus = ref<string | undefined>(undefined)
 const filterJobType = ref<string | undefined>(undefined)
@@ -336,6 +363,43 @@ defineExpose({ loadJobs })
             <span style="color: #e5484d">{{ detailJob.error }}</span>
           </Descriptions.Item>
         </Descriptions>
+
+        <template v-if="detailJob.job_type === 'anomaly_head'">
+          <Typography.Title :level="5" style="margin-top: 24px">训练输入质量</Typography.Title>
+          <Descriptions :column="1" bordered size="small">
+            <Descriptions.Item label="输入适用性">
+              <Tag
+                data-test="baseline-quality-state"
+                :color="baselineQuality.passed === null ? 'default' : baselineQuality.passed === false ? 'red' : baselineQuality.fixedSceneOnly || baselineQuality.warnings.length ? 'orange' : 'green'"
+              >
+                {{ baselineQuality.passed === null ? '未评估或报告无效' : baselineQuality.passed === false ? '不满足训练输入要求' : baselineQuality.fixedSceneOnly ? '训练输入可用（有限覆盖）' : '训练输入可用' }}
+              </Tag>
+            </Descriptions.Item>
+            <Descriptions.Item label="质量策略">{{ baselineQuality.policyVersion }}</Descriptions.Item>
+          </Descriptions>
+          <Alert
+            v-if="baselineQuality.fixedSceneOnly || baselineQuality.warnings.length"
+            type="warning"
+            show-icon
+            style="margin-top: 12px"
+            :message="baselineQuality.fixedSceneOnly ? '仅覆盖已观察到的固定场景正常工况' : '训练数据适用性提示'"
+            :description="baselineQuality.warnings.join('；') || '未证明其他光照、人员活动或工况下的适用性。'"
+          />
+          <Alert
+            v-if="baselineQuality.errors.length"
+            type="error"
+            show-icon
+            style="margin-top: 12px"
+            message="训练输入质量检查记录"
+            :description="baselineQuality.errors.join('；')"
+          />
+          <Alert
+            type="info"
+            show-icon
+            style="margin-top: 12px"
+            message="训练输入可用不等于生产验收通过；独立评估、场景审批及现有发布安全门保持不变。"
+          />
+        </template>
 
         <template v-if="detailJob.validation_report && typeof detailJob.validation_report === 'object'">
           <Typography.Title :level="5" style="margin-top: 24px">验证报告</Typography.Title>

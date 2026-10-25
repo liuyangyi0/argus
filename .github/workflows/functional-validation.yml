@@ -1,0 +1,71 @@
+name: Functional validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: functional-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ordinary-functions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements/functional.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install locked ordinary-function dependencies (no model engines)
+        run: python -m pip install --require-hashes -r requirements/functional.txt
+      - name: Check dependency declarations and locks
+        run: python scripts/check_dependency_locks.py
+      - name: Python lint
+        run: python -m ruff check .
+      - name: Ordinary functionality and simulated failure paths
+        run: python scripts/run_local_functional_tests.py --suite all
+      - name: OpenAPI TypeScript consistency
+        run: python scripts/generate_openapi_types.py --check
+      - name: Frontend locked install, unit tests and build
+        run: |
+          npm --prefix web ci
+          python scripts/run_local_frontend_tests.py unit
+          python scripts/run_local_frontend_tests.py build
+      - name: Install browser for isolated ordinary-function tests
+        run: npm --prefix web exec -- playwright install --with-deps chromium
+      - name: User navigation and role checks against isolated Dashboard
+        run: python scripts/run_functional_browser_checks.py
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ordinary-function-failure
+          path: |
+            .local-validation/vitest.json
+            .local-validation/playwright-ci/
+            .local-validation/functional-server.log
+          retention-days: 7
+
+  container-packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image without model dependencies
+        run: docker build --target functional-check --tag argus-functional-check .
+      - name: Validate ordinary functions as the container's non-root user
+        run: docker run --rm --network none argus-functional-check

@@ -53,6 +53,43 @@ from argus.core.pipeline_mode_guard import GlobalPipelineModeGuard
 
 logger = structlog.get_logger()
 
+
+def _baseline_quality_evidence(value: object) -> dict:
+    """Snapshot training-input diagnostics without inventing a passing result."""
+    unavailable = {
+        "report_status": "not_evaluated", "passed": None, "integrity_passed": None,
+        "warnings": [], "errors": [], "production_readiness": "not_evaluated",
+    }
+    if value is None:
+        return unavailable
+    try:
+        if not isinstance(value, dict):
+            raise ValueError("baseline quality report must be an object")
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode("utf-8")) > 512 * 1024:
+            raise ValueError("baseline quality report exceeds its evidence budget")
+        snapshot = json.loads(encoded)
+        if type(snapshot.get("passed")) is not bool:
+            raise ValueError("baseline quality passed must be a literal boolean")
+        for field in ("warnings", "errors"):
+            values = snapshot.setdefault(field, [])
+            if not isinstance(values, list) or any(type(item) is not str for item in values):
+                raise ValueError(f"baseline quality {field} must contain strings")
+        if snapshot["passed"] and (snapshot["errors"] or snapshot.get("integrity_passed") is False):
+            raise ValueError("a passing quality report cannot contain failed integrity or errors")
+        if (
+            snapshot.get("scope") == "observed_fixed_scene_only" and snapshot["passed"]
+            and snapshot.get("integrity_passed") is not True
+        ):
+            raise ValueError("fixed-scene suitability requires explicit integrity evidence")
+    except (TypeError, ValueError, OverflowError):
+        return {**unavailable, "report_status": "invalid", "errors": ["训练输入质量报告缺失必要字段或格式无效"]}
+    snapshot["report_status"] = "available"
+    # Input suitability is not production readiness or approval.
+    snapshot["production_readiness"] = "not_evaluated"
+    return snapshot
+
+
 # ── Hyperparameter validation ──
 
 _HYPERPARAMETER_LIMITS: dict[str, dict] = {
@@ -257,6 +294,15 @@ class TrainingJobExecutor:
                 raise ValueError(f"Unknown job type: {job.job_type}")
         except Exception as e:
             duration = time.monotonic() - start
+            # Per-invocation evidence prevents a previous/concurrent job's
+            # passing report from being reused for this failure.
+            carried_metrics = getattr(e, "_argus_training_metrics", None)
+            failure_metrics = dict(carried_metrics) if isinstance(carried_metrics, dict) else {}
+            if job.job_type == TrainingJobType.ANOMALY_HEAD.value:
+                quality = getattr(e, "_argus_baseline_quality", None)
+                failure_metrics["baseline_quality"] = (
+                    quality if isinstance(quality, dict) else _baseline_quality_evidence(None)
+                )
             failed = self._db.update_training_job(
                 job_id,
                 expected_status=TrainingJobStatus.RUNNING.value,
@@ -264,6 +310,7 @@ class TrainingJobExecutor:
                 error=str(e),
                 completed_at=datetime.now(timezone.utc),
                 duration_seconds=duration,
+                **({"metrics": json.dumps(failure_metrics, ensure_ascii=False, allow_nan=False)} if failure_metrics else {}),
             )
             if not failed:
                 logger.warning("job_executor.late_failure_ignored", job_id=job_id, error=str(e))
@@ -355,6 +402,17 @@ class TrainingJobExecutor:
 
     def _execute_head(self, job) -> None:
         """Execute anomaly detection head training job."""
+        evidence: dict = {}
+        try:
+            self._execute_head_with_evidence(job, evidence)
+        except Exception as exc:
+            # Keep the original exception class/message, while carrying the
+            # immutable report to the outer conditional failure write.
+            exc._argus_baseline_quality = evidence.get("baseline_quality")
+            exc._argus_training_metrics = evidence.get("failure_metrics")
+            raise
+
+    def _execute_head_with_evidence(self, job, evidence: dict) -> None:
         camera_id = job.camera_id
         if not camera_id:
             raise ValueError("camera_id is required for anomaly_head jobs")
@@ -446,6 +504,20 @@ class TrainingJobExecutor:
                 scene_training_input=scene_input,
             )
 
+        def train_with_evidence(**kwargs):
+            result = self._trainer.train(**kwargs)
+            # Capture before context-manager cleanup: a restore/temporary-data
+            # cleanup failure must not erase an already produced report.
+            evidence["baseline_quality"] = _baseline_quality_evidence(getattr(result, "pre_validation", None))
+            if scene_input is not None:
+                evidence["failure_metrics"] = {
+                    "scene_workflow": dict(scene_input.lineage),
+                    "calibration_status": result.calibration_status,
+                    "train_count": scene_input.training_count,
+                    "calibration_count": scene_input.calibration_count,
+                }
+            return result
+
         with self._training_mode_guard(reason=f"head_train:{job.job_id}"):
             if selection is not None:
                 from argus.anomaly.trainer import _DatasetMerger, _build_merger_items
@@ -455,15 +527,16 @@ class TrainingJobExecutor:
                 image_count = bm.count_images_multi(resolved_dirs)
                 merger_items = _build_merger_items(selection, resolved_dirs)
                 with _DatasetMerger(merger_items) as merged_root:
-                    result = self._trainer.train(
+                    result = train_with_evidence(
                         **train_kwargs,
                         baseline_dir_override=merged_root,
                         image_count_override=image_count,
                         baseline_versions_label=selection.version_summary(),
                     )
             else:
-                result = self._trainer.train(**train_kwargs)
+                result = train_with_evidence(**train_kwargs)
 
+        baseline_quality = evidence["baseline_quality"]
         if result.status.value != TrainingStatus.COMPLETE.value:
             raise RuntimeError(result.error or f"Training failed with status {result.status}")
 
@@ -536,6 +609,7 @@ class TrainingJobExecutor:
                     "training_dir": result.training_dir,
                     "export_dir": result.export_dir,
                     "artifact_manifest": metadata,
+                    "baseline_quality": baseline_quality,
                     **({"scene_workflow": dict(scene_input.lineage)}
                        if scene_input is not None else {}),
                     "labeling_entry_ids": _coerce_int_list(
@@ -637,19 +711,21 @@ class TrainingJobExecutor:
                             error=retirement_error,
                         )
 
-                # Persist the packaging error on the job's metrics BEFORE
-                # re-raising. The outer handler in ``_execute_job`` only
-                # updates ``status``/``error``/``completed_at``/``duration``,
-                # so metrics written here survive.
+                # Keep compensation receipts alongside data-quality evidence.
+                # Carry the same per-job metrics to the outer failure CAS so
+                # it cannot overwrite them with only a generic quality state.
+                packaging_metrics = evidence.setdefault("failure_metrics", {})
+                packaging_metrics.update({
+                    "packaging_error": err_str,
+                    "candidate_retirement": retirement,
+                    "candidate_retirement_error": retirement_error,
+                    "baseline_quality": baseline_quality,
+                })
                 try:
                     self._db.update_training_job(
                         job.job_id,
                         expected_status=TrainingJobStatus.RUNNING.value,
-                        metrics=json.dumps({
-                            "packaging_error": err_str,
-                            "candidate_retirement": retirement,
-                            "candidate_retirement_error": retirement_error,
-                        }),
+                        metrics=json.dumps(packaging_metrics, ensure_ascii=False, allow_nan=False),
                     )
                 except Exception as db_err:  # pragma: no cover — defensive
                     logger.error(
@@ -669,7 +745,7 @@ class TrainingJobExecutor:
             _packaging_error = None
 
         # Build metrics dict
-        metrics = {}
+        metrics = {"baseline_quality": baseline_quality}
         if scene_input is not None:
             metrics["scene_workflow"] = dict(scene_input.lineage)
             metrics["calibration_status"] = result.calibration_status

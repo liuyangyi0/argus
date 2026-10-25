@@ -14,6 +14,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT_SUITES = {
+    "platform": """
+        analysis_task_storage analysis_tasks_api analysis_task_runtime frame_hub
+        analysis_task_manager analysis_task_adversarial task_platform_storage
+        task_execution task_execution_manager task_adapters task_workflows task_collector task_platform_api task_preannotations task_automation
+        task_deployments_api task_deployments task_deployment_adversarial
+        gpu_smoke_contracts
+    """.split(),
     "core": """
         auth permissions startup_security api_contract core_api_dtos config config_loader config_api
         database database_alert_evidence_migration alert_workflow alerts_route alerts_route_evidence
@@ -24,7 +31,7 @@ UNIT_SUITES = {
         camera_rbac camera_groups zone_rbac sensors_route physics_runtime_contract
         dashboard_streaming_contract preview_gateway_contract stream_registry_contract
         stream_websocket_proxy model_registry model_registry_scope model_deletion model_deletion_events
-        model_list_operations models_status_route model_release_service release_pipeline release_execution
+        model_list_operations models_status_route model_release_service model_rollback release_pipeline release_execution
         release_slot_invariants release_api_policy release_evidence scene_training
         scene_training_execution data_contracts dataset_selection dataset_merger calibration
         circuit_breaker backpressure degradation degradation_bridge degradation_manager diagnostics

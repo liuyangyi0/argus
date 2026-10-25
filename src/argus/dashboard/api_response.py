@@ -79,6 +79,7 @@ _STATUS_ERROR_CODES: dict[int, int] = {
 # contract explicit instead of relying on FastAPI's default JSON response class
 # for functions which return a FileResponse/StreamingResponse at runtime.
 API_MEDIA_RESPONSES: dict[str, tuple[str, ...]] = {
+    "/api/analysis-tasks/{task_id}/workflows/{workflow_id}/samples/{sample_id}/image": ("image/png",),
     "/api/alerts/{alert_id}/evidence.zip": ("application/zip",),
     "/api/alerts/{alert_id}/image/{image_type}": ("image/jpeg",),
     "/api/alerts/export-csv": ("text/csv",),

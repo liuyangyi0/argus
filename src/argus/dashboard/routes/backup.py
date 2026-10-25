@@ -8,7 +8,7 @@ import structlog
 from fastapi import APIRouter, Request
 
 from argus.dashboard.api_response import api_success, api_error, api_forbidden, api_unavailable
-from argus.dashboard.auth import require_role
+from argus.dashboard.auth import require_human_permission, require_role
 from argus.dashboard.forms import parse_request_form
 
 logger = structlog.get_logger()
@@ -80,9 +80,10 @@ async def create_backup(request: Request):
 @router.post("/restore")
 async def restore_backup(request: Request):
     """Restore database from a named backup."""
-    denied = _deny_non_admin(request)
-    if denied:
-        return denied
+    # A whole-database restore can reinstate passwords and user privileges.
+    # Shared automation credentials must not mint a personal approval identity.
+    if not require_human_permission(request, "manage_users"):
+        return api_forbidden("恢复数据库需要启用认证并使用有效的个人管理员账号登录")
 
     backup_manager = getattr(request.app.state, "backup_manager", None)
     if not backup_manager:

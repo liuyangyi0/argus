@@ -60,16 +60,22 @@ logger = structlog.get_logger()
 
 
 def _resolve_session_secret(auth_config: object) -> str:
-    """Return a restart-stable, purpose-separated session signing secret."""
+    """Use independent server material for personal-account session signatures.
+
+    Deriving this key from the shared API credential would let automation
+    impersonate any account. Without a separately configured secret, sessions
+    intentionally expire when this application instance restarts.
+    """
     configured = os.environ.get("ARGUS_SESSION_SECRET", "").strip()
     api_token = str(getattr(auth_config, "api_token", "") or "")
-    material = configured or api_token
-    if not material:
-        # Auth-disabled development instances do not need cross-restart
-        # sessions. Keep an unpredictable per-process value in that case.
+    if not configured:
         return secrets.token_hex(32)
+    if api_token.strip() and secrets.compare_digest(
+        configured.encode("utf-8"), api_token.strip().encode("utf-8"),
+    ):
+        raise ValueError("ARGUS_SESSION_SECRET must be independent from the shared API token")
     return hashlib.sha256(
-        b"argus.dashboard.session.v1\0" + material.encode("utf-8")
+        b"argus.dashboard.session.v1\0" + configured.encode("utf-8")
     ).hexdigest()
 
 
@@ -279,10 +285,45 @@ def create_app(
                     )
                     app.state.go2rtc = None
 
+            task_coordinator = getattr(app.state, "task_deployment_coordinator", None)
+            if task_coordinator is not None:
+                available = await asyncio.to_thread(task_coordinator.start)
+                if not available:
+                    logger.warning("app.task_deployment_owner_unavailable")
+
             yield
         finally:
             # Async context managers receive shutdown/cancellation at the
             # yield expression. Cleanup therefore has to live in finally.
+            task_coordinator = getattr(app.state, "task_deployment_coordinator", None)
+            if task_coordinator is not None:
+                try:
+                    await asyncio.to_thread(task_coordinator.close, wait=False)
+                except Exception:
+                    logger.error("app.task_deployment_close_failed")
+            for name in ("task_execution",):
+                service = getattr(app.state, name, None)
+                close = getattr(service, "close", None)
+                if callable(close):
+                    try:
+                        cleaned = await asyncio.get_running_loop().run_in_executor(_default_executor, close)
+                        if cleaned is False:
+                            logger.error("app.task_service_cleanup_pending", service=name)
+                    except Exception:
+                        logger.warning("app.task_service_cleanup_failed", service=name)
+            if task_coordinator is not None:
+                try:
+                    if not await asyncio.to_thread(task_coordinator.join, timeout=5.0):
+                        logger.error("app.task_deployment_owner_cleanup_pending")
+                except Exception:
+                    logger.error("app.task_deployment_owner_release_failed")
+            workflows = getattr(app.state, "task_workflows", None)
+            if workflows is not None:
+                try:
+                    if await asyncio.to_thread(workflows.close) is False:
+                        logger.error("app.task_service_cleanup_pending", service="task_workflows")
+                except Exception:
+                    logger.warning("app.task_service_cleanup_failed", service="task_workflows")
             if release_worker is not None:
                 await asyncio.get_running_loop().run_in_executor(
                     _default_executor,
@@ -377,6 +418,107 @@ def create_app(
     app.state.baseline_lifecycle = BaselineLifecycle(database) if database else None
     app.state.baseline_manager = baseline_manager
     app.state.model_trainer = model_trainer
+
+    # Additive P0-P2 task identity bootstrap. Existing release services remain
+    # authoritative; this never promotes an artifact or claims runtime applied.
+    from argus.storage.analysis_tasks import AnalysisTaskService
+    from argus.storage.database import Database
+    from argus.config.schema import CameraConfig, StorageConfig
+
+    app.state.analysis_task_service = None
+    app.state.analysis_task_bootstrap_errors = set()
+    task_storage_config = getattr(config, "storage", None)
+    if not isinstance(task_storage_config, StorageConfig):
+        task_storage_config = StorageConfig()
+    if isinstance(database, Database):
+        analysis_tasks = AnalysisTaskService(database, models_root=task_storage_config.models_dir)
+        for camera in getattr(config, "cameras", []):
+            if isinstance(camera, CameraConfig):
+                try:
+                    analysis_tasks.bootstrap_legacy(
+                        camera.camera_id,
+                        camera.model_dump(mode="json", exclude={"source"}),
+                    )
+                except Exception as exc:
+                    # A damaged compatibility identity may block its task, not
+                    # the dashboard needed to inspect/repair the installation.
+                    # Do not log exception text: it can include source secrets.
+                    app.state.analysis_task_bootstrap_errors.add(camera.camera_id)
+                    logger.warning(
+                        "app.analysis_task_bootstrap_failed",
+                        camera_id=camera.camera_id, error_type=type(exc).__name__,
+                    )
+                    continue
+                try:
+                    analysis_tasks.sync_legacy_model_projection(camera.camera_id)
+                except Exception as exc:
+                    # This is an observation, never the release authority. A
+                    # registry CAS conflict must not stop unrelated cameras or
+                    # make FastAPI unavailable. Reads retain not_synced/stale.
+                    logger.warning(
+                        "app.analysis_task_projection_failed",
+                        camera_id=camera.camera_id, error_type=type(exc).__name__,
+                    )
+        app.state.analysis_task_service = analysis_tasks
+
+    app.state.task_execution = None
+    app.state.task_workflows = None
+    app.state.task_automation = None
+    app.state.task_deployments = None
+    app.state.task_deployment_coordinator = None
+    if app.state.analysis_task_service is not None:
+        from argus.capture.task_execution_manager import TaskExecutionManager
+        from argus.storage.task_workflows import TaskWorkflowService
+        from argus.storage.task_deployments import TaskDeploymentService
+
+        app.state.task_deployments = TaskDeploymentService(database, app.state.analysis_task_service)
+
+        def _register_task_candidate(*, task_id, candidate, training_manifest, actor, idempotency_key):
+            from argus.core.analysis_task_contracts import template_spec
+
+            service = app.state.analysis_task_service
+            task = service.get_task(task_id)
+            binding = training_manifest["binding"]
+            if (task is None or task["authority"] != "managed" or task.get("archived")
+                    or binding["task_id"] != task_id
+                    or binding["task_revision"] != task["current_revision"]
+                    or binding["task_config_sha256"] != task["config_sha256"]):
+                raise ValueError("candidate task binding is stale")
+            if set(candidate) != {"relative_path", "descriptor"}:
+                raise ValueError("candidate requires a model path and descriptor")
+            expected = set(template_spec(task["template_id"])["model_roles"].values())
+            if candidate["descriptor"].get("adapter_id") not in expected:
+                raise ValueError("candidate adapter does not match the training task")
+            model = service.register_task_model(
+                candidate["relative_path"], candidate["descriptor"],
+                scope_camera_id=task["camera_id"], requested_by=actor, idempotency_key=idempotency_key,
+            )
+            return {"artifact_id": model["model_id"]}
+
+        app.state.task_workflows = TaskWorkflowService(
+            database, task_storage_config.baselines_dir.parent / "task_datasets",
+            candidate_registrar=_register_task_candidate,
+        )
+        if camera_manager is not None:
+            app.state.task_execution = TaskExecutionManager(
+                app.state.analysis_task_service, camera_manager,
+                models_root=task_storage_config.models_dir,
+            )
+            source_canceller = getattr(camera_manager, "set_source_task_canceller", None)
+            if callable(source_canceller):
+                source_canceller(app.state.task_execution.stop_source)
+            from argus.runtime.task_automation import TaskAutomationService
+
+            app.state.task_automation = TaskAutomationService(
+                app.state.analysis_task_service, app.state.task_execution,
+                app.state.task_workflows, camera_manager,
+            )
+            from argus.runtime.task_deployments import TaskDeploymentCoordinator
+
+            app.state.task_deployment_coordinator = TaskDeploymentCoordinator(
+                app.state.task_deployments, app.state.task_execution,
+                on_observed=app.state.task_automation.reconcile_deployment,
+            )
 
     if (
         camera_manager is not None
@@ -506,6 +648,25 @@ def create_app(
     app.include_router(config_router, prefix="/api/config", tags=["config"])
     app.include_router(system_router, prefix="/api/system", tags=["system"])
     app.include_router(tasks_router, prefix="/api/tasks", tags=["tasks"])
+    from argus.dashboard.routes.analysis_tasks import (
+        router as analysis_tasks_router,
+        templates_router as analysis_task_templates_router,
+    )
+
+    app.include_router(analysis_tasks_router, prefix="/api/analysis-tasks", tags=["analysis-tasks"])
+    app.include_router(analysis_task_templates_router, prefix="/api/analysis-task-templates", tags=["analysis-tasks"])
+    from argus.dashboard.routes.task_platform import (
+        models_router as task_models_router, router as task_platform_router,
+    )
+
+    app.include_router(task_platform_router, prefix="/api/analysis-tasks", tags=["analysis-tasks"])
+    app.include_router(task_models_router, prefix="/api/analysis-task-models", tags=["analysis-tasks"])
+    from argus.dashboard.routes.task_workflows import router as task_workflows_router
+
+    app.include_router(task_workflows_router, prefix="/api/analysis-tasks", tags=["analysis-tasks"])
+    from argus.dashboard.routes.task_deployments import router as task_deployments_router
+
+    app.include_router(task_deployments_router, prefix="/api/analysis-tasks", tags=["analysis-tasks"])
     app.include_router(audit_router, prefix="/api/audit", tags=["audit"])
     app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
     app.include_router(users_router, prefix="/api/users", tags=["users"])
@@ -730,7 +891,14 @@ def create_app(
 
     # ── Vue SPA static files ──
     # Serve built Vue app from web/dist/ (production)
-    vue_dist = Path(__file__).parent.parent.parent.parent / "web" / "dist"
+    configured_dist = getattr(dashboard_config, "frontend_dist_dir", None)
+    vue_dist = (
+        Path(configured_dist)
+        if configured_dist is not None
+        else Path(__file__).parent.parent.parent.parent / "web" / "dist"
+    )
+    if configured_dist is not None and not (vue_dist / "index.html").is_file():
+        raise ValueError("Configured dashboard.frontend_dist_dir has no index.html")
     if vue_dist.is_dir():
         _mount_vue_spa(app, vue_dist)
 

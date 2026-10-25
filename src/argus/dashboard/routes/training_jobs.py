@@ -24,7 +24,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import current_username, require_permission
+from argus.dashboard.auth import current_username, require_human_permission, require_permission
 from argus.anomaly.job_executor import validate_hyperparameters
 from argus.storage.models import (
     AlertRecord,
@@ -318,6 +318,8 @@ async def create_training_job(request: Request):
 @router.post("/{job_id}/confirm")
 async def confirm_training_job(request: Request, job_id: str):
     """Human confirms a pending training job (writes audit log)."""
+    if not require_human_permission(request, "manage_training"):
+        return api_forbidden("训练审批需要开启认证并使用有效个人账号登录；共享 API 凭证不能代替人工审批")
     denied = _deny_without_training_permission(request)
     if denied:
         return denied
@@ -357,6 +359,8 @@ async def confirm_training_job(request: Request, job_id: str):
 @router.post("/{job_id}/reject")
 async def reject_training_job(request: Request, job_id: str):
     """Human rejects a pending training job."""
+    if not require_human_permission(request, "manage_training"):
+        return api_forbidden("训练审批需要开启认证并使用有效个人账号登录；共享 API 凭证不能代替人工审批")
     denied = _deny_without_training_permission(request)
     if denied:
         return denied

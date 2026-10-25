@@ -40,6 +40,59 @@ describe('release request idempotency', () => {
     expect(client.post.mock.calls[1][1].idempotency_key).toBe(firstKey)
   })
 
+  it('reuses a rollback key and both revisions after a timeout and module reload', async () => {
+    client.post.mockRejectedValueOnce(new Error('timeout'))
+    let models = await import('../models')
+    const payload = {
+      source_model_version_id: 'production-1',
+      source_release_revision: 7,
+      expected_revision: 4,
+      reason: 'Restore verified previous version',
+    }
+    await expect(models.rollbackModel('retired-1', payload)).rejects.toThrow('timeout')
+    const firstKey = client.post.mock.calls[0][1].idempotency_key
+    expect(firstKey).toMatch(/^[0-9a-f-]{36}$/)
+    expect(client.post.mock.calls[0]).toEqual([
+      '/models/retired-1/rollback', { ...payload, idempotency_key: firstKey },
+    ])
+
+    vi.resetModules()
+    models = await import('../models')
+    client.post.mockResolvedValueOnce(result('pending'))
+    await models.rollbackModel('retired-1', payload)
+    expect(client.post.mock.calls[1]).toEqual(client.post.mock.calls[0])
+    expect(payload).not.toHaveProperty('idempotency_key')
+  })
+
+  it.each([
+    ['source model identity', { source_model_version_id: 'production-2' }],
+    ['source release revision', { source_release_revision: 8 }],
+  ])('uses a separate rollback key when the %s changes', async (_name, change) => {
+    const models = await import('../models')
+    client.post.mockResolvedValue(result('pending'))
+    const payload = {
+      source_model_version_id: 'production-1',
+      source_release_revision: 7,
+      expected_revision: 4,
+      reason: 'Restore verified previous version',
+    }
+    await models.rollbackModel('retired-1', payload)
+    const initialKey = client.post.mock.calls[0][1].idempotency_key
+    const changedPayload = { ...payload, ...change }
+    await models.rollbackModel('retired-1', changedPayload)
+    const changedKey = client.post.mock.calls[1][1].idempotency_key
+    expect(changedKey).toMatch(/^[0-9a-f-]{36}$/)
+    expect(changedKey).not.toBe(initialKey)
+    expect(client.post.mock.calls[1][1]).toEqual({
+      ...changedPayload, idempotency_key: changedKey,
+    })
+
+    await models.rollbackModel('retired-1', payload)
+    await models.rollbackModel('retired-1', changedPayload)
+    expect(client.post.mock.calls[2][1].idempotency_key).toBe(initialKey)
+    expect(client.post.mock.calls[3][1].idempotency_key).toBe(changedKey)
+  })
+
   it('retains a pending key and clears it when polling confirms a terminal result', async () => {
     const models = await import('../models')
     client.post.mockResolvedValue(result('pending'))

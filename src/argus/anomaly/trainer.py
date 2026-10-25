@@ -29,11 +29,13 @@ from argus.anomaly import _trainer_export as _te
 from argus.anomaly.artifacts import (
     artifact_metadata,
     exported_artifact,
+    inherited_baseline_quality,
     new_artifact_run,
     training_directory,
     write_artifact_manifest,
 )
 from argus.anomaly.baseline import BaselineManager
+from argus.anomaly.baseline_quality import FixedSceneQualityContext, inspect_baseline_quality
 from argus.anomaly.scene_training import (
     SceneTrainingInput,
     revalidate_scene_training_input,
@@ -235,6 +237,17 @@ def _resolve_dinomaly_backbone(backbone: str) -> str:
     it is returned as-is.
     """
     return _DINOMALY_BACKBONE_MAP.get(backbone, backbone)
+
+
+def _training_device_kwargs(backend: str, *, cuda_available: bool) -> dict[str, object]:
+    """Resolve explicit device policies without importing or running a model."""
+    if backend == "torch-cuda":
+        if cuda_available is not True:
+            raise RuntimeError("torch-cuda training requires CUDA; CPU fallback is forbidden")
+        return {"accelerator": "gpu", "devices": 1}
+    if backend == "torch-cpu":
+        return {"accelerator": "cpu", "devices": 1}
+    return {}
 
 
 class TrainingStatus(str, Enum):
@@ -766,7 +779,16 @@ class ModelTrainer:
         self._status = TrainingStatus.VALIDATING
         _progress(5, "正在验证基线质量...")
 
-        pre_validation = self._validate_baseline_quality(baseline_dir, min_images=min_images)
+        try:
+            quality_context = (
+                {"scene_training_input": scene_training_input}
+                if scene_training_input is not None else {}
+            )
+            pre_validation = self._validate_baseline_quality(
+                baseline_dir, min_images=min_images, **quality_context,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            return self._fail(start, error=f"基线质量上下文校验失败: {exc}", image_count=image_count)
         if not pre_validation["passed"]:
             if skip_baseline_validation:
                 logger.warning(
@@ -924,6 +946,7 @@ class ModelTrainer:
             Path(export_path_str) if export_path_str else None,
             val_dir,
             artifact_path=artifact_path,
+            inference_backend=getattr(anomaly_config, "inference_backend", "auto"),
         )
 
         if artifact_path is not None and not output_validation["smoke_test_passed"]:
@@ -984,6 +1007,9 @@ class ModelTrainer:
 
         # Quality report (TRN-004)
         quality_report = self._generate_quality_report(val_stats, threshold_recommended)
+        for warning in pre_validation.get("warnings", []):
+            if warning not in quality_report.suggestions:
+                quality_report.suggestions.append(warning)
 
         # Three-step validation pipeline (if configured)
         validation_report = None
@@ -1084,6 +1110,7 @@ class ModelTrainer:
                 metadata = write_artifact_manifest(
                     run, artifact_path, model_type=model_type,
                     calibration_status=calibration_status,
+                    baseline_quality=pre_validation,
                 )
                 if self._model_registry is not None:
                     model_version_id = self._model_registry.register(
@@ -1104,6 +1131,7 @@ class ModelTrainer:
                             "training_dir": str(output_dir),
                             "export_dir": str(run.export_dir),
                             "artifact_manifest": metadata,
+                            "baseline_quality": pre_validation,
                             **({"scene_workflow": dict(scene_training_input.lineage)}
                                if scene_training_input is not None else {}),
                         },
@@ -1285,79 +1313,48 @@ class ModelTrainer:
 
     def _validate_baseline_quality(
         self, baseline_dir: Path, min_images: int = MIN_BASELINE_IMAGES,
+        *, scene_training_input: SceneTrainingInput | None = None,
     ) -> dict:
-        """Validate baseline image quality before training.
+        """Select static input rules only after server-side strict V3 validation.
 
-        Thresholds: corruption < 10%, near-duplicate < 80%, brightness std > 2.0.
+        An adjacent manifest or client-selected mode is not authority. The
+        context is resolved again here, then rechecked after scanning. Existing
+        split-copy hashes and the final pre-registration revalidation remain.
         """
-        images = _list_images(baseline_dir)
-        total = len(images)
-        errors: list[str] = []
+        context = None
+        verified = None
+        if scene_training_input is not None:
+            from argus.preprocessing.scene_guard import SceneGuardConfig
 
-        if total < min_images:
-            return {
-                "passed": False,
-                "corruption_rate": 0.0,
-                "near_duplicate_rate": 0.0,
-                "brightness_std": 0.0,
-                "errors": [f"图片数量不足: {total} (需要 >= {min_images})"],
-            }
-
-        corrupted = 0
-        brightness_values: list[float] = []
-        hashes: list[np.ndarray] = []
-
-        for img_path in images:
-            frame = cv2.imread(str(img_path))
-            if frame is None or frame.size == 0:
-                corrupted += 1
-                continue
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness_values.append(float(gray.mean()))
-
-            # Perceptual hash: 8x8 grayscale, threshold at mean -> 64-bit hash
-            small = cv2.resize(gray, (8, 8), interpolation=cv2.INTER_AREA)
-            phash = (small > small.mean()).flatten().astype(np.uint8)
-            hashes.append(phash)
-
-        corruption_rate = corrupted / total if total > 0 else 0.0
-
-        if corruption_rate >= 0.1:
-            errors.append(f"损坏率过高: {corruption_rate:.1%} (上限 10%)")
-
-        brightness_std = float(np.std(brightness_values)) if brightness_values else 0.0
-        if brightness_std <= 2.0:
-            errors.append(f"亮度多样性不足: std={brightness_std:.1f} (需要 > 2.0)")
-
-        # Vectorized near-duplicate detection via hamming distance
-        near_duplicate_count = 0
-        n = len(hashes)
-        if n > 1:
-            hash_matrix = np.array(hashes)  # (n, 64)
-            duplicate_flags = np.zeros(n, dtype=bool)
-            for i in range(n):
-                if duplicate_flags[i]:
-                    continue
-                # Hamming distances from i to all j > i
-                dists = np.sum(hash_matrix[i] != hash_matrix[i + 1:], axis=1)
-                dup_mask = dists <= 5  # very similar (out of 64 bits)
-                new_dups = dup_mask & ~duplicate_flags[i + 1:]
-                near_duplicate_count += int(new_dups.sum())
-                duplicate_flags[i + 1:] |= dup_mask
-
-        near_duplicate_rate = near_duplicate_count / total if total > 0 else 0.0
-
-        if near_duplicate_rate >= 0.8:
-            errors.append(f"近似重复率过高: {near_duplicate_rate:.1%} (上限 80%)")
-
-        return {
-            "passed": len(errors) == 0,
-            "corruption_rate": corruption_rate,
-            "near_duplicate_rate": near_duplicate_rate,
-            "brightness_std": brightness_std,
-            "errors": errors,
-        }
+            verified = revalidate_scene_training_input(scene_training_input)
+            if Path(baseline_dir).absolute() != verified.images_dir.absolute():
+                raise ValueError("static quality input is not the verified scene image directory")
+            manifest_path = verified.root / "manifest.json"
+            with manifest_path.open("rb") as stream:
+                raw = stream.read(16 * 1024 * 1024 + 1)
+            if len(raw) > 16 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != verified.lineage["manifest_sha256"]:
+                raise ValueError("static quality manifest changed or exceeds its metadata budget")
+            manifest = json.loads(raw)
+            if manifest.get("schema_version") != "argus.scene-profile-baseline.v3":
+                raise ValueError("static quality requires its exact strict V3 baseline")
+            try:
+                split = manifest["split_contract"]
+                context = FixedSceneQualityContext(
+                    config=SceneGuardConfig(**manifest["parameters"]["scene_guard"]),
+                    expected_shape=(manifest["reference"]["height"], manifest["reference"]["width"]),
+                    sample_count=verified.image_count, training_count=verified.training_count,
+                    calibration_count=verified.calibration_count,
+                    source_session_count=len(split["declared_session_ids"]),
+                    accepted_span_seconds=sum(split["accepted_time_span_seconds"][role]
+                        for role in ("train", "calibration")),
+                )
+            except (KeyError, TypeError) as exc:
+                raise ValueError("static quality context lacks complete frozen scene metadata") from exc
+        report = inspect_baseline_quality(_list_images(baseline_dir), min_images, fixed_scene=context)
+        if verified is not None:
+            revalidate_scene_training_input(verified)
+            report["scene_workflow"] = dict(verified.lineage)
+        return report
 
     # ── TRN-002: Auto train/val split ──
 
@@ -1524,7 +1521,7 @@ class ModelTrainer:
             )
 
         if grade in ("F", "C"):
-            suggestions.append("建议重新采集更多样化的基线图片（不同光照、角度）")
+            suggestions.append("建议补充同一固定机位下业务允许的正常工况；不要移动机位或焦距制造多样性")
         if std > 0.15:
             suggestions.append("基线图片质量不一致，检查是否有异常值或场景变化")
         if max_score > 0 and max_score > threshold_recommended * 0.7:
@@ -1532,7 +1529,7 @@ class ModelTrainer:
         if mean > 0.4:
             suggestions.append("模型在正常图片上的平均分偏高，可能欠拟合")
         if grade == "A" and not suggestions:
-            suggestions.append("模型质量优秀，可直接部署使用")
+            suggestions.append("仅说明已观察正常工况下的拟合较好；仍需独立业务验收、场景绑定、人工审批和可信 soak，不能直接部署")
 
         return QualityReport(
             grade=grade,
@@ -1566,6 +1563,7 @@ class ModelTrainer:
     def _validate_output(
         self, output_dir: Path, export_path: Path | None, val_dir: Path,
         artifact_path: Path | None = None,
+        *, inference_backend: str = "auto",
     ) -> tuple[dict, object | None]:
         """Validate training output: checkpoint integrity, export files, smoke test.
 
@@ -1620,6 +1618,7 @@ class ModelTrainer:
                     # calibration or calibrate already calibrated scores.
                     detector = AnomalibDetector(
                         model_path=model_file, threshold=0.5, enable_calibration=False,
+                        inference_backend=inference_backend,
                     )
                     if detector.load():
                         frame = cv2.imread(str(test_images[0]))
@@ -1796,6 +1795,12 @@ class ModelTrainer:
         from torchvision.transforms.v2 import Compose, Resize, ToDtype, ToImage
         import torch
 
+        # Explicit deployment policies apply to training too. Lightning's
+        # default accelerator="auto" would otherwise silently train on CPU
+        # when a required CUDA device is unavailable.
+        backend = getattr(anomaly_config, "inference_backend", "auto")
+        device_kwargs = _training_device_kwargs(backend, cuda_available=torch.cuda.is_available())
+
         # Free GPU memory used by inference models (YOLO, anomaly detector)
         # so training has enough VRAM. Models are reloaded after training.
         if torch.cuda.is_available():
@@ -1953,6 +1958,7 @@ class ModelTrainer:
             default_root_dir=str(output_dir),
             max_epochs=max_epochs,
             callbacks=callbacks if callbacks else None,
+            **device_kwargs,
         )
 
         # Checkpoint resumption
@@ -2159,10 +2165,12 @@ class ModelTrainer:
                 calibrator.save(cal_result, cal_path, sorted_scores=np.sort(score_array))
                 self._sync_calibration_to_export(cal_path, run.export_dir)
                 calibration_status = "ok"
+            source_quality = inherited_baseline_quality(metadata, source_model_path=str(source_path))
             manifest = write_artifact_manifest(
                 run, artifact, model_type=model_type,
                 calibration_status=calibration_status,
                 source_model_path=str(source_path),
+                baseline_quality=source_quality,
             )
             version_id = self._model_registry.register(
                 model_path=artifact,
@@ -2176,6 +2184,7 @@ class ModelTrainer:
                     "export_format": export_format,
                     "quantization": actual_quantization,
                     "derived_operation": "reexport",
+                    "baseline_quality": source_quality,
                     "artifact_manifest": manifest,
                 },
                 registered_by="model_reexport",
@@ -2316,9 +2325,11 @@ class ModelTrainer:
             # candidate artifact as calibrated.
             sigmoid_recalibrated = False
 
+            source_quality = inherited_baseline_quality(metadata, source_model_path=str(source_path))
             manifest = write_artifact_manifest(
                 run, derived_artifact, model_type=model_type,
                 calibration_status="ok", source_model_path=str(source_path),
+                baseline_quality=source_quality,
             )
             version_id = self._model_registry.register(
                 model_path=derived_artifact,
@@ -2329,6 +2340,7 @@ class ModelTrainer:
                     "zone_id": zone_id,
                     "run_id": run.run_id,
                     "derived_operation": "recalibrate",
+                    "baseline_quality": source_quality,
                     "artifact_manifest": manifest,
                 },
                 registered_by="model_recalibrate",

@@ -13,6 +13,7 @@ from argus.core.pipeline import PipelineMode
 from argus.dashboard.api_contracts import (
     CameraDetailResponse,
     CameraLifecycleResponse,
+    CameraSourceResponse,
     CameraListResponse,
     CameraModeRequest,
     CameraModeResponse,
@@ -28,7 +29,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import require_role
+from argus.dashboard.auth import require_permission, require_role
 from argus.dashboard.forms import htmx_toast_headers, parse_request_form
 from argus.streaming.preview_gateway import (
     PreviewGateway,
@@ -815,6 +816,63 @@ async def stop_camera(request: Request, camera_id: str):
         CameraLifecycleResponse,
         headers=htmx_toast_headers("摄像头已停止"),
     )
+
+
+def _source_payload(manager, camera_id: str) -> dict:
+    observed = manager.get_source_runtime_status(camera_id)
+    if not isinstance(observed, dict):
+        raise LookupError("source is not configured")
+    payload = {key: observed[key] for key in (
+        "state", "running", "connected", "generation", "source_session_id",
+        "source_epoch", "cleanup_pending", "frames_published",
+    ) if key in observed}
+    payload["camera_id"] = camera_id
+    if observed.get("cleanup_pending"):
+        payload["reason_code"] = "CLEANUP_PENDING"
+    elif observed.get("error"):
+        payload["reason_code"] = "SOURCE_FAILED"
+    return payload
+
+
+@router.get("/{camera_id}/source", response_model=ApiEnvelope[CameraSourceResponse])
+def camera_source_status(request: Request, camera_id: str):
+    if not require_permission(request, "read_cameras"):
+        return api_forbidden()
+    manager = getattr(request.app.state, "camera_manager", None)
+    if manager is None:
+        return api_unavailable()
+    try:
+        return api_typed_success(_source_payload(manager, camera_id), CameraSourceResponse)
+    except LookupError:
+        return api_not_found()
+    except Exception:
+        return api_unavailable("无法读取摄像头源状态")
+
+
+@router.post("/{camera_id}/source/{action}", response_model=ApiEnvelope[CameraSourceResponse])
+async def camera_source_command(request: Request, camera_id: str, action: str):
+    if not require_role(request, "admin", "operator", "engineer"):
+        return api_forbidden()
+    if action not in {"start", "stop"}:
+        return api_not_found()
+    manager = getattr(request.app.state, "camera_manager", None)
+    if manager is None:
+        return api_unavailable()
+    if manager.get_camera_config(camera_id) is None:
+        return api_not_found("摄像头不存在")
+    try:
+        if action == "start":
+            _ensure_go2rtc_stream(request, manager.get_camera_config(camera_id))
+            succeeded = await asyncio.to_thread(manager.start_source, camera_id)
+        else:
+            succeeded = await asyncio.to_thread(manager.stop_source, camera_id)
+        payload = _source_payload(manager, camera_id)
+        if succeeded is False or payload.get("cleanup_pending"):
+            return api_conflict("摄像头源操作未完成，请检查状态后重试", payload)
+        return api_typed_success(payload, CameraSourceResponse)
+    except Exception:
+        # Capture SDK errors can include credentials or local device paths.
+        return api_unavailable("摄像头源操作失败；未改变任务生产授权")
 
 
 @router.post("/{camera_id}/test-connection")

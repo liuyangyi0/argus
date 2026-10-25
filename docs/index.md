@@ -1,6 +1,6 @@
 # Argus 文档入口
 
-> 最后更新：2026-07-13
+> 最后更新：2026-10-23
 
 本文档定义 Argus 仓库的文档结构。后续写模块细节时，先读 `docs/source-index.md` 的压缩源码索引，再按模块打开源码和对应文档，避免一次性把全仓库上下文塞满。
 
@@ -13,7 +13,11 @@
 | `docs/acceptance.md` | 检测质量验收数字、误报/召回计数口径和物理边界 | 调整检测质量目标、回归库结论或部署边界时 |
 | `docs/design/recovery-plan-2026-06-12.md` | 检测质量收敛计划、P0/P1 当前状态和后续 P2-P4 路线 | 继续检测质量收敛工作、调整阶段状态或复盘计划时 |
 | `docs/design/camera-scene-guard-and-video-recognition-2026-07-13.md` | 摄像机移动防护、视频案例生产管线回放、算法路线与 GO/NO-GO 门槛 | 调整 SceneGuard、scene profile、视频回归或候选确认方案时 |
+| `docs/design/multi-task-platform-p0-p2.md` | 单摄像头多分析任务的领域契约、legacy 迁移、模型/部署分离与 P0—P2 边界 | 调整任务身份、采集所有权、多订阅运行时或后续阶段范围时 |
+| `docs/design/multi-task-platform-p3-p6.md` | 多任务工作台、受控 ONNX 旁路执行、定时采集、人审及外部训练交接的实现边界 | 调整任务模板、执行包、数据流程、依赖或生产准入时 |
 | `docs/runbooks/gpu-validation-runtime.md` | gpu-validation 测试机、OBSBOT、go2rtc exec+NVENC、Argus 启停、模型切换与回归命令 | 测试机运行状态、摄像头档位、隧道、GPU/OpenVINO 切换变化时 |
+| `docs/runbooks/container-deployment.md` | Linux 容器、私有配置、数据持久化与无模型镜像验证 | 容器构建、挂载、身份或设备映射变化时 |
+| `requirements/README.md` | Python / 前端依赖锁定与普通功能 CI | 依赖版本、验证环境或 CI 范围变化时 |
 | `data/regression/HANDOFF.md` | 真实回归素材的恢复入口、远端路径、commit、基线数字、推荐采集帧率和下一步 | 下次接着跑回归库、恢复视频、查首版基线或录新素材时 |
 | `docs/source-index.md` | 自动提取的目录树、Python 类/函数签名、FastAPI 路由、前端路由/API 客户端 | 改动源码结构或 API 后运行生成脚本 |
 | `docs/api-reference.md` | Dashboard HTTP API、WebSocket 主题、响应约定 | 新增、删除或改变 `/api/*` / `/ws` 行为时 |

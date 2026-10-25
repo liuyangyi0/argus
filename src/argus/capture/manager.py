@@ -20,7 +20,10 @@ import numpy as np
 import structlog
 
 from argus.alerts.grader import Alert, AlertSeverity
+from argus.capture.source_runtime import CameraSourceRuntime, SourceCaptureView, create_source_capture
 from argus.config.schema import AlertConfig, AnomalyConfig, CameraConfig, ClassifierConfig, CrossCameraConfig, SegmenterConfig
+from argus.core.analysis_task_contracts import legacy_task_id
+from argus.core.analysis_task_runtime import TaskRuntime, TaskSupervisor
 from argus.core.correlation import CameraOverlapPair, CrossCameraCorrelator
 from argus.core.error_channel import (
     SEVERITY_ERROR,
@@ -281,6 +284,19 @@ class CameraManager:
         self._runners: dict[str, CameraInferenceRunner] = {}
         self._pipelines: dict[str, DetectionPipeline] = {}  # backward compat
         self._threads: dict[str, threading.Thread] = {}
+        self._sources: dict[str, CameraSourceRuntime] = {}
+        self._retiring_sources: dict[str, CameraSourceRuntime] = {}
+        self._starting_sources: dict[str, CameraSourceRuntime] = {}
+        self._source_runtime_configs: dict[str, CameraConfig] = {}
+        self._source_declared_inputs: dict[str, tuple[str, str]] = {}
+        self._legacy_task_errors: dict[str, str] = {}
+        self._legacy_candidate_sources: dict[str, CameraSourceRuntime] = {}
+        self._source_snapshot_identities: dict[str, FrameIdentity] = {}
+        self._source_preview_identities: dict[str, FrameIdentity] = {}
+        self._source_task_canceller: Callable[[str], bool] | None = None
+        self._task_supervisor = TaskSupervisor()
+        self._legacy_task_enabled: dict[str, bool] = {}
+        self._legacy_task_locks: dict[str, threading.RLock] = {}
         self._starting_cameras: set[str] = set()
         self._starting_generations: dict[str, int] = {}
         self._camera_generations: dict[str, int] = {}
@@ -347,16 +363,26 @@ class CameraManager:
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
 
-        # DET-012: Pre-load shared YOLO model for all pipelines
+        # Source-only operation must never preload any recognition engine.
+        # Legacy startup retains the shared model behavior through lazy loading.
         self._shared_yolo = None
-        if cameras:
+        self._shared_yolo_attempted = False
+        self._shared_yolo_lock = threading.Lock()
+
+    def _get_legacy_shared_yolo(self, cam_config: CameraConfig):
+        with self._shared_yolo_lock:
+            if self._shared_yolo_attempted:
+                return self._shared_yolo
+            self._shared_yolo_attempted = True
             try:
                 from argus.person.detector import get_shared_yolo
 
-                model_name = cameras[0].person_filter.model_name
+                cameras = getattr(self, "_cameras", ())
+                model_name = (cameras[0] if cameras else cam_config).person_filter.model_name
                 self._shared_yolo = get_shared_yolo(model_name)
             except Exception as e:
                 logger.warning("manager.shared_yolo_failed", error=str(e))
+            return self._shared_yolo
 
     def _get_shared_detector(self, anomaly_config: AnomalyConfig) -> object:
         """Get or create the shared anomaly detector for multi-class Dinomaly mode.
@@ -507,7 +533,9 @@ class CameraManager:
 
         with self._lock:
             self._ensure_lifecycle_state()
-            camera_ids = set(self._pipelines) | set(self._threads) | self._starting_cameras | set(self._retiring_cameras)
+            camera_ids = (set(self._pipelines) | set(self._threads) | self._starting_cameras
+                          | set(self._retiring_cameras) | set(self._sources)
+                          | set(self._retiring_sources) | set(self._starting_sources))
         failures = []
         for camera_id in camera_ids:
             try:
@@ -535,6 +563,12 @@ class CameraManager:
             ("_camera_cleanup_locks", dict),
             ("_retiring_cameras", dict), ("_camera_lifecycle_errors", dict),
             ("_module_desired", dict),
+            ("_sources", dict), ("_retiring_sources", dict), ("_starting_sources", dict),
+            ("_source_runtime_configs", dict), ("_source_declared_inputs", dict),
+            ("_legacy_task_errors", dict),
+            ("_legacy_candidate_sources", dict),
+            ("_source_snapshot_identities", dict), ("_source_preview_identities", dict),
+            ("_legacy_task_enabled", dict), ("_legacy_task_locks", dict),
         ):
             if not hasattr(self, name):
                 setattr(self, name, factory())
@@ -542,6 +576,11 @@ class CameraManager:
             self._module_revision = 0
         if not hasattr(self, "_module_apply_lock"):
             self._module_apply_lock = threading.RLock()
+        if not hasattr(self, "_task_supervisor"):
+            self._task_supervisor = TaskSupervisor()
+        if not hasattr(self, "_shared_yolo_lock"):
+            self._shared_yolo_lock = threading.Lock()
+            self._shared_yolo_attempted = getattr(self, "_shared_yolo", None) is not None
 
     def _desired_auxiliary_states(self) -> dict[str, bool]:
         result = {}
@@ -556,10 +595,11 @@ class CameraManager:
     def _camera_lifecycle_status_locked(self, camera_id: str) -> dict:
         generation = self._camera_generations.get(camera_id, 0)
         reason = self._camera_lifecycle_errors.get(camera_id)
-        starting = camera_id in self._starting_cameras
+        starting = camera_id in self._starting_cameras or camera_id in self._starting_sources
         stopping = camera_id in self._stopping_cameras
-        retiring = camera_id in self._retiring_cameras
-        cancelled_start = starting and self._starting_generations.get(camera_id) != generation
+        retiring = camera_id in self._retiring_cameras or camera_id in self._retiring_sources
+        cancelled_start = (camera_id in self._starting_cameras
+                           and self._starting_generations.get(camera_id) != generation)
         if reason:
             state = "cleanup_failed"
         elif stopping:
@@ -571,6 +611,8 @@ class CameraManager:
         elif camera_id in self._pipelines:
             thread = getattr(self, "_threads", {}).get(camera_id)
             state = "running" if thread is not None and thread.is_alive() else "runtime_dead"
+        elif camera_id in self._sources:
+            state = "source_only"
         else:
             state = "stopped"
         if reason is None and cancelled_start:
@@ -579,12 +621,37 @@ class CameraManager:
             "state": state, "generation": generation, "reason": reason,
             "starting": starting, "stopping": stopping,
             "cleanup_pending": retiring or stopping or cancelled_start,
+            "legacy_error": self._legacy_task_errors.get(camera_id),
         }
 
     def add_camera_config(self, cam_config: CameraConfig) -> None:
         """Thread-safe addition of a new camera config to the managed list."""
+        self._bootstrap_task_identity(cam_config)
         with self._lock:
             self._cameras.append(cam_config)
+
+    def _bootstrap_task_identity(self, cam_config: CameraConfig) -> None:
+        """Import identity once, without overwriting approved task snapshots."""
+        from argus.storage.analysis_tasks import AnalysisTaskService
+        from argus.storage.database import Database
+
+        database = getattr(self, "_db", None)
+        if isinstance(database, Database):
+            service = AnalysisTaskService(database)
+            service.bootstrap_legacy(
+                cam_config.camera_id, cam_config.model_dump(mode="json", exclude={"source"}),
+            )
+            try:
+                service.sync_legacy_model_projection(cam_config.camera_id)
+            except Exception:
+                # This is a non-authoritative read-model projection, not the
+                # model release gate. Concurrent publishing may invalidate its
+                # snapshot. Keep the existing registry/runner checks in charge
+                # and retry projection on the next explicit lifecycle action.
+                logger.warning(
+                    "manager.analysis_task_projection_unavailable",
+                    camera_id=cam_config.camera_id,
+                )
 
     def remove_camera_config(self, camera_id: str) -> None:
         """Thread-safe removal of a camera config from the managed list."""
@@ -601,6 +668,125 @@ class CameraManager:
         if result:
             self._broadcast_camera_and_wall(camera_id)
         return result
+
+    def start_source(self, camera_id: str) -> bool:
+        """Start acquisition/preview/recording without constructing legacy models."""
+        cam_config = self.get_camera_config(camera_id)
+        if cam_config is None:
+            return False
+        result = self._start_source(cam_config)
+        if result:
+            with self._lock:
+                self._legacy_task_enabled.setdefault(camera_id, False)
+            self._broadcast_camera_and_wall(camera_id)
+        return result
+
+    def stop_source(self, camera_id: str) -> None:
+        """Stop this source and its subscribers; retain failed cleanup ownership."""
+        self.stop_camera(camera_id)
+
+    def set_source_task_canceller(self, callback: Callable[[str], bool] | None) -> None:
+        """Wire prepared/queued managed workers without transferring source ownership."""
+        if callback is not None and not callable(callback):
+            raise TypeError("source task canceller must be callable")
+        with self._lock:
+            self._source_task_canceller = callback
+
+    def _resolve_source_config(self, cam_config: CameraConfig) -> CameraConfig:
+        if self._source_resolver is not None:
+            try:
+                resolved = self._source_resolver(cam_config)
+                if resolved is not None:
+                    return resolved
+            except Exception as exc:
+                logger.warning("manager.source_resolve_failed", camera_id=cam_config.camera_id,
+                               error=str(exc))
+        return cam_config
+
+    def _create_source_capture(self, runtime_config, declared_config, stream_id):
+        return create_source_capture(runtime_config, source_declared=declared_config.source,
+                                     stream_id=stream_id)
+
+    def _start_source(self, cam_config, *, runtime_config=None, expected_generation=None) -> bool:
+        camera_id = cam_config.camera_id
+        runtime_config = runtime_config or self._resolve_source_config(cam_config)
+        # Reconnect must use this source's frozen capture settings, never an
+        # in-place edit of the manager/YAML object made after source startup.
+        cam_config = cam_config.model_copy(deep=True)
+        runtime_config = runtime_config.model_copy(deep=True)
+        stream_id = self._frame_identity_stream_id(cam_config, runtime_config)
+        with self._lock:
+            self._ensure_lifecycle_state()
+            previous = self._sources.get(camera_id)
+            declared = self._source_declared_inputs.get(camera_id)
+        if previous is not None:
+            state = previous.state
+            with self._lock:
+                return (self._sources.get(camera_id) is previous
+                        and declared == (cam_config.source, cam_config.protocol)
+                        and camera_id not in self._stopping_cameras
+                        and camera_id not in self._retiring_sources
+                        and (camera_id not in self._retiring_cameras
+                             or self._legacy_candidate_sources.get(camera_id) is previous)
+                        and not self._stop_event.is_set()
+                        and (expected_generation is None
+                             or self._camera_generations.get(camera_id, 0) == expected_generation)
+                        and state.running and not state.cleanup_pending)
+        with self._lock:
+            self._ensure_lifecycle_state()
+            generation = self._camera_generations.get(camera_id, 0)
+            if (self._stop_event.is_set()
+                    or expected_generation is not None and expected_generation != generation
+                    or camera_id in self._stopping_cameras or camera_id in self._retiring_sources
+                    or camera_id in self._retiring_cameras):
+                return False
+            if camera_id in self._sources or camera_id in self._starting_sources:
+                return False
+
+            def on_frame(frame_data):
+                # Ownership is independent of legacy generations. A failed or
+                # restarted legacy task cannot stop recording for peer tasks.
+                with self._lock:
+                    current = (self._sources.get(camera_id) is source
+                               and camera_id not in self._stopping_cameras)
+                if current and self._continuous_recording_mgr is not None:
+                    wall_ts = (frame_data.identity.capture_wall_ts
+                               if frame_data.identity is not None else time.time())
+                    self._continuous_recording_mgr.push_frame(camera_id, frame_data.frame, wall_ts)
+
+            source = CameraSourceRuntime(
+                camera_id, lambda: self._create_source_capture(runtime_config, cam_config, stream_id),
+                source=runtime_config.source, protocol=runtime_config.protocol, on_frame=on_frame,
+            )
+            source.configure_frame_identity(source_declared=cam_config.source,
+                                            source_runtime=runtime_config.source, stream_id=stream_id)
+            self._starting_sources[camera_id] = source
+        published = False
+        try:
+            connected = source.start()
+            with self._lock:
+                if (connected and self._starting_sources.get(camera_id) is source
+                        and self._camera_generations.get(camera_id, 0) == generation
+                        and not self._stop_event.is_set()
+                        and camera_id not in self._stopping_cameras
+                        and camera_id not in self._retiring_sources):
+                    self._sources[camera_id] = source
+                    self._source_runtime_configs[camera_id] = runtime_config
+                    self._source_declared_inputs[camera_id] = (cam_config.source, cam_config.protocol)
+                    published = True
+            return published
+        finally:
+            if not published:
+                clean = source.stop()
+                with self._lock:
+                    if not clean:
+                        self._retiring_sources[camera_id] = source
+                        self._camera_lifecycle_errors[camera_id] = "source cleanup is still pending"
+                    elif self._retiring_sources.get(camera_id) is source:
+                        self._retiring_sources.pop(camera_id, None)
+            with self._lock:
+                if self._starting_sources.get(camera_id) is source:
+                    self._starting_sources.pop(camera_id, None)
 
     def stop_camera(self, camera_id: str) -> None:
         """Invalidate pending starts and retain resources until cleanup is confirmed."""
@@ -625,6 +811,26 @@ class CameraManager:
                         pipeline, thread = previous
                     if pipeline is not None or thread is not None:
                         self._retiring_cameras[camera_id] = (pipeline, thread)
+                    self._legacy_candidate_sources.pop(camera_id, None)
+                    source = self._sources.pop(camera_id, None)
+                    if source is None:
+                        source = self._starting_sources.get(camera_id)
+                    if source is None:
+                        source = self._retiring_sources.get(camera_id)
+                    if source is not None:
+                        self._retiring_sources[camera_id] = source
+                    cancel_tasks = getattr(self, "_source_task_canceller", None)
+                if cancel_tasks is not None:
+                    try:
+                        if cancel_tasks(camera_id) is not True:
+                            failures.append("managed task preparation cleanup is still pending")
+                    except Exception:
+                        failures.append("managed task preparation cleanup failed")
+                try:
+                    if not self._task_supervisor.stop_source(camera_id):
+                        failures.append("analysis task cleanup is still pending")
+                except Exception as exc:
+                    failures.append(f"analysis task cleanup: {exc}")
                 if pipeline is not None:
                     try:
                         pipeline.shutdown()
@@ -638,12 +844,27 @@ class CameraManager:
                             failures.append("previous camera thread is still running")
                     except Exception as exc:
                         failures.append(f"thread cleanup: {exc}")
+                if source is not None:
+                    try:
+                        if not source.stop():
+                            failures.append("source cleanup is still pending")
+                    except Exception as exc:
+                        failures.append(f"source cleanup: {exc}")
+                if not failures:
+                    if not self._task_supervisor.unregister_clean_source(camera_id, source=source):
+                        failures.append("analysis task ownership cleanup is still pending")
                 with self._lock:
                     if failures:
                         self._camera_lifecycle_errors[camera_id] = "; ".join(failures)
                     elif self._retiring_cameras.get(camera_id, (None,))[0] is pipeline:
                         self._retiring_cameras.pop(camera_id, None)
+                        self._retiring_sources.pop(camera_id, None)
+                        self._source_runtime_configs.pop(camera_id, None)
+                        self._source_declared_inputs.pop(camera_id, None)
+                        self._source_snapshot_identities.pop(camera_id, None)
+                        self._source_preview_identities.pop(camera_id, None)
                         self._camera_lifecycle_errors.pop(camera_id, None)
+                        self._legacy_task_errors.pop(camera_id, None)
         finally:
             with self._lock:
                 self._stopping_cameras.discard(camera_id)
@@ -672,6 +893,7 @@ class CameraManager:
             cameras = list(self._cameras)
             pipelines = dict(self._pipelines)
             threads = dict(self._threads)
+            sources = dict(self._sources)
             lifecycle = {c.camera_id: self._camera_lifecycle_status_locked(c.camera_id) for c in cameras}
         statuses = []
         for cam_config in cameras:
@@ -694,10 +916,15 @@ class CameraManager:
                     ),
                 ))
             else:
+                source = sources.get(cam_config.camera_id)
                 statuses.append(CameraStatus(
                     camera_id=cam_config.camera_id,
                     name=cam_config.name,
-                    error=getattr(self, "_camera_lifecycle_errors", {}).get(cam_config.camera_id),
+                    connected=source.state.connected if source is not None else False,
+                    running=source.state.running if source is not None else False,
+                    capture_status=source.runtime_status() if source is not None else None,
+                    error=(self._camera_lifecycle_errors.get(cam_config.camera_id)
+                           or self._legacy_task_errors.get(cam_config.camera_id)),
                     lifecycle=lifecycle[cam_config.camera_id],
                 ))
         return statuses
@@ -772,6 +999,144 @@ class CameraManager:
             scene_guard=lambda: self.get_scene_guard_status(camera_id),
             reconnect=lambda: self.reconnect_camera(camera_id),
         )
+
+    def get_source_runtime_status(self, camera_id: str) -> dict | None:
+        """Observe the shared source, independently of any analysis task."""
+        with self._lock:
+            self._ensure_lifecycle_state()
+            source = self._sources.get(camera_id) or self._retiring_sources.get(camera_id)
+            configured = any(c.camera_id == camera_id for c in self._cameras)
+        if source is not None:
+            return source.snapshot()
+        if configured:
+            return {"state": "stopped", "running": False, "connected": False}
+        return None
+
+    def get_camera_source(self, camera_id: str) -> CameraSourceRuntime | None:
+        """Return the current shared source for trusted task/collection services.
+
+        This never starts a device. Callers must retain the exact source identity
+        and refuse stale results when the camera is stopped or replaced.
+        """
+        with self._lock:
+            self._ensure_lifecycle_state()
+            if (camera_id in self._stopping_cameras
+                    or camera_id in self._retiring_cameras
+                    and self._legacy_candidate_sources.get(camera_id) is not self._sources.get(camera_id)
+                    or camera_id in self._retiring_sources):
+                return None
+            return self._sources.get(camera_id)
+
+    def get_analysis_task_runtime(self, task_id: str) -> dict | None:
+        """Return observed task state; registry stage is never runtime evidence."""
+        runtime = None
+        with self._lock:
+            self._ensure_lifecycle_state()
+            camera_id = next((c.camera_id for c in self._cameras
+                              if legacy_task_id(c.camera_id) == task_id), None)
+            if camera_id is None:
+                try:
+                    runtime = self._task_supervisor.get(task_id)
+                except KeyError:
+                    return None
+            else:
+                lifecycle = self._camera_lifecycle_status_locked(camera_id)
+                runner = self._runners.get(camera_id)
+                enabled = self._legacy_task_enabled.get(camera_id, True)
+        # Task callbacks may inspect the manager. Never acquire a task lock
+        # while holding the manager lock (task -> source -> manager is valid).
+        if camera_id is None:
+            return runtime.snapshot() if runtime is not None else None
+        running = lifecycle["state"] == "running" and enabled
+        state = lifecycle["state"] if enabled else "stopped"
+        reason = None
+        if runner is None and lifecycle.get("legacy_error"):
+            state, reason = "failed", lifecycle["legacy_error"]
+        elif state == "source_only":
+            state, reason = "stopped", "LEGACY_NOT_STARTED"
+        source = self.get_source_runtime_status(camera_id)
+        guard = self.get_scene_guard_status(camera_id)
+        if running and source and not source.get("connected"):
+            state, reason = "blocked", "WAITING_SOURCE"
+        elif running and guard and guard.get("enabled") and not guard.get("usable"):
+            state, reason = "blocked", "SCENE_BLOCKED"
+        identity = runner.model_identity if runner is not None else None
+        verified = isinstance(identity, ModelIdentity) and bool(
+            identity.version and identity.artifact_sha256
+        )
+        return {
+            "state": state, "running": running,
+            "generation": lifecycle["generation"], "reason_code": reason,
+            "desired_state": "running" if enabled else "stopped",
+            "model_version": identity.version if verified else None,
+            "artifact_sha256": identity.artifact_sha256 if verified else None,
+            "model_identity_verified": verified,
+        }
+
+    def set_analysis_task_enabled(self, task_id: str, enabled: bool) -> bool:
+        """Stop/resume the legacy consumer without closing its shared source.
+
+        P2 retains the loaded legacy models while stopped. Draining is serialized
+        with frame processing; resuming reconfirms the original scene gate.
+        This is not a model release or a way to change pipeline safety policy.
+        """
+        with self._lock:
+            self._ensure_lifecycle_state()
+            camera_id = next((c.camera_id for c in self._cameras
+                              if legacy_task_id(c.camera_id) == task_id), None)
+            if camera_id is None:
+                return False
+            lock = self._legacy_task_locks.setdefault(camera_id, threading.RLock())
+            pipeline = self._pipelines.get(camera_id)
+        if pipeline is None:
+            if not enabled:
+                with self._lock:
+                    self._legacy_task_enabled[camera_id] = False
+                    self._legacy_task_errors.pop(camera_id, None)
+                return True
+            if not self.start_camera(camera_id):
+                return False
+            with self._lock:
+                pipeline = self._pipelines.get(camera_id)
+            if pipeline is None:
+                return False
+        with lock:
+            with self._lock:
+                if self._pipelines.get(camera_id) is not pipeline:
+                    return False
+                previous = self._legacy_task_enabled.get(camera_id, True)
+            if enabled and not previous:
+                pipeline.reconfirm_task_session()
+            with self._lock:
+                if self._pipelines.get(camera_id) is not pipeline:
+                    return False
+                self._legacy_task_enabled[camera_id] = enabled
+        self._broadcast_camera_and_wall(camera_id)
+        return True
+
+    def register_analysis_task_runtime(self, runtime: TaskRuntime) -> TaskRuntime:
+        """Internal adapter seam for bounded consumers, not a public plugin API.
+
+        No deployment authorization or production alert path is created here.
+        Only the manager's exact current source can be subscribed to.
+        """
+        with self._lock:
+            self._ensure_lifecycle_state()
+            source = self._sources.get(runtime.source.camera_id)
+            if (source is not runtime.source
+                    or runtime.source.camera_id in self._stopping_cameras
+                    or runtime.source.camera_id in self._retiring_cameras
+                    and self._legacy_candidate_sources.get(runtime.source.camera_id) is not source
+                    or runtime.source.camera_id in self._retiring_sources):
+                raise ValueError("task must use the manager-owned current source")
+            if runtime.task_id == legacy_task_id(source.camera_id):
+                raise ValueError("legacy task is owned by its compatibility runner")
+            return self._task_supervisor.register(runtime)
+
+    def unregister_analysis_task_runtime(self, task_id: str, *, runtime: TaskRuntime) -> bool:
+        """Detach only the expected, fully cleaned application task instance."""
+        self._ensure_lifecycle_state()
+        return self._task_supervisor.unregister_clean_task(task_id, runtime=runtime)
 
     def set_degradation_publisher(
         self,
@@ -914,6 +1279,12 @@ class CameraManager:
     def get_latest_frame(self, camera_id: str) -> np.ndarray | None:
         """Get the latest processed frame from a camera for live preview."""
         pipeline = self._pipelines.get(camera_id)
+        source = getattr(self, "_sources", {}).get(camera_id)
+        if source is not None and (
+            pipeline is None or not self._legacy_task_enabled.get(camera_id, True)
+        ):
+            latest = source.latest_frame
+            return latest.frame if latest is not None else None
         if pipeline is None:
             return None
         return pipeline.get_latest_frame()
@@ -924,6 +1295,12 @@ class CameraManager:
     ) -> tuple[np.ndarray | None, FrameIdentity | None]:
         """Get the latest processed frame and its identity."""
         pipeline = self._pipelines.get(camera_id)
+        source = getattr(self, "_sources", {}).get(camera_id)
+        if source is not None and (
+            pipeline is None or not self._legacy_task_enabled.get(camera_id, True)
+        ):
+            latest = source.latest_frame
+            return (latest.frame, latest.identity) if latest is not None else (None, None)
         if pipeline is None:
             return None, None
         getter = getattr(pipeline, "get_latest_frame_with_identity", None)
@@ -933,7 +1310,11 @@ class CameraManager:
 
     def get_latest_frame_identity(self, camera_id: str) -> FrameIdentity | None:
         """Get identity for the latest processed frame."""
+        source = getattr(self, "_sources", {}).get(camera_id)
         pipeline = self._pipelines.get(camera_id)
+        if source is not None and (pipeline is None or not self._legacy_task_enabled.get(camera_id, True)):
+            latest = source.latest_frame
+            return latest.identity if latest is not None else None
         if pipeline is None:
             return None
         get_identity = getattr(pipeline, "get_latest_frame_identity", None)
@@ -948,8 +1329,13 @@ class CameraManager:
     ) -> FrameIdentity | None:
         """Mark that a frame was served by the snapshot API."""
         pipeline = self._pipelines.get(camera_id)
-        if pipeline is None:
-            return None
+        if pipeline is None or not self._legacy_task_enabled.get(camera_id, True):
+            identity = self.get_latest_frame_identity(camera_id)
+            if identity is not None:
+                identity = identity.with_updates(snapshot_id=snapshot_id)
+                with self._lock:
+                    self._source_snapshot_identities[camera_id] = identity
+            return identity
         mark = getattr(pipeline, "mark_snapshot_identity", None)
         if not callable(mark):
             return None
@@ -958,8 +1344,13 @@ class CameraManager:
     def record_preview_stream_access(self, camera_id: str) -> FrameIdentity | None:
         """Mark that a frame was served by the backend preview stream."""
         pipeline = self._pipelines.get(camera_id)
-        if pipeline is None:
-            return None
+        if pipeline is None or not self._legacy_task_enabled.get(camera_id, True):
+            identity = self.get_latest_frame_identity(camera_id)
+            if identity is not None:
+                identity = identity.with_updates(preview_stream_ts=time.time())
+                with self._lock:
+                    self._source_preview_identities[camera_id] = identity
+            return identity
         mark = getattr(pipeline, "mark_preview_stream_identity", None)
         if not callable(mark):
             return None
@@ -968,8 +1359,41 @@ class CameraManager:
     def get_frame_identity_status(self, camera_id: str) -> dict | None:
         """Return source and frame identity diagnostics for one camera."""
         pipeline = self._pipelines.get(camera_id)
-        if pipeline is None:
-            return None
+        if pipeline is None or not self._legacy_task_enabled.get(camera_id, True):
+            source = self.get_camera_source(camera_id)
+            if source is None:
+                return None
+            identity = self.get_latest_frame_identity(camera_id)
+            with self._lock:
+                snapshot = self._source_snapshot_identities.get(camera_id)
+                preview = self._source_preview_identities.get(camera_id)
+                declared = self._source_declared_inputs.get(camera_id)
+                runtime_config = self._source_runtime_configs.get(camera_id)
+            token = source.source_token
+            def current(value):
+                return value if value is not None and (
+                    value.source_session_id, value.source_epoch,
+                ) == token else None
+            snapshot, preview = current(snapshot), current(preview)
+            declared_source = declared[0] if declared else source.source
+            return {
+                "declared_source": declared_source, "runtime_source": source.source,
+                "go2rtc_stream": identity.stream_id if identity is not None else (
+                    camera_id if runtime_config is not None and declared
+                    and (runtime_config.source, runtime_config.protocol) != declared else None
+                ),
+                "latest": identity.to_dict() if identity is not None else None,
+                "last_snapshot": snapshot.to_dict() if snapshot is not None else None,
+                "last_preview_stream": preview.to_dict() if preview is not None else None,
+                "last_frame_index": identity.frame_index if identity is not None else None,
+                "last_capture_ts": identity.capture_wall_ts if identity is not None else None,
+                "last_pipeline_ts": None,
+                "last_snapshot_ts": None,
+                "last_snapshot_id": snapshot.snapshot_id if snapshot is not None else None,
+                "last_snapshot_frame_index": snapshot.frame_index if snapshot is not None else None,
+                "last_preview_stream_ts": preview.preview_stream_ts if preview is not None else None,
+                "last_preview_stream_frame_index": preview.frame_index if preview is not None else None,
+            }
         get_status = getattr(pipeline, "get_frame_identity_status", None)
         if not callable(get_status):
             return None
@@ -985,6 +1409,77 @@ class CameraManager:
             return None
         status = get_status()
         return status if isinstance(status, dict) else None
+
+    def get_managed_scene_guard_status(self, camera_id: str, *, source=None) -> dict:
+        """Nonblocking, source-bound safety evidence for managed shadow tasks."""
+        blocked = {"enabled": True, "usable": False, "reference_available": False,
+                   "profile_id": None, "consumer_enabled": False,
+                   "reason_code": "SCENE_EVIDENCE_UNAVAILABLE"}
+        # A final task commit may already hold the source lock. Never wait for
+        # manager lifecycle or legacy geometry calculations in that callback.
+        if not self._lock.acquire(blocking=False):
+            return {**blocked, "reason_code": "SCENE_EVIDENCE_BUSY"}
+        try:
+            current = getattr(self, "_sources", {}).get(camera_id)
+            pipeline = self._pipelines.get(camera_id)
+            enabled = getattr(self, "_legacy_task_enabled", {}).get(camera_id, True)
+            thread = getattr(self, "_threads", {}).get(camera_id)
+            consumer = bool(
+                enabled and pipeline is not None and thread is not None and thread.is_alive()
+                and camera_id not in getattr(self, "_stopping_cameras", ())
+                and camera_id not in getattr(self, "_retiring_cameras", ())
+                and camera_id not in getattr(self, "_retiring_sources", ())
+            )
+        finally:
+            self._lock.release()
+        if not consumer or current is None or (source is not None and source is not current):
+            return blocked
+        token = current.source_token
+        getter = getattr(pipeline, "get_managed_scene_guard_observation", None)
+        if token is None or not callable(getter):
+            return blocked
+        observation = getter()
+        if (not isinstance(observation, dict) or observation.get("source_token") != token
+                or observation.get("usable") is not True):
+            reason = observation.get("reason_code") if isinstance(observation, dict) else None
+            if reason in {"SCENE_EVIDENCE_BUSY", "SCENE_EVIDENCE_EXPIRED", "SCENE_PROFILE_UNAPPROVED"}:
+                return {**blocked, "reason_code": reason}
+            return blocked
+        # Copy under the lifecycle lock again; replacement/disable that won
+        # during the observation invalidates it. There is still no SDK call.
+        if not self._lock.acquire(blocking=False):
+            return {**blocked, "reason_code": "SCENE_EVIDENCE_BUSY"}
+        try:
+            if (getattr(self, "_sources", {}).get(camera_id) is not current
+                    or self._pipelines.get(camera_id) is not pipeline
+                    or not getattr(self, "_legacy_task_enabled", {}).get(camera_id, True)
+                    or getattr(self, "_threads", {}).get(camera_id) is not thread or not thread.is_alive()
+                    or camera_id in getattr(self, "_stopping_cameras", ())
+                    or camera_id in getattr(self, "_retiring_cameras", ())
+                    or camera_id in getattr(self, "_retiring_sources", ())):
+                return blocked
+        finally:
+            self._lock.release()
+        return {**observation, "consumer_enabled": True}
+
+    def commit_managed_scene_if_current(self, camera_id: str, *, source, profile_id: str, callback) -> bool:
+        """Fence consumer/source ownership and guard evidence through a short memory commit."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            pipeline = self._pipelines.get(camera_id)
+            thread = getattr(self, "_threads", {}).get(camera_id)
+            if (getattr(self, "_sources", {}).get(camera_id) is not source
+                    or pipeline is None or thread is None or not thread.is_alive()
+                    or not getattr(self, "_legacy_task_enabled", {}).get(camera_id, True)
+                    or camera_id in getattr(self, "_stopping_cameras", ())
+                    or camera_id in getattr(self, "_retiring_cameras", ())
+                    or camera_id in getattr(self, "_retiring_sources", ())):
+                return False
+            commit = getattr(pipeline, "commit_managed_scene_guard_observation", None)
+            return bool(callable(commit) and commit(source.source_token, profile_id, callback))
+        finally:
+            self._lock.release()
 
     def get_active_tracks_snapshot(self, camera_id: str) -> list[dict] | None:
         """Return active physics tracks, or ``None`` when runtime is absent."""
@@ -1291,6 +1786,10 @@ class CameraManager:
 
     def get_raw_frame(self, camera_id: str) -> np.ndarray | None:
         """Get unmasked raw frame for baseline capture."""
+        source = self.get_camera_source(camera_id)
+        if source is not None:
+            latest = source.latest_frame
+            return latest.frame if latest is not None else None
         pipeline = self._pipelines.get(camera_id)
         if pipeline is None:
             return None
@@ -1298,6 +1797,10 @@ class CameraManager:
 
     def reconnect_camera(self, camera_id: str) -> bool:
         """Request capture reconnect through a public manager operation."""
+        source = getattr(self, "_sources", {}).get(camera_id)
+        if source is not None:
+            source.request_reconnect()
+            return True
         pipeline = self._pipelines.get(camera_id)
         if pipeline is None:
             return False
@@ -2266,7 +2769,7 @@ class CameraManager:
 
     @property
     def is_running(self) -> bool:
-        return not self._stop_event.is_set() and len(self._threads) > 0
+        return not self._stop_event.is_set() and bool(self._threads or getattr(self, "_sources", {}))
 
     def _start_camera(
         self, cam_config: CameraConfig, *, expected_generation: int | None = None,
@@ -2281,7 +2784,8 @@ class CameraManager:
                 expected_generation is not None and expected_generation != current_generation
             ):
                 return False
-            if camera_id in self._stopping_cameras or camera_id in self._retiring_cameras:
+            if (camera_id in self._stopping_cameras or camera_id in self._retiring_cameras
+                    or camera_id in self._retiring_sources):
                 logger.warning("manager.camera_cleanup_pending", camera_id=camera_id)
                 return False
             if camera_id in self._threads and self._threads[camera_id].is_alive():
@@ -2299,21 +2803,18 @@ class CameraManager:
             self._starting_generations[camera_id] = generation
 
         pipeline = None
+        source_runtime = None
         thread = None
         published = False
         try:
-            runtime_cam_config = cam_config
-            if self._source_resolver is not None:
-                try:
-                    resolved = self._source_resolver(cam_config)
-                    if resolved is not None:
-                        runtime_cam_config = resolved
-                except Exception as exc:
-                    logger.warning(
-                        "manager.source_resolve_failed",
-                        camera_id=camera_id,
-                        error=str(exc),
-                    )
+            self._bootstrap_task_identity(cam_config)
+            runtime_cam_config = self._resolve_source_config(cam_config)
+            if not self._start_source(cam_config, runtime_config=runtime_cam_config,
+                                      expected_generation=generation):
+                return False
+            with self._lock:
+                source_runtime = self._sources.get(camera_id)
+                runtime_cam_config = self._source_runtime_configs.get(camera_id, runtime_cam_config)
 
             frame_identity_stream_id = self._frame_identity_stream_id(
                 cam_config,
@@ -2321,6 +2822,7 @@ class CameraManager:
             )
 
             def _alert_handler(alert: Alert):
+                source_token = None
                 with self._lock:
                     if (
                         not published
@@ -2328,7 +2830,14 @@ class CameraManager:
                         or self._stop_event.is_set()
                         or self._camera_generations.get(camera_id) != generation
                         or self._pipelines.get(camera_id) is not pipeline
+                        or not self._legacy_task_enabled.get(camera_id, True)
                     ):
+                        return
+                if source_runtime is not None:
+                    identity = pipeline.get_latest_frame_identity()
+                    source_token = ((identity.source_session_id, identity.source_epoch)
+                                    if identity is not None else None)
+                    if source_token is None or source_runtime.source_token != source_token:
                         return
                 # C3: Cross-camera correlation check before emitting
                 if self._correlator is not None:
@@ -2376,10 +2885,32 @@ class CameraManager:
                             severity=alert.severity.value,
                         )
 
-                with self._lock:
-                    self._alert_count += 1
-                if self._on_alert:
-                    self._on_alert(alert)
+                accepted_alerts = []
+
+                def _commit_alert():
+                    with self._lock:
+                        if (
+                            self._stop_event.is_set()
+                            or self._camera_generations.get(camera_id) != generation
+                            or self._pipelines.get(camera_id) is not pipeline
+                            or not self._legacy_task_enabled.get(camera_id, True)
+                        ):
+                            return
+                        self._alert_count += 1
+                        # Acceptance is the linearization point.  Delivery of
+                        # this accepted result may finish after a reconnect,
+                        # but slow disk/DB effects must never hold the source
+                        # lock and stall every other task on the camera.
+                        accepted_alerts.append(alert)
+
+                # Correlation can take time: a reconnect during that work
+                # invalidates the original frame before any external dispatch.
+                if source_runtime is not None:
+                    source_runtime.commit_if_current(source_token, _commit_alert)
+                else:
+                    _commit_alert()
+                if accepted_alerts and self._on_alert:
+                    self._on_alert(accepted_alerts[0])
 
             # B1-5: Use shared detector for dinomaly multi-class mode
             shared_detector = None
@@ -2407,7 +2938,7 @@ class CameraManager:
                 camera_config=runtime_cam_config,
                 alert_config=self._alert_config,
                 on_alert=_alert_handler,
-                shared_yolo_model=self._shared_yolo,
+                shared_yolo_model=self._get_legacy_shared_yolo(runtime_cam_config),
                 on_drift=self._on_status_change,
                 segmenter_config=self._segmenter_config,
                 classifier_config=self._classifier_config,
@@ -2433,6 +2964,20 @@ class CameraManager:
                 baselines_dir=self._baselines_dir,
             )
 
+            def _share_capture(capture):
+                # The constructor's unopened adapter never becomes a reader.
+                # Its task view owns only a subscription to the existing source.
+                if source_runtime is None or self.get_camera_source(camera_id) is not source_runtime:
+                    raise RuntimeError("camera source changed during legacy initialization")
+                capture.stop()
+                return SourceCaptureView(source_runtime, legacy_task_id(camera_id))
+
+            # A public ownership handoff keeps standalone pipelines compatible
+            # while the managed path has exactly one capture reader.
+            bind_capture = getattr(pipeline, "bind_capture_runtime", None)
+            if callable(bind_capture):
+                bind_capture(_share_capture)
+
             # 5.1: Wrap pipeline in CameraInferenceRunner
             deg_config = runtime_cam_config.degradation
             runner = CameraInferenceRunner(
@@ -2454,6 +2999,8 @@ class CameraManager:
                 runner.set_record_store(self._record_store)
 
             if not runner.initialize():
+                with self._lock:
+                    self._legacy_task_errors[camera_id] = "LEGACY_INITIALIZATION_FAILED"
                 logger.error("manager.init_failed", camera_id=camera_id)
                 get_error_channel().emit(
                     severity=SEVERITY_WARNING,
@@ -2498,12 +3045,16 @@ class CameraManager:
                         continue
                     self._runners[camera_id] = runner
                     self._pipelines[camera_id] = pipeline
+                    if self._sources.get(camera_id) is not source_runtime:
+                        return False
+                    self._legacy_task_locks.setdefault(camera_id, threading.RLock())
                     self._threads[camera_id] = thread
                     # Starting under the publication lock prevents stop from
                     # attempting to join a not-yet-started published thread.
                     thread.start()
                     published = True
                     self._camera_lifecycle_errors.pop(camera_id, None)
+                    self._legacy_task_errors.pop(camera_id, None)
                     break
             if not published:
                 logger.warning("manager.module_revision_unstable", camera_id=camera_id)
@@ -2518,6 +3069,11 @@ class CameraManager:
             )
             return True
         finally:
+            with self._lock:
+                if (not published and self._sources.get(camera_id) is source_runtime
+                        and source_runtime is not None
+                        and self._camera_generations.get(camera_id) == generation):
+                    self._legacy_task_errors.setdefault(camera_id, "LEGACY_INITIALIZATION_FAILED")
             if not published and pipeline is not None:
                 failures = []
                 with self._lock:
@@ -2529,8 +3085,9 @@ class CameraManager:
                             self._runners.pop(camera_id, None)
                             self._threads.pop(camera_id, None)
                         self._retiring_cameras[camera_id] = (pipeline, thread)
-                        stopping_owned = camera_id not in self._stopping_cameras
-                        self._stopping_cameras.add(camera_id)
+                        if (source_runtime is not None and self._sources.get(camera_id) is source_runtime
+                                and camera_id not in self._stopping_cameras):
+                            self._legacy_candidate_sources[camera_id] = source_runtime
                     try:
                         pipeline.shutdown()
                     except Exception as exc:
@@ -2544,13 +3101,12 @@ class CameraManager:
                         except Exception as exc:
                             failures.append(f"candidate thread cleanup: {exc}")
                     with self._lock:
-                        if stopping_owned:
-                            self._stopping_cameras.discard(camera_id)
                         if failures:
                             self._camera_lifecycle_errors[camera_id] = "; ".join(failures)
                             logger.error("manager.candidate_cleanup_failed", camera_id=camera_id, error="; ".join(failures))
                         elif self._retiring_cameras.get(camera_id, (None,))[0] is pipeline:
                             self._retiring_cameras.pop(camera_id, None)
+                            self._legacy_candidate_sources.pop(camera_id, None)
                             self._camera_lifecycle_errors.pop(camera_id, None)
             with self._lock:
                 if self._starting_generations.get(camera_id) == generation:
@@ -2559,6 +3115,8 @@ class CameraManager:
 
     def _camera_loop(self, camera_id: str, runner: CameraInferenceRunner) -> None:
         """Main loop for a single camera thread with frame-rate watchdog."""
+        with self._lock:
+            self._ensure_lifecycle_state()
         pipeline = runner.pipeline
         logger.info("camera_loop.started", camera_id=camera_id)
         last_frame_time = time.monotonic()
@@ -2584,6 +3142,12 @@ class CameraManager:
                 and self._runners.get(camera_id) is runner
             ):
                 try:
+                    if not self._legacy_task_enabled.get(camera_id, True):
+                        # Preview, recording and other task subscriptions keep
+                        # consuming the independently owned source.
+                        last_frame_time = time.monotonic()
+                        self._stop_event.wait(0.05)
+                        continue
                     # Backpressure check: skip non-heartbeat frames when overloaded
                     with self._bp_lock:
                         pending = self._pending_frames.get(camera_id, 0)
@@ -2615,13 +3179,17 @@ class CameraManager:
                         self._pending_frames[camera_id] = self._pending_frames.get(camera_id, 0) + 1
 
                     try:
-                        run_once_outcome = getattr(runner, "run_once_outcome", None)
-                        if callable(run_once_outcome):
-                            outcome = run_once_outcome()
-                            alert = outcome.alert
-                        else:
-                            outcome = None
-                            alert = runner.run_once()
+                        task_lock = self._legacy_task_locks.setdefault(camera_id, threading.RLock())
+                        with task_lock:
+                            if not self._legacy_task_enabled.get(camera_id, True):
+                                continue
+                            run_once_outcome = getattr(runner, "run_once_outcome", None)
+                            if callable(run_once_outcome):
+                                outcome = run_once_outcome()
+                                alert = outcome.alert
+                            else:
+                                outcome = None
+                                alert = runner.run_once()
                     finally:
                         with self._bp_lock:
                             self._pending_frames[camera_id] = max(0, self._pending_frames.get(camera_id, 0) - 1)
@@ -2658,7 +3226,8 @@ class CameraManager:
                         self._stop_event.wait(0.05)
 
                     # M6: Feed frame to continuous recorder (if active)
-                    if self._continuous_recording_mgr is not None:
+                    if (self._continuous_recording_mgr is not None
+                            and not getattr(pipeline, "_capture_runtime_bound", False)):
                         raw = pipeline.get_raw_frame()
                         if raw is not None:
                             self._continuous_recording_mgr.push_frame(

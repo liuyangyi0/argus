@@ -123,6 +123,26 @@ class ModelRetireRequest(ApiContractModel):
     triggered_by: StrictStr | None = Field(default=None, max_length=256)
 
 
+class ModelRollbackRequest(ApiContractModel):
+    source_model_version_id: StrictStr = Field(min_length=1, max_length=512)
+    source_release_revision: StrictInt = Field(ge=0)
+    expected_revision: StrictInt = Field(ge=0)
+    reason: StrictStr = Field(min_length=1, max_length=4000)
+    idempotency_key: StrictStr = Field(min_length=1, max_length=128)
+
+
+class RollbackReadinessResponse(ApiContractModel):
+    model_version_id: str
+    camera_id: str
+    rollback_allowed: bool
+    expected_revision: int = Field(ge=0)
+    source_model_version_id: str | None = None
+    source_release_revision: int | None = Field(default=None, ge=0)
+    reasons: list[str]
+    scene_reconfirmation_required: Literal[True] = True
+    checked_at: datetime
+
+
 class ModelReexportRequest(ApiContractModel):
     export_format: Literal["openvino", "onnx", "torch"] = "openvino"
     quantization: Literal["fp16", "fp32", "int8"] = "fp16"
@@ -192,6 +212,16 @@ class CameraStatsResponse(ApiContractModel):
     frames_dropped: int | None = None
 
 
+class CameraRuntimeLifecycleResponse(ApiContractModel):
+    state: Literal["cleanup_failed", "stopping", "draining", "starting", "running", "source_only", "runtime_dead", "stopped"]
+    generation: int = Field(ge=0)
+    reason: str | None
+    starting: bool
+    stopping: bool
+    cleanup_pending: bool
+    legacy_error: str | None = None
+
+
 class CameraLifecycleResponse(ApiContractModel):
     """Canonical payload returned after camera start/stop.
 
@@ -203,10 +233,27 @@ class CameraLifecycleResponse(ApiContractModel):
     name: str | None = None
     connected: bool | None = None
     running: bool | None = None
+    error: str | None = None
+    lifecycle: CameraRuntimeLifecycleResponse | None = None
     pipeline_mode: PipelineModeValue | None = None
     health: dict[str, JsonValue] | None = None
     capture_status: dict[str, JsonValue] | None = None
     stats: CameraStatsResponse | None = None
+
+
+class CameraSourceResponse(ApiContractModel):
+    """Source observations do not claim any analysis task is detecting."""
+
+    camera_id: str
+    state: str = "unknown"
+    running: bool | None = None
+    connected: bool | None = None
+    generation: int | None = Field(default=None, ge=0)
+    source_session_id: str | None = None
+    source_epoch: int | None = Field(default=None, ge=0)
+    cleanup_pending: bool = False
+    frames_published: int | None = Field(default=None, ge=0)
+    reason_code: str | None = None
 
 
 class CameraSummaryResponse(ApiContractModel):
@@ -218,6 +265,8 @@ class CameraSummaryResponse(ApiContractModel):
     region_phone: str | None
     connected: bool
     running: bool
+    error: str | None = None
+    lifecycle: CameraRuntimeLifecycleResponse | None = None
     pipeline_mode: PipelineModeValue | None
     health: dict[str, JsonValue] | None
     capture_status: dict[str, JsonValue] | None

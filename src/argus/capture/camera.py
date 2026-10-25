@@ -500,6 +500,10 @@ class CameraCapture:
         Spawns a background thread to handle exponential backoff reconnection
         so the calling thread (e.g. the detection pipeline) is not blocked.
         """
+        owner = getattr(self, "_reconnect_handler", None)
+        if owner is not None:
+            owner()
+            return
         with self._reconnect_lock:
             if self._reconnecting:
                 return  # already trying
@@ -511,6 +515,14 @@ class CameraCapture:
             daemon=True,
         )
         thread.start()
+
+    def set_reconnect_handler(self, handler) -> None:
+        """Delegate reconnect to the source owner instead of opening a rival reader."""
+        self._reconnect_handler = handler
+
+    def request_stop(self) -> None:
+        """Interrupt throttling without releasing an adapter inside a native read."""
+        self._stop_event.set()
 
     def _reconnect_background(self) -> None:
         """Background reconnection with exponential backoff."""

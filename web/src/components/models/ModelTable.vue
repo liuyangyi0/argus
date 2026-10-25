@@ -12,7 +12,7 @@ import {
 import { useRouter } from 'vue-router'
 import {
   deleteModel,
-  promoteModel, retireModel,
+  promoteModel, retireModel, rollbackModel, getRollbackReadiness,
   getStageHistory, getShadowReport, getReleaseOperation,
   acknowledgeReleaseOperation,
   reexportModel, recalibrateModel,
@@ -30,7 +30,7 @@ import type {
   ReleaseReadiness,
   ShadowReportResponse,
 } from '../../types/api'
-import type { ModelReleaseRequest } from '../../api/models'
+import type { ModelReleaseRequest, RollbackReadiness } from '../../api/models'
 import ResponsiveTable from '../common/ResponsiveTable.vue'
 
 // ── Release pipeline stage stepper config ──
@@ -42,7 +42,6 @@ const STAGES: { key: string; label: string }[] = [
   { key: 'canary', label: '灰度' },
   { key: 'production', label: '生产' },
 ]
-const ROLLBACK_NO_GO_REASON = '两阶段 rollback 尚未实现；发布 readiness 为 NO-GO，禁止调用 legacy 回滚接口'
 const STAGE_INDEX: Record<string, number> = STAGES.reduce(
   (acc, s, i) => ((acc[s.key] = i), acc),
   {} as Record<string, number>,
@@ -87,6 +86,92 @@ const reexportModalVisible = ref(false)
 const reexportForm = ref({ version_id: '', export_format: 'openvino', quantization: 'fp16' })
 const reexportLoading = ref(false)
 const recalibrateLoading = ref<string | null>(null)
+const rollbackVisible = ref(false)
+const rollbackTarget = ref('')
+const rollbackReason = ref('')
+const rollbackChecking = ref(false)
+const rollbackSubmitting = ref(false)
+const rollbackReadiness = ref<RollbackReadiness | null>(null)
+const rollbackError = ref('')
+let rollbackGeneration = 0
+const rollbackRevisionMatches = computed(() => {
+  const ready = rollbackReadiness.value
+  const target = props.models.find(model => model.model_version_id === rollbackTarget.value)
+  const source = props.models.find(model => model.model_version_id === ready?.source_model_version_id)
+  return !!ready && ready.model_version_id === rollbackTarget.value && target?.stage === 'retired'
+    && target.release_revision === ready.expected_revision
+    && source?.stage === 'production' && source.is_active
+    && source.release_revision === ready.source_release_revision
+})
+const canSubmitRollback = computed(() => !!rollbackReadiness.value?.rollback_allowed
+  && rollbackRevisionMatches.value && !rollbackChecking.value && !rollbackSubmitting.value
+  && !!rollbackReason.value.trim())
+
+async function checkRollback() {
+  const generation = ++rollbackGeneration
+  const versionId = rollbackTarget.value
+  rollbackChecking.value = true
+  rollbackReadiness.value = null
+  rollbackError.value = ''
+  try {
+    const readiness = await getRollbackReadiness(versionId)
+    if (generation !== rollbackGeneration || !rollbackVisible.value) return
+    rollbackReadiness.value = readiness
+  } catch (error) {
+    if (generation === rollbackGeneration && rollbackVisible.value) {
+      rollbackError.value = extractErrorMessage(error, '回滚检查失败')
+    }
+  } finally {
+    if (generation === rollbackGeneration) rollbackChecking.value = false
+  }
+}
+
+function openRollback(versionId: string) {
+  rollbackSubmitting.value = false
+  rollbackTarget.value = versionId
+  rollbackReason.value = ''
+  rollbackVisible.value = true
+  void checkRollback()
+}
+
+function closeRollback() {
+  ++rollbackGeneration
+  rollbackVisible.value = false
+  rollbackReadiness.value = null
+  rollbackChecking.value = false
+}
+
+async function submitRollback() {
+  const ready = rollbackReadiness.value
+  if (!canSubmitRollback.value || !ready?.source_model_version_id || ready.source_release_revision == null) return
+  rollbackSubmitting.value = true
+  const generation = rollbackGeneration
+  const versionId = rollbackTarget.value
+  const isCurrent = () => !releaseTrackingDisposed && generation === rollbackGeneration
+    && rollbackVisible.value && rollbackTarget.value === versionId
+  try {
+    const result = await rollbackModel(versionId, {
+      source_model_version_id: ready.source_model_version_id,
+      source_release_revision: ready.source_release_revision,
+      expected_revision: ready.expected_revision,
+      reason: rollbackReason.value.trim(),
+    })
+    if (isCurrent()) {
+      notifyReleaseResult(result, '模型回滚')
+      rollbackSubmitting.value = false
+      closeRollback()
+    } else if (result.operation) {
+      scheduleReleaseOperationRefresh(result.operation)
+    }
+    if (!releaseTrackingDisposed) emit('changed')
+  } catch (error) {
+    const operation = releaseOperationFromError(error)
+    if (operation) scheduleReleaseOperationRefresh(operation)
+    if (isCurrent()) rollbackError.value = extractErrorMessage(error, '回滚提交失败')
+  } finally {
+    if (isCurrent()) rollbackSubmitting.value = false
+  }
+}
 const releaseOperations = reactive<Record<string, ReleaseOperation>>({})
 const releaseOperationTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let releaseTrackingDisposed = false
@@ -147,6 +232,7 @@ function scheduleReleaseOperationRefresh(operation: ReleaseOperation): boolean {
 }
 
 onUnmounted(() => {
+  ++rollbackGeneration
   releaseTrackingDisposed = true
   for (const timer of releaseOperationTimers.values()) clearTimeout(timer)
   releaseOperationTimers.clear()
@@ -811,19 +897,16 @@ const columns = [
             <Tooltip v-if="record.stage === 'canary'" title="回退到影子阶段">
               <Button size="small" @click="handlePromote(record)">回退</Button>
             </Tooltip>
-            <!-- Rollback stays visible as an explicit release gate. The legacy
-                 endpoint cannot guarantee desired/applied atomicity. -->
-            <Tooltip :title="ROLLBACK_NO_GO_REASON">
+            <Tooltip title="检查此历史生产版本是否可通过两阶段事务恢复">
               <Button
-                v-if="record.is_active && record.stage !== 'retired'"
+                v-if="record.stage === 'retired' && !record.is_active"
                 size="small"
                 danger
-                disabled
-                :title="ROLLBACK_NO_GO_REASON"
-                :aria-label="`回滚模型 ${record.model_version_id} 不可用：${ROLLBACK_NO_GO_REASON}`"
+                :aria-label="`检查回滚到模型 ${record.model_version_id}`"
+                @click="openRollback(record.model_version_id)"
               >
                 <template #icon><RollbackOutlined /></template>
-                回滚 NO-GO
+                检查回滚
               </Button>
             </Tooltip>
             <!-- More dropdown -->
@@ -869,6 +952,39 @@ const columns = [
       暂无注册的模型版本
     </div>
   </Card>
+
+  <Modal
+    v-model:open="rollbackVisible"
+    title="受控模型回滚"
+    okText="确认回滚"
+    cancelText="取消"
+    :confirmLoading="rollbackSubmitting"
+    :okButtonProps="{ disabled: !canSubmitRollback }"
+    :cancelButtonProps="{ disabled: rollbackSubmitting }"
+    :closable="!rollbackSubmitting"
+    :keyboard="!rollbackSubmitting"
+    :maskClosable="false"
+    @ok="submitRollback"
+    @cancel="closeRollback"
+  >
+    <p>目标版本：{{ rollbackTarget }}</p>
+    <p>只恢复已验证的历史生产模型；请先选择其已批准场景。系统不会自动切换场景。</p>
+    <p>模型应用成功后仍需 SceneGuard 重新确认机位，确认前检测与告警保持暂停。</p>
+    <p v-if="rollbackChecking" role="status">正在复核历史发布证据与运行版本…</p>
+    <p v-if="rollbackError" role="alert">{{ rollbackError }}</p>
+    <template v-if="rollbackReadiness">
+      <p v-if="rollbackReadiness.rollback_allowed && !rollbackRevisionMatches" role="alert">模型版本已变化，回滚检查已过期，请重新检查。</p>
+      <p v-else-if="rollbackReadiness.rollback_allowed">模型回滚检查通过；不代表场景已放行。</p>
+      <ul v-else><li v-for="reason in rollbackReadiness.reasons" :key="reason">{{ reason }}</li></ul>
+      <p v-if="rollbackReadiness.source_model_version_id">将替换：{{ rollbackReadiness.source_model_version_id }}</p>
+    </template>
+    <Button :loading="rollbackChecking" :disabled="rollbackSubmitting" @click="checkRollback">重新检查</Button>
+    <Form layout="vertical">
+      <Form.Item label="回滚原因" required>
+        <Input.TextArea v-model:value="rollbackReason" aria-label="回滚原因" :maxlength="4000" :disabled="rollbackSubmitting" />
+      </Form.Item>
+    </Form>
+  </Modal>
 
   <!-- Promote Modal -->
   <Modal

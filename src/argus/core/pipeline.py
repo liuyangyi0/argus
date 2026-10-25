@@ -24,6 +24,7 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from copy import copy
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from enum import Enum
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
@@ -467,6 +468,8 @@ class DetectionPipeline:
         self._scene_guard_last_check_frame = 0
         self._scene_guard_last_check_monotonic = 0.0
         self._scene_guard_last_usable = False
+        self._managed_scene_evidence = None
+        self._managed_scene_reference_metadata: dict = {}
         self._scene_guard_policy_recovery_required = False
         self._scene_guard_policy_recovery_count = 0
         self._scene_guard_reference_frame: np.ndarray | None = None
@@ -744,47 +747,8 @@ class DetectionPipeline:
         # existing protocol branch for backwards compatibility.
         if capture is not None:
             self._camera: CaptureAdapter = capture
-        elif camera_config.protocol == "gige":
-            from argus.capture.gige_capture import GigECapture
-
-            gige_cfg = camera_config.gige
-            self._camera: CaptureAdapter = GigECapture(
-                camera_id=camera_config.camera_id,
-                source=camera_config.source,
-                fps_target=camera_config.fps_target,
-                resolution=camera_config.resolution,
-                exposure=gige_cfg.exposure,
-                gain=gige_cfg.gain,
-                pixel_format=gige_cfg.pixel_format,
-                reconnect_delay=camera_config.reconnect_delay,
-                max_reconnect_attempts=camera_config.max_reconnect_attempts,
-                source_declared=self._frame_identity_declared_source,
-                source_runtime=self._frame_identity_runtime_source,
-                stream_id=self._frame_identity_stream_id,
-            )
         else:
-            camera_kwargs = {
-                "camera_id": camera_config.camera_id,
-                "source": camera_config.source,
-                "protocol": camera_config.protocol,
-                "fps_target": camera_config.fps_target,
-                "resolution": camera_config.resolution,
-                "reconnect_delay": camera_config.reconnect_delay,
-                "max_reconnect_attempts": camera_config.max_reconnect_attempts,
-                "source_declared": self._frame_identity_declared_source,
-                "source_runtime": self._frame_identity_runtime_source,
-                "stream_id": self._frame_identity_stream_id,
-            }
-            if camera_config.protocol == "usb":
-                usb_cfg = camera_config.usb
-                camera_kwargs.update(
-                    usb_backend=usb_cfg.preferred_backend,
-                    usb_pixel_format=usb_cfg.pixel_format,
-                    usb_min_runtime_fps=usb_cfg.min_runtime_fps,
-                )
-            self._camera = CameraCapture(
-                **camera_kwargs,
-            )
+            self._camera = self.create_capture_adapter()
 
         configure_identity = getattr(self._camera, "configure_frame_identity", None)
         if callable(configure_identity):
@@ -1255,6 +1219,8 @@ class DetectionPipeline:
         self._scene_guard_last_quick_shift_px: float | None = None
         self._scene_guard_last_reconnect_count: int | None = None
         self._scene_guard_last_stream_key: tuple | None = None
+        self._managed_scene_reference_metadata = {}
+        self._managed_scene_evidence = None
         if not cfg.enabled:
             return
 
@@ -1294,6 +1260,7 @@ class DetectionPipeline:
             str(bound_model_artifact) if bound_model_artifact is not None else None
         )
         self._scene_guard_reference_error = error
+        self._managed_scene_reference_metadata = dict(metadata) if error is None else {}
         if reference is not None:
             self._scene_guard_reference_edges = self._scene_edge_signature(reference)
             self._scene_guard_quick_hanning = cv2.createHanningWindow(
@@ -1659,6 +1626,8 @@ class DetectionPipeline:
                 self._scene_guard_reference_sha256 = _frame_content_sha256(frame)
                 self._scene_guard_reference_source = str(source)
                 self._scene_guard_profile_id = profile_id
+                self._managed_scene_reference_metadata = dict(metadata or {})
+                self._managed_scene_evidence = None
                 self._scene_guard_bound_model_version = (
                     str((metadata or {}).get("model_version_id"))
                     if (metadata or {}).get("model_version_id") is not None
@@ -1834,6 +1803,93 @@ class DetectionPipeline:
                 },
                 "metrics": metrics,
             }
+
+    def get_managed_scene_guard_observation(self) -> dict:
+        """Read only actual SceneGuard evidence; never wait for geometry work.
+
+        This stricter managed-task observation does not change the legacy
+        scene decision or recovery policy. Preview frame identities are not
+        evidence that SceneGuard processed the corresponding source epoch.
+        """
+        blocked = {"enabled": True, "usable": False, "reference_available": False,
+                   "profile_id": None, "source_token": None, "reason_code": "SCENE_EVIDENCE_UNAVAILABLE"}
+        lock = getattr(self, "_scene_guard_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            return {**blocked, "reason_code": "SCENE_EVIDENCE_BUSY"}
+        try:
+            evidence = getattr(self, "_managed_scene_evidence", None)
+            metadata = getattr(self, "_managed_scene_reference_metadata", {})
+            config = self.camera_config.scene_guard
+            result = self._scene_guard_last_result
+            if (not config.enabled or self._scene_guard is None or not self._scene_guard_last_usable
+                    or self._scene_guard_runtime_error or self._scene_guard_reference_frame is None
+                    or result is None or result.state.value != "stable" or result.raw_state.value != "stable"
+                    or not isinstance(evidence, dict)
+                    or evidence.get("profile_id") != self._scene_guard_profile_id
+                    or evidence.get("reference_sha256") != self._scene_guard_reference_sha256
+                    or evidence.get("model_artifact_sha256") != self._model_artifact_sha256
+                    or evidence.get("model_version_id") != getattr(self, "_model_version_id", None)):
+                return blocked
+            # Legacy/offline deployments can intentionally use permissive
+            # validation references. That never constitutes operator approval
+            # for a managed task's require_profile policy. Keep this independent
+            # of the legacy algorithm/allow-alignable/recovery decision.
+            version = getattr(self, "_model_version_id", None)
+            artifact = self._model_artifact_sha256
+            approver = metadata.get("approved_by") if isinstance(metadata, dict) else None
+            approved_at = metadata.get("approved_at") if isinstance(metadata, dict) else None
+            try:
+                approved_time = datetime.fromisoformat(approved_at) if isinstance(approved_at, str) else None
+                approval_time_valid = approved_time is not None and approved_time.utcoffset() is not None
+            except (TypeError, ValueError, OverflowError):
+                approval_time_valid = False
+            if (not isinstance(metadata, dict) or metadata.get("operator_approved") is not True
+                    or metadata.get("validation_only", False) is not False
+                    or not isinstance(approver, str) or not approver.strip()
+                    or len(approver) > 100 or approver.strip().lower() == "unknown"
+                    or any(ord(char) < 32 for char in approver) or not approval_time_valid
+                    or getattr(self, "_scene_guard_reference_error", None)
+                    or not isinstance(self._scene_guard_profile_id, str) or not self._scene_guard_profile_id
+                    or not isinstance(version, str) or not version
+                    or metadata.get("model_version_id") != version
+                    or getattr(self, "_scene_guard_bound_model_version", None) != version
+                    or not isinstance(artifact, str) or len(artifact) != 64
+                    or any(char not in "0123456789abcdef" for char in artifact)
+                    or metadata.get("model_artifact_sha256") != artifact
+                    or getattr(self, "_scene_guard_bound_model_artifact_sha256", None) != artifact
+                    or metadata.get("model_artifact_hash_scheme") != RUNTIME_ARTIFACT_HASH_SCHEME):
+                return {**blocked, "reason_code": "SCENE_PROFILE_UNAPPROVED"}
+            observed_at = evidence.get("observed_monotonic")
+            token = evidence.get("source_token")
+            if (type(observed_at) not in {int, float} or not math.isfinite(observed_at)
+                    or not isinstance(token, tuple) or len(token) != 2
+                    or not isinstance(token[0], str) or not token[0]
+                    or type(token[1]) is not int or token[1] < 1):
+                return blocked
+            age = time.monotonic() - observed_at
+            if not 0 <= age <= config.check_interval_seconds:
+                return {**blocked, "reason_code": "SCENE_EVIDENCE_EXPIRED"}
+            return {"enabled": True, "usable": True, "reference_available": True,
+                    "profile_id": evidence["profile_id"], "source_token": token,
+                    "observed_monotonic": observed_at,
+                    "reason_code": None}
+        finally:
+            lock.release()
+
+    def commit_managed_scene_guard_observation(self, source_token, profile_id: str, callback) -> bool:
+        """Keep a nonblocking safety observation stable through an in-memory CAS."""
+        lock = getattr(self, "_scene_guard_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            return False
+        try:
+            observation = self.get_managed_scene_guard_observation()
+            if (observation.get("usable") is not True or observation.get("source_token") != source_token
+                    or observation.get("profile_id") != profile_id):
+                return False
+            callback()
+            return True
+        finally:
+            lock.release()
 
     def _scene_policy_usable(self, result, *, checked: bool) -> bool:
         """Apply the deployment policy on top of geometric match quality."""
@@ -2039,6 +2095,8 @@ class DetectionPipeline:
             stream_key = (
                 getattr(identity, "source_runtime", None),
                 getattr(identity, "stream_id", None),
+                getattr(identity, "source_session_id", None),
+                getattr(identity, "source_epoch", 0),
                 frame.shape[:2],
             )
             stream_changed = bool(
@@ -2139,6 +2197,17 @@ class DetectionPipeline:
                 self._scene_guard_last_quick_shift_px = quick_shift_px
                 policy_usable = self._scene_policy_usable(result, checked=checked)
                 self._scene_guard_last_usable = policy_usable
+                session = getattr(identity, "source_session_id", None)
+                epoch = getattr(identity, "source_epoch", 0)
+                self._managed_scene_evidence = {
+                    "source_token": (session, epoch), "profile_id": self._scene_guard_profile_id,
+                    "reference_sha256": self._scene_guard_reference_sha256,
+                    "model_artifact_sha256": self._model_artifact_sha256,
+                    "model_version_id": getattr(self, "_model_version_id", None),
+                    "observed_monotonic": check_now,
+                } if (policy_usable and isinstance(session, str) and session
+                      and type(epoch) is int and epoch > 0
+                      and result.state.value == "stable" and result.raw_state.value == "stable") else None
 
         except Exception as exc:
             logger.error(
@@ -3986,6 +4055,64 @@ class DetectionPipeline:
         after the initial state has been set still surfaces future events.
         """
         self._degradation_publisher = publisher
+
+    def create_capture_adapter(self) -> CaptureAdapter:
+        """Build an unopened adapter; reconnect never reuses a stopped reader."""
+        cfg = self.camera_config
+        kwargs = {
+            "camera_id": cfg.camera_id, "source": cfg.source,
+            "fps_target": cfg.fps_target, "resolution": cfg.resolution,
+            "reconnect_delay": cfg.reconnect_delay,
+            "max_reconnect_attempts": cfg.max_reconnect_attempts,
+            "source_declared": self._frame_identity_declared_source,
+            "source_runtime": self._frame_identity_runtime_source,
+            "stream_id": self._frame_identity_stream_id,
+        }
+        if cfg.protocol == "gige":
+            from argus.capture.gige_capture import GigECapture
+
+            return GigECapture(**kwargs, exposure=cfg.gige.exposure, gain=cfg.gige.gain,
+                               pixel_format=cfg.gige.pixel_format)
+        kwargs["protocol"] = cfg.protocol
+        if cfg.protocol == "usb":
+            kwargs.update(usb_backend=cfg.usb.preferred_backend,
+                          usb_pixel_format=cfg.usb.pixel_format,
+                          usb_min_runtime_fps=cfg.usb.min_runtime_fps)
+        return CameraCapture(**kwargs)
+
+    def bind_capture_runtime(self, wrapper: Callable) -> None:
+        """Transfer unopened capture ownership to the camera source runtime.
+
+        The returned view is a task subscription, not an owner of the device.
+        This deliberately does not change model initialization or scene gates.
+        Standalone/offline callers may continue to own their original capture.
+        """
+        if getattr(self, "_capture_runtime_bound", False):
+            raise RuntimeError("capture runtime is already bound")
+        if self.stats.frames_captured or self._camera.state.connected:
+            raise RuntimeError("capture ownership must be transferred before initialization")
+        view = wrapper(self._camera)
+        if view is None:
+            raise ValueError("capture runtime wrapper must return a subscription")
+        self._camera = view
+        self._capture_runtime_bound = True
+
+    def reconfirm_task_session(self) -> None:
+        """Resume a task with fresh scene/temporal evidence, never a new profile."""
+        with self._scene_processing_lock:
+            if self._auxiliary_shutdown:
+                raise RuntimeError("stopped pipeline requires reinitialization")
+            with self._scene_guard_lock:
+                if self._scene_guard is not None:
+                    self._scene_guard.require_reconfirmation()
+                self._scene_guard_last_result = None
+                self._scene_guard_last_usable = False
+                self._managed_scene_evidence = None
+                self._scene_guard_last_check_frame = 0
+                self._scene_guard_last_check_monotonic = 0.0
+                self._scene_guard_policy_recovery_required = True
+                self._scene_guard_policy_recovery_count = 0
+            self._reset_scene_sensitive_state()
 
     def initialize(self) -> bool:
         """Initialize all pipeline components. Returns True on success."""
@@ -9056,6 +9183,8 @@ class DetectionPipeline:
             self._scene_guard_reference_source = source
             self._scene_guard_profile_id = profile_id
             self._scene_guard_reference_error = error
+            self._managed_scene_reference_metadata = {}
+            self._managed_scene_evidence = None
             self._scene_guard_runtime_error = None
             self._scene_guard_last_result = None
             self._scene_guard_last_check_frame = 0

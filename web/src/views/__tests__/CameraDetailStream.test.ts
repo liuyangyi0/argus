@@ -1,15 +1,18 @@
-import { mount, flushPromises } from '@vue/test-utils'
+import { mount, flushPromises, enableAutoUnmount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { nextTick, ref } from 'vue'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { message } from 'ant-design-vue'
 
 import CameraDetail from '../CameraDetail.vue'
 import { useAuthStore } from '../../stores/useAuthStore'
 import { getCameraDetail } from '../../api'
 import { setCameraMode } from '../../api/cameras'
+import { getAnalysisTasks } from '../../api/analysisTasks'
 import { updateZones } from '../../api/zones'
 import { ApiError, ErrorCode, type CameraDetailPayload } from '../../types/api'
+
+enableAutoUnmount(afterEach)
 
 const routerPush = vi.hoisted(() => vi.fn())
 const streamStart = vi.hoisted(() => vi.fn())
@@ -64,6 +67,11 @@ vi.mock('../../api', () => ({
 
 vi.mock('../../api/cameras', () => ({
   setCameraMode: vi.fn(),
+}))
+
+vi.mock('../../api/analysisTasks', () => ({
+  getAnalysisTasks: vi.fn().mockResolvedValue({ tasks: [] }),
+  getAnalysisTaskTemplates: vi.fn().mockResolvedValue({ templates: [] }),
 }))
 
 vi.mock('../../api/zones', () => ({
@@ -151,6 +159,7 @@ describe('CameraDetail live stream fallback', () => {
     // later tick never resolves to undefined after one-shot fixtures are used.
     vi.mocked(getCameraDetail).mockResolvedValue(cameraDetail())
     vi.mocked(setCameraMode).mockReset()
+    vi.mocked(getAnalysisTasks).mockClear()
     vi.mocked(updateZones).mockReset()
     vi.mocked(message.success).mockReset()
     vi.mocked(message.error).mockReset()
@@ -173,6 +182,7 @@ describe('CameraDetail live stream fallback', () => {
 
     expect(streamStart).toHaveBeenCalledTimes(1)
     expect(streamStart).toHaveBeenCalledWith('dev_cam')
+    expect(getAnalysisTasks).toHaveBeenCalledWith('dev_cam')
     expect(streamVideoElementAtStart).toHaveBeenCalledWith(expect.any(HTMLVideoElement))
     const stream = wrapper.find('img.player-vid')
     expect(stream.exists()).toBe(true)
@@ -594,6 +604,7 @@ describe('CameraDetail live stream fallback', () => {
     expect(streamStop).toHaveBeenCalled()
     expect(streamStart).toHaveBeenLastCalledWith('cam_02')
     expect(getCameraDetail).toHaveBeenCalledWith('cam_02')
+    expect(getAnalysisTasks).toHaveBeenCalledWith('cam_02')
     expect(wrapper.text()).toContain('Second camera')
     expect(wrapper.find('[data-test="zone-editor"]').text()).toContain('zone_b')
     expect(wrapper.find('[data-test="zone-editor"]').text()).toContain('/api/cameras/cam_02/snapshot')

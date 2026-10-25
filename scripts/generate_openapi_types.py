@@ -23,6 +23,9 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "web" / "src" / "types" / "generated-openapi.ts"
 CORE_PREFIXES = (
+    "/api/analysis-tasks",
+    "/api/analysis-task-templates",
+    "/api/analysis-task-models",
     "/api/alerts",
     "/api/cameras",
     "/api/config",

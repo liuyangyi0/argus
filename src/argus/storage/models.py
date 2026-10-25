@@ -749,6 +749,196 @@ class ModelReleaseOperation(Base):
         }
 
 
+class AnalysisTaskRecord(Base):
+    """Stable task identity; legacy release authority is not transferred here."""
+
+    __tablename__ = "analysis_tasks"
+
+    task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    template_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    authority: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    current_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    created_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+
+
+class AnalysisTaskRevisionRecord(Base):
+    """Immutable canonical configuration snapshot, not an executable command."""
+
+    __tablename__ = "analysis_task_revisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    config_json: Mapped[str] = mapped_column(Text, nullable=False)
+    config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+
+
+class ModelArtifactRecord(Base):
+    """Immutable artifact identity, intentionally without active/stage fields.
+
+    Camera-scoped legacy artifacts cannot become globally reusable merely by
+    being projected into this table.  Deployment rows refer to this identity;
+    the existing ModelRecord/release service remain the production authority.
+    """
+
+    __tablename__ = "model_artifacts"
+
+    artifact_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    authority: Mapped[str] = mapped_column(String(20), nullable=False)
+    legacy_model_version_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    scope_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    scope_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    model_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    component_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    registry_model_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+
+
+class TaskDeploymentRecord(Base):
+    """Per-task desired/observed identities; a projection is not runtime proof."""
+
+    __tablename__ = "task_deployments"
+
+    task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    authority: Mapped[str] = mapped_column(String(20), nullable=False)
+    desired_artifact_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    registry_artifact_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    applied_artifact_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    registry_model_version_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    registry_release_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    registry_stage: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    projection_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    runtime_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Managed shadow deployment authority is independent of the legacy model
+    # projection above. Never interpret these fields as production approval.
+    desired_bundle_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    applied_bundle_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    previous_bundle_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    desired_state: Mapped[str] = mapped_column(String(20), nullable=False, default="stopped", server_default="stopped")
+    deployment_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    applied_deployment_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+
+class TaskDeploymentOperationRecord(Base):
+    """Durable managed-shadow intent; runtime and database are not a transaction."""
+
+    __tablename__ = "task_deployment_operations"
+
+    operation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(20), nullable=False)
+    bundle_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    previous_bundle_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deployment_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
+    failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    requested_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TaskModelRecord(Base):
+    """Immutable managed model registration; paths never confer publish authority."""
+
+    __tablename__ = "task_models"
+
+    model_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    authority: Mapped[str] = mapped_column(String(20), nullable=False)
+    relative_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_camera_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    descriptor_json: Mapped[str] = mapped_column(Text, nullable=False)
+    descriptor_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class TaskExecutionBundleRecord(Base):
+    """Immutable task/model/config manifest; managed execution is shadow only."""
+
+    __tablename__ = "task_execution_bundles"
+
+    bundle_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    task_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    template_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    manifest_json: Mapped[str] = mapped_column(Text, nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class AnalysisTaskOperationRecord(Base):
+    """Immutable idempotency receipt committed atomically with its state change."""
+
+    __tablename__ = "analysis_task_operations"
+
+    operation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class TaskWorkflowRecord(Base):
+    """Task-bound data workflow, separately revisioned from task configuration."""
+
+    __tablename__ = "task_workflows"
+
+    workflow_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    task_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    task_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    template_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[str] = mapped_column(String(40), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    manifest_json: Mapped[str] = mapped_column(Text, nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class TaskDatasetRecord(Base):
+    """Frozen dataset manifest; revisions are new records, never overwritten."""
+
+    __tablename__ = "task_datasets"
+
+    dataset_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    task_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    manifest_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # Nullable only for additive migration: an older unsigned row must be
+    # rejected by readers rather than silently acquiring trusted provenance.
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class TrainingJobStatus(str, Enum):
     """Lifecycle status for training jobs (industrial environment: human confirmation required)."""
 

@@ -13,6 +13,7 @@ from argus.dashboard.routes import training_jobs as routes
 
 
 def _request(database, body, *, role="engineer", username="authenticated-reviewer"):
+    database.get_user.return_value = SimpleNamespace(active=True, role=role)
     payload = json.dumps(body).encode("utf-8")
 
     async def receive():
@@ -21,7 +22,7 @@ def _request(database, body, *, role="engineer", username="authenticated-reviewe
     return Request({
         "type": "http", "method": "POST", "path": "/api/training-jobs/job1/confirm",
         "headers": [(b"content-type", b"application/json")],
-        "state": {"user": {"username": username, "role": role}},
+        "state": {"user": {"username": username, "role": role}, "auth_method": "session"},
         "app": SimpleNamespace(state=SimpleNamespace(
             database=database, config=SimpleNamespace(cameras=[SimpleNamespace(camera_id="cam1")]),
         )),
@@ -169,3 +170,65 @@ async def test_losing_training_rejection_does_not_write_an_approval_audit(monkey
     response = await routes.reject_training_job(_request(database, {"rejected_by": "forged"}), "job1")
     assert response.status_code == 409
     audit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["confirm_training_job", "reject_training_job"])
+@pytest.mark.parametrize("auth_method", [None, "api_token", "disabled", "anonymous"])
+async def test_machine_or_bypass_identity_cannot_make_a_training_review(monkeypatch, action, auth_method):
+    database, audit = Mock(), Mock()
+    monkeypatch.setattr(routes, "_write_audit", audit)
+    request = _request(database, {})
+    request.state.auth_method = auth_method
+    response = await getattr(routes, action)(request, "job1")
+    assert response.status_code == 403
+    database.get_training_job.assert_not_called()
+    database.update_training_job.assert_not_called()
+    audit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["confirm_training_job", "reject_training_job"])
+@pytest.mark.parametrize("record", [None, SimpleNamespace(active=False, role="admin"),
+                                    SimpleNamespace(active=True, role="viewer")])
+async def test_training_review_rechecks_current_account_and_role(monkeypatch, action, record):
+    database, audit = Mock(), Mock()
+    monkeypatch.setattr(routes, "_write_audit", audit)
+    request = _request(database, {}, role="admin")
+    database.get_user.return_value = record
+    response = await getattr(routes, action)(request, "job1")
+    assert response.status_code == 403
+    database.get_training_job.assert_not_called()
+    database.update_training_job.assert_not_called()
+    audit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirmation_retry_preserves_the_original_review(monkeypatch):
+    database, audit = Mock(), Mock()
+    original = SimpleNamespace(
+        status="queued", confirmed_by="first-reviewer", confirmed_at="original-time",
+    )
+    database.get_training_job.return_value = original
+    monkeypatch.setattr(routes, "_write_audit", audit)
+    response = await routes.confirm_training_job(_request(database, {}, username="retry-reviewer"), "job1")
+    assert response.status_code == 400
+    database.update_training_job.assert_not_called()
+    audit.assert_not_called()
+    assert (original.confirmed_by, original.confirmed_at) == ("first-reviewer", "original-time")
+
+
+@pytest.mark.asyncio
+async def test_automation_can_submit_but_cannot_approve_its_training_job():
+    database = Mock()
+    request = _request(database, {"job_type": "ssl_backbone"}, username="api", role="admin")
+    request.state.auth_method = "api_token"
+    submitted = await routes.create_training_job(request)
+    assert submitted.status_code == 201
+    record = database.save_training_job.call_args.args[0]
+    assert record.status == "pending_confirmation"
+    assert record.confirmation_required is True
+    assert record.triggered_by == "api"
+    rejected_approval = await routes.confirm_training_job(request, record.job_id)
+    assert rejected_approval.status_code == 403
+    database.update_training_job.assert_not_called()

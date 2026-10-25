@@ -1,35 +1,33 @@
-# Argus FOE Detection System
-# Usage: docker compose up -d
-
+# See docs/runbooks/container-deployment.md before the first start.
 services:
   argus:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: argus-edge
+      target: runtime
+    platform: linux/amd64
+    init: true
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${ARGUS_HTTP_PORT:-8080}:8080"
     volumes:
-      # Persist data across restarts
-      - ./data/baselines:/app/data/baselines
-      - ./data/models:/app/data/models
-      - ./data/exports:/app/data/exports
-      - ./data/db:/app/data/db
-      - ./data/alerts:/app/data/alerts
-      - ./data/logs:/app/data/logs
-      # Custom config
-      - ./configs:/app/configs:ro
+      # Persist the entire tree, including recordings, profiles and review data.
+      - argus-data:/app/data
+      # The service writes configuration atomically: mount the directory, not a file.
+      - type: bind
+        source: ${ARGUS_CONFIG_DIR:?Set ARGUS_CONFIG_DIR to a private configuration directory}
+        target: /app/configs
+        bind:
+          create_host_path: false
     environment:
-      - ARGUS_LOG_LEVEL=INFO
-    # Resource limits for edge deployment
-    deploy:
-      resources:
-        limits:
-          cpus: "4.0"
-          memory: 4G
-    healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/api/system/health').raise_for_status()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      ARGUS__LOG_LEVEL: INFO
+      ARGUS__DASHBOARD__HOST: 0.0.0.0
+      ARGUS__DASHBOARD__PORT: "8080"
+      ARGUS__DASHBOARD__FRONTEND_DIST_DIR: /app/web/dist
+      ARGUS__AUTH__ENABLED: "true"
+      ARGUS__AUTH__API_TOKEN: ${ARGUS_API_TOKEN:?Set a long random ARGUS_API_TOKEN}
+    stop_grace_period: 60s
+    shm_size: 256m
+
+volumes:
+  argus-data:

@@ -14,6 +14,7 @@ import pytest
 from argus.anomaly.artifacts import (
     artifact_metadata,
     exported_artifact,
+    inherited_baseline_quality,
     new_artifact_run,
     training_directory,
     write_artifact_manifest,
@@ -132,6 +133,25 @@ def test_manifest_cannot_redirect_an_exact_file_to_a_different_model(tmp_path):
         artifact_metadata(other)
 
 
+def test_manifest_snapshots_quality_scope_without_granting_production_readiness(tmp_path):
+    run = new_artifact_run(tmp_path / "models", tmp_path / "exports", "cam", "zone")
+    artifact = run.export_dir / "model.pt"
+    artifact.write_bytes(b"protocol-only-artifact")
+    quality = {"passed": True, "scope": "observed_fixed_scene_only",
+        "policy_version": "argus.baseline-quality.scene-static.v1",
+        "warnings": ["static-only coverage"], "production_readiness": "not_evaluated"}
+    manifest = write_artifact_manifest(
+        run, artifact, model_type="patchcore", calibration_status="skipped", baseline_quality=quality,
+    )
+    quality["warnings"].append("later mutation")
+
+    assert manifest["baseline_quality"]["warnings"] == ["static-only coverage"]
+    metadata = artifact_metadata(artifact)
+    assert metadata["baseline_quality"] == manifest["baseline_quality"]
+    assert metadata["baseline_quality"]["production_readiness"] == "not_evaluated"
+    assert "production_allowed" not in metadata
+
+
 def test_manifest_rejects_artifact_outside_its_declared_export_run(tmp_path):
     run = new_artifact_run(tmp_path / "models", tmp_path / "exports", "cam", "zone")
     artifact = run.export_dir / "model.pt"
@@ -144,6 +164,23 @@ def test_manifest_rejects_artifact_outside_its_declared_export_run(tmp_path):
 
     with pytest.raises(ValueError, match="escapes"):
         artifact_metadata(artifact)
+
+
+@pytest.mark.parametrize("value", [None, {}, "invalid", {"passed": "true"},
+    {"passed": True, "errors": ["failed"]},
+    {"passed": True, "scope": "observed_fixed_scene_only", "integrity_passed": False}])
+def test_derived_missing_or_invalid_quality_never_invents_a_passing_input(value):
+    report = inherited_baseline_quality({"baseline_quality": value}, source_model_path="source.pt")
+    assert report["passed"] is None
+    assert report["production_readiness"] == "not_evaluated"
+    assert report["evidence_origin"] == "inherited_source_conditions_not_reevaluated"
+
+
+def _static_quality_report():
+    return {"passed": True, "integrity_passed": True, "errors": [],
+        "policy_version": "argus.baseline-quality.scene-static.v1", "scope": "observed_fixed_scene_only",
+        "warnings": ["only observed fixed-scene conditions"], "corruption_rate": 0.0,
+        "near_duplicate_rate": 0.99, "brightness_std": 0.2, "production_readiness": "not_evaluated"}
 
 
 @pytest.fixture
@@ -262,6 +299,7 @@ def test_failed_registry_write_does_not_report_training_complete(mocked_trainer)
 
 def test_reexport_from_exact_artifact_creates_a_new_candidate(mocked_trainer, monkeypatch):
     trainer, registry = mocked_trainer
+    monkeypatch.setattr(trainer, "_validate_baseline_quality", lambda *a, **k: _static_quality_report())
     source = trainer.train("cam", "zone", export_format="torch", quantization="fp32")
     source_bytes = Path(source.model_path).read_bytes()
     engine = MagicMock()
@@ -286,10 +324,18 @@ def test_reexport_from_exact_artifact_creates_a_new_candidate(mocked_trainer, mo
     # New exports must not inherit score thresholds from a differently
     # normalized model; absent enough baseline samples this is explicit.
     assert artifact_metadata(Path(derived["model_path"]))["calibration_status"] == "skipped"
+    quality = artifact_metadata(Path(derived["model_path"]))["baseline_quality"]
+    assert quality["warnings"] == _static_quality_report()["warnings"]
+    assert quality["scope"] == "observed_fixed_scene_only"
+    assert quality["evidence_origin"] == "inherited_source_conditions_not_reevaluated"
+    assert quality["production_readiness"] == "not_evaluated"
+    assert registry.register.call_args.kwargs["training_params"]["baseline_quality"] == quality
+    assert "evidence_origin" not in artifact_metadata(Path(source.model_path))["baseline_quality"]
 
 
 def test_recalibration_copies_runtime_bundle_and_never_edits_source(mocked_trainer, monkeypatch):
     trainer, registry = mocked_trainer
+    monkeypatch.setattr(trainer, "_validate_baseline_quality", lambda *a, **k: _static_quality_report())
     source = trainer.train("cam", "zone", export_format="torch", quantization="fp32")
     source_calibration = Path(source.model_path).parent / "calibration.json"
     source_bytes = source_calibration.read_bytes()
@@ -316,6 +362,12 @@ def test_recalibration_copies_runtime_bundle_and_never_edits_source(mocked_train
     assert not (Path(derived["export_path"]) / "unrelated.pt").exists()
     assert json.loads((Path(derived["export_path"]) / "calibration.json").read_text())["n_samples"] == 50
     assert registry.register.call_args.kwargs["training_params"]["derived_operation"] == "recalibrate"
+    quality = artifact_metadata(Path(derived["model_path"]))["baseline_quality"]
+    assert quality["warnings"] == _static_quality_report()["warnings"]
+    assert quality["scope"] == "observed_fixed_scene_only"
+    assert quality["evidence_origin"] == "inherited_source_conditions_not_reevaluated"
+    assert quality["production_readiness"] == "not_evaluated"
+    assert registry.register.call_args.kwargs["training_params"]["baseline_quality"] == quality
 
 
 def test_registry_binding_does_not_replace_an_already_bound_registry(mocked_trainer):
@@ -482,6 +534,39 @@ def test_mandatory_calibration_refuses_missing_detector_before_registration(mock
     assert result.status == TrainingStatus.FAILED
     assert result.calibration_status == "skipped"
     registry.register.assert_not_called()
+
+
+def test_training_propagates_explicit_cuda_policy_to_output_calibration(mocked_trainer, monkeypatch):
+    trainer, _registry = mocked_trainer
+    output_validation = MagicMock(wraps=trainer._validate_output)
+    monkeypatch.setattr(trainer, "_validate_output", output_validation)
+    result = trainer.train(
+        "cam", "zone", export_format="torch", quantization="fp32", require_calibration=True,
+        anomaly_config=SimpleNamespace(inference_backend="torch-cuda"),
+    )
+
+    assert result.status == TrainingStatus.COMPLETE
+    assert output_validation.call_args.kwargs["inference_backend"] == "torch-cuda"
+
+
+def test_training_retains_static_quality_limits_in_candidate_and_report(mocked_trainer, monkeypatch):
+    trainer, registry = mocked_trainer
+    quality = {"passed": True, "corruption_rate": 0.0, "near_duplicate_rate": 0.99,
+        "brightness_std": 0.2, "warnings": ["only observed fixed-scene conditions"],
+        "policy_version": "argus.baseline-quality.scene-static.v1", "scope": "observed_fixed_scene_only",
+        "production_readiness": "not_evaluated"}
+    monkeypatch.setattr(trainer, "_validate_baseline_quality", lambda *a, **k: quality)
+
+    result = trainer.train("cam", "zone", export_format="torch", quantization="fp32", require_calibration=True)
+
+    assert result.status == TrainingStatus.COMPLETE
+    assert quality["warnings"][0] in result.quality_report.suggestions
+    params = registry.register.call_args.kwargs["training_params"]
+    assert params["baseline_quality"] == quality
+    assert params["artifact_manifest"]["baseline_quality"] == quality
+    assert "production_allowed" not in params
+    assert not result.baseline_validation_skipped
+    registry.activate.assert_not_called()
 
 
 def test_scene_training_rechecks_baseline_after_fit_before_registration(mocked_trainer, monkeypatch):

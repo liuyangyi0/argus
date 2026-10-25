@@ -835,7 +835,9 @@ def _train_model_task(
                 baseline_count=result.image_count,
                 train_count=result.train_count,
                 val_count=result.val_count,
-                pre_validation_passed=pre_val.get("passed", True),
+                # Missing or merely truthy report fields are unverified, not
+                # evidence that baseline quality checks actually passed.
+                pre_validation_passed=pre_val.get("passed") is True,
                 corruption_rate=pre_val.get("corruption_rate"),
                 near_duplicate_rate=pre_val.get("near_duplicate_rate"),
                 brightness_std=pre_val.get("brightness_std"),

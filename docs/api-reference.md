@@ -1,6 +1,6 @@
 # Argus API 参考
 
-> 最后更新：2026-06-12
+> 最后更新：2026-10-23
 > 自动端点清单来源：`docs/source-index.md`。后端装配入口：`src/argus/dashboard/app.py`。
 
 本文档按业务域描述 Dashboard HTTP API 和 WebSocket。精确函数签名、源码行号和完整路由列表可从 `docs/source-index.md` 重新生成。
@@ -80,6 +80,39 @@ GET /ws?token=<token>
 | `GET` | `/{camera_id}/stream` | MJPEG 回退流 |
 | `GET` | `/{camera_id}/heatmap-stream` | 热力图 MJPEG 流 |
 | `GET` | `/wall/status` | 视频墙状态 |
+
+## Analysis tasks：多任务旁路平台
+
+`/api/tasks` 仍是后台作业，不是分析任务。分析任务使用独立 `/api/analysis-tasks` 命名空间；legacy 任务在此只读，新 managed 任务只能旁路运行，不触发生产告警。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/analysis-task-templates` | 模板、默认配置、模型角色和 NO-GO 原因 |
+| `GET/POST` | `/api/analysis-tasks` | 读取任务 / 创建旁路任务 |
+| `GET/PUT` | `/api/analysis-tasks/{task_id}` | 任务详情 / 配置修订 |
+| `POST` | `/api/analysis-tasks/{task_id}/archive` | 停止并清理后归档，保留历史 |
+| `GET/POST` | `/api/analysis-task-models` | 候选模型登记表 / 核验本机受控 ONNX 文件 |
+| `GET` | `/api/analysis-tasks/{task_id}/compatible-models` | 模板及 camera scope 兼容的模型 |
+| `GET/POST` | `/api/analysis-tasks/{task_id}/bundles` | 执行包列表 / 冻结配置及模型 SHA |
+| `POST` | `/api/analysis-tasks/{task_id}/runtime/start`、`stop` | 独立进程启停，不启停视频源 |
+| `GET` | `/api/analysis-tasks/{task_id}/results`、`release-readiness` | 最近旁路结果 / 明确的生产阻断原因 |
+
+任务创建、配置修改、归档、模型登记及执行包冻结要求 `Idempotency-Key`（8–128 字符）。结果未知时必须用原请求、原键重试。配置修改、归档要求 `expected_revision`；不能修改正在运行或未清理的任务。任务写操作需要 `edit_config`，模型登记需要人工 `manage_models`，执行包冻结需要 `manage_models`。
+
+数据工作流前缀为 `/api/analysis-tasks/{task_id}/workflows`：
+
+- `GET/POST` 根路径读取或创建流程（创建要求幂等键）。
+- `POST /{workflow_id}/collect`、`stop`：定时抽样采集及停止/清单对账。
+- `GET /{workflow_id}/samples/{sample_id}/image`：鉴权 PNG，私有 no-store，不接受任意文件路径。
+- `POST /{workflow_id}/review`、`preannotations`、`freeze`：人工审核、精确同帧预标注和冻结数据集。
+- `GET /{workflow_id}/review-export?target=cvat|fiftyone`、`POST /{workflow_id}/review-import`：离线任务图片清单交换，不自动上传 SDK。
+- `POST /{workflow_id}/training`、`training-approve`、`GET /{workflow_id}/training-export`：外部训练提案、人工批准和交接清单。
+- `POST /{workflow_id}/candidate`：核验交接摘要后登记候选，不能发布。
+- `GET /api/analysis-tasks/{task_id}/training-recipes`：显式训练配方能力。
+
+流程写入需要 `expected_revision`，审核还需原 `sample_id` 和 `expected_image_sha256`。审核、导入和训练批准要求个人登录的 `manage_training`，共享 token 不能代替人审。自动建议始终待复核；审核变化会使旧冻结数据集/训练批准失效。候选登记要求人工 `manage_models`，绑定任务、数据集和 package SHA。
+
+响应均使用 `{code,msg,data}`，图片例外。不可把流程 DB `state` 当实际采集观测：另读 `collection_runtime`；失败、未知提交和清理未确认必须重试对账。完整限制见 [P3—P6 说明](design/multi-task-platform-p3-p6.md)。
 
 ## Streaming
 
@@ -202,7 +235,8 @@ GET /ws?token=<token>
 | `GET` | `/status` | 模型运行状态 |
 | `GET` | `/json` | 模型注册表 |
 | `POST` | `/{version_id}/activate` | 兼容激活入口 |
-| `POST` | `/{version_id}/rollback` | 回滚 |
+| `GET` | `/{version_id}/rollback-readiness` | 历史生产版本回滚资格、源/目标修订号和阻断原因 |
+| `POST` | `/{version_id}/rollback` | 提交受控回滚；返回 `202 + operation_id`，不等于已应用 |
 | `POST` | `/{version_id}/promote` | stage promote |
 | `POST` | `/{version_id}/retire` | 退役 |
 | `DELETE` | `/{version_id}` | 删除 |
@@ -218,6 +252,16 @@ GET /ws?token=<token>
 | `GET` | `/backbone/status` | backbone 状态 |
 | `POST` | `/backbone/upgrade` | backbone 升级 |
 | `GET` | `/threshold-preview` | 阈值预览 |
+
+回滚检查与提交必须使用具有 `rollback_model` 权限的有效个人登录会话，
+共享 API token 和关闭认证模式不能代替人审。路径中的版本是拟恢复的、当前已退役的历史生产版本。
+提交 JSON 必须包含检查结果中的 `source_model_version_id`、`source_release_revision`、
+`expected_revision`（目标修订号），以及 `reason` 和 `idempotency_key`。
+网络结果未知时，用原请求和原幂等键重试；不能擅自更换版本、修订号或理由。
+通过 `/api/models/release-operations/{operation_id}` 查询最终 `pending/applied/failed` 状态。
+源模型变化或证据不再有效会被拒绝，需重新检查；已接受的失败操作不能用同一键变成新操作。
+回滚仍要求严格发布证据及当前目标 profile 绑定，且运行时换模后继续由 SceneGuard 确认场景，
+`applied` 不表示异常评分与告警已经恢复。详见[模型发布说明](modules/models-training.md)。
 
 ## Config
 

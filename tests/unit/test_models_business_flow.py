@@ -12,8 +12,9 @@ from fastapi.testclient import TestClient
 from argus.anomaly.job_executor import TrainingJobExecutor
 from argus.anomaly.trainer import TrainingResult, TrainingStatus
 from argus.capture.manager import CameraManager
-from argus.config.schema import AlertConfig, CameraConfig, DashboardConfig
+from argus.config.schema import AlertConfig, AuthConfig, CameraConfig, DashboardConfig
 from argus.dashboard.app import create_app
+from argus.dashboard.auth import create_session_token, hash_password
 from argus.storage.database import Database
 from argus.storage.model_registry import ModelRegistry
 from argus.storage.model_release_service import (
@@ -172,11 +173,13 @@ def test_training_candidate_release_and_rollback_flow(
     camera_manager = _camera_manager(database, current_version=previous_id)
     alerts_dir = tmp_path / "alerts"
     alerts_dir.mkdir()
+    database.create_user("review-engineer", hash_password("test-review-password"), "engineer")
     app = create_app(
         database=database,
         camera_manager=camera_manager,
         alerts_dir=str(alerts_dir),
         config=SimpleNamespace(
+            auth=AuthConfig(enabled=True, api_token="business-flow-test-token"),
             dashboard=DashboardConfig(go2rtc_enabled=False), cameras=camera_manager._cameras,
         ),
     )
@@ -186,6 +189,9 @@ def test_training_candidate_release_and_rollback_flow(
         min_canary_days=0,
     )
     client = running_release_client(app)
+    client.cookies.set("argus_session", create_session_token(
+        "review-engineer", "engineer", app.state.session_secret,
+    ))
 
     create_response = client.post(
         "/api/training-jobs/",
@@ -287,7 +293,15 @@ def test_training_job_actions_default_to_authenticated_user(tmp_path):
 
     alerts_dir = tmp_path / "alerts"
     alerts_dir.mkdir()
-    client = TestClient(create_app(database=database, alerts_dir=str(alerts_dir)))
+    database.create_user("review-engineer", hash_password("test-review-password"), "engineer")
+    app = create_app(database=database, alerts_dir=str(alerts_dir), config=SimpleNamespace(
+        auth=AuthConfig(enabled=True, api_token="training-audit-test-token"),
+        dashboard=DashboardConfig(go2rtc_enabled=False),
+    ))
+    client = TestClient(app)
+    client.cookies.set("argus_session", create_session_token(
+        "review-engineer", "engineer", app.state.session_secret,
+    ))
 
     create_response = client.post(
         "/api/training-jobs/",
@@ -297,12 +311,12 @@ def test_training_job_actions_default_to_authenticated_user(tmp_path):
     job_id = create_response.json()["data"]["job_id"]
 
     detail = client.get(f"/api/training-jobs/{job_id}").json()["data"]
-    assert detail["triggered_by"] == "system"
+    assert detail["triggered_by"] == "review-engineer"
 
     confirm_response = client.post(f"/api/training-jobs/{job_id}/confirm", json={})
     assert confirm_response.status_code == 200
     confirmed = client.get(f"/api/training-jobs/{job_id}").json()["data"]
-    assert confirmed["confirmed_by"] == "system"
+    assert confirmed["confirmed_by"] == "review-engineer"
 
     reject_create_response = client.post(
         "/api/training-jobs/",
@@ -314,7 +328,7 @@ def test_training_job_actions_default_to_authenticated_user(tmp_path):
     reject_response = client.post(f"/api/training-jobs/{reject_job_id}/reject", json={})
     assert reject_response.status_code == 200
     rejected = client.get(f"/api/training-jobs/{reject_job_id}").json()["data"]
-    assert rejected["error"] == "Rejected by system"
+    assert rejected["error"] == "Rejected by review-engineer"
 
 
 def test_reexport_api_invokes_trainer_with_requested_format(tmp_path, monkeypatch):

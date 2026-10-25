@@ -300,9 +300,46 @@ def training_directory(path: Path) -> Path:
     return path if path.is_dir() else path.parent
 
 
+def inherited_baseline_quality(metadata: dict, *, source_model_path: str) -> dict:
+    """Preserve source limitations, never claim a fresh input evaluation."""
+    unavailable = {
+        "report_status": "not_evaluated", "passed": None, "integrity_passed": None,
+        "scope": "unrecorded_source_conditions", "warnings": [], "errors": [],
+        "production_readiness": "not_evaluated",
+    }
+    value = metadata.get("baseline_quality")
+    snapshot = dict(unavailable)
+    if value is not None:
+        try:
+            if not isinstance(value, dict):
+                raise ValueError("source quality must be a report")
+            encoded = json.dumps(value, allow_nan=False)
+            if len(encoded.encode("utf-8")) > 512 * 1024:
+                raise ValueError("source quality report exceeds its budget")
+            candidate = json.loads(encoded)
+            if "passed" not in candidate or (type(candidate.get("passed")) is not bool and candidate.get("passed") is not None):
+                raise ValueError("source quality has no literal decision")
+            for key in ("warnings", "errors"):
+                if not isinstance(candidate.get(key, []), list) or any(type(x) is not str for x in candidate.get(key, [])):
+                    raise ValueError("source quality messages are invalid")
+            if candidate.get("passed") is True and (
+                candidate.get("errors") or candidate.get("integrity_passed") is False
+                or (candidate.get("scope") == "observed_fixed_scene_only" and candidate.get("integrity_passed") is not True)
+            ):
+                raise ValueError("source quality evidence contradicts a passing decision")
+            snapshot = candidate
+        except (TypeError, ValueError, OverflowError):
+            snapshot = {**unavailable, "report_status": "invalid", "errors": ["源制品质量报告无效，不能推断输入质量通过"]}
+    snapshot["production_readiness"] = "not_evaluated"
+    snapshot["evidence_origin"] = "inherited_source_conditions_not_reevaluated"
+    snapshot["inherited_from"] = {"model_path": source_model_path, "run_id": metadata.get("run_id")}
+    return snapshot
+
+
 def write_artifact_manifest(
     run: ArtifactRun, artifact: Path, *, model_type: str,
     calibration_status: str, source_model_path: str | None = None,
+    baseline_quality: dict | None = None,
 ) -> dict:
     """Finalize metadata only after calibration and all export sidecars exist."""
     artifact = _validate_file(artifact.resolve())
@@ -323,8 +360,15 @@ def write_artifact_manifest(
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
         hashes[file.relative_to(run.export_dir).as_posix()] = digest.hexdigest()
+    quality_snapshot = None
+    if baseline_quality is not None:
+        if not isinstance(baseline_quality, dict):
+            raise ValueError("baseline_quality must be a structured quality report")
+        # A provenance snapshot, never a mutable reference or release flag.
+        quality_snapshot = json.loads(json.dumps(baseline_quality, allow_nan=False))
     metadata = {
         "schema_version": 1,
+        **({"baseline_quality": quality_snapshot} if quality_snapshot is not None else {}),
         "run_id": run.run_id,
         "camera_id": run.camera_id,
         "zone_id": run.zone_id,

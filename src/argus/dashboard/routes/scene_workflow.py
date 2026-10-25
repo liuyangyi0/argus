@@ -20,7 +20,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import current_username, require_permission
+from argus.dashboard.auth import current_username, require_human_permission, require_permission
 from argus.dashboard.model_runtime import get_registry
 from argus.storage.scene_workflow import SceneWorkflowConflict, SceneWorkflowService
 
@@ -265,6 +265,8 @@ def create_scene_training(request: Request, camera_id: Identifier, workflow_id: 
 @router.post("/{camera_id}/workflows/{workflow_id}/approve-profile", response_model=ApiEnvelope[ProfileApproved])
 def approve_scene_profile(request: Request, camera_id: Identifier, workflow_id: Identifier, body: ProfileApprovalRequest):
     try:
+        if not require_human_permission(request, "manage_models"):
+            return api_forbidden("场景审批需要开启认证并使用有效个人账号登录；共享 API 凭证不能代替人工审批")
         service, error = _service(request, camera_id, "manage_models")
         if error is not None:
             return error

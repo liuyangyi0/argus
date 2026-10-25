@@ -7,6 +7,7 @@ import { getCameraDetail } from '../api'
 import { setCameraMode } from '../api/cameras'
 import ZoneEditor from '../components/ZoneEditor.vue'
 import CalibrationWizard from '../components/calibration/CalibrationWizard.vue'
+import AnalysisTaskPanel from '../components/cameras/AnalysisTaskPanel.vue'
 import { streamFallbackReasonLabel, useGo2RTC } from '../composables/useGo2RTC'
 import { useAuthStore } from '../stores/useAuthStore'
 import { extractErrorMessage } from '../utils/error'
@@ -703,6 +704,7 @@ async function handleModeChange(value: string | number) {
       </section>
 
       <!-- Calibration section (below main content area) -->
+      <AnalysisTaskPanel :camera-id="cameraId" :can-manage="auth.hasRole(['admin', 'engineer'])" />
       <CalibrationWizard :camera-id="cameraId" style="margin-top: 12px" />
       </div>
 

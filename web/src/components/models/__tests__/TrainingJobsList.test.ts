@@ -12,6 +12,10 @@ import {
 
 const antStubs = vi.hoisted(() => ({
   card: { template: '<section><slot /></section>' },
+  alert: {
+    props: ['message', 'description', 'type'],
+    template: '<section class="alert" :data-type="type">{{ message }} {{ description }}</section>',
+  },
   button: {
     props: ['type', 'size', 'danger'],
     emits: ['click'],
@@ -76,6 +80,7 @@ vi.mock('../../../api', () => ({
 
 vi.mock('ant-design-vue', () => ({
   Card: antStubs.card,
+  Alert: antStubs.alert,
   Table: antStubs.table,
   Button: antStubs.button,
   Tag: antStubs.tag,
@@ -207,5 +212,56 @@ describe('TrainingJobsList', () => {
     expect(message.warning).toHaveBeenCalledWith('任务已被其他操作员确认或状态已变更')
     expect(getTrainingJobs).toHaveBeenCalledTimes(2)
     expect(wrapper.emitted('update:pendingCount')?.at(-1)).toEqual([0])
+  })
+
+  async function openQualityDetail(metrics: unknown, status = 'complete') {
+    const job = trainingJob({ status, metrics })
+    vi.mocked(getTrainingJobs).mockResolvedValue({ jobs: [job], pending_count: 0 })
+    vi.mocked(getTrainingJob).mockResolvedValue(job)
+    const wrapper = mount(TrainingJobsList, { props: { cameras: [] } })
+    await flushPromises()
+    const detail = wrapper.findAll('button').find(button => button.text() === '详情')
+    await detail!.trigger('click')
+    await flushPromises()
+    return wrapper
+  }
+
+  it('shows narrow fixed-scene suitability and warnings without presenting production approval', async () => {
+    const wrapper = await openQualityDetail({ baseline_quality: {
+      report_status: 'available', passed: true, integrity_passed: true,
+      policy_version: 'argus.baseline-quality.scene-static.v1', scope: 'observed_fixed_scene_only',
+      warnings: ['静态素材没有覆盖照明变化'], errors: [], production_readiness: 'not_evaluated',
+    } })
+    const state = wrapper.get('[data-test="baseline-quality-state"]')
+    expect(state.text()).toBe('训练输入可用（有限覆盖）')
+    expect(state.attributes('data-color')).toBe('orange')
+    expect(wrapper.text()).toContain('仅覆盖已观察到的固定场景正常工况')
+    expect(wrapper.text()).toContain('静态素材没有覆盖照明变化')
+    expect(wrapper.text()).toContain('训练输入可用不等于生产验收通过')
+  })
+
+  it.each([null, {}, { baseline_quality: { passed: true } }, {
+    baseline_quality: { report_status: 'invalid', passed: true, warnings: [], errors: [] },
+  }, {
+    baseline_quality: { report_status: 'available', passed: true, warnings: [], errors: ['完整性失败'] },
+  }, {
+    baseline_quality: { report_status: 'available', passed: true, warnings: [], errors: [], scope: 'observed_fixed_scene_only' },
+  }])('never treats an absent or malformed quality report as passing: %j', async (metrics) => {
+    const wrapper = await openQualityDetail(metrics)
+    const state = wrapper.get('[data-test="baseline-quality-state"]')
+    expect(state.text()).toBe('未评估或报告无效')
+    expect(state.attributes('data-color')).toBe('default')
+  })
+
+  it('keeps failed input evidence and its warnings visible on failed training jobs', async () => {
+    const wrapper = await openQualityDetail({ baseline_quality: {
+      report_status: 'available', passed: false, scope: 'observed_fixed_scene_only',
+      warnings: ['仅验证当前场景'], errors: ['图片身份已改变'],
+    } }, 'failed')
+    const state = wrapper.get('[data-test="baseline-quality-state"]')
+    expect(state.text()).toBe('不满足训练输入要求')
+    expect(state.attributes('data-color')).toBe('red')
+    expect(wrapper.text()).toContain('图片身份已改变')
+    expect(wrapper.text()).toContain('仅验证当前场景')
   })
 })

@@ -8,6 +8,7 @@ import type { ReleaseOperation } from '../../../types/api'
 import {
   getShadowReport,
   getReleaseOperation,
+  getRollbackReadiness,
   promoteModel,
   reexportModel,
   retireModel,
@@ -56,13 +57,14 @@ const antStubs = vi.hoisted(() => ({
     `,
   },
   modal: {
-    props: ['open', 'title', 'okText'],
-    emits: ['ok'],
+    props: ['open', 'title', 'okText', 'okButtonProps', 'keyboard', 'cancelButtonProps'],
+    emits: ['ok', 'cancel'],
     template: `
-      <section v-if="open" class="ant-modal">
+      <section v-if="open" class="ant-modal" @keydown.esc="keyboard !== false && $emit('cancel')">
         <h2>{{ title }}</h2>
         <slot />
-        <button type="button" data-test="modal-ok" @click="$emit('ok')">{{ okText || 'OK' }}</button>
+        <button type="button" data-test="modal-ok" :disabled="okButtonProps?.disabled" @click="$emit('ok')">{{ okText || 'OK' }}</button>
+        <button type="button" data-test="modal-cancel" :disabled="cancelButtonProps?.disabled" @click="$emit('cancel')">Cancel</button>
       </section>
     `,
   },
@@ -138,6 +140,7 @@ vi.mock('../../../api', () => ({
   promoteModel: vi.fn(),
   reexportModel: vi.fn(),
   rollbackModel: vi.fn(),
+  getRollbackReadiness: vi.fn(),
   deleteModel: vi.fn(),
   retireModel: vi.fn(),
   getStageHistory: vi.fn().mockResolvedValue({ events: [] }),
@@ -249,6 +252,7 @@ describe('ModelTable release actions', () => {
     vi.mocked(reexportModel).mockReset()
     vi.mocked(retireModel).mockReset()
     vi.mocked(rollbackModel).mockReset()
+    vi.mocked(getRollbackReadiness).mockReset()
     routerPush.mockReset()
     modalConfirm.mockReset()
     vi.mocked(message.success).mockReset()
@@ -526,23 +530,119 @@ describe('ModelTable release actions', () => {
     )
   })
 
-  it('keeps legacy rollback disabled until the two-phase release path is ready', async () => {
-    const wrapper = mountTable()
-
-    const productionRow = wrapper.find('[data-vid="production-1"]')
-    const rollbackButton = productionRow
-      .findAll('button')
-      .find(button => button.text().includes('回滚 NO-GO'))
-    expect(rollbackButton).toBeTruthy()
-    expect(rollbackButton!.attributes('disabled')).toBeDefined()
-    expect(rollbackButton!.attributes('title')).toContain('两阶段 rollback 尚未实现')
-    expect(rollbackButton!.attributes('title')).toContain('readiness 为 NO-GO')
-    await rollbackButton!.trigger('click')
+  it('requires server rollback readiness and keeps failed evidence disabled', async () => {
+    vi.mocked(getRollbackReadiness).mockResolvedValue({
+      model_version_id: 'retired-1', camera_id: 'dev_cam', rollback_allowed: false,
+      expected_revision: 4, source_model_version_id: 'production-1', source_release_revision: 3,
+      reasons: ['历史发布证据未通过'], scene_reconfirmation_required: true, checked_at: '',
+    })
+    const wrapper = mountTable({ models: [
+      ...models(), { ...models()[0], model_version_id: 'retired-1', stage: 'retired', release_revision: 4 },
+    ] })
+    await wrapper.find('[aria-label="检查回滚到模型 retired-1"]').trigger('click')
     await flushPromises()
-
+    await wrapper.find('textarea').setValue('restore previous model')
+    expect(wrapper.text()).toContain('历史发布证据未通过')
+    expect(wrapper.find('[data-test="modal-ok"]').attributes('disabled')).toBeDefined()
     expect(rollbackModel).not.toHaveBeenCalled()
-    expect(modalConfirm).not.toHaveBeenCalled()
-    expect(wrapper.emitted('changed')).toBeFalsy()
+    wrapper.unmount()
+  })
+
+  it.each(['success', 'failure', 'unmount'])('isolates a late rollback %s from a newer dialog', async outcome => {
+    vi.mocked(getRollbackReadiness).mockImplementation(async versionId => ({
+      model_version_id: versionId, camera_id: 'dev_cam', rollback_allowed: true,
+      expected_revision: 4, source_model_version_id: 'production-1', source_release_revision: 3,
+      reasons: [], scene_reconfirmation_required: true, checked_at: '',
+    }))
+    let resolve!: (value: any) => void
+    let reject!: (reason: unknown) => void
+    vi.mocked(rollbackModel).mockImplementation(() => new Promise((res, rej) => { resolve = res; reject = rej }))
+    const wrapper = mountTable({ models: [
+      { ...models()[1], release_revision: 3 },
+      ...['retired-1', 'retired-2'].map(model_version_id => ({
+        ...models()[0], model_version_id, stage: 'retired', release_revision: 4,
+      })),
+    ] })
+    await wrapper.find('[aria-label="检查回滚到模型 retired-1"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('textarea').setValue('restore verified previous model')
+    await wrapper.find('[data-test="modal-ok"]').trigger('click')
+    await wrapper.find('.ant-modal').trigger('keydown', { key: 'Escape' })
+    expect(wrapper.find('.ant-modal').exists()).toBe(true)
+    expect(wrapper.find('[data-test="modal-cancel"]').attributes('disabled')).toBeDefined()
+    if (outcome === 'unmount') {
+      wrapper.unmount()
+    } else {
+      // Even a forced programmatic close/switch cannot let A's reply touch B.
+      wrapper.findComponent(antStubs.modal).vm.$emit('cancel')
+      await wrapper.vm.$nextTick()
+      await wrapper.find('[aria-label="检查回滚到模型 retired-2"]').trigger('click')
+      await flushPromises()
+    }
+    if (outcome === 'failure') reject(new Error('old request failed'))
+    else resolve({ operation: operation({ model_version_id: 'retired-1', target_stage: 'production' }), runtime_synced: false })
+    await flushPromises()
+    expect(message.info).not.toHaveBeenCalled()
+    expect(message.error).not.toHaveBeenCalled()
+    if (outcome === 'unmount') expect(wrapper.emitted('changed')).toBeFalsy()
+    else {
+      expect(wrapper.find('.ant-modal').text()).toContain('目标版本：retired-2')
+      expect(wrapper.find('.ant-modal').text()).not.toContain('old request failed')
+      wrapper.unmount()
+    }
+  })
+
+  it('submits an exact revision-bound rollback without claiming scene release', async () => {
+    vi.mocked(getRollbackReadiness).mockResolvedValue({
+      model_version_id: 'retired-1', camera_id: 'dev_cam', rollback_allowed: true,
+      expected_revision: 4, source_model_version_id: 'production-1', source_release_revision: 3,
+      reasons: [], scene_reconfirmation_required: true, checked_at: '',
+    })
+    vi.mocked(rollbackModel).mockResolvedValue({
+      operation: operation({ model_version_id: 'retired-1', from_stage: 'retired', target_stage: 'production' }),
+      runtime_synced: false,
+    } as any)
+    const wrapper = mountTable({ models: [
+      { ...models()[1], release_revision: 3 },
+      { ...models()[0], model_version_id: 'retired-1', stage: 'retired', release_revision: 4 },
+    ] })
+    await wrapper.find('[aria-label="检查回滚到模型 retired-1"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('不代表场景已放行')
+    expect(wrapper.text()).toContain('确认前检测与告警保持暂停')
+    await wrapper.find('textarea').setValue('restore verified previous model')
+    expect(wrapper.find('[data-test="modal-ok"]').attributes('disabled')).toBeUndefined()
+    await wrapper.find('[data-test="modal-ok"]').trigger('click')
+    await flushPromises()
+    expect(rollbackModel).toHaveBeenCalledWith('retired-1', {
+      source_model_version_id: 'production-1', source_release_revision: 3,
+      expected_revision: 4, reason: 'restore verified previous model',
+    })
+    expect(message.info).toHaveBeenCalledWith(expect.stringContaining('发布请求已受理'))
+    expect(message.success).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('invalidates rollback readiness when the source revision changes', async () => {
+    vi.mocked(getRollbackReadiness).mockResolvedValue({
+      model_version_id: 'retired-1', camera_id: 'dev_cam', rollback_allowed: true,
+      expected_revision: 4, source_model_version_id: 'production-1', source_release_revision: 3,
+      reasons: [], scene_reconfirmation_required: true, checked_at: '',
+    })
+    const entries = [
+      { ...models()[1], release_revision: 3 },
+      { ...models()[0], model_version_id: 'retired-1', stage: 'retired', release_revision: 4 },
+    ]
+    const wrapper = mountTable({ models: entries })
+    await wrapper.find('[aria-label="检查回滚到模型 retired-1"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('textarea').setValue('restore')
+    await wrapper.setProps({ models: entries.map(model => model.model_version_id === 'production-1'
+      ? { ...model, release_revision: 5 } : model) })
+    expect(wrapper.find('[data-test="modal-ok"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('回滚检查已过期')
+    expect(rollbackModel).not.toHaveBeenCalled()
+    wrapper.unmount()
   })
 
   it('retires a model without sending a hard-coded operator name', async () => {

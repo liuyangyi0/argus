@@ -1,5 +1,6 @@
 import { api, unwrap, u } from './client'
 import { ApiError } from '../types/api'
+import type { RollbackReadinessResponse } from '../types/generated-openapi'
 import type {
   ApiResponse,
   ModelRegistryResponse, ShadowReportResponse,
@@ -32,10 +33,6 @@ export const activateModel = (versionId: string): Promise<ModelRuntimeMutationRe
   api
     .post<ApiResponse<ModelRuntimeMutationResponse>>(`/models/${versionId}/activate`)
     .then(unwrap)
-export const rollbackModel = (versionId: string): Promise<ModelRuntimeMutationResponse> =>
-  api
-    .post<ApiResponse<ModelRuntimeMutationResponse>>(`/models/${versionId}/rollback`)
-    .then(unwrap)
 export const deleteModel = (versionId: string) => api.delete(`/models/${versionId}`).then(u)
 export const reexportModel = (versionId: string, data: { export_format?: string; quantization?: string }) =>
   api.post(`/models/${versionId}/reexport`, data, { timeout: 300000 }).then(u)
@@ -57,6 +54,17 @@ export interface ModelReleaseRequest {
   expected_revision?: number
   idempotency_key?: string
 }
+
+export interface ModelRollbackRequest {
+  source_model_version_id: string
+  source_release_revision: number
+  expected_revision: number
+  reason: string
+  idempotency_key?: string
+}
+
+export type RollbackReadiness = RollbackReadinessResponse
+type ReleaseCommand = Partial<ModelReleaseRequest> & Partial<ModelRollbackRequest>
 
 const RELEASE_KEYS_STORAGE = 'argus.release-idempotency.v1'
 const releaseRequestKeys = new Map<string, string>()
@@ -81,10 +89,11 @@ function persistReleaseKeys(): void {
   } catch { /* In-memory fallback. */ }
 }
 
-function releaseFingerprint(versionId: string, action: string, data: Partial<ModelReleaseRequest>): string {
+function releaseFingerprint(versionId: string, action: string, data: ReleaseCommand): string {
   return JSON.stringify([
     versionId, action, data.target_stage ?? '', data.expected_revision ?? null,
     data.triggered_by ?? '', data.reason ?? '', data.canary_camera_id ?? '',
+    data.source_model_version_id ?? '', data.source_release_revision ?? null,
   ])
 }
 
@@ -109,8 +118,8 @@ export function acknowledgeReleaseOperation(operation: ReleaseOperation): void {
 
 async function submitRelease(
   versionId: string,
-  action: 'promote' | 'retire',
-  data: Partial<ModelReleaseRequest>,
+  action: 'promote' | 'retire' | 'rollback',
+  data: ReleaseCommand,
 ): Promise<ModelReleaseMutationResponse> {
   restoreReleaseKeys()
   const fingerprint = releaseFingerprint(versionId, action, data)
@@ -147,6 +156,10 @@ export const promoteModel = (versionId: string, data: ModelReleaseRequest): Prom
   submitRelease(versionId, 'promote', data)
 export const retireModel = (versionId: string, data?: Omit<ModelReleaseRequest, 'target_stage' | 'canary_camera_id'>): Promise<ModelReleaseMutationResponse> =>
   submitRelease(versionId, 'retire', data || {})
+export const rollbackModel = (versionId: string, data: ModelRollbackRequest): Promise<ModelReleaseMutationResponse> =>
+  submitRelease(versionId, 'rollback', data)
+export const getRollbackReadiness = (versionId: string): Promise<RollbackReadiness> =>
+  api.get<ApiResponse<RollbackReadiness>>(`/models/${versionId}/rollback-readiness`).then(unwrap)
 export const getReleaseOperation = (operationId: string): Promise<ReleaseOperation> =>
   api
     .get<ApiResponse<ReleaseOperationResponse>>(`/models/release-operations/${operationId}`)

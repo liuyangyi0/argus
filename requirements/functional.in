@@ -1,0 +1,29 @@
+# Ordinary API, storage, configuration and mock tests only. No model engines.
+# Compile with uv 0.12.5; see requirements/README.md.
+-c runtime-constraints.txt
+opencv-python
+fastapi
+python-multipart
+uvicorn[standard]
+sqlalchemy
+pydantic
+pydantic-settings
+pyyaml
+structlog
+scikit-image
+numpy
+pillow
+httpx
+websockets
+janus
+apscheduler
+av
+prometheus-client
+hatchling
+paramiko==4.0.0
+pytest==9.0.2
+pytest-asyncio==1.3.0
+pytest-cov==7.1.0
+pytest-benchmark==5.2.3
+hypothesis==6.153.0
+ruff==0.15.14

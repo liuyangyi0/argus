@@ -1,20 +1,27 @@
 """Tests for the dashboard authentication system."""
 
 
+from base64 import b64encode
+import hashlib
+from types import SimpleNamespace
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from argus.config.schema import ArgusConfig, AuthConfig
 from argus.dashboard.app import _resolve_session_secret, create_app
 from argus.dashboard.auth import (
     PERMISSION_MAP,
+    AuthMiddleware,
     _safe_next_url,
     create_session_token,
     current_username,
     has_permission,
     hash_password,
+    require_human_permission,
     require_role,
     verify_password,
     verify_session_token,
@@ -229,6 +236,92 @@ class TestCurrentUsername:
         assert current_username(req) == "unknown"
 
 
+def _human_approval_client(*, enabled=True, username="reviewer", role="engineer", database=True):
+    """Exercise the real auth middleware without starting runtime services."""
+    app = FastAPI()
+    db = Mock()
+    db.get_user.return_value = SimpleNamespace(active=True, role=role)
+    app.state.database = db if database else None
+    app.add_middleware(
+        AuthMiddleware, config=AuthConfig(enabled=enabled, api_token="shared-test-token"),
+        session_secret="human-test-secret", database=app.state.database,
+    )
+
+    @app.post("/api/review-probe")
+    async def probe(request: Request):
+        return {
+            "allowed": require_human_permission(request, "manage_training"),
+            "method": request.state.auth_method,
+            "username": current_username(request),
+        }
+
+    client = TestClient(app)
+    session = create_session_token(username, role, "human-test-secret")
+    return client, db, session
+
+
+@pytest.mark.parametrize("method", ["header", "basic"])
+def test_shared_credentials_cannot_be_used_as_human_approval(method):
+    client, _db, _session = _human_approval_client()
+    headers = {"X-API-Token": "shared-test-token"}
+    if method == "basic":
+        encoded = b64encode(b"reviewer:shared-test-token").decode()
+        headers = {"Authorization": f"Basic {encoded}"}
+    # A caller-supplied name/source must not change the server auth provenance.
+    headers["X-Auth-Method"] = "session"
+    response = client.post("/api/review-probe", headers=headers, json={"username": "reviewer"})
+    assert response.status_code == 200
+    assert response.json() == {"allowed": False, "method": "api_token", "username": "api"}
+
+
+def test_auth_disabled_is_not_human_approval_even_with_a_signed_cookie():
+    client, _db, session = _human_approval_client(enabled=False)
+    client.cookies.set("argus_session", session)
+    response = client.post("/api/review-probe")
+    assert response.json() == {"allowed": False, "method": "disabled", "username": "system"}
+
+
+@pytest.mark.parametrize("username", ["reviewer", "api", "system"])
+@pytest.mark.parametrize("role", ["admin", "engineer"])
+def test_human_approval_accepts_actual_accounts_not_username_heuristics(username, role):
+    client, db, session = _human_approval_client(username=username, role=role)
+    client.cookies.set("argus_session", session)
+    response = client.post("/api/review-probe")
+    assert response.json() == {"allowed": True, "method": "session", "username": username}
+    db.get_user.assert_called_with(username)
+
+
+def test_human_approval_requires_a_database_backed_identity():
+    client, _db, session = _human_approval_client(database=False)
+    client.cookies.set("argus_session", session)
+    assert client.post("/api/review-probe").json()["allowed"] is False
+
+
+def test_human_approval_rechecks_account_changes_after_middleware_authentication():
+    client, db, session = _human_approval_client(role="admin")
+    client.cookies.set("argus_session", session)
+    db.get_user.side_effect = [
+        SimpleNamespace(active=True, role="admin"),
+        SimpleNamespace(active=True, role="viewer"),
+    ]
+    assert client.post("/api/review-probe").json()["allowed"] is False
+
+
+@pytest.mark.parametrize("record", [None, SimpleNamespace(active=False, role="admin")])
+def test_disabled_or_deleted_account_cannot_review(record):
+    client, db, session = _human_approval_client(role="admin")
+    client.cookies.set("argus_session", session)
+    db.get_user.return_value = record
+    assert client.post("/api/review-probe").status_code == 401
+
+
+def test_human_approval_fails_closed_when_account_lookup_fails_after_authentication():
+    client, db, session = _human_approval_client(role="admin")
+    client.cookies.set("argus_session", session)
+    db.get_user.side_effect = [SimpleNamespace(active=True, role="admin"), RuntimeError("db unavailable")]
+    assert client.post("/api/review-probe").json()["allowed"] is False
+
+
 # ── /api/me endpoint ──
 
 
@@ -248,20 +341,100 @@ def _build_auth_enabled_client(database: Database) -> tuple[TestClient, str]:
     return client, app.state.session_secret
 
 
-def test_session_secret_is_restart_stable_and_purpose_separated(monkeypatch):
+def test_session_secret_cannot_be_derived_from_shared_api_token(monkeypatch):
+    monkeypatch.delenv("ARGUS_SESSION_SECRET", raising=False)
     config = AuthConfig(enabled=True, api_token="stable-api-token")
 
     first = _resolve_session_secret(config)
     second = _resolve_session_secret(config)
 
-    assert first == second
+    assert first != second
     assert first != config.api_token
     assert len(first) == 64
+    legacy_derived = hashlib.sha256(
+        b"argus.dashboard.session.v1\0" + config.api_token.encode(),
+    ).hexdigest()
+    assert first != legacy_derived
 
     monkeypatch.setenv("ARGUS_SESSION_SECRET", "independent-session-material")
     overridden = _resolve_session_secret(config)
     assert overridden != first
     assert overridden != "independent-session-material"
+    assert overridden == _resolve_session_secret(config)
+
+
+@pytest.mark.parametrize("value", ["shared-test-token", "共享测试凭证"])
+def test_session_secret_rejects_the_same_value_as_shared_api_token(monkeypatch, value):
+    config = AuthConfig(enabled=True, api_token=value)
+    monkeypatch.setenv("ARGUS_SESSION_SECRET", f" {value} ")
+    with pytest.raises(ValueError, match="independent"):
+        _resolve_session_secret(config)
+
+
+def test_independent_unicode_session_secret_does_not_crash_comparison(monkeypatch):
+    config = AuthConfig(enabled=True, api_token="共享测试凭证")
+    monkeypatch.setenv("ARGUS_SESSION_SECRET", "独立的测试会话密钥")
+    assert len(_resolve_session_secret(config)) == 64
+
+
+def test_api_credential_cannot_forge_a_personal_account_cookie(_me_db, monkeypatch):
+    monkeypatch.delenv("ARGUS_SESSION_SECRET", raising=False)
+    _me_db.create_user("reviewer", hash_password("reviewer-password"), "engineer", None)
+    client, _actual_secret = _build_auth_enabled_client(_me_db)
+    # Reproduce the old derivation using only the shared API credential. This
+    # must no longer produce a session accepted as a named account.
+    derived_from_api_token = hashlib.sha256(
+        b"argus.dashboard.session.v1\0me-test-token",
+    ).hexdigest()
+    client.cookies.set("argus_session", create_session_token(
+        "reviewer", "engineer", derived_from_api_token,
+    ))
+    assert client.get("/api/me").status_code == 401
+
+
+@pytest.mark.parametrize("identity", ["api_token", "basic_token", "disabled", "engineer", "inactive"])
+@pytest.mark.parametrize(
+    ("method", "url", "payload"),
+    [
+        ("POST", "/api/users/json", {"username": "forged-reviewer", "password": "new-secret", "role": "admin"}),
+        ("PUT", "/api/users/reviewer/json", {"password": "new-secret", "role": "admin"}),
+        ("DELETE", "/api/users/reviewer/json", None),
+        ("POST", "/api/users/reviewer/toggle-active/json", None),
+    ],
+)
+def test_personal_identity_mutations_reject_shared_or_invalid_authority(
+    _me_db, identity, method, url, payload,
+):
+    victim = _me_db.create_user("reviewer", hash_password("original-secret"), "viewer", None)
+    original_hash = victim.password_hash
+    role = "engineer" if identity == "engineer" else "admin"
+    _me_db.create_user("acting-user", hash_password("actor-secret"), role, None)
+    config = ArgusConfig(auth=AuthConfig(enabled=identity != "disabled", api_token="me-test-token"))
+    app = create_app(database=_me_db, config=config)
+    client = TestClient(app)
+    if identity == "api_token":
+        client.headers["X-API-Token"] = "me-test-token"
+    elif identity == "basic_token":
+        client.headers["Authorization"] = "Basic " + b64encode(b"machine:me-test-token").decode()
+    else:
+        client.cookies.set("argus_session", create_session_token(
+            "acting-user", role, app.state.session_secret,
+        ))
+        if identity == "inactive":
+            _me_db.update_user("acting-user", active=False)
+
+    response = client.request(method, url, json=payload)
+
+    assert response.status_code == (401 if identity == "inactive" else 403)
+    assert _me_db.get_user("forged-reviewer") is None
+    unchanged = _me_db.get_user("reviewer")
+    assert unchanged is not None
+    assert unchanged.password_hash == original_hash
+    assert unchanged.role == "viewer"
+    assert unchanged.active is True
+    if identity in {"api_token", "basic_token", "disabled"}:
+        # Preserve the existing read-only administration API authorization.
+        assert client.get("/api/users/json").status_code == 200
 
 
 class TestMeEndpoint:

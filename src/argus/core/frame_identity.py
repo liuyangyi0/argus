@@ -22,6 +22,16 @@ class FrameIdentity:
     pipeline_ingest_ts: float | None = None
     preview_stream_ts: float | None = None
     snapshot_id: str | None = None
+    # Capture-local counters are not decoder frame indexes or media PTS.  Keep
+    # unknown source metadata absent instead of manufacturing it from FPS.
+    source_session_id: str | None = None
+    source_epoch: int = 0
+    source_frame_index: int | None = None
+    pts: int | None = None
+    time_base_num: int | None = None
+    time_base_den: int | None = None
+    frame_index_provenance: str = "capture_sequence"
+    timestamp_provenance: str = "local_capture_clock"
 
     def with_updates(self, **updates: Any) -> "FrameIdentity":
         """Return a copy with selected fields replaced."""
@@ -48,6 +58,14 @@ def build_frame_identity(
     frame_index: int,
     capture_wall_ts: float | None = None,
     capture_monotonic_ts: float | None = None,
+    source_session_id: str | None = None,
+    source_epoch: int = 0,
+    source_frame_index: int | None = None,
+    pts: int | None = None,
+    time_base_num: int | None = None,
+    time_base_den: int | None = None,
+    frame_index_provenance: str = "capture_sequence",
+    timestamp_provenance: str = "local_capture_clock",
 ) -> FrameIdentity:
     """Create a frame identity with current timestamps by default."""
     return FrameIdentity(
@@ -62,4 +80,12 @@ def build_frame_identity(
             if capture_monotonic_ts is None
             else capture_monotonic_ts
         ),
+        source_session_id=source_session_id,
+        source_epoch=source_epoch,
+        source_frame_index=source_frame_index,
+        pts=pts,
+        time_base_num=time_base_num,
+        time_base_den=time_base_den,
+        frame_index_provenance=frame_index_provenance,
+        timestamp_provenance=timestamp_provenance,
     )

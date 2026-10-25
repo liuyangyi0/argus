@@ -1,6 +1,17 @@
 # Argus - Jetson Orin NX Deployment Image
 # Based on NVIDIA L4T with CUDA support
 # Builds Python 3.11 + PyTorch from source for CUDA 11.4
+# Hardware-specific reference build; not covered by the x86_64 runtime lock.
+# Validate the final CUDA/PyTorch dependency graph on the target before use.
+
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS frontend
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+FROM alexxit/go2rtc:1.9.14 AS streaming
 
 FROM nvcr.io/nvidia/l4t-base:r35.2.1 AS builder
 
@@ -142,11 +153,6 @@ ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/tegra:${LD
 COPY --from=builder /wheels/ /tmp/wheels/
 RUN pip3.11 install --no-cache-dir /tmp/wheels/*.whl && rm -rf /tmp/wheels
 
-# Install Node.js 18 for frontend build
-RUN wget -qO /tmp/node18.tar.xz https://nodejs.org/dist/v18.20.4/node-v18.20.4-linux-arm64.tar.xz \
-    && tar -xJf /tmp/node18.tar.xz -C /usr/local --strip-components=1 \
-    && rm /tmp/node18.tar.xz
-
 WORKDIR /app
 
 # Copy project and install dependencies
@@ -154,18 +160,13 @@ COPY pyproject.toml .
 COPY src/ src/
 RUN pip3.11 install --no-cache-dir -e "."
 
-# Build frontend
-COPY web/ web/
-RUN cd web && npm install && npm run build
-
-# Download go2rtc for aarch64
-RUN wget -qO /usr/local/bin/go2rtc \
-    https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_arm64 \
-    && chmod +x /usr/local/bin/go2rtc
+COPY --from=frontend /web/dist /app/web/dist
+COPY --from=streaming /usr/local/bin/go2rtc /usr/local/bin/go2rtc
+ENV ARGUS__DASHBOARD__FRONTEND_DIST_DIR=/app/web/dist
 
 # Copy configs and data dirs
 COPY configs/ configs/
-COPY yolo11n.pt .
+# Model weights are deployment data and must be supplied through a private mount.
 RUN mkdir -p data/baselines data/models data/exports data/db data/alerts data/logs data/recordings data/backbones data/foe_objects data/model_packages data/inference_records data/validation
 
 EXPOSE 8080 1984 8554

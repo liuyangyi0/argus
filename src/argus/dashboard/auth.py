@@ -247,6 +247,32 @@ def require_permission(request: Request, permission: str) -> bool:
     return has_permission(request, permission)
 
 
+def require_human_permission(request: Request, permission: str) -> bool:
+    """Require an active account session for a human approval operation.
+
+    Shared API credentials and development auth bypass keep their existing
+    automation permissions, but cannot supply evidence of a human review.
+    The authentication source is set by middleware, never inferred from the
+    username: a real account named ``api`` or ``system`` remains valid.
+    """
+    if getattr(request.state, "auth_method", None) != "session":
+        return False
+    user = getattr(request.state, "user", None)
+    if not isinstance(user, dict):
+        return False
+    database = getattr(request.app.state, "database", None)
+    if database is None:
+        database = getattr(request.app.state, "db", None)
+    if database is None:
+        return False
+    identity = refresh_session_identity(user, database)
+    if identity is None:
+        return False
+    # Recheck the current role at the approval boundary as well as at login.
+    request.state.user = identity
+    return has_permission(request, permission)
+
+
 def get_denied_response(request: Request, permission: str) -> dict:
     """Build a standardized 403 response body for permission denial.
 
@@ -374,9 +400,11 @@ class AuthMiddleware:
 
         # HTTP requests
         request = Request(scope)
+        request.state.auth_method = "anonymous"
 
         if not self._enabled:
             request.state.user = {"username": "system", "role": "admin"}
+            request.state.auth_method = "disabled"
             await self.app(scope, receive, send)
             return
 
@@ -395,6 +423,7 @@ class AuthMiddleware:
                 current_identity = refresh_session_identity(user_info, self._database)
                 if current_identity is not None:
                     request.state.user = current_identity
+                    request.state.auth_method = "session"
                     await self.app(scope, receive, send)
                     return
 
@@ -402,6 +431,7 @@ class AuthMiddleware:
         api_token = request.headers.get("x-api-token", "")
         if api_token and self._verify_api_token(api_token):
             request.state.user = {"username": "api", "role": "admin"}
+            request.state.auth_method = "api_token"
             await self.app(scope, receive, send)
             return
 
@@ -415,6 +445,7 @@ class AuthMiddleware:
                     _, _, token = decoded.partition(":")
                     if token and self._verify_api_token(token):
                         request.state.user = {"username": "api", "role": "admin"}
+                        request.state.auth_method = "api_token"
                         await self.app(scope, receive, send)
                         return
                 except Exception:

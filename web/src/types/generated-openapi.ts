@@ -45,6 +45,94 @@ export type AlertWorkflowTransitionResponse = {
   severity: string
 }
 
+export type AnalysisTaskDeploymentResponse = {
+  applied_artifact_id?: (string) | (null)
+  applied_bundle_id?: (string) | (null)
+  applied_deployment_revision?: (number) | (null)
+  authority: string
+  current_operation_id?: (string) | (null)
+  deployment_revision?: number
+  desired_artifact_id?: (string) | (null)
+  desired_bundle_id?: (string) | (null)
+  desired_state?: ("running" | "stopped") | (null)
+  failure_code?: (string) | (null)
+  observed_at?: (string) | (null)
+  previous_bundle_id?: (string) | (null)
+  projection_status?: "not_synced" | "unbound" | "blocked" | "authorized" | "stale" | "shadow_unconfigured"
+  registry_artifact_id?: (string) | (null)
+  registry_model_version_id?: (string) | (null)
+  registry_release_revision?: (number) | (null)
+  registry_stage?: (string) | (null)
+  runtime_status?: string
+}
+
+export type AnalysisTaskResponse = {
+  authority: string
+  camera_id: string
+  config?: ({
+  [key: string]: unknown
+}) | (null)
+  config_sha256: string
+  created_at?: (string) | (null)
+  current_revision: number
+  deployment?: (AnalysisTaskDeploymentResponse) | (null)
+  lifecycle?: string
+  name?: (string) | (null)
+  runtime?: AnalysisTaskRuntimeResponse
+  source?: AnalysisTaskSourceResponse
+  task_id: string
+  template_id: string
+}
+
+export type AnalysisTaskRuntimeResponse = {
+  applied_task_revision?: (number) | (null)
+  artifact_sha256?: (string) | (null)
+  bundle_id?: (string) | (null)
+  generation?: (number) | (null)
+  mode?: ("shadow") | (null)
+  model_identity_verified?: (boolean) | (null)
+  model_version?: (string) | (null)
+  reason_code?: (string) | (null)
+  running?: (boolean) | (null)
+  state?: "unknown" | "stopped" | "starting" | "running" | "stopping" | "failed" | "blocked" | "waiting_source" | "sampling_insufficient" | "cleanup_pending" | "runtime_dead" | "cleanup_failed" | "draining"
+}
+
+export type AnalysisTaskSourceResponse = {
+  connected?: (boolean) | (null)
+  generation?: (number) | (null)
+  reason_code?: (string) | (null)
+  running?: (boolean) | (null)
+  state?: "unknown" | "stopped" | "starting" | "running" | "stopping" | "failed" | "blocked" | "waiting_source" | "sampling_insufficient" | "cleanup_pending" | "runtime_dead" | "cleanup_failed" | "draining"
+}
+
+export type AnalysisTaskTemplateResponse = {
+  availability: "legacy_compatibility" | "shadow"
+  default_config?: ({
+  [key: string]: unknown
+}) | (null)
+  deployment_authority?: "legacy" | "managed"
+  model_role_requirements?: {
+  [key: string]: {
+  [key: string]: Array<string>
+}
+}
+  model_roles?: {
+  [key: string]: string
+}
+  name: string
+  safety_contract: string
+  supports_creation?: boolean
+  template_id: string
+}
+
+export type AnalysisTaskTemplatesResponse = {
+  templates: Array<AnalysisTaskTemplateResponse>
+}
+
+export type AnalysisTasksResponse = {
+  tasks: Array<AnalysisTaskResponse>
+}
+
 export type ApiEnvelope = {
   code: number
   data: unknown
@@ -75,6 +163,24 @@ export type ApiEnvelope_AlertWorkflowTransitionResponse_ = {
   msg: string
 }
 
+export type ApiEnvelope_AnalysisTaskResponse_ = {
+  code: number
+  data: (AnalysisTaskResponse) | (null)
+  msg: string
+}
+
+export type ApiEnvelope_AnalysisTaskTemplatesResponse_ = {
+  code: number
+  data: (AnalysisTaskTemplatesResponse) | (null)
+  msg: string
+}
+
+export type ApiEnvelope_AnalysisTasksResponse_ = {
+  code: number
+  data: (AnalysisTasksResponse) | (null)
+  msg: string
+}
+
 export type ApiEnvelope_CameraDetailResponse_ = {
   code: number
   data: (CameraDetailResponse) | (null)
@@ -96,6 +202,12 @@ export type ApiEnvelope_CameraListResponse_ = {
 export type ApiEnvelope_CameraModeResponse_ = {
   code: number
   data: (CameraModeResponse) | (null)
+  msg: string
+}
+
+export type ApiEnvelope_CameraSourceResponse_ = {
+  code: number
+  data: (CameraSourceResponse) | (null)
   msg: string
 }
 
@@ -153,9 +265,39 @@ export type ApiEnvelope_ReplaySignalsResponse_ = {
   msg: string
 }
 
+export type ApiEnvelope_RollbackReadinessResponse_ = {
+  code: number
+  data: (RollbackReadinessResponse) | (null)
+  msg: string
+}
+
 export type ApiEnvelope_TaskCreated_ = {
   code: number
   data: (TaskCreated) | (null)
+  msg: string
+}
+
+export type ApiEnvelope_TaskDocumentResponse_ = {
+  code: number
+  data: (TaskDocumentResponse) | (null)
+  msg: string
+}
+
+export type ApiEnvelope_TaskDocumentsResponse_ = {
+  code: number
+  data: (TaskDocumentsResponse) | (null)
+  msg: string
+}
+
+export type ApiEnvelope_TaskReleaseReadinessResponse_ = {
+  code: number
+  data: (TaskReleaseReadinessResponse) | (null)
+  msg: string
+}
+
+export type ApiEnvelope_TaskResultsResponse_ = {
+  code: number
+  data: (TaskResultsResponse) | (null)
   msg: string
 }
 
@@ -237,9 +379,11 @@ export type CameraLifecycleResponse = {
   [key: string]: JsonValue
 }) | (null)
   connected?: (boolean) | (null)
+  error?: (string) | (null)
   health?: ({
   [key: string]: JsonValue
 }) | (null)
+  lifecycle?: (CameraRuntimeLifecycleResponse) | (null)
   name?: (string) | (null)
   pipeline_mode?: ("active" | "maintenance" | "learning" | "collection" | "training") | (null)
   running?: (boolean) | (null)
@@ -303,6 +447,16 @@ export type CameraRunnerResponse = {
   version_tag: string
 }
 
+export type CameraRuntimeLifecycleResponse = {
+  cleanup_pending: boolean
+  generation: number
+  legacy_error?: (string) | (null)
+  reason: (string) | (null)
+  starting: boolean
+  state: "cleanup_failed" | "stopping" | "draining" | "starting" | "running" | "source_only" | "runtime_dead" | "stopped"
+  stopping: boolean
+}
+
 export type CameraRuntimeResponse = {
   anomaly_locked: boolean
   capture_status: ({
@@ -341,6 +495,19 @@ export type CameraSourceDiagnosticsResponse = {
   source_consistency: string
 }
 
+export type CameraSourceResponse = {
+  camera_id: string
+  cleanup_pending?: boolean
+  connected?: (boolean) | (null)
+  frames_published?: (number) | (null)
+  generation?: (number) | (null)
+  reason_code?: (string) | (null)
+  running?: (boolean) | (null)
+  source_epoch?: (number) | (null)
+  source_session_id?: (string) | (null)
+  state?: string
+}
+
 export type CameraStatsResponse = {
   alerts_emitted: number
   anomalies_detected: number
@@ -356,9 +523,11 @@ export type CameraSummaryResponse = {
   [key: string]: JsonValue
 }) | (null)
   connected: boolean
+  error?: (string) | (null)
   health: ({
   [key: string]: JsonValue
 }) | (null)
+  lifecycle?: (CameraRuntimeLifecycleResponse) | (null)
   name: string
   pipeline_mode: ("active" | "maintenance" | "learning" | "collection" | "training") | (null)
   region_id: (number) | (null)
@@ -447,6 +616,14 @@ export type ModelRetireRequest = {
   idempotency_key?: (string) | (null)
   reason?: string
   triggered_by?: (string) | (null)
+}
+
+export type ModelRollbackRequest = {
+  expected_revision: number
+  idempotency_key: string
+  reason: string
+  source_model_version_id: string
+  source_release_revision: number
 }
 
 export type ModuleToggleRequest = {
@@ -637,6 +814,18 @@ export type ReplayTrajectoryPointResponse = {
   y: number
 }
 
+export type RollbackReadinessResponse = {
+  camera_id: string
+  checked_at: string
+  expected_revision: number
+  model_version_id: string
+  reasons: Array<string>
+  rollback_allowed: boolean
+  scene_reconfirmation_required?: true
+  source_model_version_id?: (string) | (null)
+  source_release_revision?: (number) | (null)
+}
+
 export type SceneCreateRequest = {
   normal_reference_confirmed: true
   reference_path: string
@@ -743,8 +932,125 @@ export type StrictBaselineRequest = {
   sources: Array<NormalSource>
 }
 
+export type TaskBundleCreateRequest = {
+  expected_revision: number
+  model_ids?: {
+  [key: string]: string
+}
+}
+
+export type TaskCandidateImportRequest = {
+  candidate: {
+  [key: string]: unknown
+}
+  expected_package_sha256: string
+  expected_revision: number
+}
+
+export type TaskCollectionRequest = {
+  expected_revision: number
+  params?: {
+  [key: string]: unknown
+}
+}
+
+export type TaskConfigurationRestoreRequest = {
+  bundle_id: string
+  expected_revision: number
+}
+
+export type TaskCreateRequest = {
+  camera_id: string
+  config?: {
+  [key: string]: unknown
+}
+  name: string
+  template_id: string
+}
+
 export type TaskCreated = {
   task_id: string
+}
+
+export type TaskDeploymentRequest = {
+  action: "deploy" | "stop" | "rollback"
+  bundle_id?: (string) | (null)
+  expected_deployment_revision: number
+}
+
+export type TaskDocumentResponse = {
+  document: {
+  [key: string]: unknown
+}
+}
+
+export type TaskDocumentsResponse = {
+  documents: Array<{
+  [key: string]: unknown
+}>
+}
+
+export type TaskModelRegisterRequest = {
+  descriptor: {
+  [key: string]: unknown
+}
+  relative_path: string
+  scope_camera_id?: (string) | (null)
+}
+
+export type TaskReleaseReadinessResponse = {
+  authority: "legacy" | "managed"
+  production_ready?: boolean
+  production_supported?: boolean
+  reasons: Array<string>
+  task_id: string
+}
+
+export type TaskResultsResponse = {
+  mode?: "shadow"
+  results: Array<{
+  [key: string]: unknown
+}>
+  task_id: string
+}
+
+export type TaskReviewImportRequest = {
+  expected_revision: number
+  payload: {
+  [key: string]: unknown
+}
+}
+
+export type TaskReviewRequest = {
+  annotation?: {
+  [key: string]: unknown
+}
+  decision: "approved" | "rejected" | "needs_review"
+  expected_image_sha256: string
+  expected_revision: number
+  notes?: string
+  sample_id: string
+}
+
+export type TaskRevisionRequest = {
+  expected_revision: number
+}
+
+export type TaskStartRequest = {
+  bundle_id: string
+}
+
+export type TaskTrainingProposalRequest = {
+  expected_revision: number
+  recipe_id: string
+}
+
+export type TaskUpdateRequest = {
+  config?: ({
+  [key: string]: unknown
+}) | (null)
+  expected_revision: number
+  name?: (string) | (null)
 }
 
 export type ThresholdUpdateRequest = {
@@ -965,6 +1271,154 @@ export interface CoreApiOperations {
     request: AlertWorkflowTransitionRequest
     response: ApiEnvelope_AlertWorkflowTransitionResponse_
   }
+  "GET /api/analysis-task-models": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "POST /api/analysis-task-models": {
+    request: TaskModelRegisterRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-task-templates": {
+    request: void
+    response: ApiEnvelope_AnalysisTaskTemplatesResponse_
+  }
+  "GET /api/analysis-tasks": {
+    request: void
+    response: ApiEnvelope_AnalysisTasksResponse_
+  }
+  "POST /api/analysis-tasks": {
+    request: TaskCreateRequest
+    response: ApiEnvelope_AnalysisTaskResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}": {
+    request: void
+    response: ApiEnvelope_AnalysisTaskResponse_
+  }
+  "PUT /api/analysis-tasks/{task_id}": {
+    request: TaskUpdateRequest
+    response: ApiEnvelope_AnalysisTaskResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/archive": {
+    request: TaskRevisionRequest
+    response: ApiEnvelope_AnalysisTaskResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/bundles": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/bundles": {
+    request: TaskBundleCreateRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/compatible-models": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/configuration-restores": {
+    request: TaskConfigurationRestoreRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/deployment": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/deployment-operations": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/deployment-operations/{operation_id}": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/deployment/reconcile": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/deployments": {
+    request: TaskDeploymentRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/model-compatibility": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/release-readiness": {
+    request: void
+    response: ApiEnvelope_TaskReleaseReadinessResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/results": {
+    request: void
+    response: ApiEnvelope_TaskResultsResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/runtime/start": {
+    request: TaskStartRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/runtime/stop": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/training-recipes": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/workflows": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/candidate": {
+    request: TaskCandidateImportRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/collect": {
+    request: TaskCollectionRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/freeze": {
+    request: TaskRevisionRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/preannotations": {
+    request: TaskRevisionRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/review": {
+    request: TaskReviewRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/workflows/{workflow_id}/review-export": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/review-import": {
+    request: TaskReviewImportRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/workflows/{workflow_id}/samples/{sample_id}/image": {
+    request: void
+    response: Blob
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/stop": {
+    request: TaskRevisionRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/training": {
+    request: TaskTrainingProposalRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/training-approve": {
+    request: TaskRevisionRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/workflows/{workflow_id}/training-export": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
   "POST /api/cameras": {
     request: void
     response: (ApiEnvelope) & ({
@@ -1038,6 +1492,14 @@ export interface CoreApiOperations {
   "GET /api/cameras/{camera_id}/snapshot": {
     request: void
     response: Blob
+  }
+  "GET /api/cameras/{camera_id}/source": {
+    request: void
+    response: ApiEnvelope_CameraSourceResponse_
+  }
+  "POST /api/cameras/{camera_id}/source/{action}": {
+    request: void
+    response: ApiEnvelope_CameraSourceResponse_
   }
   "POST /api/cameras/{camera_id}/start": {
     request: void
@@ -1296,10 +1758,14 @@ export interface CoreApiOperations {
 })
   }
   "POST /api/models/{version_id}/rollback": {
-    request: void
+    request: (ModelRollbackRequest) | (null)
     response: (ApiEnvelope) & ({
   data?: (unknown) | (null)
 })
+  }
+  "GET /api/models/{version_id}/rollback-readiness": {
+    request: void
+    response: ApiEnvelope_RollbackReadinessResponse_
   }
   "GET /api/models/{version_id}/shadow-report": {
     request: void

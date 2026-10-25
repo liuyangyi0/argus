@@ -8,6 +8,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from argus.config.schema import AuthConfig
+from argus.dashboard.auth import AuthMiddleware, create_session_token, hash_password
 from argus.dashboard.routes import labeling, training_jobs
 from argus.storage.database import Database
 from argus.storage.models import (
@@ -20,7 +22,8 @@ from argus.storage.models import (
 def db(tmp_path):
     database = Database(database_url=f"sqlite:///{(tmp_path / 'argus.db').as_posix()}")
     database.initialize()
-    return database
+    yield database
+    database.close()
 
 
 @pytest.fixture
@@ -29,14 +32,24 @@ def app(db):
     app.state.db = db
     app.state.database = db
 
-    @app.middleware("http")
-    async def _engineer_user(request, call_next):
-        request.state.user = {"username": "engineer", "role": "engineer"}
-        return await call_next(request)
+    db.create_user("engineer", hash_password("lineage-test-password"), "engineer", None)
+    app.add_middleware(
+        AuthMiddleware, config=AuthConfig(enabled=True),
+        session_secret="lineage-session-test-only", database=db,
+    )
 
     app.include_router(labeling.router, prefix="/labeling")
     app.include_router(training_jobs.router, prefix="/training-jobs")
     return app
+
+
+@pytest.fixture
+def client(app):
+    client = TestClient(app)
+    client.cookies.set("argus_session", create_session_token(
+        "engineer", "engineer", "lineage-session-test-only",
+    ))
+    return client
 
 
 def _save_labeled_entries(db: Database, tmp_path, count: int = 5) -> list[int]:
@@ -59,9 +72,8 @@ def _save_labeled_entries(db: Database, tmp_path, count: int = 5) -> list[int]:
     return ids
 
 
-def test_trigger_retrain_stores_label_ids_without_consuming(app, db, tmp_path):
+def test_trigger_retrain_stores_label_ids_without_consuming(client, db, tmp_path):
     entry_ids = _save_labeled_entries(db, tmp_path)
-    client = TestClient(app)
 
     response = client.post(
         "/labeling/trigger-retrain",
@@ -78,9 +90,8 @@ def test_trigger_retrain_stores_label_ids_without_consuming(app, db, tmp_path):
     assert {entry.id for entry in reusable} == set(entry_ids)
 
 
-def test_rejected_triggered_job_leaves_labels_reusable(app, db, tmp_path):
+def test_rejected_triggered_job_leaves_labels_reusable(client, db, tmp_path):
     entry_ids = _save_labeled_entries(db, tmp_path)
-    client = TestClient(app)
     trigger_response = client.post(
         "/labeling/trigger-retrain",
         json={"camera_id": "cam_01", "model_type": "patchcore"},

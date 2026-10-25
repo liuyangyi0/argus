@@ -26,7 +26,9 @@ from argus.dashboard.api_contracts import (
     ModelPromoteRequest,
     ModelReexportRequest,
     ModelRetireRequest,
+    ModelRollbackRequest,
     ReleaseReadinessResponse,
+    RollbackReadinessResponse,
 )
 from argus.dashboard.api_response import (
     ApiEnvelope,
@@ -41,7 +43,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import current_username, require_permission
+from argus.dashboard.auth import current_username, require_human_permission, require_permission
 from argus.dashboard.model_runtime import get_registry
 from argus.preprocessing.scene_profile import runtime_artifact_sha256
 from argus.storage.model_registry import (
@@ -177,6 +179,16 @@ def release_service_for_app(state) -> ModelReleaseService | None:
 
     def _runtime_prepare(plan) -> RuntimeReleasePreparation:
         camera_manager = getattr(state, "camera_manager", None)
+        if getattr(plan, "rollback_context", None) is not None:
+            runtime = _safe_runtime_state(camera_manager, plan.camera_id)
+            context = plan.rollback_context
+            if not runtime or (
+                runtime.get("primary_model_version") != context["source_model_version_id"]
+                or runtime.get("release_revision") != context["source_release_revision"]
+            ):
+                return RuntimeReleasePreparation(
+                    success=False, error="Rollback source does not match the running model revision",
+                )
         if (
             camera_manager is None
             or inspect.getattr_static(
@@ -378,31 +390,80 @@ async def activate_model(request: Request, version_id: str):
 
 
 @router.post("/{version_id}/rollback")
-async def rollback_model(request: Request, version_id: str):
-    """Reject rollback until it has a two-phase release transaction.
-
-    The historical implementation switched registry rows first and attempted a
-    runtime reload afterwards.  ``ModelReleaseService.request_transition`` does
-    not currently represent retired-production → production rollback, so this
-    command fails closed instead of restoring the old unsafe sequence.
-    """
-    denied = _deny_without_permission(request, "rollback_model")
-    if denied:
-        return denied
-
-    registry = _get_registry(request)
-    if registry is None:
+def rollback_model(request: Request, version_id: str, body: ModelRollbackRequest | None = None):
+    """Queue an explicit retired target; never infer or directly mutate a fallback."""
+    if not require_human_permission(request, "rollback_model"):
+        return api_forbidden("回滚需要具有权限的独立用户登录会话")
+    if body is None:
+        return api_conflict("旧回滚命令已禁用；请先检查目标版本并提交受控两阶段回滚")
+    service = _get_release_service(request)
+    if service is None:
         return api_unavailable("数据库不可用")
+    worker = release_worker_for_app(request.app.state)
+    if worker is None or not worker.running:
+        return api_unavailable("模型发布执行器未运行")
+    try:
+        operation, record = service.submit_rollback(
+            model_version_id=version_id,
+            source_model_version_id=body.source_model_version_id,
+            source_release_revision=body.source_release_revision,
+            expected_revision=body.expected_revision,
+            reason=body.reason, requested_by=current_username(request),
+            idempotency_key=body.idempotency_key,
+        )
+        worker.notify()
+        payload = {
+            "operation_id": operation.operation_id, "operation": operation.to_dict(),
+            "model": record.to_dict(), "runtime_synced": operation.status == "applied",
+            "runtime_state": operation.to_dict().get("runtime_state"),
+            "scene_reconfirmation_required": True,
+        }
+        if operation.status == "failed":
+            return api_error(ErrorCode.CONFLICT, operation.error or "回滚失败", status_code=409, data=payload)
+        return api_success(payload, status_code=202)
+    except (ValueError, StageTransitionError) as exc:
+        return api_conflict(str(exc))
 
-    # Look up the camera_id from the version_id
-    record = registry.get_by_version_id(version_id)
-    if record is None:
+
+@router.get("/{version_id}/rollback-readiness", response_model=ApiEnvelope[RollbackReadinessResponse])
+def get_rollback_readiness(request: Request, version_id: str):
+    if not require_human_permission(request, "rollback_model"):
+        return api_forbidden("回滚检查需要具有权限的独立用户登录会话")
+    service = _get_release_service(request)
+    registry = _get_registry(request)
+    if service is None or registry is None:
+        return api_unavailable("数据库不可用")
+    model = registry.get_by_version_id(version_id)
+    if model is None:
         return api_not_found(f"模型版本不存在: {version_id}")
-    return api_conflict(
-        "回滚入口已安全关闭，未修改 registry 或运行时。只有在回滚被纳入 "
-        "ModelReleaseService 两阶段事务后才能恢复该操作；当前请发布一个经过 "
-        "baseline v3 与可信 soak 验证的新版本。"
-    )
+    context: dict = {}
+    reasons: list[str] = []
+    try:
+        context = service.rollback_readiness(version_id)
+    except Exception as exc:
+        # Paths and detailed evidence exceptions remain in the server log.
+        logger.warning("models.rollback_readiness_rejected", model_version_id=version_id, error=str(exc))
+        reasons.append("历史生产记录或原始发布证据未通过复核；请核对目标场景绑定及证据文件")
+    worker = release_worker_for_app(request.app.state)
+    if worker is None or not worker.running:
+        reasons.append("模型发布执行器未运行")
+    manager = getattr(request.app.state, "camera_manager", None)
+    runtime = _safe_runtime_state(manager, model.camera_id)
+    if _public_runtime_method(manager, "prepare_model_release") is None or not runtime or (
+        runtime.get("primary_model_version") != context.get("source_model_version_id")
+        or runtime.get("release_revision") != context.get("source_release_revision")
+    ):
+        reasons.append("当前运行模型与待替换的生产版本或修订号不一致")
+    if any(op.camera_id == model.camera_id for op in service.list_pending_operations()):
+        reasons.append("该摄像头已有待完成的发布操作")
+    return api_typed_success({
+        "model_version_id": version_id, "camera_id": model.camera_id,
+        "expected_revision": context.get("expected_revision", int(model.release_revision or 0)),
+        "source_model_version_id": context.get("source_model_version_id"),
+        "source_release_revision": context.get("source_release_revision"),
+        "rollback_allowed": not reasons, "reasons": reasons,
+        "scene_reconfirmation_required": True, "checked_at": datetime.now(timezone.utc),
+    }, RollbackReadinessResponse)
 
 
 def _run_batch_inference(
@@ -896,6 +957,10 @@ def promote_model(
         return api_unavailable("数据库不可用")
 
     target_stage = body.target_stage
+    if target_stage == ModelStage.PRODUCTION.value and not require_human_permission(
+        request, "manage_models",
+    ):
+        return api_forbidden("生产发布审批需要具有权限的独立用户登录会话")
     triggered_by = current_username(request)
 
     try:

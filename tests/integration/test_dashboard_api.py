@@ -19,6 +19,7 @@ from argus.config.loader import save_config
 from argus.config.schema import ArgusConfig
 from argus.core.health import HealthMonitor
 from argus.dashboard.app import create_app
+from argus.dashboard.auth import create_session_token, hash_password
 from argus.dashboard.tasks import TaskManager
 from argus.storage.database import Database
 from argus.storage.model_registry import ModelRegistry
@@ -382,6 +383,8 @@ class TestDashboardFeatureChain:
     ):
         """Exercise the dashboard chain from camera add to model activation."""
         config = ArgusConfig()
+        config.auth.enabled = True
+        config.auth.api_token = "dashboard-chain-test-token"
         config.dashboard.go2rtc_enabled = False
         config_path = tmp_path / "config.yaml"
         save_config(config, config_path)
@@ -395,6 +398,7 @@ class TestDashboardFeatureChain:
         task_manager = MagicMock()
         task_manager.submit.return_value = "baseline-task-001"
 
+        integration_db.create_user("review-admin", hash_password("test-review-password"), "admin")
         app = create_app(
             database=integration_db,
             camera_manager=camera_manager,
@@ -410,6 +414,9 @@ class TestDashboardFeatureChain:
             min_canary_days=0,
         )
         client = running_release_client(app)
+        client.cookies.set("argus_session", create_session_token(
+            "review-admin", "admin", app.state.session_secret,
+        ))
 
         add_resp = client.post(
             "/api/cameras",

@@ -7,10 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient as FastAPITestClient
 
 from argus.config.loader import load_config
-from argus.config.schema import DashboardConfig
+from argus.config.schema import AuthConfig, DashboardConfig
 from argus.dashboard.app import create_app
 from argus.dashboard.routes.models import _get_release_anomaly_config
 from argus.preprocessing.scene_profile import runtime_artifact_sha256
@@ -125,8 +125,11 @@ class ReadinessCameraManager(ReleaseStateCameraManager):
 
 @pytest.fixture()
 def db(tmp_path):
+    from argus.dashboard.auth import hash_password
+
     database = Database(database_url=f"sqlite:///{tmp_path / 'api_policy.db'}")
     database.initialize()
+    database.create_user("admin", hash_password("release-test-password"), "admin")
     yield database
     database.close()
 
@@ -144,7 +147,10 @@ def _make_app(db, camera_manager, alerts_dir):
         database=db,
         camera_manager=camera_manager,
         alerts_dir=str(alerts_dir),
-        config=SimpleNamespace(dashboard=DashboardConfig(go2rtc_enabled=False), cameras=[]),
+        config=SimpleNamespace(
+            dashboard=DashboardConfig(go2rtc_enabled=False), cameras=[],
+            auth=AuthConfig(enabled=True, api_token="test-release-policy-token-very-long"),
+        ),
     )
     app.state._release_pipeline = ReleasePipeline(
         db.get_session,
@@ -152,6 +158,22 @@ def _make_app(db, camera_manager, alerts_dir):
         min_canary_days=0,
     )
     return app
+
+
+def _login(client):
+    response = client.post("/login", data={"username": "admin", "password": "release-test-password"}, follow_redirects=False)
+    assert response.status_code == 302 and "argus_session=" in response.headers.get("set-cookie", ""), response.text
+    return client
+
+
+def TestClient(app):
+    """Exercise release approval through a real account session, not auth bypass."""
+    return _login(FastAPITestClient(app))
+
+
+@pytest.fixture
+def running_release_client(running_release_client):
+    return lambda app: _login(running_release_client(app))
 
 
 def _create_model_tree(root: Path, camera_id: str = "cam_01") -> tuple[Path, Path]:
@@ -422,7 +444,7 @@ def test_promote_ignores_client_triggered_by_and_uses_authenticated_user(
     await_release_operation(client, response)
     event = registry.get_version_events(model_version_id=version_id, limit=1)[0]
     assert event.to_stage == "shadow"
-    assert event.triggered_by == "system"
+    assert event.triggered_by == "admin"
 
 
 @pytest.mark.parametrize("operation", ["reexport", "recalibrate"])
@@ -535,11 +557,77 @@ def test_rollback_legacy_endpoint_fails_closed_without_state_change(
     response = client.post(f"/api/models/{version_id_2}/rollback")
 
     assert response.status_code == 409
-    assert "回滚入口已安全关闭" in response.json()["msg"]
+    assert "旧回滚命令已禁用" in response.json()["msg"]
     registry = ModelRegistry(session_factory=db.get_session)
     assert registry.get_active("cam_01").model_version_id == version_id_2
     assert registry.get_by_version_id(version_id_1).stage == "retired"
     camera_manager.reload_model.assert_not_called()
+
+
+@pytest.mark.parametrize("identity", ["session", "api_token", "auth_disabled"])
+def test_typed_rollback_command_requires_human_session_and_only_enqueues(
+    db, alerts_dir, monkeypatch, identity,
+):
+    app = _make_app(db, LegacyCameraManager(), alerts_dir)
+    if identity == "auth_disabled":
+        app = create_app(database=db, alerts_dir=str(alerts_dir))
+    client = TestClient(app) if identity == "session" else FastAPITestClient(app)
+    if identity == "api_token":
+        client.headers["X-API-Token"] = "test-release-policy-token-very-long"
+    service = MagicMock()
+    service.submit_rollback.return_value = (
+        SimpleNamespace(operation_id="rollback-op", status="pending", to_dict=lambda: {
+            "operation_id": "rollback-op", "status": "pending",
+        }),
+        SimpleNamespace(to_dict=lambda: {"model_version_id": "target", "stage": "retired"}),
+    )
+    worker = SimpleNamespace(running=True, notify=MagicMock())
+    monkeypatch.setattr("argus.dashboard.routes.models._get_release_service", lambda request: service)
+    monkeypatch.setattr("argus.dashboard.routes.models.release_worker_for_app", lambda state: worker)
+    response = client.post("/api/models/target/rollback", json={
+        "source_model_version_id": "current", "source_release_revision": 3, "expected_revision": 4,
+        "reason": "restore proven version", "idempotency_key": "same-command",
+    })
+    if identity != "session":
+        assert response.status_code == 403
+        service.submit_rollback.assert_not_called()
+        worker.notify.assert_not_called()
+    else:
+        assert response.status_code == 202
+        assert response.json()["data"]["operation_id"] == "rollback-op"
+        assert response.json()["data"]["scene_reconfirmation_required"] is True
+        assert response.json()["data"]["runtime_synced"] is False
+        service.submit_rollback.assert_called_once_with(
+            model_version_id="target", source_model_version_id="current", source_release_revision=3,
+            expected_revision=4, reason="restore proven version", requested_by="admin", idempotency_key="same-command",
+        )
+        worker.notify.assert_called_once()
+    service.execute_operation.assert_not_called()
+
+
+def test_rollback_readiness_uses_validated_revision_without_claiming_scene_usable(db, alerts_dir, monkeypatch):
+    app = _make_app(db, LegacyCameraManager(), alerts_dir)
+    client = TestClient(app)
+    service = MagicMock()
+    service.rollback_readiness.return_value = {
+        "expected_revision": 6, "source_model_version_id": "current", "source_release_revision": 5,
+    }
+    service.list_pending_operations.return_value = []
+    registry = SimpleNamespace(get_by_version_id=lambda version: SimpleNamespace(camera_id="cam_01", release_revision=4))
+    monkeypatch.setattr("argus.dashboard.routes.models._get_release_service", lambda request: service)
+    monkeypatch.setattr("argus.dashboard.routes.models._get_registry", lambda request: registry)
+    monkeypatch.setattr("argus.dashboard.routes.models.release_worker_for_app", lambda state: SimpleNamespace(running=True))
+    monkeypatch.setattr("argus.dashboard.routes.models._public_runtime_method", lambda manager, method: lambda: None)
+    monkeypatch.setattr("argus.dashboard.routes.models._safe_runtime_state", lambda manager, camera_id: {
+        "primary_model_version": "current", "release_revision": 5, "scene_guard": {"usable": False},
+    })
+    response = client.get("/api/models/target/rollback-readiness")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["rollback_allowed"] is True
+    assert data["expected_revision"] == 6
+    assert data["scene_reconfirmation_required"] is True
+    service.submit_rollback.assert_not_called()
 
 
 def test_rollback_api_fails_closed_when_previous_sidecar_changed(
@@ -571,7 +659,7 @@ def test_rollback_api_fails_closed_when_previous_sidecar_changed(
     response = client.post(f"/api/models/{version_id_2}/rollback")
 
     assert response.status_code == 409
-    assert "回滚入口已安全关闭" in response.json()["msg"]
+    assert "旧回滚命令已禁用" in response.json()["msg"]
     camera_manager.reload_model.assert_not_called()
 
 

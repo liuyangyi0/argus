@@ -14,7 +14,7 @@ Argus 将多路视频接入、场景与机位校验、异常检测、告警处�
 - **场景校验**：SceneGuard 检查当前画面与已批准场景是否匹配；不匹配时保留预览，暂停受保护检测流程并显示原因。
 - **异常检测**：结合正常场景基线、异常模型、运动分析和时序证据，检测持续变化并形成告警候选；支持 include / exclude 区域。
 - **告警与回放**：支持筛选、确认、误报反馈和实时更新，按告警类型和配置关联可用的录像、快照、热力图、轨迹及诊断信号，方便复核告警来源。
-- **基线与模型**：管理场景、基线版本、训练确认、独立校准、模型登记、分阶段发布与回滚。训练完成不等于自动上线。
+- **基线与模型**：管理场景、基线版本、训练确认、独立校准、模型登记与分阶段发布；支持重新核验证据后回滚到历史已应用的生产版本，不支持任意旧模型直接上线。训练完成不等于自动上线。
 - **权限与运维**：提供角色权限、审计、运行状态、故障与降级提示、配置管理、备份和清理入口。
 
 ### 检测通道
@@ -29,6 +29,12 @@ Argus 将多路视频接入、场景与机位校验、异常检测、告警处�
 “开启”指配置状态，不代表视频源、模型或检测质量已经就绪。快速运动目标对帧率、分辨率和运动模糊有额外要求；水渍与羽流分析不提供液体成分或无色气体识别。具体参数见 [默认配置](configs/default.yaml)，适用边界见 [检测质量验收](docs/acceptance.md)。
 
 开放词汇分类、分割、跨摄像头关联和自动重训练也是可选模块，默认关闭。
+
+### 单摄像头多任务（旁路阶段）
+
+相机详情新增多任务工作台：同一采集源可保留原异物检测，同时配置目标检测、姿态、安全帽和快速运动旁路任务。任务配置、候选模型、执行包和运行状态独立管理，提供周期采集、逐帧人审、数据集冻结与外部训练清单交接。
+
+新模型适配器目前只接受受控的静态 YOLOv8 ONNX 格式；不支持任意模型即插即用。新任务不产生生产告警，生产发布保持 NO-GO；训练交接不等于内置训练已完成，CVAT/FiftyOne 任务图片导出也不表示已上传外部服务。能力与依赖边界见 [多任务平台 P3—P6](docs/design/multi-task-platform-p3-p6.md)。
 
 ## 业务流程
 
@@ -51,11 +57,13 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
 
-npm --prefix web install
+npm --prefix web ci
 npm --prefix web run build
 ```
 
 前端构建产物位于 `web/dist`，完成构建后后端才能托管完整 Vue 工作台。CVAT、FiftyOne 和 LightGlue 不属于这组默认安装依赖。
+
+可复现的普通功能环境见 [依赖锁定说明](requirements/README.md)；Linux 镜像的配置、持久化和验证见 [容器部署手册](docs/runbooks/container-deployment.md)。
 
 ### 2. 配置并启动
 
@@ -70,6 +78,8 @@ python -m argus --config configs/default.yaml
 打开 [本机工作台](http://127.0.0.1:8080)。默认仅绑定回环地址，认证关闭；空数据库首次初始化账号为 `admin/admin`。对外访问前必须更换默认密码、开启认证、设置强随机 API token，并配置 TLS 与网络访问控制。
 
 配置支持进程环境变量覆盖，例如 `ARGUS__AUTH__ENABLED`、`ARGUS__AUTH__API_TOKEN`。变量清单见 [.env.example](.env.example)；Argus 不会自动加载 `.env` 文件，需要由终端或服务管理器显式导入。
+
+场景批准、训练确认等人工审批必须先开启认证，再使用独立的工程或管理员账号登录。关闭认证模式和共享 API token 不能代替个人审批身份。
 
 ### 3. 前端开发模式（可选）
 
@@ -101,11 +111,14 @@ npm --prefix web run dev -- --host 127.0.0.1
 
 ```powershell
 .\.venv\Scripts\python.exe scripts/run_local_functional_tests.py --suite core
+.\.venv\Scripts\python.exe scripts/run_local_functional_tests.py --suite platform
 .\.venv\Scripts\python.exe scripts/run_local_frontend_tests.py unit
 .\.venv\Scripts\python.exe scripts/run_local_frontend_tests.py build
 ```
 
 完整普通功能清单和隔离浏览器验证见 [开发验证说明](docs/runbooks/video-review-integrations.md#本机普通功能验证禁训练和识别)。真实训练、识别、GPU 性能、完整视频回归和长稳运行需另行验证；模拟测试通过不代表这些项目已通过。
+
+已进行受控的新相机 GPU 训练、完整校准、候选离线评分及真实旁路任务隔离/恢复/回滚验证；范围和未验收项见 [Windows GPU 验证记录](docs/runbooks/windows-gpu-task-validation.md#新相机离线流程验证记录2026-10-25)。这些流程检查不代表模型精度合格或生产部署已放行。
 
 ## 代码与文档
 

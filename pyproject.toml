@@ -47,6 +47,11 @@ lucid = ["arena-api>=2.0"]
 cvat = ["cvat-sdk>=2.79,<2.80"]
 # Offline review tools are optional; prefer an isolated venv for FiftyOne.
 review = ["cvat-sdk>=2.79,<2.80", "fiftyone>=1.8,<2.0"]
+# Managed shadow workers only. Choose one ORT distribution in a dedicated
+# deployment environment; never install both CPU and CUDA extras together.
+# 1.23.2 is required for constructor-time enable_fallback=0 support.
+task-onnx-cpu = ["onnx>=1.17,<2", "onnxruntime>=1.23.2,<2"]
+task-onnx-cuda = ["onnx>=1.17,<2", "onnxruntime-gpu>=1.23.2,<2"]
 # Explicit offline SceneGuard comparison only; never imported by the live pipeline.
 lightglue = [
     "lightglue @ git+https://github.com/cvg/LightGlue.git@eb42fee2d71449efb0aa5c10549752b5d75384d8",

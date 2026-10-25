@@ -415,6 +415,10 @@ class GigECapture:
 
     def request_reconnect(self) -> None:
         """Request a non-blocking reconnection attempt."""
+        owner = getattr(self, "_reconnect_handler", None)
+        if owner is not None:
+            owner()
+            return
         with self._reconnect_lock:
             if self._reconnecting:
                 return
@@ -426,6 +430,14 @@ class GigECapture:
             daemon=True,
         )
         thread.start()
+
+    def set_reconnect_handler(self, handler) -> None:
+        """Use the manager's sole source owner for reconnects."""
+        self._reconnect_handler = handler
+
+    def request_stop(self) -> None:
+        """Signal shutdown; native handles are released after the reader exits."""
+        self._stop_event.set()
 
     def _reconnect_background(self) -> None:
         """Background reconnection with exponential backoff."""

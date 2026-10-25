@@ -311,6 +311,7 @@ dashboard:
   host: 127.0.0.1
   port: 8080
   debug: false
+  frontend_dist_dir: null
   mjpeg_fps: 5.0
   websocket_heartbeat_seconds: 30
   websocket_max_connections: 100

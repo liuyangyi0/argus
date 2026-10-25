@@ -89,6 +89,7 @@ class ReleaseTransitionPlan:
     release_evidence_json: str | None
     release_evidence_sha256: str | None
     validated_at: datetime
+    rollback_context: dict | None = None
 
 
 class ReleasePipeline:
@@ -263,6 +264,46 @@ class ReleasePipeline:
                 validated_at=now,
             )
 
+    def prepare_rollback(
+        self,
+        *,
+        model_version_id: str,
+        expected_revision: int,
+        rollback_context: dict,
+        release_evidence: object,
+    ) -> ReleaseTransitionPlan:
+        """Restore only proven production history; never alter normal stage rules."""
+        from argus.storage.model_registry import validate_persisted_release_evidence
+        from argus.storage.rollback_policy import validate_rollback_context
+
+        with self._session_factory() as session:
+            record = validate_rollback_context(session, model_version_id, rollback_context)
+            if int(record.release_revision or 0) != expected_revision:
+                raise StageTransitionError("Stale rollback target revision")
+            old_validation = validate_persisted_release_evidence(record)
+            if not old_validation.valid:
+                raise StageTransitionError(
+                    "Original production evidence rejected: " + "; ".join(old_validation.reasons)
+                )
+            artifact = runtime_artifact_sha256(record.model_path)
+            validation = self._validate_production_evidence(
+                record, release_evidence, artifact_sha256=artifact,
+            )
+            if not validation.valid:
+                raise StageTransitionError(
+                    "Rollback production evidence rejected: " + "; ".join(validation.reasons)
+                )
+            return ReleaseTransitionPlan(
+                model_version_id=record.model_version_id, camera_id=record.camera_id,
+                from_stage=record.stage, target_stage=ModelStage.PRODUCTION.value,
+                expected_revision=expected_revision, canary_camera_id=None,
+                model_path=record.model_path, runtime_artifact_sha256=artifact,
+                release_evidence_json=validation.canonical_json,
+                release_evidence_sha256=validation.sha256,
+                validated_at=datetime.now(timezone.utc),
+                rollback_context=json.loads(json.dumps(rollback_context)),
+            )
+
     def commit_transition(
         self,
         plan: ReleaseTransitionPlan,
@@ -310,6 +351,32 @@ class ReleasePipeline:
                         raise StageTransitionError(
                             "Release operation no longer matches validated plan"
                         )
+
+                if plan.rollback_context is not None:
+                    from argus.storage.model_registry import validate_persisted_release_evidence
+                    from argus.storage.rollback_policy import validate_rollback_context
+
+                    if operation is None or json.loads(operation.desired_state_json).get(
+                        "rollback"
+                    ) != plan.rollback_context:
+                        raise StageTransitionError("Rollback requires its exact durable command")
+                    source = plan.rollback_context
+                    reserved = session.query(ModelRecord).filter_by(
+                        model_version_id=source["source_model_version_id"],
+                        camera_id=plan.camera_id, stage="production", is_active=True,
+                        release_revision=source["source_release_revision"],
+                    ).update(
+                        {"release_revision": source["source_release_revision"]},
+                        synchronize_session=False,
+                    )
+                    if reserved != 1:
+                        raise StageTransitionError("Rollback source production changed")
+                    target = validate_rollback_context(
+                        session, plan.model_version_id, plan.rollback_context,
+                    )
+                    validation = validate_persisted_release_evidence(target)
+                    if not validation.valid:
+                        raise StageTransitionError("Rollback original evidence changed before commit")
 
                 # The conditional UPDATE is the cross-process CAS.  A normal
                 # query/check pair would permit two workers to validate the
@@ -410,7 +477,7 @@ class ReleasePipeline:
                 session.add(AuditLog(
                     timestamp=plan.validated_at,
                     user=triggered_by,
-                    action="model_stage_transition",
+                    action="model_rollback" if plan.rollback_context else "model_stage_transition",
                     target_type="model",
                     target_id=plan.model_version_id,
                     detail=(

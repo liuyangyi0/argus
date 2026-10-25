@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, h, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { Button, notification } from 'ant-design-vue'
+import { Button, Drawer, notification } from 'ant-design-vue'
 import {
   AlertOutlined,
   BarChartOutlined,
@@ -119,26 +119,74 @@ const modelsOpen = ref(isActive('/models'))
 const systemOpen = ref(isActive('/system'))
 const viewportWidth = ref(typeof window === 'undefined' ? 1280 : window.innerWidth)
 const compactSidebar = computed(() => viewportWidth.value >= 768 && viewportWidth.value < 1280)
+const compactNavigation = ref<'models' | 'system' | null>(null)
+const compactNavigationDialog = ref<HTMLElement | null>(null)
+let compactNavigationTrigger: HTMLElement | null = null
+const compactNavigationTitle = computed(() => compactNavigation.value === 'models' ? '模型管理导航' : '系统设置导航')
+const compactNavigationItems = computed(() => compactNavigation.value === 'models'
+  ? visibleModelsChildren.value : visibleSystemChildren.value)
+
+watch(compactSidebar, () => { compactNavigation.value = null })
+
+function closeCompactNavigation() {
+  compactNavigation.value = null
+}
+
+function onCompactNavigationVisibilityChange(open: boolean) {
+  if (open && compactNavigation.value) {
+    const dialog = compactNavigationDialog.value
+    // The animation may finish after the user has already moved focus inside
+    // the drawer. Initial focus must not overwrite that keyboard interaction.
+    if (dialog && !dialog.contains(document.activeElement)) {
+      dialog.querySelector<HTMLElement>('a')?.focus()
+    }
+  } else if (!open && !compactNavigation.value && compactSidebar.value && compactNavigationTrigger?.isConnected) {
+    compactNavigationTrigger.focus()
+  }
+}
+
+function handleCompactNavigationKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    closeCompactNavigation()
+    return
+  }
+  if (event.key !== 'Tab') return
+  const items = compactNavigationDialog.value?.querySelectorAll<HTMLElement>('a[href], button')
+  if (!items?.length) return
+  const first = items[0]!
+  const last = items[items.length - 1]!
+  const focused = document.activeElement
+  if (!compactNavigationDialog.value?.contains(focused)
+      || (event.shiftKey && focused === first) || (!event.shiftKey && focused === last)) {
+    event.preventDefault()
+    const target = event.shiftKey ? last : first
+    target.focus()
+  }
+}
 
 // Auto-open the parent group whose route is active
 watch(
   () => route.path,
   (p) => {
+    compactNavigation.value = null
     if (p.startsWith('/models')) modelsOpen.value = true
     if (p.startsWith('/system')) systemOpen.value = true
   },
 )
 
-function toggleModels() {
+function toggleModels(event: MouseEvent) {
   if (compactSidebar.value) {
-    void router.push('/models')
+    compactNavigationTrigger = event.currentTarget as HTMLElement
+    compactNavigation.value = 'models'
     return
   }
   modelsOpen.value = !modelsOpen.value
 }
-function toggleSystem() {
+function toggleSystem(event: MouseEvent) {
   if (compactSidebar.value) {
-    void router.push('/system')
+    compactNavigationTrigger = event.currentTarget as HTMLElement
+    compactNavigation.value = 'system'
     return
   }
   systemOpen.value = !systemOpen.value
@@ -176,6 +224,13 @@ const { connected: wsConnected, reconnecting: wsReconnecting, fallbackMode: wsFa
   },
 })
 
+const realtimeStatus = computed(() => {
+  if (wsConnected.value) return '实时已连接'
+  if (wsFallbackMode.value) return '实时数据受限'
+  if (wsReconnecting.value) return '实时重连中'
+  return '实时未连接'
+})
+
 // 痛点 4: global pipeline mode banner (capturing / training / maintenance)
 const { showBanner: showModeBanner, bannerLabel: modeBannerLabel, bannerColor: modeBannerColor } = useSystemMode()
 
@@ -191,6 +246,12 @@ const navKeys: Record<string, string> = {
 }
 
 function handleKeyDown(e: KeyboardEvent) {
+  // Keep focus inside the modal navigation and prevent global page shortcuts
+  // from navigating behind it. Ant Design's drawer does not trap focus.
+  if (compactNavigation.value) {
+    handleCompactNavigationKeydown(e)
+    return
+  }
   const tag = (e.target as HTMLElement)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
 
@@ -243,19 +304,19 @@ onUnmounted(() => {
         <div class="nav">
           <div class="nav-label">工作台</div>
 
-          <router-link to="/overview" :class="{ active: isActive('/overview') }">
+          <router-link to="/overview" aria-label="总览" :class="{ active: isActive('/overview') }">
             <DashboardOutlined /><span class="nav-text">总览</span>
           </router-link>
 
-          <router-link to="/cameras" :class="{ active: isActive('/cameras') }">
+          <router-link to="/cameras" aria-label="摄像头" :class="{ active: isActive('/cameras') }">
             <VideoCameraOutlined /><span class="nav-text">摄像头</span>
           </router-link>
 
-          <router-link to="/alerts" :class="{ active: isActive('/alerts') }">
+          <router-link to="/alerts" aria-label="告警中心" :class="{ active: isActive('/alerts') }">
             <AlertOutlined /><span class="nav-text">告警中心</span>
           </router-link>
 
-          <router-link to="/reports" :class="{ active: isActive('/reports') }">
+          <router-link to="/reports" aria-label="报表" :class="{ active: isActive('/reports') }">
             <BarChartOutlined /><span class="nav-text">报表</span>
           </router-link>
 
@@ -267,7 +328,9 @@ onUnmounted(() => {
               type="button"
               class="sub-toggle"
               :class="{ active: isActive('/models') }"
-              :aria-expanded="modelsOpen"
+              :aria-expanded="compactSidebar ? compactNavigation === 'models' : modelsOpen"
+              :aria-controls="compactSidebar ? 'compact-navigation' : 'models-navigation'"
+              :aria-haspopup="compactSidebar ? 'dialog' : undefined"
               aria-label="模型管理"
               title="模型管理"
               @click="toggleModels"
@@ -276,7 +339,7 @@ onUnmounted(() => {
               <span class="sub-label">模型管理</span>
               <RightOutlined class="caret" />
             </button>
-            <div v-show="modelsOpen" class="sub-list">
+            <div id="models-navigation" v-show="modelsOpen" class="sub-list">
               <router-link
                 v-for="item in visibleModelsChildren"
                 :key="item.path"
@@ -295,7 +358,9 @@ onUnmounted(() => {
               type="button"
               class="sub-toggle"
               :class="{ active: isActive('/system') }"
-              :aria-expanded="systemOpen"
+              :aria-expanded="compactSidebar ? compactNavigation === 'system' : systemOpen"
+              :aria-controls="compactSidebar ? 'compact-navigation' : 'system-navigation'"
+              :aria-haspopup="compactSidebar ? 'dialog' : undefined"
               aria-label="系统设置"
               title="系统设置"
               @click="toggleSystem"
@@ -304,7 +369,7 @@ onUnmounted(() => {
               <span class="sub-label">设置</span>
               <RightOutlined class="caret" />
             </button>
-            <div v-show="systemOpen" class="sub-list">
+            <div id="system-navigation" v-show="systemOpen" class="sub-list">
               <router-link
                 v-for="item in visibleSystemChildren"
                 :key="item.path"
@@ -321,7 +386,12 @@ onUnmounted(() => {
 
       <div class="side-foot">
         <span class="mono">v0.2.0</span>
-        <div class="pulse"><span class="pulse-dot"></span>Online</div>
+        <span
+          class="realtime-status"
+          :class="{ 'is-connected': wsConnected }"
+          role="status"
+          aria-label="实时数据连接状态"
+        >{{ realtimeStatus }}</span>
       </div>
     </aside>
 
@@ -391,6 +461,34 @@ onUnmounted(() => {
       </ErrorBoundary>
     </div>
 
+
+    <Drawer
+      :open="compactNavigation !== null"
+      placement="left"
+      :width="300"
+      :keyboard="true"
+      :autofocus="false"
+      :closable="false"
+      @close="closeCompactNavigation"
+      @after-open-change="onCompactNavigationVisibilityChange"
+    >
+      <section ref="compactNavigationDialog" role="dialog" aria-modal="true" :aria-label="compactNavigationTitle">
+        <header class="compact-navigation-header">
+          <h2>{{ compactNavigationTitle }}</h2>
+          <Button aria-label="关闭导航" @click="closeCompactNavigation">关闭</Button>
+        </header>
+        <nav id="compact-navigation" class="compact-navigation" :aria-label="compactNavigationTitle">
+          <router-link
+            v-for="item in compactNavigationItems"
+            :key="item.path"
+            :to="item.path"
+            :class="{ active: isExact(item.path) }"
+            :aria-current="isExact(item.path) ? 'page' : undefined"
+            @click="closeCompactNavigation"
+          >{{ item.label }}</router-link>
+        </nav>
+      </section>
+    </Drawer>
 
     <!-- Global error center drawer (mounted once at app shell level) -->
     <ErrorCenterDrawer />
@@ -584,6 +682,32 @@ onUnmounted(() => {
 .sub-item.active .sub-dot { background: var(--ink); transform: scale(1.4); }
 
 .side-foot { padding: 12px 12px 4px; border-top: 0.5px solid var(--line); display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--ink-5); font-weight: 500; }
+.realtime-status { color: var(--text-secondary); }
+.realtime-status::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--status-warning);
+}
+.realtime-status.is-connected::before { background: var(--status-success); }
+
+.compact-navigation { display: flex; flex-direction: column; gap: 6px; }
+.compact-navigation-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.compact-navigation-header h2 { font-size: 16px; color: var(--text-primary); }
+.compact-navigation a {
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  color: var(--ink-3);
+  text-decoration: none;
+}
+.compact-navigation a:hover,
+.compact-navigation a.active { color: var(--ink); background: var(--surface-canvas); }
+.compact-navigation a:focus-visible,
+.nav a:focus-visible,
+.sub-toggle:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 
 
 .shortcut-help {

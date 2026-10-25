@@ -86,6 +86,7 @@ def main() -> None:
                     await JSONResponse({
                         "schema_version": "argus.local-functional-server.v1",
                         "pid": os.getpid(), "isolated_database": True,
+                        "run_id": os.environ.get("ARGUS_FUNCTIONAL_RUN_ID"),
                         "training_disabled": True, "inference_disabled": True,
                     })(scope, receive, send)
                     return

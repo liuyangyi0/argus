@@ -16,6 +16,8 @@ from argus.storage.scene_workflow import SceneWorkflowConflict
 
 
 def _request(tmp_path, *, role="engineer", username="authenticated-operator", camera=True):
+    database = Mock()
+    database.get_user.return_value = SimpleNamespace(active=True, role=role)
     config = SimpleNamespace(
         storage=SimpleNamespace(baselines_dir=tmp_path / "baselines"),
         cameras=[SimpleNamespace(
@@ -24,9 +26,11 @@ def _request(tmp_path, *, role="engineer", username="authenticated-operator", ca
     )
     return Request({
         "type": "http", "method": "POST", "path": "/api/scene-workflows/cam1",
-        "headers": [], "state": {"user": {"username": username, "role": role}},
+        "headers": [], "state": {
+            "user": {"username": username, "role": role}, "auth_method": "session",
+        },
         "app": SimpleNamespace(state=SimpleNamespace(
-            config=config, database=object(), task_manager=Mock(), ws_manager=Mock(),
+            config=config, database=database, task_manager=Mock(), ws_manager=Mock(),
         )),
     })
 
@@ -240,6 +244,47 @@ def test_approval_and_selection_are_separate_explicit_operations(tmp_path, contr
         expected_active_profile_id=None, expected_active_profile_revision=None,
     )
     assert not hasattr(request.app.state, "model_release_service")
+
+
+@pytest.mark.parametrize("auth_method", [None, "disabled", "api_token", "anonymous"])
+def test_profile_approval_requires_a_personal_account_session(tmp_path, contract_service, auth_method):
+    service, factory = contract_service
+    request = _request(tmp_path)
+    request.state.auth_method = auth_method
+    response = routes.approve_scene_profile(
+        request, "cam1", "scene1", routes.ProfileApprovalRequest(operator_approved=True),
+    )
+    assert response.status_code == 403
+    factory.assert_not_called()
+    service.approve_profile.assert_not_called()
+    request.app.state.ws_manager.broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize("record", [None, SimpleNamespace(active=False, role="admin"),
+                                    SimpleNamespace(active=True, role="viewer")])
+def test_profile_approval_rechecks_current_account_and_role(tmp_path, contract_service, record):
+    service, factory = contract_service
+    request = _request(tmp_path, role="admin")
+    request.app.state.database.get_user.return_value = record
+    response = routes.approve_scene_profile(
+        request, "cam1", "scene1", routes.ProfileApprovalRequest(operator_approved=True),
+    )
+    assert response.status_code == 403
+    factory.assert_not_called()
+    service.approve_profile.assert_not_called()
+
+
+@pytest.mark.parametrize("username", ["api", "system"])
+def test_profile_approval_does_not_confuse_named_accounts_with_machine_credentials(
+    tmp_path, contract_service, username,
+):
+    service, _factory = contract_service
+    request = _request(tmp_path, username=username)
+    response = routes.approve_scene_profile(
+        request, "cam1", "scene1", routes.ProfileApprovalRequest(operator_approved=True),
+    )
+    assert response.status_code == 200
+    service.approve_profile.assert_called_once_with("cam1", "scene1", actor=username)
 
 
 @pytest.mark.parametrize("failure,status", [

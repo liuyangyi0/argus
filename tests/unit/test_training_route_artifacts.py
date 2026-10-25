@@ -95,3 +95,32 @@ def test_candidate_registration_failure_does_not_report_training_complete(tmp_pa
             assert session.query(TrainingRecord).count() == 0
     finally:
         database.close()
+
+
+@pytest.mark.parametrize("pre_validation,expected_passed", [
+    (None, False),
+    ({}, False),
+    ({"warnings": ["observed static conditions only"]}, False),
+    ({"passed": None}, False),
+    ({"passed": False}, False),
+    ({"passed": 1}, False),
+    ({"passed": "true"}, False),
+    ({"passed": True}, True),
+])
+def test_manual_training_history_requires_literal_quality_pass(
+    tmp_path, monkeypatch, pre_validation, expected_passed,
+):
+    """The trainer is replaced: no SDK, media decoder, or real model runs."""
+    expected, kwargs = prepare_training_result(tmp_path, monkeypatch)
+    expected.pre_validation = pre_validation
+
+    _train_model_task(lambda *_: None, **kwargs)
+
+    database = Database(database_url=kwargs["database_url"])
+    database.initialize()
+    try:
+        with database.get_session() as session:
+            record = session.query(TrainingRecord).one()
+            assert record.pre_validation_passed is expected_passed
+    finally:
+        database.close()

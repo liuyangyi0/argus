@@ -71,7 +71,12 @@ def _patch_probe(
         stdout=json.dumps(payload).encode("utf-8"),
         stderr=stderr,
     )
-    monkeypatch.setattr(decoder.subprocess, "run", lambda *args, **kwargs: completed)
+    def run(command, **kwargs):
+        if command[-2:] == ["-h", "full"]:
+            return subprocess.CompletedProcess(command, 0, b"-fps_mode mode  frame sync method\n", b"")
+        return completed
+
+    monkeypatch.setattr(decoder.subprocess, "run", run)
 
 
 class _FakePopen:
@@ -110,6 +115,10 @@ def _patch_ffmpeg(
     stderr: bytes = b"",
 ) -> None:
     def make_process(*args, **kwargs):
+        command = args[0]
+        assert command[command.index("-fps_mode") + 1] == "passthrough"
+        assert "-vsync" not in command
+        assert command[command.index("-enc_time_base") + 1] == "1/1000"
         return _FakePopen(
             raw_output,
             returncode=returncode,
@@ -118,6 +127,27 @@ def _patch_ffmpeg(
         )
 
     monkeypatch.setattr(decoder.subprocess, "Popen", make_process)
+
+
+@pytest.mark.parametrize("help_text,expected", [
+    (b"-fps_mode mode  sync method\n-vsync mode  deprecated\n", ["-fps_mode", "passthrough"]),
+    (b"-fps_mode[:<stream_spec>] mode  sync method\n", ["-fps_mode", "passthrough"]),
+    (b"-vsync mode  sync method\n", ["-vsync", "0"]),
+])
+def test_frame_sync_uses_supported_passthrough_option(monkeypatch, help_text, expected):
+    monkeypatch.setattr(decoder.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a[0], 0, help_text, b"",
+    ))
+    assert decoder._passthrough_sync_arguments("ffmpeg") == expected
+
+
+@pytest.mark.parametrize("code,help_text", [(0, b"-r rate  force frame rate\n"), (1, b"-fps_mode mode\n")])
+def test_missing_or_failed_sync_capability_check_fails_closed(monkeypatch, code, help_text):
+    monkeypatch.setattr(decoder.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a[0], code, help_text, b"",
+    ))
+    with pytest.raises(decoder.StrictDecodeError, match="frame-sync"):
+        decoder._passthrough_sync_arguments("ffmpeg")
 
 
 def test_probe_inventory_preserves_pts_and_detects_vfr() -> None:

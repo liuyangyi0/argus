@@ -3,7 +3,7 @@
 Dashboard helpers and scheduled retraining used to call ModelRegistry and
 CameraManager mutators directly.  Those calls commit registry state and runtime
 state in separate steps.  All supported model stage changes must now enter via
-ModelReleaseService.submit_transition (durable HTTP command) or its synchronous
+ModelReleaseService.submit_transition / submit_rollback (durable HTTP commands) or its synchronous
 internal request_transition API; legacy commands that cannot yet be
 represented by that state machine must fail closed.
 """
@@ -71,9 +71,11 @@ def test_model_routes_have_one_release_mutation_api() -> None:
         if receiver == "service" and name == "submit_transition"
     ]
     assert len(service_calls) == 2, (
-        "promote and retire must be the only supported route mutations and both "
+        "promote and retire must be the only generic stage route mutations and both "
         "must call ModelReleaseService.submit_transition"
     )
+    rollback_calls = [line for receiver, name, line in calls if receiver == "service" and name == "submit_rollback"]
+    assert len(rollback_calls) == 1, "HTTP rollback must submit one durable explicit-target rollback command"
     assert not any(
         receiver == "service" and name in {"request_transition", "execute_operation"}
         for receiver, name, _line in calls
@@ -95,9 +97,41 @@ def test_legacy_deploy_and_rollback_commands_are_explicitly_fail_closed() -> Non
     assert "activate_model_version" not in baseline_source
     assert ".reload_model(" not in config_source
     assert "直接激活入口已关闭，未修改 registry 或运行时" in models_source
-    assert "回滚入口已安全关闭，未修改 registry 或运行时" in models_source
+    assert "旧回滚命令已禁用" in models_source
     assert "路径部署入口已关闭，未修改 registry 或运行时" in baseline_source
     assert "按路径直接热加载模型的入口已关闭" in config_source
+
+
+def test_http_rollback_requires_typed_command_and_human_approval() -> None:
+    tree = _tree("src/argus/dashboard/routes/models.py")
+    rollback = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "rollback_model")
+    body = next(argument for argument in rollback.args.args if argument.arg == "body")
+    assert "ModelRollbackRequest" in ast.unparse(body.annotation)
+    calls = [node for node in ast.walk(rollback) if isinstance(node, ast.Call)]
+    assert any(
+        isinstance(node.func, ast.Name) and node.func.id == "require_human_permission"
+        and any(isinstance(arg, ast.Constant) and arg.value == "rollback_model" for arg in node.args)
+        for node in calls
+    )
+    command = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "submit_rollback")
+    required = {"model_version_id", "source_model_version_id", "source_release_revision", "expected_revision", "requested_by", "reason", "idempotency_key"}
+    assert required <= {keyword.arg for keyword in command.keywords}
+    assert not any(
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"rollback", "commit", "update", "transition", "request_transition", "execute_operation"}
+        for node in calls
+    ), "HTTP rollback may only enqueue; registry/runtime state changes belong to the release worker"
+    assert any(
+        isinstance(node.func, ast.Name) and node.func.id == "api_success"
+        and any(keyword.arg == "status_code" and isinstance(keyword.value, ast.Constant) and keyword.value.value == 202 for keyword in node.keywords)
+        for node in calls
+    )
+
+
+def test_retired_stage_cannot_use_generic_production_promotion() -> None:
+    from argus.storage.release_pipeline import VALID_TRANSITIONS
+
+    assert "production" not in VALID_TRANSITIONS.get("retired", set())
 
 
 def test_scheduler_never_activates_or_promotes_registered_candidate() -> None:

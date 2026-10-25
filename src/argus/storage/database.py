@@ -51,6 +51,18 @@ _REGION_UPDATABLE_FIELDS = {
 # When you add a new column to an ORM model, append it here AND keep this in sync
 # with the SQL type. Tuple shape: (table_name, column_name, column_sql_type).
 _AUTO_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("analysis_tasks", "archived", "BOOLEAN DEFAULT 0 NOT NULL"),
+    ("analysis_tasks", "created_by", "VARCHAR(100)"),
+    ("analysis_tasks", "updated_at", "DATETIME"),
+    ("task_datasets", "manifest_sha256", "VARCHAR(64)"),
+    ("task_deployments", "desired_bundle_id", "VARCHAR(64)"),
+    ("task_deployments", "applied_bundle_id", "VARCHAR(64)"),
+    ("task_deployments", "previous_bundle_id", "VARCHAR(64)"),
+    ("task_deployments", "desired_state", "VARCHAR(20) DEFAULT 'stopped' NOT NULL"),
+    ("task_deployments", "deployment_revision", "INTEGER DEFAULT 0 NOT NULL"),
+    ("task_deployments", "applied_deployment_revision", "INTEGER"),
+    ("task_deployments", "current_operation_id", "VARCHAR(64)"),
+    ("task_deployments", "failure_code", "VARCHAR(80)"),
     ("alerts", "workflow_status", "VARCHAR(20) DEFAULT 'new'"),
     ("alerts", "assigned_to", "VARCHAR(100)"),
     ("alerts", "resolved_at", "DATETIME"),
@@ -149,6 +161,55 @@ _AUTO_INDEX_MIGRATIONS: list[tuple[str, str]] = [
     ),
 ]
 
+# P0-P2 tables are additive and are created by Base.metadata.create_all(); no
+# existing ORM column is changed. Keep their index migration separate from the
+# legacy model-production invariant, whose tests deliberately inspect models.
+_ANALYSIS_TASK_INDEX_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "uq_analysis_tasks_legacy_per_camera",
+        "CREATE UNIQUE INDEX uq_analysis_tasks_legacy_per_camera "
+        "ON analysis_tasks(camera_id) "
+        "WHERE authority = 'legacy' AND template_id = 'legacy_anomaly.v1'",
+    ),
+    (
+        "uq_analysis_task_revision",
+        "CREATE UNIQUE INDEX uq_analysis_task_revision "
+        "ON analysis_task_revisions(task_id, revision)",
+    ),
+    (
+        "uq_analysis_task_operation_key",
+        "CREATE UNIQUE INDEX uq_analysis_task_operation_key "
+        "ON analysis_task_operations(idempotency_key)",
+    ),
+    ("ix_task_workflows_task_created", "CREATE INDEX ix_task_workflows_task_created "
+     "ON task_workflows(task_id, created_at)"),
+    ("ix_task_datasets_task_created", "CREATE INDEX ix_task_datasets_task_created "
+     "ON task_datasets(task_id, created_at)"),
+    ("uq_task_deployment_operation_key", "CREATE UNIQUE INDEX uq_task_deployment_operation_key "
+     "ON task_deployment_operations(idempotency_key)"),
+    ("uq_task_deployment_operation_revision", "CREATE UNIQUE INDEX uq_task_deployment_operation_revision "
+     "ON task_deployment_operations(task_id, deployment_revision)"),
+    ("ix_task_deployment_pending", "CREATE INDEX ix_task_deployment_pending "
+     "ON task_deployment_operations(status, created_at)"),
+]
+
+# Immutability is enforced for ordinary SQL as well as ORM writes. These are
+# initial-version tables, so no data is rewritten or interpreted as a new
+# approval during schema creation. Unknown/corrupt existing rows fail reads.
+_ANALYSIS_TASK_TRIGGER_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        f"immutable_{table}_{operation.lower()}",
+        f"CREATE TRIGGER IF NOT EXISTS immutable_{table}_{operation.lower()} "
+        f"BEFORE {operation} ON {table} "
+        "BEGIN SELECT RAISE(ABORT, 'immutable analysis identity'); END",
+    )
+    for table in (
+        "analysis_task_revisions", "model_artifacts", "task_models",
+        "task_execution_bundles", "analysis_task_operations", "task_datasets",
+    )
+    for operation in ("UPDATE", "DELETE")
+]
+
 # Tables that were dropped in code and should be removed from any pre-existing
 # SQLite database on next startup. Idempotent — DROP TABLE IF EXISTS.
 _DROP_TABLES: list[str] = [
@@ -208,6 +269,7 @@ class Database:
         # Auto-migrate: add missing columns + drop deprecated tables
         self._auto_migrate()
         self._auto_migrate_indexes()
+        self._auto_migrate_analysis_task_guards()
         self._drop_deprecated_tables()
 
         logger.info("database.initialized", url=self._database_url)
@@ -322,7 +384,7 @@ class Database:
                 for item in sa_inspect(conn).get_indexes(table)
                 if item.get("name")
             }
-            for name, sql in _AUTO_INDEX_MIGRATIONS:
+            for name, sql in _AUTO_INDEX_MIGRATIONS + _ANALYSIS_TASK_INDEX_MIGRATIONS:
                 if name in existing:
                     continue
                 try:
@@ -339,7 +401,20 @@ class Database:
                     )
                     raise RuntimeError(
                         f"Auto-index migration failed for {name}: {exc}. "
-                        "Resolve duplicate active production rows before restart."
+                        "Resolve conflicting identity rows before restart."
+                    ) from exc
+
+    def _auto_migrate_analysis_task_guards(self) -> None:
+        """Install immutable revision/artifact guards for the SQLite store."""
+        if not self._database_url.startswith("sqlite"):
+            return
+        with self._engine.begin() as conn:
+            for name, sql in _ANALYSIS_TASK_TRIGGER_MIGRATIONS:
+                try:
+                    conn.execute(text(sql))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Analysis identity guard migration failed for {name}: {exc}"
                     ) from exc
 
     @staticmethod

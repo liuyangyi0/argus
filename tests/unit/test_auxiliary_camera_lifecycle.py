@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from argus.capture.manager import CameraManager
+from argus.capture.camera import CameraState
 from argus.config.schema import AlertConfig, CameraConfig, ClassifierConfig, SegmenterConfig
 
 
@@ -77,6 +78,30 @@ def fake_manager(monkeypatch):
     monkeypatch.setattr(manager, "_resolve_model_path", lambda config: None)
     monkeypatch.setattr(manager, "_model_version_id", lambda *args: "fake-version")
     monkeypatch.setattr(manager, "_create_shadow_runner", lambda config: None)
+    monkeypatch.setattr(manager, "_get_legacy_shared_yolo", lambda config: None)
+
+    class SyntheticCapture:
+        def __init__(self, config):
+            self.camera_id, self.source, self.protocol = config.camera_id, config.source, config.protocol
+            self.state = CameraState()
+            self.stopped = threading.Event()
+
+        def connect(self):
+            self.state.connected = True
+            return True
+
+        def read(self):
+            self.stopped.wait(0.01)
+            return None
+
+        def request_stop(self):
+            self.stopped.set()
+
+        def stop(self):
+            self.stopped.set()
+            self.state.connected = False
+
+    monkeypatch.setattr(manager, "_create_source_capture", lambda config, *_args: SyntheticCapture(config))
     yield manager, control, instances
     control.shutdown = lambda pipeline: None
     for pipeline in instances:

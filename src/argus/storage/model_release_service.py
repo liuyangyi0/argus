@@ -226,6 +226,108 @@ class ModelReleaseService:
                 status=ReleaseOperationStatus.PENDING.value,
             ).order_by(ModelReleaseOperation.id.asc()).all()
 
+    def rollback_readiness(self, model_version_id: str) -> dict:
+        """Recheck historical evidence without creating an operation or approval."""
+        from argus.storage.rollback_policy import rollback_context
+
+        with self._session_factory() as session:
+            model, context = rollback_context(session, model_version_id)
+            history = session.query(ModelReleaseOperation).filter_by(
+                operation_id=context["history_operation_id"],
+            ).one()
+            evidence = self._build_rollback_evidence(
+                model, context, history.requested_by, history.requested_at,
+            )
+            revision = int(model.release_revision or 0)
+        self._pipeline.prepare_rollback(
+            model_version_id=model_version_id, expected_revision=revision,
+            rollback_context=context, release_evidence=evidence,
+        )
+        return {"expected_revision": revision, **context}
+
+    def submit_rollback(
+        self,
+        *,
+        model_version_id: str,
+        source_model_version_id: str,
+        source_release_revision: int,
+        expected_revision: int,
+        requested_by: str,
+        reason: str,
+        idempotency_key: str | None = None,
+    ) -> tuple[ModelReleaseOperation, ModelRecord]:
+        """Persist a source-revision-bound rollback for the ordinary release worker."""
+        from argus.storage.rollback_policy import rollback_context
+
+        requested_by = requested_by.strip()
+        reason = reason.strip()
+        if not requested_by or not reason:
+            raise ValueError("Rollback requester and reason are required")
+        key = idempotency_key.strip() if idempotency_key else None
+        if key is not None and (not key or len(key) > 128):
+            raise ValueError("idempotency_key must contain 1 to 128 characters")
+        existing = self._get_operation_by_idempotency(key) if key else None
+        if existing is not None:
+            desired = json.loads(existing.desired_state_json or "{}")
+            previous = desired.get("rollback", {})
+            if (
+                existing.model_version_id != model_version_id
+                or existing.target_stage != ModelStage.PRODUCTION.value
+                or existing.requested_by != requested_by
+                or existing.reason != reason
+                or int(existing.expected_revision) != expected_revision
+                or previous.get("source_model_version_id") != source_model_version_id
+                or previous.get("source_release_revision") != source_release_revision
+            ):
+                raise ValueError("idempotency key was already used for another rollback command")
+            return self._return_idempotent(
+                existing, model_version_id=model_version_id,
+                target_stage=ModelStage.PRODUCTION.value, requested_by=requested_by,
+                desired_state_json=existing.desired_state_json,
+            )
+        with self._session_factory() as session:
+            model, context = rollback_context(session, model_version_id)
+            if (
+                int(model.release_revision or 0) != expected_revision
+                or context["source_model_version_id"] != source_model_version_id
+                or context["source_release_revision"] != source_release_revision
+            ):
+                raise ValueError("Rollback identity changed; reload readiness before retrying")
+        desired = self._canonical_desired_state(
+            reason=reason, canary_camera_id=None, release_evidence=None,
+            release_evidence_sources=context["release_evidence_sources"],
+            rollback=context,
+        )
+        operation, created = self._create_operation(
+            model=model, target_stage=ModelStage.PRODUCTION.value,
+            requested_by=requested_by, reason=reason, expected_revision=expected_revision,
+            idempotency_key=key, desired_state_json=desired,
+        )
+        self._validate_idempotent_command(
+            operation, model_version_id=model_version_id,
+            target_stage=ModelStage.PRODUCTION.value, requested_by=requested_by,
+            desired_state_json=desired,
+        )
+        if created:
+            self._publish(operation, model)
+        return operation, model
+
+    @staticmethod
+    def _build_rollback_evidence(model, context: dict, operator_id: str, approved_time):
+        from argus.preprocessing.scene_profile import runtime_artifact_sha256
+        from argus.storage.release_evidence import build_release_evidence_from_sources
+
+        if approved_time.tzinfo is None:
+            approved_time = approved_time.replace(tzinfo=timezone.utc)
+        return build_release_evidence_from_sources(
+            context["release_evidence_sources"], model_version_id=model.model_version_id,
+            camera_id=model.camera_id, registry_model_hash=model.model_hash,
+            registry_data_hash=model.data_hash,
+            runtime_artifact_digest=runtime_artifact_sha256(model.model_path),
+            operator_id=operator_id, operator_approved=True,
+            approved_at=approved_time.isoformat(),
+        )
+
     def submit_transition(
         self,
         *,
@@ -347,6 +449,12 @@ class ModelReleaseService:
                 desired = json.loads(operation.desired_state_json or "{}")
                 if not isinstance(desired, dict):
                     raise ValueError("release desired command is not an object")
+                if desired.get("rollback") is not None and (
+                    not isinstance(desired["rollback"], dict)
+                    or desired.get("release_evidence_sources")
+                    != desired["rollback"].get("release_evidence_sources")
+                ):
+                    raise ValueError("Rollback command evidence identity is inconsistent")
                 evidence = desired.get("release_evidence")
                 if operation.target_stage == ModelStage.PRODUCTION.value:
                     from argus.preprocessing.scene_profile import runtime_artifact_sha256
@@ -384,6 +492,7 @@ class ModelReleaseService:
                     _operation_id=operation_id,
                     _desired_state_json=operation.desired_state_json,
                     _execution_locked=True,
+                    _rollback_context=desired.get("rollback"),
                 )
             except Exception as exc:
                 latest = self.get_operation(operation_id)
@@ -445,6 +554,7 @@ class ModelReleaseService:
         _operation_id: str | None = None,
         _desired_state_json: str | None = None,
         _execution_locked: bool = False,
+        _rollback_context: dict | None = None,
     ) -> tuple[ModelReleaseOperation, ModelRecord]:
         """Execute a release command without an intermediate applied DB state."""
 
@@ -477,6 +587,7 @@ class ModelReleaseService:
                         _operation_id=_operation_id,
                         _desired_state_json=_desired_state_json,
                         _execution_locked=True,
+                        _rollback_context=_rollback_context,
                     )
             existing = (
                 self.get_operation(_operation_id)
@@ -554,6 +665,7 @@ class ModelReleaseService:
                         expected_revision=expected_revision,
                         idempotency_key=normalized_key,
                         _execution_locked=True,
+                        _rollback_context=_rollback_context,
                     )
 
             # From this point, ordinary failures mark the desired operation
@@ -561,13 +673,26 @@ class ModelReleaseService:
             # crash leaves a durable pending operation while applied state is
             # unchanged, which a startup reconciler can safely inspect.
             try:
-                plan = self._pipeline.prepare_transition(
-                    model_version_id=model_version_id,
-                    target_stage=target_stage,
-                    canary_camera_id=canary_camera_id,
-                    release_evidence=release_evidence,
-                    expected_revision=requested_revision,
-                )
+                if _rollback_context is not None:
+                    if (
+                        _operation_id is None
+                        or target_stage != ModelStage.PRODUCTION.value
+                        or json.loads(operation.desired_state_json).get("rollback")
+                        != _rollback_context
+                    ):
+                        raise ValueError("Rollback requires its exact durable worker command")
+                    plan = self._pipeline.prepare_rollback(
+                        model_version_id=model_version_id, expected_revision=requested_revision,
+                        rollback_context=_rollback_context, release_evidence=release_evidence,
+                    )
+                else:
+                    plan = self._pipeline.prepare_transition(
+                        model_version_id=model_version_id,
+                        target_stage=target_stage,
+                        canary_camera_id=canary_camera_id,
+                        release_evidence=release_evidence,
+                        expected_revision=requested_revision,
+                    )
             except Exception as exc:
                 self._finish_failed_operation(operation.operation_id, error=str(exc))
                 raise
@@ -856,6 +981,7 @@ class ModelReleaseService:
         canary_camera_id: str | None,
         release_evidence: object | None,
         release_evidence_sources: dict | None = None,
+        rollback: dict | None = None,
     ) -> str:
         desired = {
             "canary_camera_id": canary_camera_id,
@@ -864,6 +990,8 @@ class ModelReleaseService:
         }
         if release_evidence_sources is not None:
             desired["release_evidence_sources"] = release_evidence_sources
+        if rollback is not None:
+            desired["rollback"] = rollback
         return json.dumps(
             desired,
             allow_nan=False,

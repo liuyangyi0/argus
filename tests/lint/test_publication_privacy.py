@@ -21,6 +21,8 @@ FORBIDDEN = {
     "private_deployment_subnet": bytes.fromhex("3139322e3136382e36362e"),
     "private_account_path": bytes.fromhex("2f686f6d652f776870"),
     "private_key_filename": bytes.fromhex("69645f656432353531395f6172677573"),
+    "private_windows_validation_host": bytes.fromhex("6e6c792d6465736b746f70"),
+    "private_windows_validation_address": bytes.fromhex("3139322e3136382e332e313232"),
 }
 PRIVATE_KEY_BLOCK = re.compile(
     rb"-----BEGIN "

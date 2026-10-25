@@ -92,6 +92,37 @@ def _required_binary(name: str) -> str:
     return executable
 
 
+def _passthrough_sync_arguments(executable: str) -> list[str]:
+    """Keep every decoded frame on old and new FFmpeg, never guess CFR.
+
+    FFmpeg 9 removed ``-vsync``. Older supported installations may lack
+    ``-fps_mode``; discover the actual binary's advertised options rather than
+    retrying an unsuccessful decode or silently accepting default frame sync.
+    """
+    try:
+        result = subprocess.run(
+            [executable, "-hide_banner", "-h", "full"], check=False,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise StrictDecodeError(f"cannot inspect FFmpeg frame-sync capabilities: {exc}") from exc
+    if result.returncode != 0:
+        raise StrictDecodeError("FFmpeg frame-sync capability inspection failed")
+    help_text = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+    # Newer builds print e.g. ``-fps_mode[:<stream_spec>]``. The optional
+    # per-stream suffix is documentation syntax, not part of the option name.
+    options = {
+        line.strip().split()[0].split("[", 1)[0].split(":", 1)[0]
+        for line in help_text.splitlines() if line.strip()
+    }
+    if "-fps_mode" in options:
+        return ["-fps_mode", "passthrough"]
+    if "-vsync" in options:
+        return ["-vsync", "0"]
+    raise StrictDecodeError("FFmpeg advertises no supported lossless frame-sync option")
+
+
 def _positive_fraction(raw: object, *, field: str) -> Fraction:
     if type(raw) is not str:
         raise StrictDecodeError(f"ffprobe {field} is missing or not a string")
@@ -403,6 +434,7 @@ class StrictVideoDecoder(Iterator[StrictDecodedFrame]):
     def __enter__(self) -> StrictVideoDecoder:
         if self._process is not None:
             raise RuntimeError("strict decoder cannot be entered twice")
+        sync_arguments = _passthrough_sync_arguments(self.ffmpeg_executable)
         self._stderr_file = tempfile.TemporaryFile(mode="w+b")
         command = [
             self.ffmpeg_executable,
@@ -421,8 +453,13 @@ class StrictVideoDecoder(Iterator[StrictDecodedFrame]):
             "-an",
             "-sn",
             "-dn",
-            "-vsync",
-            "0",
+            *sync_arguments,
+            # The rawvideo encoder otherwise defaults to 1/framerate. VFR
+            # timestamps may collapse onto one encoder tick and make the
+            # output muxer report duplicate DTS even with passthrough enabled.
+            # Keep the audited source time base; do not rewrite source PTS.
+            "-enc_time_base",
+            self._probe.time_base,
             "-pix_fmt",
             "bgr24",
             "-f",

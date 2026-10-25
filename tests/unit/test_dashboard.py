@@ -142,6 +142,26 @@ def _two_phase_release_runtime() -> SimpleNamespace:
 
 
 class TestDashboardPages:
+    def test_installed_app_serves_explicit_frontend_directory(self, tmp_path, db):
+        dist = tmp_path / "installed-frontend"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text('<div id="packaged-ui"></div>', encoding="utf-8")
+        (dist / "assets/app.js").write_text("/* packaged asset */", encoding="utf-8")
+        config = ArgusConfig()
+        config.dashboard.go2rtc_enabled = False
+        config.dashboard.frontend_dist_dir = dist
+        client = TestClient(create_app(database=db, config=config))
+        assert 'id="packaged-ui"' in client.get("/models/registry").text
+        assert client.get("/assets/app.js").text == "/* packaged asset */"
+        assert client.get("/api/not-a-route").status_code == 404
+
+    def test_explicit_missing_frontend_is_a_configuration_error(self, tmp_path):
+        config = ArgusConfig()
+        config.dashboard.go2rtc_enabled = False
+        config.dashboard.frontend_dist_dir = tmp_path / "missing-dist"
+        with pytest.raises(ValueError, match="frontend_dist_dir"):
+            create_app(config=config)
+
     def test_core_business_routes_fallback_to_vue_spa(self, tmp_path):
         """Every dashboard route in the operator loop must serve the SPA shell."""
         vue_dist = tmp_path / "dist"
@@ -1347,10 +1367,24 @@ class TestModelPublishRoutes:
 
 
 class TestUserManagementRoutes:
+    @staticmethod
+    def _human_admin_client(db, health, alerts_dir):
+        db.create_user("user-admin", hash_password("admin-secret"), "admin", None)
+        app = create_app(
+            database=db,
+            health_monitor=health,
+            alerts_dir=str(alerts_dir),
+            config=ArgusConfig(auth=AuthConfig(enabled=True, api_token="user-test-token")),
+        )
+        client = TestClient(app)
+        client.cookies.set("argus_session", create_session_token(
+            "user-admin", "admin", app.state.session_secret,
+        ))
+        return client
+
     def test_create_and_update_engineer_role(self, db, health, alerts_dir):
         """User management accepts the canonical four-role RBAC set."""
-        app = create_app(database=db, health_monitor=health, alerts_dir=str(alerts_dir))
-        client = TestClient(app)
+        client = self._human_admin_client(db, health, alerts_dir)
 
         create_resp = client.post(
             "/api/users/json",
@@ -1449,12 +1483,7 @@ class TestUserManagementRoutes:
             "viewer",
             "Keep This Name",
         )
-        app = create_app(
-            database=db,
-            health_monitor=health,
-            alerts_dir=str(alerts_dir),
-        )
-        client = TestClient(app)
+        client = self._human_admin_client(db, health, alerts_dir)
 
         response = client.put(
             "/api/users/partial-update/json",
@@ -1694,8 +1723,9 @@ class TestUserManagementRoutes:
         camera_manager = MagicMock()
         camera_manager.reload_model.return_value = True
 
-        config = ArgusConfig()
+        config = ArgusConfig(auth=AuthConfig(enabled=True, api_token="release-test-token"))
         config.dashboard.go2rtc_enabled = False
+        db.create_user("release-admin", hash_password("release-secret"), "admin", None)
         app = create_app(
             database=db,
             camera_manager=camera_manager,
@@ -1704,6 +1734,9 @@ class TestUserManagementRoutes:
             config=config,
         )
         client = running_release_client(app)
+        client.cookies.set("argus_session", create_session_token(
+            "release-admin", "admin", app.state.session_secret,
+        ))
         registered = registry.get_by_version_id(version_id)
         release_evidence_sources = release_evidence_sources_factory(
             root=tmp_path / "release-sources",

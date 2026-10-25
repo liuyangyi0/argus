@@ -13,7 +13,7 @@ from argus.dashboard.api_response import (
     api_unavailable,
     api_validation_error,
 )
-from argus.dashboard.auth import VALID_ROLES, hash_password, require_role
+from argus.dashboard.auth import VALID_ROLES, hash_password, require_human_permission, require_role
 
 router = APIRouter()
 
@@ -90,8 +90,8 @@ async def users_json(
 @router.post("/json")
 async def create_user_json(request: Request, body: UserCreateRequest):
     """JSON API: create a new user."""
-    if not require_role(request, "admin"):
-        return api_forbidden("权限不足")
+    if not require_human_permission(request, "manage_users"):
+        return api_forbidden("用户管理需要启用认证并使用有效的个人管理员账号登录")
 
     db = request.app.state.db
     if not db:
@@ -130,8 +130,8 @@ async def update_user_json(
     body: UserUpdateRequest,
 ):
     """JSON API: update a user."""
-    if not require_role(request, "admin"):
-        return api_forbidden("权限不足")
+    if not require_human_permission(request, "manage_users"):
+        return api_forbidden("用户管理需要启用认证并使用有效的个人管理员账号登录")
 
     db = request.app.state.db
     if not db:
@@ -178,8 +178,8 @@ async def update_user_json(
 @router.delete("/{username}/json")
 async def delete_user_json(request: Request, username: str):
     """JSON API: delete a user."""
-    if not require_role(request, "admin"):
-        return api_forbidden("权限不足")
+    if not require_human_permission(request, "manage_users"):
+        return api_forbidden("用户管理需要启用认证并使用有效的个人管理员账号登录")
 
     db = request.app.state.db
     if not db:
@@ -200,8 +200,8 @@ async def delete_user_json(request: Request, username: str):
 @router.post("/{username}/toggle-active/json")
 async def toggle_active_json(request: Request, username: str):
     """JSON API: toggle user active status."""
-    if not require_role(request, "admin"):
-        return api_forbidden("权限不足")
+    if not require_human_permission(request, "manage_users"):
+        return api_forbidden("用户管理需要启用认证并使用有效的个人管理员账号登录")
 
     db = request.app.state.db
     if not db:

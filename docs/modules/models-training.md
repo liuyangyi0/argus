@@ -75,11 +75,12 @@ TaskScheduler
 - model path
 - 初始 stage：`candidate`
 
-模型记录是上线状态的事实来源之一，但运行时是否已经热加载还要看 `CameraManager.apply_model_release_state()` 和 API 返回的 `runtime_state`。
+模型记录是上线状态的事实来源之一，但运行时是否已经热加载还要看发布 operation 的
+`applied` 状态和 API 返回的 `runtime_state`，不能仅凭数据库 stage 判断。
 
 ## 发布管线
 
-模型发布阶段由 `ReleasePipeline` 管理：
+外部发布请求统一交给 `ModelReleaseService` 持久化命令；`ReleasePipeline` 负责阶段与证据规则：
 
 ```text
 candidate -> shadow -> canary -> production -> retired
@@ -97,6 +98,26 @@ canary -> shadow / retired
 - transition 成功后可通过 WebSocket 向前端发布模型发布事件。
 
 训练完成只生成 candidate，不直接上线。
+
+## 受控回滚
+
+回滚是独立命令，不开放通用的 `retired -> production` 晋级，也不恢复旧激活接口的绕过能力。
+只有同一摄像头曾经完成两阶段生产发布、当前已退役且不活跃的版本可以作为目标。
+仅有历史 stage 字段、手工迁移记录或缺少原始证据的旧模型均不具备资格。
+
+操作流程：
+
+1. 使用个人账号登录，在模型页对历史版本执行回滚检查。
+2. 核对目标 profile 与当前配置绑定、原始 artifact、baseline v3 严格解码证据、
+   可信 soak 签名及其配置/语料摘要。系统不会自动切换或批准场景 profile。
+3. 确认理由后提交。请求冻结当前生产版本、源/目标 release revision 和历史证据身份，
+   返回 `202 + operation_id`；同一摄像头已有待完成发布或 canary 时拒绝。
+4. worker 再次核验，执行 runtime prepare/swap 和数据库 CAS；成功才更新 applied stage，
+   旧生产版本退役。失败沿用原补偿链，补偿失败保持失败/阻断，不伪报回滚成功。
+5. 换模后仍需 SceneGuard 连续确认；预览可用不等于评分和告警已恢复。
+
+网络超时后保留原幂等键与请求重试，先查 operation，不能把超时理解为回滚失败。
+数据库版本变化、证据变更或 profile 不符时重新检查，禁止跳过现有 production 门禁。
 
 ## Shadow / Canary 运行时
 

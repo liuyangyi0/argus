@@ -8,9 +8,11 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from argus.config.schema import ArgusConfig, DashboardConfig
+from argus.capture.manager import CameraManager
+from argus.config.schema import ArgusConfig, CameraConfig, DashboardConfig
 from argus.dashboard.api_contracts import (
     AlertIdListRequest,
+    CameraLifecycleResponse,
     CameraModeRequest,
     ReplayClipRequest,
     SceneGuardStatusResponse,
@@ -21,6 +23,31 @@ from argus.dashboard.app import create_app
 def _client() -> TestClient:
     config = ArgusConfig(dashboard=DashboardConfig(go2rtc_enabled=False))
     return TestClient(create_app(config=config))
+
+
+@pytest.mark.parametrize("cleanup_error", [None, "resource cleanup is still pending"])
+def test_camera_list_accepts_actual_manager_lifecycle_without_starting_capture(cleanup_error):
+    config = ArgusConfig(
+        dashboard=DashboardConfig(go2rtc_enabled=False),
+        cameras=[CameraConfig(camera_id="contract-camera", name="Contract fixture",
+                              protocol="file", source="not-opened")],
+    )
+    manager = CameraManager(config.cameras, config.alerts)
+    if cleanup_error:
+        manager._camera_lifecycle_errors["contract-camera"] = cleanup_error
+    try:
+        canonical = manager.get_camera_status_payload("contract-camera")
+        lifecycle = CameraLifecycleResponse.model_validate(canonical)
+        assert lifecycle.error == cleanup_error
+        client = TestClient(create_app(config=config, camera_manager=manager))
+        response = client.get("/api/cameras/json")
+        assert response.status_code == 200
+        row = response.json()["data"]["cameras"][0]
+        assert row["error"] == cleanup_error
+        assert row["lifecycle"] == canonical["lifecycle"]
+        assert row["lifecycle"]["state"] == ("cleanup_failed" if cleanup_error else "stopped")
+    finally:
+        manager.stop_all()
 
 
 def _scene_guard_payload() -> dict:

@@ -56,8 +56,6 @@ pre_trained/
 .venv-review/
 venv/
 
-web/package-lock.json
-
 # IDE
 .vscode/
 .idea/

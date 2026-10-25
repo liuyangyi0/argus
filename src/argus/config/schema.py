@@ -1498,6 +1498,10 @@ class DashboardConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8080, ge=1024, le=65535)
     debug: bool = False
+    frontend_dist_dir: Path | None = Field(
+        default=None,
+        description="Explicit built frontend directory for installed-wheel/container deployments",
+    )
     frame_identity_overlay: bool = Field(
         default=False,
         description="Deprecated compatibility flag; prefer debug.frame_identity_overlay",

@@ -585,7 +585,9 @@ class TestQualityReport:
         stats = {"scores": [0.1], "mean": 0.1, "std": 0.05, "max": 0.2, "p95": 0.18}
         report = ModelTrainer._generate_quality_report(stats, threshold_recommended=0.5)
         assert report.grade == "A"
-        assert any("优秀" in s for s in report.suggestions)
+        assert any("已观察正常工况" in s for s in report.suggestions)
+        assert all("可直接部署使用" not in s for s in report.suggestions)
+        assert any("独立业务验收" in s for s in report.suggestions)
 
     def test_grade_b(self):
         """Should grade B for good model."""
@@ -598,7 +600,8 @@ class TestQualityReport:
         stats = {"scores": [0.4], "mean": 0.45, "std": 0.2, "max": 0.55, "p95": 0.52}
         report = ModelTrainer._generate_quality_report(stats, threshold_recommended=0.7)
         assert report.grade == "C"
-        assert any("重新采集" in s for s in report.suggestions)
+        assert any("固定机位" in s for s in report.suggestions)
+        assert any("不要移动机位" in s for s in report.suggestions)
 
     def test_grade_f(self):
         """Should grade F for poor model."""
