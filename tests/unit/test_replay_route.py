@@ -11,7 +11,11 @@ production path where __main__.py constructs the store.
 
 from __future__ import annotations
 
+import base64
+import json
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -81,7 +85,50 @@ def db(tmp_path):
 
 
 @pytest.fixture
-def store(tmp_path):
+def replay_media(monkeypatch):
+    """Replace only media encoding/extraction, never the replay/store logic.
+
+    These HTTP tests must not select a host-dependent OpenCV/FFmpeg encoder.
+    The temporary .mp4 files contain explicitly fake JSON carrying the input
+    JPEGs so store publication/renaming and exact reference indices are real.
+    Codec correctness belongs to separate media tests, not this mock suite.
+    """
+    state = SimpleNamespace(encodings=[], extractions=[], fail_at=None)
+
+    class FakeEncoder:
+        def __init__(self, path, *, fps, width, height, **_options):
+            self.path = Path(path)
+            self.frames = []
+            state.encodings.append({"fps": fps, "width": width, "height": height})
+
+        def write_jpeg_frame(self, jpeg):
+            if state.fail_at == "write":
+                raise OSError("simulated frame encoding failure")
+            self.frames.append(base64.b64encode(jpeg).decode("ascii"))
+
+        def finalize(self):
+            if state.fail_at == "finalize":
+                raise OSError("simulated encoder finalization failure")
+            payload = json.dumps({"test_only_jpeg_frames": self.frames}).encode("ascii")
+            self.path.write_bytes(payload)
+            return len(payload)
+
+    def extract_frame(path, index):
+        state.extractions.append((Path(path), index))
+        frames = json.loads(Path(path).read_bytes())["test_only_jpeg_frames"]
+        if index < 0 or index >= len(frames):
+            return None
+        return base64.b64decode(frames[index], validate=True)
+
+    monkeypatch.setattr("argus.storage.alert_recording.Mp4Encoder", FakeEncoder)
+    monkeypatch.setattr("argus.storage.alert_recording.extract_frame_jpeg", extract_frame)
+    # /reference imports the helper at request time, unlike store.load_frame.
+    monkeypatch.setattr("argus.core.video_encoder.extract_frame_jpeg", extract_frame)
+    return state
+
+
+@pytest.fixture
+def store(tmp_path, replay_media):
     return AlertRecordingStore(archive_dir=str(tmp_path / "recordings"))
 
 
@@ -339,6 +386,52 @@ class TestReplayCacheHeaders:
         assert response.headers["cache-control"] == "no-store"
 
 
+class TestReplayMockMediaPersistence:
+    def test_saved_metadata_signals_and_frame_indices_agree(self, store, replay_media):
+        recording = _recording(trigger_ts=1_700_000_000.0, frame_count=8)
+        path, size = store.save(recording)
+
+        metadata = store.load_metadata(recording.alert_id)
+        assert metadata["frame_count"] == len(recording.frames)
+        assert metadata["trigger_frame_index"] == recording.trigger_frame_index
+        assert metadata["start_timestamp"] == recording.frames[0].timestamp
+        assert metadata["end_timestamp"] == recording.frames[-1].timestamp
+        assert metadata["fps"] == recording.fps
+        assert (metadata["width"], metadata["height"]) == (320, 240)
+        assert replay_media.encodings == [{"fps": 15, "width": 320, "height": 240}]
+        video = Path(path) / metadata["video_file"]
+        assert size == video.stat().st_size
+        signals = store.load_signals(recording.alert_id)
+        assert signals["timestamps"] == [frame.timestamp for frame in recording.frames]
+        assert signals["frame_numbers"] == [frame.frame_number for frame in recording.frames]
+        for index in (0, 3, 7):
+            assert store.load_frame(recording.alert_id, index) == recording.frames[index].frame_jpeg
+        assert [index for _path, index in replay_media.extractions] == [0, 3, 7]
+
+    @pytest.mark.parametrize("fail_at", ["write", "finalize"])
+    def test_encoding_failure_preserves_previous_recording_and_retry(
+        self, store, replay_media, fail_at,
+    ):
+        original = _recording(trigger_ts=1_700_000_000.0)
+        path, _size = store.save(original)
+        old_metadata = store.load_metadata(original.alert_id)
+        old_signals = store.load_signals(original.alert_id)
+        replacement = _recording(trigger_ts=original.trigger_timestamp, frame_count=3)
+        replay_media.fail_at = fail_at
+
+        with pytest.raises(OSError, match="simulated"):
+            store.save(replacement)
+
+        assert store.load_metadata(original.alert_id) == old_metadata
+        assert store.load_signals(original.alert_id) == old_signals
+        assert store.load_frame(original.alert_id, 7) == original.frames[7].frame_jpeg
+        assert not list(Path(path).parent.glob(f".{original.alert_id}.*"))
+        replay_media.fail_at = None
+        store.save(replacement)
+        assert store.load_metadata(original.alert_id)["frame_count"] == 3
+        assert store.load_frame(original.alert_id, 2) == replacement.frames[2].frame_jpeg
+
+
 def _auth_client_for_role(db, store, tmp_path, role: str) -> TestClient:
     username = f"replay-{role}"
     db.create_user(username, hash_password("replay-secret"), role, username)
@@ -507,11 +600,11 @@ class TestReplayClipsEndpoints:
 
 
 class TestReplayReferenceOffset:
-    def test_reference_offset_shifts_target_frame(self, client, store, tmp_path):
+    def test_reference_offset_shifts_target_frame(self, client, store, replay_media):
         """Two different offsets should request two different in-recording frames."""
         # Reference recording — a full day before the alert so the /reference
         # handler finds it via the yesterday fallback.
-        historical_ts = time.time() - 86400
+        historical_ts = 1_700_000_000.0
         historical = _recording(
             alert_id="HISTORICAL-001",
             trigger_ts=historical_ts,
@@ -520,7 +613,7 @@ class TestReplayReferenceOffset:
         store.save(historical)
 
         # The alert that will be replayed — current time, same camera.
-        current = _recording(alert_id="ALT-RT-001")
+        current = _recording(alert_id="ALT-RT-001", trigger_ts=historical_ts + 86400)
         store.save(current)
 
         resp0 = client.get("/api/replay/ALT-RT-001/reference")
@@ -532,12 +625,10 @@ class TestReplayReferenceOffset:
         # available and base64 non-empty.
         assert body0["data"]["available"] is True
         frame0 = body0["data"]["frame_base64"]
-        assert frame0
+        assert base64.b64decode(frame0) == historical.frames[29].frame_jpeg
 
-        # A -5s offset should move the target to an earlier frame. The JPEG
-        # bytes are produced by different frames in the MP4 so they will
-        # differ (even with default CRF, adjacent frames differ unless fed
-        # identical JPEGs — here frames are shaded with per-index values).
+        # A -5s offset should request the exact earlier input JPEG. Codec
+        # behavior is mocked; selecting the right recording/index is not.
         resp_neg = client.get(
             "/api/replay/ALT-RT-001/reference",
             params={"frame_offset_seconds": -5.0},
@@ -547,7 +638,7 @@ class TestReplayReferenceOffset:
         assert body_neg["code"] == 0
         assert body_neg["data"]["available"] is True
         frame_neg = body_neg["data"]["frame_base64"]
-        assert frame_neg
+        assert base64.b64decode(frame_neg) == historical.frames[25].frame_jpeg
 
         # Positive offset (post-trigger) should succeed too — availability
         # depends on whether an in-range frame exists; when the offset walks
@@ -559,14 +650,15 @@ class TestReplayReferenceOffset:
         assert resp_pos.status_code == 200
         assert resp_pos.json()["code"] == 0
 
-        # The -5s offset should yield a visibly different frame vs the 0s one
-        # (they index into different positions within the same historical MP4).
+        assert [index for _path, index in replay_media.extractions] == [29, 25, 29]
+        assert all(path.parent.name == "HISTORICAL-001" for path, _index in replay_media.extractions)
+        # Different offsets must not accidentally return the same cached frame.
         assert frame0 != frame_neg
 
     def test_reference_offset_zero_matches_default(self, client, store):
-        historical_ts = time.time() - 86400
+        historical_ts = 1_700_000_000.0
         store.save(_recording(alert_id="HISTORICAL-002", trigger_ts=historical_ts))
-        store.save(_recording(alert_id="ALT-RT-002"))
+        store.save(_recording(alert_id="ALT-RT-002", trigger_ts=historical_ts + 86400))
 
         r1 = client.get("/api/replay/ALT-RT-002/reference")
         r2 = client.get(

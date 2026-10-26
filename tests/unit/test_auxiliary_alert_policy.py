@@ -4,13 +4,96 @@ from types import SimpleNamespace
 
 import pytest
 
-from argus.alerts.grader import Alert, AlertGrader, HANDLING_POLICIES
+from argus.alerts.grader import Alert, AlertGrader, DetectionType, HANDLING_POLICIES
 from argus.anomaly.classification_policy import trusted_classification
-from argus.config.schema import AlertSeverity
+from argus.config.schema import AlertConfig, AlertSeverity, ZonePriority
 from argus.core.pipeline import DetectionPipeline
 
 
 VOCABULARY = ("wrench", "shadow", "crane")
+
+
+@pytest.mark.parametrize("uptime", [0.0, 1.0, 59.0, 299.0])
+@pytest.mark.parametrize("early_warning", [False, True])
+def test_first_alert_does_not_require_a_machine_uptime_window(
+    monkeypatch, uptime, early_warning,
+):
+    # Keep the production confirmation threshold and both cooldown windows:
+    # only the monotonic clock is fake. A fresh runner/host is not an incident.
+    monkeypatch.setattr("argus.alerts.grader.time.monotonic", lambda: uptime)
+    grader = AlertGrader(AlertConfig())
+    arguments = {
+        "camera_id": "camera", "zone_id": "default",
+        "zone_priority": ZonePriority.STANDARD, "anomaly_score": 0.99,
+        "detection_type": DetectionType.HYBRID if early_warning else DetectionType.ANOMALY,
+    }
+    if early_warning:
+        arguments["incident_key"] = "appearance-1"
+    result = None
+    for frame_number in range(1, 5):
+        result = grader.evaluate_with_evidence(**arguments, frame_number=frame_number)
+        if result.should_alert:
+            break
+    assert result.should_alert
+    assert result.alert.triggered_by_early_warning is early_warning
+    assert frame_number == (1 if early_warning else 4)
+    # A real first emission at monotonic=0 still starts the full cooldown.
+    repeat = grader.evaluate_with_evidence(**arguments, frame_number=frame_number + 1)
+    assert not repeat.should_alert
+    assert repeat.suppression_reason == "same_zone_suppression"
+
+
+@pytest.mark.parametrize("channel", [kind.value for kind in DetectionType])
+def test_missing_alert_history_has_no_suppression_at_zero_uptime(channel):
+    grader = AlertGrader(AlertConfig())
+    assert grader._suppression_reason(
+        camera_id="camera", zone_key="camera:default", detection_type=channel,
+        detected_objects=None, now=0.0, incident_key=None,
+    ) is None
+
+
+@pytest.mark.parametrize("history", ["zone", "camera"])
+def test_actual_zero_timestamp_keeps_full_suppression_window(history):
+    grader = AlertGrader(AlertConfig())
+    channel = DetectionType.ANOMALY.value
+    if history == "zone":
+        grader._last_alerts[grader._tracker_key("camera:default", channel)] = 0.0
+        window = grader._config.suppression.same_zone_window_seconds
+    else:
+        grader._last_camera_alerts[
+            grader._camera_suppression_key("camera", "camera:default", channel)
+        ] = 0.0
+        window = grader._config.suppression.same_camera_window_seconds
+    arguments = {
+        "camera_id": "camera", "zone_key": "camera:default", "detection_type": channel,
+        "detected_objects": None, "incident_key": None,
+    }
+    assert grader._suppression_reason(**arguments, now=window - 0.001) == f"same_{history}_suppression"
+    assert grader._suppression_reason(**arguments, now=window) is None
+
+
+def test_first_alerts_of_other_channels_and_task_graders_are_not_cooled_down(monkeypatch):
+    monkeypatch.setattr("argus.alerts.grader.time.monotonic", lambda: 0.0)
+    grader = AlertGrader(AlertConfig())
+    arguments = {
+        "camera_id": "camera", "zone_id": "default", "zone_priority": ZonePriority.STANDARD,
+        "anomaly_score": 0.99, "frame_number": 1,
+    }
+    assert grader.evaluate(**arguments, detection_type=DetectionType.HYBRID) is not None
+    # Independent channels must not inherit the appearance cooldown. Explicit
+    # corroboration exercises the same unchanged early-warning safety path.
+    water = grader.evaluate(
+        **arguments, detection_type=DetectionType.WATER_LEAK,
+        detected_objects=[{"class_name": "water_leak"}], incident_key="water-1",
+    )
+    assert water is not None
+    assert grader.evaluate(
+        **arguments, detection_type=DetectionType.WATER_LEAK,
+        detected_objects=[{"class_name": "water_leak"}], incident_key="water-1",
+    ) is None
+    # Task runtimes own separate graders rather than sharing mutable cooldown.
+    other_task_grader = AlertGrader(AlertConfig())
+    assert other_task_grader.evaluate(**arguments, detection_type=DetectionType.HYBRID) is not None
 
 
 @pytest.mark.parametrize(

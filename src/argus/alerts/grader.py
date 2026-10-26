@@ -1092,9 +1092,14 @@ class AlertGrader:
 
         last_alert_time = self._last_alerts.get(
             self._tracker_key(zone_key, detection_type, incident_key),
-            0,
         )
-        if now - last_alert_time < self._config.suppression.same_zone_window_seconds:
+        # Missing history is not an alert at monotonic=0. On recently booted
+        # hosts that sentinel suppressed the first real incident for an entire
+        # window. A recorded zero is valid and must still start a cooldown.
+        if (
+            last_alert_time is not None
+            and now - last_alert_time < self._config.suppression.same_zone_window_seconds
+        ):
             return "same_zone_suppression"
         last_camera_alert = self._last_camera_alerts.get(
             self._camera_suppression_key(
@@ -1103,9 +1108,11 @@ class AlertGrader:
                 detection_type,
                 incident_key,
             ),
-            0,
         )
-        if now - last_camera_alert < self._config.suppression.same_camera_window_seconds:
+        if (
+            last_camera_alert is not None
+            and now - last_camera_alert < self._config.suppression.same_camera_window_seconds
+        ):
             return "same_camera_suppression"
         return None
 

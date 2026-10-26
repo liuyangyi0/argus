@@ -7,10 +7,13 @@ Mock trainers/runtimes are allowed; the real execution entry points fail closed.
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib.abc
 import os
+import shlex
+import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT_SUITES = {
@@ -22,8 +25,10 @@ UNIT_SUITES = {
         gpu_smoke_contracts
     """.split(),
     "core": """
+        functional_test_guard
         auth permissions startup_security api_contract core_api_dtos config config_loader config_api
-        database database_alert_evidence_migration alert_workflow alerts_route alerts_route_evidence
+        database database_alert_evidence_migration alert_grader alert_grader_evidence
+        alert_workflow alerts_route alerts_route_evidence
         backup_route reports_route feedback feedback_queue feedback_record labeling_lineage
         training_history training_route_artifacts scene_training_route_authority training_job_claims
         scene_workflow scene_workflow_routes scene_workflow_task_concurrency task_pause
@@ -102,7 +107,36 @@ class FunctionalGuard:
             raise RuntimeError(f"Local functional profile forbids real execution: {label}")
         return forbidden
 
+    def guard_process_launch(self, launch):
+        """Block external media tools without blocking ordinary Python probes.
+
+        OpenCV is not the only media path: on Windows the encoder prefers an
+        FFmpeg subprocess. Check the executable as well as argv, including
+        quoted Windows paths, before the process can open any source/output.
+        """
+        @functools.wraps(launch)
+        def guarded(args, *positional, **kwargs):
+            executable = kwargs.get("executable")
+            if executable is None:
+                if isinstance(args, os.PathLike):
+                    executable = args
+                elif isinstance(args, (str, bytes)):
+                    command = os.fsdecode(args)
+                    try:
+                        tokens = shlex.split(command, posix=False)
+                    except ValueError:
+                        tokens = [command]
+                    executable = tokens[0] if tokens else ""
+                else:
+                    executable = args[0] if args else ""
+            name = PureWindowsPath(os.fsdecode(executable).strip('"\'')).name.lower()
+            if name.startswith(("ffmpeg", "ffprobe")):
+                return self.block(f"subprocess media tool: {name}")()
+            return launch(args, *positional, **kwargs)
+        return guarded
+
     def pytest_configure(self, config):
+        import av
         import cv2
 
         from argus.anomaly.detector import AnomalibDetector, MultiScaleDetector
@@ -124,6 +158,8 @@ class FunctionalGuard:
         # source video readers/writers are not opened by this profile.
         cv2.VideoCapture = self.block("cv2.VideoCapture")
         cv2.VideoWriter = self.block("cv2.VideoWriter")
+        av.open = self.block("av.open")
+        subprocess.Popen = self.guard_process_launch(subprocess.Popen)
 
     def pytest_sessionfinish(self, session, exitstatus):
         if self.violations:

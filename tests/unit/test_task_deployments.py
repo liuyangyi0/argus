@@ -7,6 +7,7 @@ import subprocess
 import sys
 import gc
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -374,16 +375,48 @@ def test_completed_source_stop_recovers_only_after_source_returns(deployment, mo
     assert executor.status(first["task_id"])["deployment_revision"] == 2
 
 
-def test_owner_os_lock_rejects_another_process_without_pid_or_time_lease(deployment):
+def _probe_owner_in_another_process(database_url, cwd):
+    # The ordinary CI profile installs dependencies, not an editable Argus
+    # package. A child interpreter must use this checkout explicitly instead
+    # of relying on pytest's in-process sys.path or a developer installation.
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    code = (
+        "import sys; from pathlib import Path; from types import SimpleNamespace; "
+        "sys.path.insert(0, sys.argv[2]); "
+        "import argus.runtime.task_deployments as deployments; "
+        "assert Path(deployments.__file__).resolve() == "
+        "Path(sys.argv[2], 'argus/runtime/task_deployments.py').resolve(); "
+        "owner=deployments._RuntimeOwner(SimpleNamespace(_database_url=sys.argv[1])); "
+        "print(owner.acquire(), flush=True)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code, database_url, str(source_root)],
+        cwd=cwd, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert result.returncode == 0, (
+        f"runtime-owner subprocess failed ({result.returncode})\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert result.stdout.strip() in {"True", "False"}, result.stdout
+    return result.stdout.strip() == "True"
+
+
+def test_owner_os_lock_rejects_another_process_without_pid_or_time_lease(deployment, tmp_path):
     coordinator = deployment[-1]
     assert coordinator._owner.acquire()
-    code = ("import sys; from types import SimpleNamespace; "
-            "from argus.runtime.task_deployments import _RuntimeOwner; "
-            "owner=_RuntimeOwner(SimpleNamespace(_database_url=sys.argv[1])); "
-            "print(owner.acquire())")
-    result = subprocess.run([sys.executable, "-c", code, deployment[0]._database_url],
-                            capture_output=True, text=True, timeout=10, check=True)
-    assert result.stdout.strip() == "False"
+    assert not _probe_owner_in_another_process(deployment[0]._database_url, tmp_path)
+    coordinator._owner.release()
+    assert _probe_owner_in_another_process(deployment[0]._database_url, tmp_path)
+
+
+def test_owner_os_lock_is_released_when_holding_process_exits(deployment, tmp_path):
+    # The child deliberately exits without release(). The OS lock must then
+    # be available without deleting the lock file or waiting for a PID lease.
+    owner = deployment[-1]._owner
+    assert _probe_owner_in_another_process(deployment[0]._database_url, tmp_path)
+    assert owner.path.is_file()
+    assert owner.acquire()
+    assert not _probe_owner_in_another_process(deployment[0]._database_url, tmp_path)
 
 
 def test_intent_commit_rechecks_task_revision_after_bundle_validation(deployment, monkeypatch):
