@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from argus.anomaly.job_executor import TrainingJobExecutor
@@ -24,6 +26,20 @@ from argus.storage.model_release_service import (
 )
 from argus.storage.models import ModelStage
 from argus.storage.release_pipeline import ReleasePipeline
+
+
+@pytest.fixture
+def compute_manager(tmp_path):
+    from argus.runtime.compute_ownership import ComputeOwnership
+    manager = CameraManager([], AlertConfig())
+    ownership = ComputeOwnership(tmp_path / "mock-compute.lock")
+    manager.enable_compute_ownership(ownership)
+    yield manager
+    # The trainer in these tests is a mock; no models or background compute
+    # ran. Do not infer this cleanup from GC or disable the production gate.
+    assert ownership.release(manager)
+    manager._inference_executor.shutdown(wait=False)
+    manager._encode_executor.shutdown(wait=False)
 
 
 class _PipelineDouble:
@@ -72,6 +88,9 @@ def _camera_manager(db: Database, current_version: str | None) -> CameraManager:
         protocol="file",
     )
     manager = CameraManager([cam_config], AlertConfig(), database=db)
+    from argus.runtime.compute_ownership import ComputeOwnership
+    lock = Path(db._database_url.removeprefix("sqlite:///")).with_suffix(".mock-compute.lock")
+    manager.enable_compute_ownership(ComputeOwnership(lock))
     manager._pipelines["cam_01"] = _PipelineDouble(cam_config, current_version)
     manager._runners["cam_01"] = MagicMock()
     manager._notify_camera_status = MagicMock()
@@ -331,7 +350,7 @@ def test_training_job_actions_default_to_authenticated_user(tmp_path):
     assert rejected["error"] == "Rejected by review-engineer"
 
 
-def test_reexport_api_invokes_trainer_with_requested_format(tmp_path, monkeypatch):
+def test_reexport_api_invokes_trainer_with_requested_format(tmp_path, monkeypatch, compute_manager):
     database = Database(database_url=f"sqlite:///{tmp_path / 'reexport.db'}")
     database.initialize()
     registry = ModelRegistry(session_factory=database.get_session)
@@ -347,7 +366,7 @@ def test_reexport_api_invokes_trainer_with_requested_format(tmp_path, monkeypatc
 
     alerts_dir = tmp_path / "alerts"
     alerts_dir.mkdir()
-    app = create_app(database=database, alerts_dir=str(alerts_dir))
+    app = create_app(database=database, alerts_dir=str(alerts_dir), camera_manager=compute_manager)
     client = TestClient(app)
 
     trainer = MagicMock()
@@ -381,7 +400,7 @@ def test_reexport_api_invokes_trainer_with_requested_format(tmp_path, monkeypatc
     )
 
 
-def test_reexport_api_prefers_shared_app_state_trainer(tmp_path):
+def test_reexport_api_prefers_shared_app_state_trainer(tmp_path, compute_manager):
     database = Database(database_url=f"sqlite:///{tmp_path / 'shared_trainer.db'}")
     database.initialize()
     registry = ModelRegistry(session_factory=database.get_session)
@@ -408,6 +427,7 @@ def test_reexport_api_prefers_shared_app_state_trainer(tmp_path):
         database=database,
         alerts_dir=str(alerts_dir),
         model_trainer=trainer,
+        camera_manager=compute_manager,
     )
     client = TestClient(app)
 

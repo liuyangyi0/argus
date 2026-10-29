@@ -95,6 +95,33 @@ def _dashboard_thread_alive(dashboard_thread: threading.Thread | None) -> bool:
     return dashboard_thread is not None and dashboard_thread.is_alive()
 
 
+def _stop_dashboard_training(app, server, dashboard_thread, *, timeout=10) -> bool:
+    """Run lifespan shutdown before DB disposal; retry bounded training cleanup.
+
+    A false result never asserts that a worker exited. Its durable execution
+    remains subject to conservative orphan reconciliation on the next start.
+    """
+    if server is not None:
+        server.should_exit = True
+    if dashboard_thread is not None and dashboard_thread is not threading.current_thread():
+        dashboard_thread.join(timeout=timeout)
+    runtime = getattr(app.state, "task_training_runtime", None) if app is not None else None
+    if runtime is not None:
+        try:
+            if runtime.close(timeout=5) is not True:
+                logger.error("shutdown.task_training_cleanup_unconfirmed")
+                return False
+        except Exception:
+            logger.error("shutdown.task_training_cleanup_failed", exc_info=True)
+            return False
+    if app is not None:
+        from argus.runtime.task_training_resources import training_compute_exclusion_required
+        if training_compute_exclusion_required(None, getattr(app.state, "database", None)):
+            logger.error("shutdown.task_training_owner_unresolved")
+            return False
+    return not _dashboard_thread_alive(dashboard_thread)
+
+
 def _should_continue_main_loop(
     running: bool,
     manager: CameraManager,
@@ -254,8 +281,16 @@ def main():
             print(f"Error: Failed to prepare dev video source: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    # ── GPU / CUDA environment check ──────────────────────────────────
-    _log_gpu_environment()
+    # Claim before starting streams, executors or creating CUDA diagnostics.
+    # A rejected second instance must not leave background services behind.
+    from argus.runtime.compute_ownership import ComputeOwnership
+    compute_ownership, startup_compute_owner = ComputeOwnership(), object()
+    if not compute_ownership.acquire(startup_compute_owner):
+        print("Error: another Argus instance owns local compute resources", file=sys.stderr)
+        sys.exit(2)
+    if config.task_training.enabled and args.no_dashboard:
+        print("Error: validation task training requires the Dashboard-owned scheduler", file=sys.stderr)
+        sys.exit(2)
 
     METRICS.ensure_initialized()
     METRICS.app_info.info({"version": "0.2.0", "node_id": config.node_id})
@@ -265,6 +300,12 @@ def main():
     # Initialize subsystems
     db = Database(database_url=config.storage.database_url)
     db.initialize()
+    from argus.runtime.task_training_resources import training_compute_exclusion_required
+    training_maintenance = training_compute_exclusion_required(config, db)
+    if training_maintenance and args.no_dashboard:
+        db.close()
+        print("Error: unresolved training ownership requires Dashboard reconciliation", file=sys.stderr)
+        sys.exit(2)
 
     # Create default admin user if no users exist
     if db.user_count() == 0:
@@ -480,6 +521,13 @@ def main():
         source_resolver=_resolve_camera_source if _go2rtc is not None else None,
         baselines_dir=config.storage.baselines_dir,
     )
+    if not compute_ownership.transfer(startup_compute_owner, manager):
+        raise RuntimeError("compute startup ownership could not be transferred")
+    manager.enable_compute_ownership(compute_ownership, retain_until_exit=True)
+    if not training_maintenance:
+        # Only the compute owner may initialize CUDA for diagnostics. The
+        # training control process must stay CUDA-inert before admission.
+        _log_gpu_environment()
     if _stream_registry is not None:
         from argus.camera.orchestrator import CameraOrchestrator
 
@@ -498,6 +546,7 @@ def main():
 
     # Start dashboard in a background thread
     dashboard_thread = None
+    dashboard_server = None
     app = None
     recording_manager = None
     retention_manager = None
@@ -578,14 +627,14 @@ def main():
         if recording_manager is not None:
             manager._continuous_recording_mgr = recording_manager
 
+        import uvicorn
+        dashboard_server = uvicorn.Server(uvicorn.Config(
+            app, host=config.dashboard.host, port=config.dashboard.port,
+            log_level="warning",
+        ))
+
         def run_dashboard():
-            import uvicorn
-            uvicorn.run(
-                app,
-                host=config.dashboard.host,
-                port=config.dashboard.port,
-                log_level="warning",
-            )
+            dashboard_server.run()
 
         dashboard_thread = threading.Thread(target=run_dashboard, name="argus-dashboard", daemon=True)
         dashboard_thread.start()
@@ -615,7 +664,7 @@ def main():
     )
 
     # Scheduled retraining (C4 + A4: active learning loop)
-    if config.retraining.enabled:
+    if config.retraining.enabled and not training_maintenance:
         from argus.storage.model_registry import ModelRegistry
 
         model_reg = ModelRegistry(session_factory=db.get_session)
@@ -653,7 +702,16 @@ def main():
 
     # Start cameras
     logger.info("argus.starting", cameras=len(cameras))
-    started = manager.start_all()
+    if training_maintenance:
+        # App construction latched compute exclusion before the scheduler
+        # started. Preview/recording sources remain independent of legacy.
+        if manager.enter_training_maintenance() is not True:
+            logger.error("main.training_maintenance_not_ready")
+            started = []
+        else:
+            started = [camera.camera_id for camera in cameras if manager.start_source(camera.camera_id)]
+    else:
+        started = manager.start_all()
 
     if not started:
         if args.no_dashboard:
@@ -783,6 +841,11 @@ def main():
                     uptime=f"{h.uptime_seconds:.0f}s",
                 )
     finally:
+        # The daemon server otherwise never receives lifespan shutdown before
+        # the shared database is disposed by the CLI's signal handler.
+        dashboard_clean = _stop_dashboard_training(app, dashboard_server, dashboard_thread)
+        if not dashboard_clean:
+            logger.error("shutdown.dashboard_cleanup_unconfirmed")
         # Stop go2rtc FIRST — daemon thread may not get cleanup time
         if app is not None:
             _go2rtc = getattr(app.state, "go2rtc", None)
@@ -793,6 +856,8 @@ def main():
                     logger.debug("shutdown.go2rtc_close_failed", exc_info=True)
         scheduler.stop()
         manager.stop_all()
+        if dashboard_clean and not manager.close_compute_ownership():
+            logger.info("shutdown.compute_ownership_retained")
         # Stop continuous recording AFTER cameras (no more frames to push)
         if recording_manager is not None:
             recording_manager.stop_all()
@@ -801,7 +866,8 @@ def main():
         record_store.stop()
         inference_buffer.stop()  # flush remaining records before DB close
         dispatcher.close()
-        db.close()
+        if dashboard_clean:
+            db.close()
 
         # Final summary
         h = health.get_health()

@@ -26,6 +26,17 @@ const auth = useAuthStore()
 const canOperateCamera = computed(() => auth.hasRole(['admin', 'operator', 'engineer']))
 const canEditZones = computed(() => auth.hasRole(['admin', 'engineer']))
 const cameraId = computed(() => String(route.params.id || ''))
+const taskNavigationInvalid = computed(() => {
+  const task = route.query.analysis_task
+  const section = route.query.task_section
+  const targets = new Set(['source', 'configuration', 'models', 'deployment', 'data', 'events', 'results', 'legacy_baseline', 'legacy_runtime', 'none'])
+  return (task !== undefined && (typeof task !== 'string' || !task.trim()))
+    || (section !== undefined && (typeof section !== 'string' || !targets.has(section)))
+})
+function clearTaskNavigation() {
+  const { analysis_task: _task, task_section: _section, ...query } = route.query
+  void router.replace({ query })
+}
 const camera = ref<CameraDetailPayload | null>(null)
 const loading = ref(true)
 const refreshing = ref(false)
@@ -704,7 +715,10 @@ async function handleModeChange(value: string | number) {
       </section>
 
       <!-- Calibration section (below main content area) -->
-      <AnalysisTaskPanel :camera-id="cameraId" :can-manage="auth.hasRole(['admin', 'engineer'])" />
+      <AnalysisTaskPanel :camera-id="cameraId" :can-manage="auth.hasRole(['admin', 'engineer'])"
+        :navigation-invalid="taskNavigationInvalid"
+        :requested-task-id="typeof route.query.analysis_task === 'string' ? route.query.analysis_task : undefined"
+        :requested-section="typeof route.query.task_section === 'string' ? route.query.task_section : undefined" @clear-task-navigation="clearTaskNavigation" />
       <CalibrationWizard :camera-id="cameraId" style="margin-top: 12px" />
       </div>
 

@@ -75,7 +75,7 @@ CPU/CUDA 必须在任务 `resources.device` 中显式声明。CUDA 不可用、�
 }
 ```
 
-当前仅执行 periodic；events / disagreement / low_confidence 不静默替代为周期采集，未实现策略明确阻断。DB 流程状态与 `collection_runtime` 分开显示；首次写入结果未知、清单落盘失败和清理失败均保留所有权供对账，不能换一个流程身份假装重试成功。
+首轮仅执行 periodic；2026-10-28 已补 `object_detection.v1` 的 events 策略，只收集冻结游标后的同执行/同源已提交事件关键帧，见 [事件入样与训练候选](object-detection-lifecycle-v1.md#验证态闭环补齐事件入样与训练候选2026-10-28)。这不是事件前后录像；disagreement / low_confidence 仍明确阻断，不静默替代为周期采集。DB 流程状态与 `collection_runtime` 分开显示；首次写入结果未知、清单落盘失败和清理失败均保留所有权供对账，不能换一个流程身份假装重试成功。
 
 ## 帧身份、审核和训练血缘
 

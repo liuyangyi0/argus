@@ -21,6 +21,8 @@ def main() -> int:
     parser.add_argument("--grep", help="Select a browser test by title")
     parser.add_argument("--project", help="Select one configured browser viewport")
     parser.add_argument("--output-name", default="playwright")
+    parser.add_argument("--max-workers", type=int, choices=(1, 2), default=1,
+                        help="Vitest concurrency (default: one worker for low-memory validation)")
     args = parser.parse_args()
     if args.task == "e2e":
         url = urlsplit(args.base_url)
@@ -48,7 +50,7 @@ def main() -> int:
         return subprocess.call([node, str(web / relative), *options], cwd=web, env=env)
 
     if args.task == "unit":
-        return run("node_modules/vitest/vitest.mjs", "run", "--maxWorkers=2",
+        return run("node_modules/vitest/vitest.mjs", "run", f"--maxWorkers={args.max_workers}",
                    "--reporter=default", "--reporter=json", f"--outputFile={output / 'vitest.json'}")
     if args.task in {"types", "build"}:
         status = run("node_modules/vue-tsc/bin/vue-tsc.js", "-b")

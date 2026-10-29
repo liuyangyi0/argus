@@ -161,6 +161,60 @@ def platform(tmp_path):
     assert manager.close()
 
 
+@pytest.fixture
+def compute_exclusion_gate(platform):
+    from argus.capture.manager import CameraManager
+    from argus.config.schema import AlertConfig
+    gate = CameraManager([], AlertConfig())
+    platform[2].acquire_task_compute_reservation = gate.acquire_task_compute_reservation
+    yield gate
+    # Fixture callers confirm cleanup before releasing this local mock gate.
+    gate._inference_executor.shutdown(wait=False)
+    gate._encode_executor.shutdown(wait=False)
+
+
+def test_worker_construction_reservation_prevents_training_entry(platform, compute_exclusion_gate):
+    manager, _, _ = platform
+    entered, release = threading.Event(), threading.Event()
+    def factory(*args):
+        entered.set()
+        assert release.wait(2)
+        return FakeWorker(*args)
+    manager._worker_factory = factory
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(manager.start, "task-1", "bundle-1")
+        try:
+            assert entered.wait(1)
+            assert compute_exclusion_gate.enter_training_maintenance() is False
+        finally:
+            release.set()
+        assert future.result(timeout=2)["state"] in {"running", "waiting_source"}
+    manager.stop("task-1")
+    assert compute_exclusion_gate.enter_training_maintenance() is True
+
+
+def test_failed_worker_cleanup_retains_training_exclusion_until_retry(platform, compute_exclusion_gate):
+    manager, _, _ = platform
+    manager.start("task-1", "bundle-1")
+    worker = manager._executions["task-1"].worker
+    worker.cleanup_ok = False
+    with pytest.raises(TaskExecutionError) as error:
+        manager.stop("task-1")
+    assert error.value.code == "CLEANUP_PENDING"
+    assert compute_exclusion_gate.enter_training_maintenance() is False
+    worker.cleanup_ok = True
+    assert manager.stop("task-1")["state"] == "stopped"
+    assert compute_exclusion_gate.enter_training_maintenance() is True
+
+
+def test_worker_constructor_failure_releases_unloaded_compute_reservation(platform, compute_exclusion_gate):
+    manager, _, _ = platform
+    manager._worker_factory = Mock(side_effect=RuntimeError("synthetic constructor failure"))
+    with pytest.raises(RuntimeError, match="synthetic constructor failure"):
+        manager.start("task-1", "bundle-1")
+    assert compute_exclusion_gate.enter_training_maintenance() is True
+
+
 def test_managed_tasks_share_source_and_independent_results_with_no_alerts(platform):
     manager, _, camera = platform
     manager.start("task-1", "bundle-1")
@@ -544,6 +598,21 @@ def test_require_profile_missing_current_evidence_fails_before_loading_worker(pl
     assert not manager._executions["task-1"].worker.running
     camera.scene["usable"] = True
     assert manager.start("task-1", "bundle-1")
+
+
+def test_status_exposes_transient_scene_reason_without_poisoning_worker(platform):
+    manager, service, camera = platform
+    require_scene(service)
+    camera.scene["usable"] = True
+    manager.start("task-1", "bundle-1")
+    camera.scene["usable"] = False
+    blocked = manager.status("task-1")
+    assert blocked["state"] == "blocked"
+    assert blocked.get("reason_code") == "SCENE_BLOCKED"
+    assert blocked["error_code"] is None
+    assert blocked["production_allowed"] is False
+    camera.scene["usable"] = True
+    assert manager.status("task-1").get("reason_code") is None
 
 
 def test_require_profile_consumer_pause_discards_late_result_and_waits_for_fresh_evidence(platform):

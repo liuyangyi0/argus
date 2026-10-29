@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+node_modules/
 .eggs/
 *.egg
 
@@ -20,6 +21,9 @@ data/recordings/
 data/backups/
 data/backbones/
 data/model_packages/
+data/task_datasets/
+data/task_events/
+data/task_release_evidence/
 data/review/
 data/argus.db*
 

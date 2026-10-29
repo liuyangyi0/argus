@@ -1319,3 +1319,63 @@ class ContinuousRecordingSegment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False,
     )
+
+
+class TaskEventRecord(Base):
+    """Task-scoped observations; validation never masquerades as an alert."""
+
+    __tablename__ = "task_events"
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    camera_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    bundle_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    task_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    deployment_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    execution_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_epoch: Mapped[int] = mapped_column(Integer, nullable=False)
+    frame_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="validation", server_default="validation")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="new", server_default="new")
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    evidence_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    evidence_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    alert_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class TaskReleaseRecord(Base):
+    """Frozen release dossier; human review alone grants no production rights."""
+
+    __tablename__ = "task_releases"
+    release_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    document_json: Mapped[str] = mapped_column(Text, nullable=False)
+    document_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class TaskTrainingExecutionRecord(Base):
+    """Durable execution of an explicitly approved, frozen task dataset."""
+
+    __tablename__ = "task_training_executions"
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    workflow_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_json: Mapped[str] = mapped_column(Text, nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

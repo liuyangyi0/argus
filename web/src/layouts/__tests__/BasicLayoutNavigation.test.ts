@@ -51,6 +51,7 @@ vi.mock('../../components/system/ErrorCenterDrawer.vue', () => ({
 
 vi.mock('@ant-design/icons-vue', () => ({
   AlertOutlined: { template: '<span />' },
+  AppstoreOutlined: { template: '<span />' },
   BarChartOutlined: { template: '<span />' },
   BellOutlined: { template: '<span />' },
   DashboardOutlined: { template: '<span />' },
@@ -152,6 +153,7 @@ describe('BasicLayout core-loop navigation', () => {
     const links = wrapper.findAll('[data-to]').map(link => link.attributes('data-to'))
     expect(links).toEqual(expect.arrayContaining([
       '/cameras',
+      '/analysis-tasks',
       '/alerts',
       '/reports',
       '/models/training',

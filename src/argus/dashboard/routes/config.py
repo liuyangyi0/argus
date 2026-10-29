@@ -498,6 +498,14 @@ async def _reload_config(request: Request, _payload):
     current_config = getattr(request.app.state, "config", None)
     if current_config is None:
         return api_unavailable("当前配置不可用")
+    # Training enablement, maintenance approval and pickle provenance are
+    # startup-only authority. A generic engineer reload cannot replace them.
+    current_training = getattr(current_config, "task_training", None)
+    replacement_training = getattr(new_config, "task_training", None)
+    if (current_training is None or replacement_training is None
+            or current_training.model_dump() != replacement_training.model_dump()):
+        return api_conflict("任务训练配置仅能在服务启动时生效，请由运维修改配置并重启服务")
+    new_config.task_training = current_training
     # Auxiliary SDKs and their risk policy retain references to these objects.
     # Replacing the app configuration alone would leave stale runtime authority.
     for section in ("classifier", "segmenter", "physics"):

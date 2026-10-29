@@ -2008,6 +2008,62 @@ class SensorFusionConfig(BaseModel):
         return self
 
 
+class TrustedTaskTrainingBaseModelConfig(BaseModel):
+    """Operator-owned trust identity; validation never opens model artifacts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", strict=True)
+    name: str = Field(min_length=1, max_length=200, strict=True)
+    relative_path: str = Field(min_length=1, max_length=500, strict=True)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$", strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        if value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("training base name must be a nonempty display label")
+        return value
+
+    @field_validator("relative_path")
+    @classmethod
+    def _validate_relative_path(cls, value: str) -> str:
+        # Use a platform-independent canonical relative identity. Do not resolve,
+        # stat, hash or deserialize anything while loading operator settings.
+        parts = value.split("/")
+        reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                    *(f"LPT{i}" for i in range(1, 10))}
+        if ("\\" in value or ":" in value or not value.endswith(".pt")
+                or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", part)
+                       or part.endswith(".") or part.split(".", 1)[0].upper() in reserved
+                       for part in parts)):
+            raise ValueError("training base path must be a canonical relative .pt path")
+        return value
+
+
+class TaskTrainingConfig(BaseModel):
+    """Startup-only authority for isolated, validation-only task training."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = Field(default=False, strict=True)
+    maintenance_approved: bool = Field(default=False, strict=True)
+    resource_mode: Literal["exclusive_maintenance"] = "exclusive_maintenance"
+    device: Literal["cuda:0"] = "cuda:0"
+    minimum_free_memory_mb: int = Field(default=4096, ge=256, le=1048576, strict=True)
+    poll_interval_seconds: float = Field(default=1.0, ge=0.1, le=60.0, strict=True, allow_inf_nan=False)
+    trusted_base_models: list[TrustedTaskTrainingBaseModelConfig] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def _validate_unique_trust_identities(self) -> TaskTrainingConfig:
+        identifiers = [base.model_id for base in self.trusted_base_models]
+        # Paths refer to the same file on Windows even if their case differs.
+        paths = [base.relative_path.casefold() for base in self.trusted_base_models]
+        if len(identifiers) != len(set(identifiers)) or len(paths) != len(set(paths)):
+            raise ValueError("training base model IDs and paths must be unique")
+        return self
+
+
 class ArgusConfig(BaseModel):
     """Top-level configuration for the Argus system."""
 
@@ -2025,6 +2081,7 @@ class ArgusConfig(BaseModel):
     segmenter: SegmenterConfig = Field(default_factory=SegmenterConfig)
     cross_camera: CrossCameraConfig = Field(default_factory=CrossCameraConfig)
     retraining: RetrainingConfig = Field(default_factory=RetrainingConfig)
+    task_training: TaskTrainingConfig = Field(default_factory=TaskTrainingConfig)
     feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
     baseline_capture: BaselineCaptureConfig = Field(default_factory=BaselineCaptureConfig)
     imaging: ImagingConfig = Field(default_factory=ImagingConfig)

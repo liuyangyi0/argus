@@ -48,12 +48,13 @@ CONTROL_TOPIC = "control"
 VALID_TOPICS = frozenset({
     "health", "cameras", "alerts", "tasks", "wall", "degradation", "heatmap",
     "audio_alert", "models", "model_release", "system_degradation",
-    "system_errors",
+    "system_errors", "task_events",
 })
 
 TOPIC_PERMISSIONS: dict[str, str] = {
     "health": "read_system",
     "cameras": "read_cameras",
+    "task_events": "read_cameras",
     "alerts": "read_alerts",
     "tasks": "manage_training",
     "wall": "read_cameras",

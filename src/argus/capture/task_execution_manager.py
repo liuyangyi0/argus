@@ -35,6 +35,8 @@ class _Execution:
     applied_task_revision: int | None = None
     deployment_operation_id: str | None = None
     deployment_revision: int | None = None
+    event_error: str | None = None
+    compute_reservation: object | None = None
 
 
 @dataclass
@@ -52,7 +54,7 @@ class TaskExecutionManager:
 
     def __init__(self, task_service, camera_manager, *, models_root: str | Path,
                  max_workers: int = 2, memory_budget_mb: int = 4096,
-                 worker_factory=IsolatedTaskWorker):
+                 worker_factory=IsolatedTaskWorker, event_sink=None):
         if type(max_workers) is not int or max_workers < 1:
             raise ValueError("max_workers must be positive")
         if type(memory_budget_mb) is not int or memory_budget_mb < 128:
@@ -63,6 +65,7 @@ class TaskExecutionManager:
         self._max_workers = max_workers
         self._memory_budget_mb = memory_budget_mb
         self._worker_factory = worker_factory
+        self._event_sink = event_sink
         self._lock = threading.RLock()
         self._task_controls: dict[str, _TaskControl] = {}
         self._executions: dict[str, _Execution] = {}
@@ -172,11 +175,16 @@ class TaskExecutionManager:
                     execution, worker = prepared, prepared.worker
                     del self._prepared[task_id]
                 else:
-                    self._reserve(manifest)
-                    worker = self._worker_factory(manifest, self._models_root)
+                    reservation = self._reserve(manifest)
+                    try:
+                        worker = self._worker_factory(manifest, self._models_root)
+                    except Exception:
+                        if reservation is not None:
+                            reservation.release()
+                        raise
                     execution = _Execution(manifest=manifest, source=source, worker=worker,
                                            deployment_operation_id=deployment_operation_id,
-                                           deployment_revision=deployment_revision)
+                                           deployment_revision=deployment_revision, compute_reservation=reservation)
                 self._executions[task_id] = execution
             try:
                 self._check_authority(execution)
@@ -214,6 +222,19 @@ class TaskExecutionManager:
                                 execution.results.append(result)
                                 execution.error_code = None
                                 execution.reason = None
+                                if self._event_sink is not None and manifest["template_id"] == "object_detection.v1":
+                                    try:
+                                        accepted = self._event_sink.offer(
+                                            manifest, result, frame,
+                                            deployment_revision=execution.deployment_revision,
+                                            operation_id=execution.deployment_operation_id,
+                                        )
+                                        execution.event_error = None if accepted else "EVENT_QUEUE_UNAVAILABLE"
+                                    except Exception:
+                                        # Evidence transport is isolated from model/source
+                                        # ownership. The sink must only enqueue here: this
+                                        # callback holds the source/task commit fences.
+                                        execution.event_error = "EVENT_QUEUE_FAILED"
 
                     self._commit_scene(execution, append)
 
@@ -283,6 +304,13 @@ class TaskExecutionManager:
                        for item in owned if item.lease_held)
         if reserved + manifest["config"]["resources"]["memory_limit_mb"] > self._memory_budget_mb:
             raise TaskExecutionError("RESOURCE_EXHAUSTED", "declared shadow memory reservation exhausted")
+        reserve = getattr(self._manager, "acquire_task_compute_reservation", None)
+        if callable(reserve):
+            try:
+                return reserve()
+            except Exception as exc:
+                raise TaskExecutionError("RESOURCE_EXHAUSTED", "training maintenance excludes model loading") from exc
+        return None
 
     def deploy(self, task_id: str, bundle_id: str, *, operation_id: str, deployment_revision: int) -> dict:
         """Prepare beside the old worker; replace only after readiness checks.
@@ -340,10 +368,16 @@ class TaskExecutionManager:
                 with self._lock:
                     if self._closed or cancelled.is_set():
                         raise TaskExecutionError("CANCELLED", "deployment was cancelled")
-                    self._reserve(manifest)
-                    candidate = _Execution(manifest, source, self._worker_factory(manifest, self._models_root),
+                    reservation = self._reserve(manifest)
+                    try:
+                        worker = self._worker_factory(manifest, self._models_root)
+                    except Exception:
+                        if reservation is not None:
+                            reservation.release()
+                        raise
+                    candidate = _Execution(manifest, source, worker,
                                            cancelled=cancelled, deployment_operation_id=operation_id,
-                                           deployment_revision=deployment_revision)
+                                           deployment_revision=deployment_revision, compute_reservation=reservation)
                     self._prepared[task_id] = candidate
                 switched = False
                 try:
@@ -417,6 +451,9 @@ class TaskExecutionManager:
                 execution.state = "cleanup_pending"
                 return False
             execution.registered = False
+        if execution.compute_reservation is not None:
+            execution.compute_reservation.release()
+            execution.compute_reservation = None
         with self._lock:
             execution.lease_held = False
             execution.state = "stopped"
@@ -503,12 +540,44 @@ class TaskExecutionManager:
                     raise TaskExecutionError("BUSY", "stop the task and confirm cleanup before mutation")
             return callback()
 
+    def set_event_sink(self, sink) -> None:
+        """Application wiring only; setting a sink never authorizes production."""
+        with self._lock:
+            self._event_sink = sink
+
+    def event_context(self, task_id: str) -> dict | None:
+        """Observe current execution identity without I/O under manager locks."""
+        with self._lock:
+            execution = self._executions.get(task_id)
+            if execution is None or execution.cancelled.is_set() or execution.state != "running":
+                return None
+        # A retained old source can still expose a plausible token after the
+        # camera manager replaces it. Token equality is not source ownership.
+        if self._manager.get_camera_source(execution.manifest["camera_id"]) is not execution.source:
+            return None
+        token = execution.source.source_token
+        try:
+            self._check_scene(execution)
+        except TaskExecutionError:
+            return None
+        with self._lock:
+            if (self._executions.get(task_id) is not execution or execution.cancelled.is_set()
+                    or execution.state != "running" or token is None):
+                return None
+            return {"task_id": task_id, "bundle_id": execution.manifest["bundle_id"],
+                    "manifest_sha256": execution.manifest["manifest_sha256"],
+                    "execution_id": getattr(execution.worker, "execution_id", None),
+                    "deployment_revision": execution.deployment_revision,
+                    "deployment_operation_id": execution.deployment_operation_id,
+                    "source_session_id": token[0], "source_epoch": token[1]}
+
     def status(self, task_id: str) -> dict | None:
         with self._lock:
             execution = self._executions.get(task_id)
             if execution is None:
                 return None
             state, reason = execution.state, execution.reason
+            reason_code = execution.error_code
             last_result = execution.results[-1] if execution.results else None
         token = execution.source.source_token
         last_state = last_result.get("data", {}).get("state") if (
@@ -526,14 +595,16 @@ class TaskExecutionManager:
                 self._check_authority(execution)
             except TaskExecutionError as exc:
                 state, reason = "blocked", str(exc)
+                reason_code = exc.code
         return {"task_id": task_id, "bundle_id": execution.manifest["bundle_id"],
                 "manifest_sha256": execution.manifest["manifest_sha256"],
                 "task_revision": execution.manifest["task_revision"], "state": state,
                 "applied_task_revision": execution.applied_task_revision,
-                "reason": reason, "error_code": execution.error_code,
+                "reason": reason, "reason_code": reason_code, "error_code": execution.error_code,
                 "runtime": runtime, "worker": execution.worker.snapshot(),
                 "deployment_operation_id": execution.deployment_operation_id,
                 "deployment_revision": execution.deployment_revision,
+                "event_error": execution.event_error,
                 "production_allowed": False, "alerts_emitted": False}
 
     def results(self, task_id: str, limit: int = 20) -> list[dict]:

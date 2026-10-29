@@ -97,6 +97,20 @@ def client(db, health, alerts_dir):
     return TestClient(app)
 
 
+@pytest.fixture
+def capture_compute_manager(tmp_path):
+    from argus.runtime.compute_ownership import ComputeOwnership
+    manager = CameraManager([], AlertConfig())
+    ownership = ComputeOwnership(tmp_path / "capture-control.lock")
+    manager.enable_compute_ownership(ownership)
+    yield manager
+    # The task manager in these control-plane tests only records submit calls;
+    # no camera/model/background task was started.
+    assert ownership.release(manager)
+    manager._inference_executor.shutdown(wait=False)
+    manager._encode_executor.shutdown(wait=False)
+
+
 def _two_phase_release_runtime() -> SimpleNamespace:
     """Minimal runtime double that proves the release identity it prepared."""
 
@@ -538,13 +552,13 @@ class TestBaselineForms:
 
         assert app.state.baseline_lifecycle is not None
 
-    def test_start_capture_submits_task(self, db, health, alerts_dir):
+    def test_start_capture_submits_task(self, db, health, alerts_dir, capture_compute_manager):
         """Baseline capture form should submit through the unified job endpoint."""
         task_manager = MagicMock()
         task_manager.submit.return_value = "baseline_capture-test1234"
         task_manager.get_task.return_value = None
 
-        camera_manager = MagicMock()
+        camera_manager = capture_compute_manager
         config = ArgusConfig()
         config.cameras = []
 
@@ -581,13 +595,13 @@ class TestBaselineForms:
         assert job_config.quality_config == config.capture_quality
         assert submit_kwargs["lifecycle"] is app.state.baseline_lifecycle
 
-    def test_legacy_capture_endpoint_alias_submits_task(self, db, health, alerts_dir):
+    def test_legacy_capture_endpoint_alias_submits_task(self, db, health, alerts_dir, capture_compute_manager):
         """Quick capture clients posting to /capture should still start the same job flow."""
         task_manager = MagicMock()
         task_manager.submit.return_value = "baseline_capture-legacy"
         task_manager.get_task.return_value = None
 
-        camera_manager = MagicMock()
+        camera_manager = capture_compute_manager
         config = ArgusConfig()
         config.cameras = []
 

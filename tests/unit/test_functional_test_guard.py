@@ -64,12 +64,17 @@ def test_media_and_model_entry_points_are_guarded_without_opening_anything():
     from argus.anomaly.detector import AnomalibDetector, MultiScaleDetector
     from argus.anomaly.trainer import ModelTrainer
     from argus.core.pipeline import DetectionPipeline
+    from argus.core import task_training
+    from argus.runtime import task_training as runtime_task_training
 
     guard = FunctionalGuard()
     patches = [(av, "open"), (cv2, "VideoCapture"), (cv2, "VideoWriter")]
     import subprocess
 
     patches.append((subprocess, "Popen"))
+    patches.extend([(task_training, "execute_training_plan"),
+                    (runtime_task_training.SpawnTrainingWorker, "start"),
+                    (runtime_task_training.SpawnTrainingWorker, "prepare")])
     for cls, methods in (
         (ModelTrainer, ("train", "export")),
         (AnomalibDetector, ("load", "predict", "predict_batch")),
@@ -87,10 +92,14 @@ def test_media_and_model_entry_points_are_guarded_without_opening_anything():
             (cv2.VideoWriter, ("never-write.mp4",)),
             (ModelTrainer.train, (None,)),
             (DetectionPipeline.process_frame, (None, None)),
+            (task_training.execute_training_plan, ({},)),
+            (runtime_task_training.SpawnTrainingWorker.start, (None, {})),
+            (runtime_task_training.SpawnTrainingWorker.prepare, (None, {})),
         ):
             with pytest.raises(RuntimeError, match="Local functional profile forbids"):
                 entry(*args)
     assert set(guard.violations) == {
         "av.open", "cv2.VideoCapture", "cv2.VideoWriter",
         "ModelTrainer.train", "DetectionPipeline.process_frame",
+        "execute_training_plan", "SpawnTrainingWorker.start", "SpawnTrainingWorker.prepare",
     }

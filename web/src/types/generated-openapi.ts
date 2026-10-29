@@ -76,6 +76,7 @@ export type AnalysisTaskResponse = {
   created_at?: (string) | (null)
   current_revision: number
   deployment?: (AnalysisTaskDeploymentResponse) | (null)
+  guidance?: (TaskGuidanceResponse) | (null)
   lifecycle?: string
   name?: (string) | (null)
   runtime?: AnalysisTaskRuntimeResponse
@@ -88,6 +89,9 @@ export type AnalysisTaskRuntimeResponse = {
   applied_task_revision?: (number) | (null)
   artifact_sha256?: (string) | (null)
   bundle_id?: (string) | (null)
+  deployment_operation_id?: (string) | (null)
+  deployment_revision?: (number) | (null)
+  event_error?: ("EVENT_QUEUE_UNAVAILABLE" | "EVENT_QUEUE_FAILED") | (null)
   generation?: (number) | (null)
   mode?: ("shadow") | (null)
   model_identity_verified?: (boolean) | (null)
@@ -298,6 +302,12 @@ export type ApiEnvelope_TaskReleaseReadinessResponse_ = {
 export type ApiEnvelope_TaskResultsResponse_ = {
   code: number
   data: (TaskResultsResponse) | (null)
+  msg: string
+}
+
+export type ApiEnvelope_TaskTrainingCapabilitiesResponse_ = {
+  code: number
+  data: (TaskTrainingCapabilitiesResponse) | (null)
   msg: string
 }
 
@@ -978,6 +988,13 @@ export type TaskDeploymentRequest = {
   expected_deployment_revision: number
 }
 
+export type TaskDetectionTrainingParameters = {
+  batch?: number
+  epochs?: number
+  imgsz?: number
+  seed?: number
+}
+
 export type TaskDocumentResponse = {
   document: {
   [key: string]: unknown
@@ -990,6 +1007,26 @@ export type TaskDocumentsResponse = {
 }>
 }
 
+export type TaskEventReviewRequest = {
+  expected_revision: number
+  notes?: (string) | (null)
+  status: "acknowledged" | "false_positive" | "resolved"
+}
+
+export type TaskGuidanceResponse = {
+  action_label: string
+  detail: string
+  is_authorization?: false
+  production_scope: "existing_legacy_gates" | "unsupported"
+  reason_code: string
+  schema_version?: "argus.task-guidance.v1"
+  state: "unknown" | "setup" | "attention" | "transitioning" | "stopped" | "observed_running" | "archived"
+  target: "none" | "source" | "configuration" | "models" | "deployment" | "events" | "results" | "legacy_baseline" | "legacy_runtime"
+  title: string
+  training_requirement: "legacy_workflow" | "optional" | "not_applicable"
+  workflow_kind: "legacy_anomaly" | "model_task" | "algorithm"
+}
+
 export type TaskModelRegisterRequest = {
   descriptor: {
   [key: string]: unknown
@@ -998,12 +1035,42 @@ export type TaskModelRegisterRequest = {
   scope_camera_id?: (string) | (null)
 }
 
+export type TaskReleaseEvidenceSource = {
+  relative_path: string
+  role: "evaluation" | "calibration" | "baseline" | "corpus" | "soak" | "soak_telemetry"
+  sha256: string
+}
+
+export type TaskReleaseEvidenceUpdateRequest = {
+  evidence_sources: Array<TaskReleaseEvidenceSource>
+  expected_revision: number
+}
+
 export type TaskReleaseReadinessResponse = {
   authority: "legacy" | "managed"
   production_ready?: boolean
   production_supported?: boolean
   reasons: Array<string>
   task_id: string
+}
+
+export type TaskReleaseRequest = {
+  bundle_id: string
+  evidence_sources?: Array<TaskReleaseEvidenceSource>
+  expected_deployment_revision: number
+  expected_task_revision: number
+}
+
+export type TaskReleaseReviewRequest = {
+  decision: "approve" | "reject"
+  expected_revision: number
+  expected_subject_sha256: string
+  notes?: string
+}
+
+export type TaskReleaseRevokeRequest = {
+  expected_revision: number
+  notes: string
 }
 
 export type TaskResultsResponse = {
@@ -1040,9 +1107,59 @@ export type TaskStartRequest = {
   bundle_id: string
 }
 
+export type TaskTrainingCancelRequest = {
+  expected_revision: number
+}
+
+export type TaskTrainingCapabilitiesResponse = {
+  configured_enabled: boolean
+  device: "cuda:0"
+  maintenance_approved: boolean
+  minimum_free_memory_mb: number
+  poll_interval_seconds: number
+  production_allowed?: false
+  recipe_id: "yolov8_detection.v1"
+  resource: TaskTrainingResourceCapabilities
+  resource_mode: "exclusive_maintenance"
+  runtime: TaskTrainingRuntimeCapabilities
+  schema: "argus.task-training-capabilities.v1"
+  trusted_base_models: Array<TaskTrainingTrustedBaseOption>
+  validation_only?: true
+}
+
+export type TaskTrainingExecutionRequest = {
+  base_model_path: string
+  base_model_sha256: string
+  expected_package_sha256: string
+  expected_revision: number
+  params?: TaskDetectionTrainingParameters
+}
+
 export type TaskTrainingProposalRequest = {
   expected_revision: number
   recipe_id: string
+}
+
+export type TaskTrainingResourceCapabilities = {
+  device?: "cuda:0"
+  free_memory_mb?: (number) | (null)
+  memory_limit_enforced?: false
+  reason_code?: (string) | (null)
+  state: "disabled" | "waiting_maintenance" | "blocked" | "ready" | "leased"
+}
+
+export type TaskTrainingRuntimeCapabilities = {
+  enabled: boolean
+  error_code?: (string) | (null)
+  state: "disabled" | "not_started" | "running" | "waiting_resources" | "reconciling" | "owner_unavailable" | "stopping" | "stopped" | "cleanup_unconfirmed" | "error"
+}
+
+export type TaskTrainingTrustedBaseOption = {
+  artifact_sha256: string
+  configured_trust?: true
+  model_id: string
+  name: string
+  relative_path: string
 }
 
 export type TaskUpdateRequest = {
@@ -1339,6 +1456,28 @@ export interface CoreApiOperations {
     request: TaskDeploymentRequest
     response: ApiEnvelope_TaskDocumentResponse_
   }
+  "GET /api/analysis-tasks/{task_id}/events": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/events/{event_id}": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/events/{event_id}/evidence": {
+    request: void
+    response: (ApiEnvelope) & ({
+  data?: (unknown) | (null)
+})
+  }
+  "GET /api/analysis-tasks/{task_id}/events/{event_id}/replay": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/events/{event_id}/review": {
+    request: TaskEventReviewRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
   "GET /api/analysis-tasks/{task_id}/model-compatibility": {
     request: void
     response: ApiEnvelope_TaskDocumentsResponse_
@@ -1346,6 +1485,34 @@ export interface CoreApiOperations {
   "GET /api/analysis-tasks/{task_id}/release-readiness": {
     request: void
     response: ApiEnvelope_TaskReleaseReadinessResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/releases": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/releases": {
+    request: TaskReleaseRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/releases/readiness": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/releases/{release_id}": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/releases/{release_id}/evidence": {
+    request: TaskReleaseEvidenceUpdateRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/releases/{release_id}/review": {
+    request: TaskReleaseReviewRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/releases/{release_id}/revoke": {
+    request: TaskReleaseRevokeRequest
+    response: ApiEnvelope_TaskDocumentResponse_
   }
   "GET /api/analysis-tasks/{task_id}/results": {
     request: void
@@ -1359,6 +1526,18 @@ export interface CoreApiOperations {
     request: void
     response: ApiEnvelope_TaskDocumentResponse_
   }
+  "GET /api/analysis-tasks/{task_id}/training-capabilities": {
+    request: void
+    response: ApiEnvelope_TaskTrainingCapabilitiesResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/training-executions": {
+    request: void
+    response: ApiEnvelope_TaskDocumentsResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/training-executions/{job_id}/cancel": {
+    request: TaskTrainingCancelRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
   "GET /api/analysis-tasks/{task_id}/training-recipes": {
     request: void
     response: ApiEnvelope_TaskDocumentsResponse_
@@ -1369,6 +1548,14 @@ export interface CoreApiOperations {
   }
   "POST /api/analysis-tasks/{task_id}/workflows": {
     request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "GET /api/analysis-tasks/{task_id}/workflows/{workflow_id}/annotation-export": {
+    request: void
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/annotation-import": {
+    request: TaskReviewImportRequest
     response: ApiEnvelope_TaskDocumentResponse_
   }
   "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/candidate": {
@@ -1413,6 +1600,10 @@ export interface CoreApiOperations {
   }
   "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/training-approve": {
     request: TaskRevisionRequest
+    response: ApiEnvelope_TaskDocumentResponse_
+  }
+  "POST /api/analysis-tasks/{task_id}/workflows/{workflow_id}/training-executions": {
+    request: TaskTrainingExecutionRequest
     response: ApiEnvelope_TaskDocumentResponse_
   }
   "GET /api/analysis-tasks/{task_id}/workflows/{workflow_id}/training-export": {

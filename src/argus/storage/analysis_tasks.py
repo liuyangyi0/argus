@@ -339,8 +339,8 @@ class AnalysisTaskService:
                 raise
             raise AnalysisTaskValidationError("model artifact is unavailable under trusted models_root") from exc
 
-    def register_task_model(self, relative_path, descriptor, *, scope_camera_id=None,
-                            requested_by, idempotency_key):
+    def _model_registration_request(self, relative_path, descriptor, *, scope_camera_id=None,
+                                    requested_by, expected_artifact_sha256=None):
         actor = self._actor(requested_by)
         if scope_camera_id is not None and (
             not isinstance(scope_camera_id, str) or not scope_camera_id.strip()
@@ -354,6 +354,30 @@ class AnalysisTaskService:
         request = {"action": "register_task_model", "relative_path": relative_path,
                    "descriptor": descriptor,
                    "scope_camera_id": scope_camera_id, "requested_by": actor}
+        if expected_artifact_sha256 is not None:
+            if (not isinstance(expected_artifact_sha256, str) or len(expected_artifact_sha256) != 64
+                    or any(char not in "0123456789abcdef" for char in expected_artifact_sha256)):
+                raise AnalysisTaskValidationError("expected artifact identity must be a SHA-256")
+            # Preserve every legacy registration request fingerprint exactly.
+            # Hash-bound imports extend this same authoritative write path.
+            request["expected_artifact_sha256"] = expected_artifact_sha256
+        return request
+
+    def get_task_model_registration_receipt(self, relative_path, descriptor, *, scope_camera_id=None,
+                                            requested_by, idempotency_key, expected_artifact_sha256=None):
+        """SELECT-only recovery of the exact registration, without mutable I/O."""
+        request = self._model_registration_request(relative_path, descriptor,
+            scope_camera_id=scope_camera_id, requested_by=requested_by,
+            expected_artifact_sha256=expected_artifact_sha256)
+        with self._db.get_session() as session:
+            return self._receipt(session, idempotency_key, request)
+
+    def register_task_model(self, relative_path, descriptor, *, scope_camera_id=None,
+                            requested_by, idempotency_key, expected_artifact_sha256=None):
+        request = self._model_registration_request(relative_path, descriptor,
+            scope_camera_id=scope_camera_id, requested_by=requested_by,
+            expected_artifact_sha256=expected_artifact_sha256)
+        descriptor, actor = request["descriptor"], request["requested_by"]
         # A committed registration is its idempotency result even if the source
         # file is later removed or changed. Execution still checks the registered
         # SHA at freeze/load time. Never hold a DB write lock while hashing a
@@ -363,6 +387,8 @@ class AnalysisTaskService:
             if receipt is not None:
                 return receipt
         _path, artifact_sha256 = self._trusted_artifact(relative_path)
+        if expected_artifact_sha256 is not None and artifact_sha256 != expected_artifact_sha256:
+            raise AnalysisTaskConflictError("model artifact does not match the expected training result")
         with self._db.get_session() as session:
             self._write_lock(session)
             receipt = self._receipt(session, idempotency_key, request)

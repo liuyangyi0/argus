@@ -13,8 +13,14 @@ from argus.dashboard.task_platform_contracts import (
     TaskDocumentsResponse, TaskReviewImportRequest, TaskReviewRequest,
     TaskRevisionRequest, TaskTrainingProposalRequest,
 )
+from argus.storage.analysis_tasks import AnalysisTaskConflictError, AnalysisTaskIntegrityError
+from argus.storage.task_workflows import TaskWorkflowBlocked, TaskWorkflowConflict
 
 router = APIRouter()
+
+
+class _UnconfirmedCandidateOutcome(Exception):
+    """A registration may be committed; a generic 409 would imply otherwise."""
 
 
 def _invoke(request, task_id, workflow_id, action):
@@ -199,5 +205,31 @@ def import_candidate(request: Request, task_id: str, workflow_id: str, body: Tas
     actor = _actor(request, "manage_models", human=True)
     if actor is None:
         return api_forbidden()
-    return command(lambda: _invoke(request, task_id, workflow_id, lambda service:
-        service.import_candidate(workflow_id, actor=actor, **body.model_dump())))
+    service = getattr(request.app.state, "task_workflows", None)
+    if service is None:
+        return api_unavailable()
+
+    try:
+        if service.get(workflow_id)["task_id"] != task_id:
+            return api_not_found()
+    except LookupError:
+        return api_not_found()
+    except Exception:
+        return api_unavailable("任务数据流程不可用")
+    if _actor(request, "manage_models", human=True) != actor:
+        return api_forbidden("个人身份或权限已变更，请重新核对")
+    if getattr(request.app.state, "task_workflows", None) is not service:
+        return api_unavailable("任务数据流程实例已变更")
+
+    def register():
+        try:
+            return service.import_candidate(workflow_id, actor=actor, **body.model_dump(), authorize=lambda: (
+                getattr(request.app.state, "task_workflows", None) is service
+                and _actor(request, "manage_models", human=True) == actor
+            ))
+        except (TaskWorkflowBlocked, TaskWorkflowConflict, AnalysisTaskConflictError, AnalysisTaskIntegrityError):
+            raise
+        except RuntimeError as exc:
+            raise _UnconfirmedCandidateOutcome("registration outcome requires reconciliation") from exc
+
+    return command(register)

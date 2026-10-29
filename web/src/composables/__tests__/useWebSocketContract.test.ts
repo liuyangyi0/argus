@@ -139,6 +139,29 @@ describe('useWebSocket v1 contract', () => {
     wrapper.unmount()
   })
 
+  it('subscribes task events with normal deduplication and REST gap reconciliation', async () => {
+    const onMessage = vi.fn(), fallbackPoll = vi.fn()
+    const { wrapper } = await mountSocket({ topics: ['task_events'], onMessage, fallbackPoll })
+    const socket = MockWebSocket.instances[0]!
+    socket.open()
+    expect(JSON.parse(String(socket.send.mock.calls[0]?.[0])).topics).toEqual(['task_events'])
+    socket.receive(event('task-event-ack', 'control', 'subscribe_ack', 0, {
+      subscriptions: ['task_events'], resource_revisions: { task_events: {} },
+    }))
+    const update = event('task-event-r1', 'task_events', 'task_event.created', 1,
+      { task_id: 'task-a', camera_id: 'cam-a', event_id: 'event-a', revision: 1 }, 'event-a')
+    socket.receive(update); socket.receive(update)
+    expect(onMessage).toHaveBeenCalledTimes(1)
+    socket.receive(event('task-event-resync', 'control', 'resync_required', 0, {
+      topics: [{ topic: 'task_events', client_revision: 1, server_revision: 3 }],
+    }))
+    await Promise.resolve()
+    expect(fallbackPoll).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(fallbackPoll).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+
   it('surfaces browser offline immediately and reconciles before reconnecting', async () => {
     const fallbackPoll = vi.fn()
     const { wrapper, state } = await mountSocket({ topics: ['cameras'], fallbackPoll })

@@ -18,11 +18,13 @@ from pathlib import Path, PureWindowsPath
 ROOT = Path(__file__).resolve().parents[1]
 UNIT_SUITES = {
     "platform": """
-        analysis_task_storage analysis_tasks_api analysis_task_runtime frame_hub
+        analysis_task_storage analysis_tasks_api analysis_task_runtime frame_hub task_guidance
         analysis_task_manager analysis_task_adversarial task_platform_storage
-        task_execution task_execution_manager task_adapters task_workflows task_collector task_platform_api task_preannotations task_automation
+        task_execution task_execution_manager task_adapters task_workflows task_collector task_event_collector task_platform_api task_preannotations task_automation
         task_deployments_api task_deployments task_deployment_adversarial
         gpu_smoke_contracts
+        task_events task_release task_training task_lifecycle_api task_annotation_adversarial
+        task_training_configuration task_training_runtime task_training_resources task_training_wiring compute_ownership
     """.split(),
     "core": """
         functional_test_guard
@@ -34,7 +36,7 @@ UNIT_SUITES = {
         scene_workflow scene_workflow_routes scene_workflow_task_concurrency task_pause
         websocket error_channel event_bus metrics health health_readiness_api system_degradation_api
         camera_rbac camera_groups zone_rbac sensors_route physics_runtime_contract
-        dashboard_streaming_contract preview_gateway_contract stream_registry_contract
+        dashboard_streaming_contract preview_gateway_contract stream_registry_contract recordings_route
         stream_websocket_proxy model_registry model_registry_scope model_deletion model_deletion_events
         model_list_operations models_status_route model_release_service model_rollback release_pipeline release_execution
         release_slot_invariants release_api_policy release_evidence scene_training
@@ -77,6 +79,21 @@ class FunctionalGuard:
     def __init__(self):
         self.violations: list[str] = []
         self._simulated_process_frame = None
+        self._simulated_training_prepare = None
+
+    def simulate_training_prepare(self, worker, plan):
+        """Exercise spawn bookkeeping only with an explicit fake context.
+
+        Preparing now creates a worker process. A real multiprocessing context
+        must not be used in this local profile, even before model authorization.
+        The separate OS-lock/IPC subprocess tests never call this entry point.
+        """
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        if (worker is None or not isinstance(getattr(worker, "context", None), (SimpleNamespace, Mock))
+                or self._simulated_training_prepare is None):
+            return self.block("SpawnTrainingWorker.prepare")()
+        return self._simulated_training_prepare(worker, plan)
 
     def simulate_frame(self, pipeline, frame):
         """Run orchestration only when every recognition head is a test double.
@@ -142,8 +159,18 @@ class FunctionalGuard:
         from argus.anomaly.detector import AnomalibDetector, MultiScaleDetector
         from argus.anomaly.trainer import ModelTrainer
         from argus.core.pipeline import DetectionPipeline
+        from argus.core import task_training
+        from argus.runtime import task_training as runtime_task_training
 
         self._simulated_process_frame = DetectionPipeline.process_frame
+        task_training.execute_training_plan = self.block("execute_training_plan")
+        runtime_task_training.SpawnTrainingWorker.start = self.block("SpawnTrainingWorker.start")
+        prepare = runtime_task_training.SpawnTrainingWorker.prepare
+        self._simulated_training_prepare = getattr(prepare, "_argus_original_prepare", prepare)
+        def guarded_prepare(worker, plan):
+            return self.simulate_training_prepare(worker, plan)
+        guarded_prepare._argus_original_prepare = self._simulated_training_prepare
+        runtime_task_training.SpawnTrainingWorker.prepare = guarded_prepare
 
         for cls, methods in (
             (ModelTrainer, ("train", "export")),

@@ -6,6 +6,7 @@ import structlog
 from fastapi import APIRouter, Request
 
 from argus.core.analysis_task_contracts import template_specs
+from argus.core.task_guidance import task_guidance
 from argus.dashboard.analysis_task_contracts import (
     AnalysisTaskResponse,
     AnalysisTasksResponse,
@@ -38,8 +39,6 @@ def _service(request: Request) -> AnalysisTaskService | None:
 def _runtime_view(request: Request, task: dict) -> tuple[dict, dict]:
     """Use public task/source snapshots, never camera.running as task state."""
     manager = getattr(request.app.state, "camera_manager", None)
-    if manager is None:
-        return {}, {}
     task_getter = getattr(manager, "get_analysis_task_runtime", None)
     source_getter = getattr(manager, "get_source_runtime_status", None)
 
@@ -54,8 +53,21 @@ def _runtime_view(request: Request, task: dict) -> tuple[dict, dict]:
             return {}
 
     executor = getattr(request.app.state, "task_execution", None)
-    if task.get("authority") == "managed" and executor is not None:
-        task_getter = executor.status
+    authoritative_executor = task.get("authority") == "managed" and executor is not None
+    if authoritative_executor:
+        def task_getter(identity):
+            candidate = executor.status(identity)
+            # None from the authoritative owner means no execution exists.
+            # Exceptions/invalid snapshots still remain unknown, not stopped.
+            if candidate is None:
+                return {"state": "stopped", "running": False}
+            if not isinstance(candidate, dict) or candidate.get("task_id") != identity:
+                return {}
+            if candidate.get("state") == "stopped" and "running" not in candidate:
+                # A retained, cleaned execution has this real status shape.
+                # Never overwrite an explicit contradictory/unknown flag.
+                return {**candidate, "running": False}
+            return candidate
     task_status = snapshot(task_getter, task["task_id"])
     source_status = snapshot(source_getter, task["camera_id"])
     allowed_states = {
@@ -73,7 +85,7 @@ def _runtime_view(request: Request, task: dict) -> tuple[dict, dict]:
     }
     allowed_reasons = {
         *state_reasons.values(), "SCENE_BLOCKED", "MANUAL_STOP", "DEPLOYMENT_UNAVAILABLE",
-        "STALE_TASK", "RESOURCE_EXHAUSTED", "LOAD_TIMEOUT", "INFER_TIMEOUT", "UNAVAILABLE", "INVALID_OUTPUT",
+        "STALE_TASK", "SOURCE_CHANGED", "CANCELLED", "RESOURCE_EXHAUSTED", "LOAD_TIMEOUT", "INFER_TIMEOUT", "UNAVAILABLE", "INVALID_OUTPUT",
         "WORKER_FAILED", "INVALID_BUNDLE", "FRAME_TOO_LARGE", "SAMPLING_INSUFFICIENT",
         "LEGACY_NOT_STARTED", "LEGACY_INITIALIZATION_FAILED",
     }
@@ -102,8 +114,24 @@ def _runtime_view(request: Request, task: dict) -> tuple[dict, dict]:
                 result["applied_task_revision"] = status["applied_task_revision"]
             if isinstance(status.get("bundle_id"), str):
                 result["bundle_id"] = status["bundle_id"]
-            if status.get("mode") == "shadow" or (task.get("authority") == "managed" and status.get("bundle_id")):
+            if type(status.get("deployment_revision")) is int and status["deployment_revision"] >= 0:
+                result["deployment_revision"] = status["deployment_revision"]
+            if isinstance(status.get("deployment_operation_id"), str):
+                result["deployment_operation_id"] = status["deployment_operation_id"]
+            # Real isolated execution snapshots omit mode. Only that owner,
+            # with an explicit shadow-only flag, may fill the absent field.
+            # An unknown/contradictory mode or production flag stays unknown.
+            no_production = status.get("production_allowed", False) is False
+            no_alerts = status.get("alerts_emitted", False) is False
+            if no_production and no_alerts and (status.get("mode") == "shadow" or (
+                authoritative_executor and "mode" not in status
+                and status.get("production_allowed") is False
+                and isinstance(status.get("bundle_id"), str) and bool(status["bundle_id"])
+            )):
                 result["mode"] = "shadow"
+            event_error = status.get("event_error")
+            if isinstance(event_error, str) and event_error in {"EVENT_QUEUE_UNAVAILABLE", "EVENT_QUEUE_FAILED"}:
+                result["event_error"] = event_error
         return result
 
     return public_status(task_status), public_status(source_status, source=True)
@@ -137,6 +165,7 @@ def _public_task(request: Request, task: dict) -> dict:
             if key in deployment
         }
     payload.update(runtime=runtime, source=source)
+    payload["guidance"] = task_guidance(payload)
     return payload
 
 

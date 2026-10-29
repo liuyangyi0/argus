@@ -205,6 +205,10 @@ def create_app(
         max_connections=dashboard_config.websocket_max_connections,
     )
     stream_proxy_connections: set[str] = set()
+    from argus.capture.manager import CameraManager
+    compute_manager = camera_manager if isinstance(camera_manager, CameraManager) else None
+    if compute_manager is not None:
+        compute_manager.enable_compute_ownership(retain_until_exit=task_manager is not None or model_trainer is not None)
 
     # go2rtc streaming proxy — reuse instance from __main__ if provided
     go2rtc: Go2RTCManager | None = go2rtc_instance
@@ -250,12 +254,17 @@ def create_app(
 
             from argus.dashboard.routes.models import release_worker_for_app
 
-            release_worker = release_worker_for_app(app.state)
+            compute_available = compute_manager is None or compute_manager.claim_compute_ownership()
+            release_worker = (None if getattr(app.state, "task_training_maintenance_requested", False) or not compute_available
+                              else release_worker_for_app(app.state))
             if release_worker is not None:
                 # A separate thread owns durable release queue execution. A
                 # second process using this database fails startup instead of
                 # independently swapping the same camera's GPU runtime.
-                release_worker.start()
+                if compute_manager is None or compute_manager.authorize_legacy_compute():
+                    release_worker.start()
+                else:
+                    release_worker = None
 
             # Start go2rtc if not already running. When launched via __main__,
             # go2rtc is started earlier so USB cameras can be redirected before
@@ -285,16 +294,42 @@ def create_app(
                     )
                     app.state.go2rtc = None
 
+            task_events = getattr(app.state, "task_events", None)
+            if task_events is not None:
+                try:
+                    if not await asyncio.to_thread(task_events.start):
+                        logger.warning("app.task_event_worker_unavailable")
+                except Exception:
+                    # A validation-only evidence worker does not own the
+                    # camera, preview, legacy pipeline or Dashboard lifetime.
+                    logger.warning("app.task_event_worker_start_failed")
             task_coordinator = getattr(app.state, "task_deployment_coordinator", None)
             if task_coordinator is not None:
                 available = await asyncio.to_thread(task_coordinator.start)
                 if not available:
                     logger.warning("app.task_deployment_owner_unavailable")
 
+            training_runtime = getattr(app.state, "task_training_runtime", None)
+            if training_runtime is not None:
+                try:
+                    if training_runtime.enabled and not await asyncio.to_thread(training_runtime.start):
+                        logger.warning("app.task_training_owner_unavailable")
+                except Exception:
+                    logger.error("app.task_training_start_failed")
+
             yield
         finally:
             # Async context managers receive shutdown/cancellation at the
             # yield expression. Cleanup therefore has to live in finally.
+            training_runtime = getattr(app.state, "task_training_runtime", None)
+            training_cleanup_complete = training_runtime is None
+            if training_runtime is not None:
+                try:
+                    training_cleanup_complete = await asyncio.to_thread(training_runtime.close, timeout=5) is True
+                    if not training_cleanup_complete:
+                        logger.error("app.task_training_cleanup_pending")
+                except Exception:
+                    logger.error("app.task_training_cleanup_failed")
             task_coordinator = getattr(app.state, "task_deployment_coordinator", None)
             if task_coordinator is not None:
                 try:
@@ -318,6 +353,13 @@ def create_app(
                 except Exception:
                     logger.error("app.task_deployment_owner_release_failed")
             workflows = getattr(app.state, "task_workflows", None)
+            task_events = getattr(app.state, "task_events", None)
+            if task_events is not None:
+                try:
+                    if not await asyncio.to_thread(task_events.close):
+                        logger.error("app.task_service_cleanup_pending", service="task_events")
+                except Exception:
+                    logger.warning("app.task_service_cleanup_failed", service="task_events")
             if workflows is not None:
                 try:
                     if await asyncio.to_thread(workflows.close) is False:
@@ -345,6 +387,10 @@ def create_app(
             # the same interpreter. concurrent.futures joins it at process
             # exit; only this lifespan's private API executor is closed here.
             _default_executor.shutdown(wait=True, cancel_futures=True)
+            if (compute_manager is not None and training_cleanup_complete
+                    and not training_compute_exclusion_required(None, database)):
+                if not compute_manager.close_compute_ownership():
+                    logger.info("app.compute_ownership_retained")
 
     app = FastAPI(
         title="Argus - 视觉异常检测系统",
@@ -466,44 +512,152 @@ def create_app(
     app.state.task_automation = None
     app.state.task_deployments = None
     app.state.task_deployment_coordinator = None
+    app.state.task_events = None
+    app.state.task_releases = None
+    app.state.task_training = None
+    app.state.task_training_runtime = None
+    app.state.task_training_admission = None
+    from argus.config.schema import TaskTrainingConfig
+    training_config = getattr(config, "task_training", None)
+    if not isinstance(training_config, TaskTrainingConfig):
+        training_config = TaskTrainingConfig()
+    training_config = training_config.model_copy(deep=True)
+    app.state.task_training_config = training_config
+    from argus.runtime.task_training_resources import training_compute_exclusion_required
+    app.state.task_training_maintenance_requested = training_compute_exclusion_required(config, database)
+    if compute_manager is not None and compute_manager.is_training_maintenance():
+        app.state.task_training_maintenance_requested = True
+    if app.state.task_training_maintenance_requested:
+        enter = getattr(camera_manager, "enter_training_maintenance", None)
+        if callable(enter) and enter() is not True:
+            logger.warning("app.task_training_maintenance_waiting_for_cleanup")
     if app.state.analysis_task_service is not None:
         from argus.capture.task_execution_manager import TaskExecutionManager
-        from argus.storage.task_workflows import TaskWorkflowService
+        from argus.storage.task_workflows import TaskWorkflowBlocked, TaskWorkflowService
         from argus.storage.task_deployments import TaskDeploymentService
 
         app.state.task_deployments = TaskDeploymentService(database, app.state.analysis_task_service)
 
-        def _register_task_candidate(*, task_id, candidate, training_manifest, actor, idempotency_key):
-            from argus.core.analysis_task_contracts import template_spec
+        def _task_candidate_metadata(*, task_id, candidate, training_manifest):
+            from argus.core.analysis_task_contracts import TaskModelDescriptor, template_spec
 
             service = app.state.analysis_task_service
             task = service.get_task(task_id)
             binding = training_manifest["binding"]
             if (task is None or task["authority"] != "managed" or task.get("archived")
                     or binding["task_id"] != task_id
+                    or binding["camera_id"] != task["camera_id"]
                     or binding["task_revision"] != task["current_revision"]
                     or binding["task_config_sha256"] != task["config_sha256"]):
                 raise ValueError("candidate task binding is stale")
-            if set(candidate) != {"relative_path", "descriptor"}:
-                raise ValueError("candidate requires a model path and descriptor")
+            if not isinstance(candidate, dict) or set(candidate) not in (
+                {"relative_path", "descriptor"}, {"relative_path", "descriptor", "artifact_sha256"},
+            ):
+                raise ValueError("candidate requires a model path, descriptor and optional artifact SHA-256")
+            descriptor = TaskModelDescriptor.model_validate(candidate["descriptor"]).model_dump(mode="json")
             expected = set(template_spec(task["template_id"])["model_roles"].values())
-            if candidate["descriptor"].get("adapter_id") not in expected:
+            if descriptor["adapter_id"] not in expected:
                 raise ValueError("candidate adapter does not match the training task")
-            model = service.register_task_model(
-                candidate["relative_path"], candidate["descriptor"],
-                scope_camera_id=task["camera_id"], requested_by=actor, idempotency_key=idempotency_key,
+            if descriptor["labels"] != training_manifest["dataset"]["label_schema"]["labels"]:
+                raise ValueError("candidate label schema does not match the training dataset")
+            return descriptor
+
+        def _validate_task_candidate(*, task_id, candidate, training_manifest):
+            service = app.state.analysis_task_service
+            descriptor = _task_candidate_metadata(task_id=task_id, candidate=candidate,
+                                                   training_manifest=training_manifest)
+            _path, actual_sha = service._trusted_artifact(candidate["relative_path"])
+            expected_sha = candidate.get("artifact_sha256")
+            if expected_sha is not None:
+                if (not isinstance(expected_sha, str) or len(expected_sha) != 64
+                        or any(char not in "0123456789abcdef" for char in expected_sha)):
+                    raise ValueError("candidate needs an exact artifact SHA-256")
+                if actual_sha != expected_sha:
+                    raise ValueError("candidate content does not match the training result")
+            return {"relative_path": candidate["relative_path"], "descriptor": descriptor,
+                    "artifact_sha256": actual_sha}
+
+        def _register_task_candidate(*, task_id, candidate, training_manifest, actor, idempotency_key):
+            service = app.state.analysis_task_service
+            # Metadata/approval identity is checked even for reconciliation,
+            # but a committed registry receipt must not depend on its source
+            # file remaining present. Runtime loading rechecks artifact bytes.
+            descriptor = _task_candidate_metadata(task_id=task_id, candidate=candidate,
+                                                   training_manifest=training_manifest)
+            arguments = ({"expected_artifact_sha256": candidate["artifact_sha256"]}
+                         if "artifact_sha256" in candidate else {})
+            model = service.get_task_model_registration_receipt(
+                candidate["relative_path"], descriptor,
+                scope_camera_id=training_manifest["binding"]["camera_id"],
+                requested_by=actor, idempotency_key=idempotency_key, **arguments,
             )
+            if model is None:
+                if "artifact_sha256" not in candidate:
+                    # An old in-flight intent without a frozen artifact SHA
+                    # cannot acquire identity from whichever file is here now.
+                    raise TaskWorkflowBlocked("LEGACY_CANDIDATE_IDENTITY_UNRECORDED")
+                normalized = _validate_task_candidate(task_id=task_id, candidate=candidate,
+                                                       training_manifest=training_manifest)
+                model = service.register_task_model(
+                    normalized["relative_path"], normalized["descriptor"],
+                    scope_camera_id=training_manifest["binding"]["camera_id"],
+                    requested_by=actor, idempotency_key=idempotency_key,
+                    expected_artifact_sha256=normalized["artifact_sha256"],
+                )
+            if "artifact_sha256" in candidate and model["artifact_sha256"] != candidate["artifact_sha256"]:
+                raise ValueError("candidate registration identity does not match the training result")
+            _task_candidate_metadata(task_id=task_id, candidate=candidate, training_manifest=training_manifest)
             return {"artifact_id": model["model_id"]}
 
         app.state.task_workflows = TaskWorkflowService(
             database, task_storage_config.baselines_dir.parent / "task_datasets",
             candidate_registrar=_register_task_candidate,
+            candidate_validator=_validate_task_candidate,
         )
+        from argus.storage.task_release import TaskReleaseService
+        from argus.storage.task_events import TaskEventService
+        from argus.core.task_training import TaskTrainingService
+
+        app.state.task_releases = TaskReleaseService(
+            database, app.state.analysis_task_service,
+            evidence_root=task_storage_config.baselines_dir.parent / "task_release_evidence",
+        )
+        app.state.task_training = TaskTrainingService(
+            app.state.task_workflows, task_storage_config.models_dir / "task_training",
+            task_storage_config.models_dir, configuration=training_config,
+        )
+        from argus.runtime.task_training_resources import TaskTrainingResourceAdmission
+        from argus.runtime.task_training_runtime import TaskTrainingRuntime
+        from argus.runtime.task_training import SpawnTrainingWorker
+        from functools import partial
+        app.state.task_training_admission = TaskTrainingResourceAdmission(
+            training_config, camera_manager, database=database,
+        )
+        app.state.task_training_runtime = TaskTrainingRuntime(
+            app.state.task_training, resource_admission=app.state.task_training_admission,
+            interval_seconds=training_config.poll_interval_seconds, enabled=training_config.enabled,
+            worker_factory=partial(SpawnTrainingWorker,
+                worker_ownership_path=compute_manager.get_training_worker_lock_path()) if compute_manager is not None else SpawnTrainingWorker,
+        )
+        # Construction and GET are inert. Only explicit enabled lifespan
+        # startup schedules approved jobs behind exclusive resource admission.
+        app.state.task_events = TaskEventService(
+            database, app.state.analysis_task_service,
+            evidence_root=task_storage_config.baselines_dir.parent / "task_events",
+            release_service=app.state.task_releases,
+            current_runtime=lambda task_id: (
+                app.state.task_execution.event_context(task_id)
+                if app.state.task_execution is not None else None
+            ),
+            broadcaster=ws_manager.broadcast,
+        )
+        app.state.task_workflows.set_event_provider(app.state.task_events)
         if camera_manager is not None:
             app.state.task_execution = TaskExecutionManager(
                 app.state.analysis_task_service, camera_manager,
                 models_root=task_storage_config.models_dir,
             )
+            app.state.task_execution.set_event_sink(app.state.task_events)
             source_canceller = getattr(camera_manager, "set_source_task_canceller", None)
             if callable(source_canceller):
                 source_canceller(app.state.task_execution.stop_source)
@@ -614,6 +768,11 @@ def create_app(
         auth_router,
     )
 
+    from argus.dashboard.training_maintenance import TrainingMaintenanceMiddleware
+    app.add_middleware(TrainingMaintenanceMiddleware, enabled=app.state.task_training_maintenance_requested,
+                       compute_admission=compute_manager.authorize_legacy_compute if compute_manager is not None else None,
+                       maintenance_check=compute_manager.is_training_maintenance if compute_manager is not None else None,
+                       require_compute_authority=True)
     app.add_middleware(RateLimitMiddleware, max_requests_per_minute=60)
 
     auth_config = getattr(config, "auth", None) or AuthConfig()
@@ -667,6 +826,9 @@ def create_app(
     from argus.dashboard.routes.task_deployments import router as task_deployments_router
 
     app.include_router(task_deployments_router, prefix="/api/analysis-tasks", tags=["analysis-tasks"])
+    from argus.dashboard.routes.task_lifecycle import router as task_lifecycle_router
+
+    app.include_router(task_lifecycle_router, prefix="/api/analysis-tasks", tags=["analysis-tasks"])
     app.include_router(audit_router, prefix="/api/audit", tags=["audit"])
     app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
     app.include_router(users_router, prefix="/api/users", tags=["users"])

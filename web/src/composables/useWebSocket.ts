@@ -6,7 +6,7 @@ import {
 } from '../config/constants'
 import type { WsEvent } from '../types/api'
 
-export type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation' | 'heatmap' | 'audio_alert' | 'models' | 'model_release' | 'system_degradation' | 'system_errors'
+export type Topic = 'health' | 'cameras' | 'alerts' | 'tasks' | 'wall' | 'degradation' | 'heatmap' | 'audio_alert' | 'models' | 'model_release' | 'system_degradation' | 'system_errors' | 'task_events'
 
 // ── Audio Alert System ──
 const audioMuted = ref(false)

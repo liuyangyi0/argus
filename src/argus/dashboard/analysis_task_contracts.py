@@ -43,7 +43,10 @@ class AnalysisTaskRuntimeResponse(ApiContractModel):
     model_identity_verified: bool | None = None
     applied_task_revision: int | None = Field(default=None, ge=1)
     bundle_id: str | None = None
+    deployment_revision: int | None = Field(default=None, ge=0)
+    deployment_operation_id: str | None = None
     mode: Literal["shadow"] | None = None
+    event_error: Literal["EVENT_QUEUE_UNAVAILABLE", "EVENT_QUEUE_FAILED"] | None = None
 
 
 class AnalysisTaskSourceResponse(ApiContractModel):
@@ -77,6 +80,23 @@ class AnalysisTaskDeploymentResponse(ApiContractModel):
     failure_code: str | None = None
 
 
+class TaskGuidanceResponse(ApiContractModel):
+    """Navigation advice only; it cannot approve a model or start a worker."""
+
+    schema_version: Literal["argus.task-guidance.v1"] = "argus.task-guidance.v1"
+    workflow_kind: Literal["legacy_anomaly", "model_task", "algorithm"]
+    training_requirement: Literal["legacy_workflow", "optional", "not_applicable"]
+    is_authorization: Literal[False] = False
+    production_scope: Literal["existing_legacy_gates", "unsupported"]
+    state: Literal["unknown", "setup", "attention", "transitioning", "stopped", "observed_running", "archived"]
+    reason_code: str
+    title: str
+    detail: str
+    target: Literal["none", "source", "configuration", "models", "deployment", "events", "results",
+                    "legacy_baseline", "legacy_runtime"]
+    action_label: str
+
+
 class AnalysisTaskResponse(ApiContractModel):
     task_id: str
     camera_id: str
@@ -91,6 +111,7 @@ class AnalysisTaskResponse(ApiContractModel):
     deployment: AnalysisTaskDeploymentResponse | None = None
     runtime: AnalysisTaskRuntimeResponse = Field(default_factory=AnalysisTaskRuntimeResponse)
     source: AnalysisTaskSourceResponse = Field(default_factory=AnalysisTaskSourceResponse)
+    guidance: TaskGuidanceResponse | None = None
 
 
 class AnalysisTasksResponse(ApiContractModel):

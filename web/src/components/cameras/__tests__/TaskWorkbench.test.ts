@@ -8,6 +8,7 @@ vi.mock('../../../api/analysisTasks', async (load) => ({
   ...await load<typeof import('../../../api/analysisTasks')>(),
   getAnalysisTaskTemplates: vi.fn(), createAnalysisTask: vi.fn(), updateAnalysisTask: vi.fn(),
   getTaskModelCompatibility: vi.fn(), getTaskBundles: vi.fn(), freezeTaskBundle: vi.fn(), startAnalysisTask: vi.fn(), stopAnalysisTask: vi.fn(),
+  getTaskResults: vi.fn(), registerTaskModel: vi.fn(), archiveAnalysisTask: vi.fn(),
 }))
 
 const task = (id = 'task-1'): AnalysisTask => ({
@@ -28,10 +29,87 @@ const model = (id: string, role = 'detector', compatible = true) => ({
 describe('TaskWorkbench', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() })
     vi.mocked(api.getAnalysisTaskTemplates).mockResolvedValue(templates())
     vi.mocked(api.getTaskModelCompatibility).mockResolvedValue({ documents: [] })
     vi.mocked(api.getTaskBundles).mockResolvedValue({ documents: [] })
     vi.mocked(api.freezeTaskBundle).mockResolvedValue({ document: {} })
+  })
+
+  it('blocks ambiguous route parameters without losing the selected task JSON draft', async () => {
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task()], initialTaskId: 'task-1' }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    const editor = () => wrapper.get('textarea[aria-label="任务配置 JSON"]')
+    await editor().setValue('{"local_draft":"keep"}')
+    await wrapper.setProps({ navigationInvalid: true }); await flushPromises()
+    expect(wrapper.find('[data-test="save-task"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="create-task"]').exists()).toBe(false)
+    await wrapper.setProps({ navigationInvalid: false }); await flushPromises()
+    expect((editor().element as HTMLTextAreaElement).value).toContain('keep')
+    expect(api.updateAnalysisTask).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('restores an exact task deep link without selecting a bundle or issuing a command', async () => {
+    const wrapper = mount(TaskWorkbench, { attachTo: document.body, props: { cameraId: 'cam1', tasks: [task(), task('task-2')], initialTaskId: 'task-2', initialSection: 'deployment' }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    expect((wrapper.get('[data-test="task-select"]').element as HTMLSelectElement).value).toBe('task-2')
+    expect(document.activeElement).toBe(wrapper.get('[data-test="task-section-deployment"]').element)
+    expect((wrapper.get('[data-test="bundle-select"]').element as HTMLSelectElement).value).toBe('')
+    expect(api.createAnalysisTask).not.toHaveBeenCalled()
+    expect(api.startAnalysisTask).not.toHaveBeenCalled()
+    expect(api.freezeTaskBundle).not.toHaveBeenCalled()
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"draft":"keep"}')
+    await wrapper.setProps({ tasks: [{ ...task() }, { ...task('task-2') }] })
+    await flushPromises()
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toContain('keep')
+    wrapper.unmount()
+  })
+
+  it('does not apply a deep link belonging to another camera or an archived task', async () => {
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [{ ...task(), camera_id: 'cam2' }, { ...task('archived'), lifecycle: 'archived' }], initialTaskId: 'task-1' }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    expect((wrapper.get('[data-test="task-select"]').element as HTMLSelectElement).value).toBe('')
+    await wrapper.setProps({ initialTaskId: 'archived' }); await flushPromises()
+    expect((wrapper.get('[data-test="task-select"]').element as HTMLSelectElement).value).toBe('')
+    expect(api.getTaskModelCompatibility).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it.each(['missing', 'archived', 'foreign'])('clears the old editable task for a changed %s deep link and preserves its draft', async invalid => {
+    const others = [{ ...task('archived'), lifecycle: 'archived' }, { ...task('foreign'), camera_id: 'cam2' }]
+    const wrapper = mount(TaskWorkbench, { attachTo: document.body, props: { cameraId: 'cam1', tasks: [task(), ...others], initialTaskId: 'task-1' }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"draft":"keep for task one"}')
+    await wrapper.setProps({ initialTaskId: invalid }); await flushPromises()
+    expect((wrapper.get('[data-test="task-select"]').element as HTMLSelectElement).value).toBe('')
+    expect(wrapper.find('[data-test="save-task"]').exists()).toBe(false)
+    expect(wrapper.findComponent({ name: 'TaskDeploymentPanel' }).exists()).toBe(false)
+    expect(wrapper.find('[data-test="create-task"]').exists()).toBe(false)
+    await wrapper.setProps({ initialTaskId: 'task-1', initialSection: 'configuration' }); await flushPromises()
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toContain('keep for task one')
+    expect(document.activeElement).toBe(wrapper.get('[data-test="task-section-configuration"]').element)
+    expect(api.updateAnalysisTask).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('reapplies an explicit deep link after clearing it and a manual selection', async () => {
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task(), task('task-2')], initialTaskId: 'task-1' }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    await wrapper.setProps({ initialTaskId: undefined }); await flushPromises()
+    await wrapper.get('[data-test="task-select"]').setValue('task-2'); await flushPromises()
+    await wrapper.setProps({ initialTaskId: 'task-1' }); await flushPromises()
+    expect((wrapper.get('[data-test="task-select"]').element as HTMLSelectElement).value).toBe('task-1')
+    wrapper.unmount()
+  })
+
+  it('opens event navigation without allowing a later task selection to inherit it', async () => {
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task(), task('task-2')], initialTaskId: 'task-1', initialSection: 'events' }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true, TaskLifecyclePanel: true } } })
+    await flushPromises()
+    expect(wrapper.findComponent({ name: 'TaskLifecyclePanel' }).props('task').task_id).toBe('task-1')
+    await wrapper.get('[data-test="task-select"]').setValue('task-2'); await flushPromises()
+    expect(wrapper.findComponent({ name: 'TaskLifecyclePanel' }).exists()).toBe(false)
+    wrapper.unmount()
   })
 
   it('reuses a command key after an uncertain create and leaves production disabled', async () => {
@@ -86,6 +164,172 @@ describe('TaskWorkbench', () => {
     wrapper.unmount()
   })
 
+  it('does not overwrite a selected task draft when templates arrive late', async () => {
+    let finish!: (value: ReturnType<typeof templates>) => void
+    vi.mocked(api.getAnalysisTaskTemplates).mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [{ ...task(), config: { stored: 'task one' } }] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await wrapper.get('[data-test="task-select"]').setValue('task-1'); await flushPromises()
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"draft":"keep before templates"}')
+    finish({ templates: [{ ...templates().templates[0]!, default_config: { template: 'not the selected task' } }] })
+    await flushPromises()
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toBe('{"draft":"keep before templates"}')
+    wrapper.unmount()
+  })
+
+  it('does not overwrite an edited creation draft when templates arrive late', async () => {
+    let finish!: (value: ReturnType<typeof templates>) => void
+    vi.mocked(api.getAnalysisTaskTemplates).mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"creation":"unsaved"}')
+    finish({ templates: [{ ...templates().templates[0]!, default_config: { template: 'default' } }] })
+    await flushPromises()
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toBe('{"creation":"unsaved"}')
+    wrapper.unmount()
+  })
+
+  it('preserves a new-task configuration separately from existing task drafts', async () => {
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task()] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    const config = () => wrapper.get('textarea[aria-label="任务配置 JSON"]')
+    await config().setValue('{"creation":"keep"}')
+    await wrapper.get('[data-test="task-select"]').setValue('task-1'); await flushPromises()
+    expect((config().element as HTMLTextAreaElement).value).not.toContain('creation')
+    await config().setValue('{"existing":"keep"}')
+    await wrapper.get('[data-test="task-select"]').setValue(''); await flushPromises()
+    expect((config().element as HTMLTextAreaElement).value).toBe('{"creation":"keep"}')
+    await wrapper.get('[data-test="task-select"]').setValue('task-1'); await flushPromises()
+    expect((config().element as HTMLTextAreaElement).value).toBe('{"existing":"keep"}')
+    wrapper.unmount()
+  })
+
+  it('preserves separate creation drafts when switching templates', async () => {
+    const fast = { ...templates().templates[0]!, template_id: 'fast_motion.v1', name: 'Fast motion', default_config: { fast: true }, model_roles: {} }
+    vi.mocked(api.getAnalysisTaskTemplates).mockResolvedValue({ templates: [templates().templates[0]!, fast] })
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    const config = () => wrapper.get('textarea[aria-label="任务配置 JSON"]')
+    await config().setValue('{"object":"draft"}')
+    await wrapper.get('[data-test="task-template"]').setValue('fast_motion.v1')
+    expect((config().element as HTMLTextAreaElement).value).toContain('fast')
+    await config().setValue('{"motion":"draft"}')
+    await wrapper.get('[data-test="task-template"]').setValue('object_detection.v1')
+    expect((config().element as HTMLTextAreaElement).value).toBe('{"object":"draft"}')
+    await wrapper.get('[data-test="task-template"]').setValue('fast_motion.v1')
+    expect((config().element as HTMLTextAreaElement).value).toBe('{"motion":"draft"}')
+    wrapper.unmount()
+  })
+
+  it('does not carry unapplied configuration-guide inputs into another task with equal JSON', async () => {
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task(), task('task-2')] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    await wrapper.get('[data-test="task-select"]').setValue('task-1'); await flushPromises()
+    await wrapper.get('[data-test="guide-labels"]').setValue('task-one-only')
+    await wrapper.get('[data-test="task-select"]').setValue('task-2'); await flushPromises()
+    expect((wrapper.get('[data-test="guide-labels"]').element as HTMLInputElement).value).toBe('')
+    await wrapper.get('[data-test="apply-object-guide"]').trigger('click')
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).not.toContain('task-one-only')
+    wrapper.unmount()
+  })
+
+  it('invalidates compatibility and bundle selections when the stored task revision changes', async () => {
+    let finish!: (value: { documents: Record<string, unknown>[] }) => void
+    vi.mocked(api.getTaskModelCompatibility).mockResolvedValueOnce({ documents: [model('prior-compatible')] })
+      .mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+    vi.mocked(api.getTaskBundles).mockResolvedValue({ documents: [{ bundle_id: 'old-bundle', task_revision: 2 }] })
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task()] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    await wrapper.get('[data-test="task-select"]').setValue('task-1'); await flushPromises()
+    await wrapper.get('[data-test="model-role-detector"]').setValue('prior-compatible')
+    await wrapper.get('[data-test="bundle-select"]').setValue('old-bundle')
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"draft":"preserve"}')
+    await wrapper.setProps({ tasks: [{ ...task(), current_revision: 3, config_sha256: 'b'.repeat(64), config: { rules: { labels: ['changed'] } } }] })
+    await flushPromises()
+    expect(api.getTaskModelCompatibility).toHaveBeenCalledTimes(2)
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toContain('preserve')
+    expect((wrapper.get('[data-test="model-role-detector"]').element as HTMLSelectElement).value).toBe('')
+    expect((wrapper.get('[data-test="bundle-select"]').element as HTMLSelectElement).value).toBe('')
+    await wrapper.findAll('button').find(button => button.text() === '重新载入当前配置')!.trigger('click')
+    await wrapper.get('[data-test="freeze-bundle"]').trigger('click'); await flushPromises()
+    expect(api.freezeTaskBundle).not.toHaveBeenCalled()
+    finish({ documents: [model('prior-compatible', 'detector', false)] }); await flushPromises()
+    expect(wrapper.get('option[value="prior-compatible"]').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('fences compatibility reads made before the selected task revision changed', async () => {
+    let finish!: (value: { documents: Record<string, unknown>[] }) => void
+    vi.mocked(api.getTaskModelCompatibility).mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+      .mockResolvedValueOnce({ documents: [model('current-revision-model')] })
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task()] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    await wrapper.get('[data-test="task-select"]').setValue('task-1'); await flushPromises()
+    await wrapper.setProps({ tasks: [{ ...task(), current_revision: 3, config_sha256: 'b'.repeat(64) }] }); await flushPromises()
+    finish({ documents: [model('prior-revision-model')] }); await flushPromises()
+    expect(wrapper.find('option[value="current-revision-model"]').exists()).toBe(true)
+    expect(wrapper.find('option[value="prior-revision-model"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it.each(['resolve', 'reject'] as const)('fences late templates after camera A to B to A when the old request %s', async outcome => {
+    let finish!: (value: ReturnType<typeof templates>) => void
+    let fail!: (cause: Error) => void
+    vi.mocked(api.getAnalysisTaskTemplates).mockReturnValueOnce(new Promise((resolve, reject) => { finish = resolve; fail = reject }))
+      .mockResolvedValueOnce(templates())
+      .mockResolvedValueOnce({ templates: [{ ...templates().templates[0]!, default_config: { fresh: 'camera A' } }] })
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await wrapper.setProps({ cameraId: 'cam2' }); await flushPromises()
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"cameraB":"private draft"}')
+    await wrapper.setProps({ cameraId: 'cam1' }); await flushPromises()
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toContain('fresh')
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"cameraA":"new draft"}')
+    if (outcome === 'resolve') finish({ templates: [{ ...templates().templates[0]!, default_config: { outdated: true } }] })
+    else fail(new Error('outdated template failure'))
+    await flushPromises()
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toBe('{"cameraA":"new draft"}')
+    expect(wrapper.text()).not.toContain('outdated template failure')
+    expect(wrapper.text()).not.toContain('private draft')
+    wrapper.unmount()
+  })
+
+  it('initializes pristine creation defaults after changing away from a selected camera task', async () => {
+    vi.mocked(api.getAnalysisTaskTemplates).mockResolvedValue({ templates: [{ ...templates().templates[0]!, default_config: { initial: 'template defaults' } }] })
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task()] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    await wrapper.get('[data-test="task-select"]').setValue('task-1'); await flushPromises()
+    await wrapper.setProps({ cameraId: 'cam2', tasks: [] }); await flushPromises()
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toContain('template defaults')
+    wrapper.unmount()
+  })
+
+  it.each(['resolve', 'reject'] as const)('does not let an old A command that later %s change a newer A command after A to B to A', async outcome => {
+    let finishOld!: (value: AnalysisTask) => void
+    let failOld!: (cause: Error) => void
+    let finishCurrent!: (value: AnalysisTask) => void
+    vi.mocked(api.updateAnalysisTask).mockReturnValueOnce(new Promise((resolve, reject) => { finishOld = resolve; failOld = reject }))
+      .mockReturnValueOnce(new Promise(resolve => { finishCurrent = resolve }))
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task(), task('task-2')], initialTaskId: 'task-1' }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"old":"draft"}')
+    await wrapper.get('[data-test="save-task"]').trigger('click'); await flushPromises()
+    await wrapper.setProps({ initialTaskId: 'task-2' }); await flushPromises()
+    await wrapper.setProps({ initialTaskId: 'task-1' }); await flushPromises()
+    expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toContain('old')
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"current":"draft"}')
+    await wrapper.get('[data-test="save-task"]').trigger('click'); await flushPromises()
+    if (outcome === 'resolve') finishOld({ ...task(), current_revision: 3 })
+    else failOld(new Error('outdated command failure'))
+    await flushPromises()
+    expect(wrapper.get('section[aria-label="多任务工作台"]').attributes('aria-busy')).toBe('true')
+    expect(wrapper.emitted('refresh')).toBeUndefined()
+    expect(wrapper.text()).not.toContain('outdated command failure')
+    expect(wrapper.text()).not.toContain('新配置版本已保存')
+    finishCurrent({ ...task(), current_revision: 3 }); await flushPromises()
+    expect(wrapper.get('section[aria-label="多任务工作台"]').attributes('aria-busy')).toBe('false')
+    expect(wrapper.emitted('refresh')).toHaveLength(1)
+    expect(wrapper.text()).toContain('新配置版本已保存')
+    wrapper.unmount()
+  })
+
   it('does not silently rebase an old configuration form onto a newer task revision', async () => {
     const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task()] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
     await flushPromises()
@@ -99,6 +343,18 @@ describe('TaskWorkbench', () => {
     await wrapper.findAll('button').find(button => button.text() === '重新载入当前配置')!.trigger('click')
     expect(wrapper.get('[data-test="save-task"]').attributes('disabled')).toBeUndefined()
     expect((wrapper.get('textarea[aria-label="任务配置 JSON"]').element as HTMLTextAreaElement).value).toContain('new')
+    wrapper.unmount()
+  })
+
+  it('does not freeze a stored revision while unsaved configuration is shown', async () => {
+    const wrapper = mount(TaskWorkbench, { props: { cameraId: 'cam1', tasks: [task()] }, global: { stubs: { TaskDatasetPanel: true, TaskDeploymentPanel: true } } })
+    await flushPromises()
+    await wrapper.get('[data-test="task-select"]').setValue('task-1'); await flushPromises()
+    await wrapper.get('textarea[aria-label="任务配置 JSON"]').setValue('{"rules":{"labels":["draft"]}}')
+    expect(wrapper.text()).toContain('未保存的修改')
+    expect(wrapper.get('[data-test="freeze-bundle"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-test="freeze-bundle"]').trigger('click'); await flushPromises()
+    expect(api.freezeTaskBundle).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 

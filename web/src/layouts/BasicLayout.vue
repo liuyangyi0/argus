@@ -8,6 +8,7 @@ import {
   BellOutlined,
   DashboardOutlined,
   DatabaseOutlined,
+  AppstoreOutlined,
   RightOutlined,
   SettingOutlined,
   VideoCameraOutlined,
@@ -310,6 +311,10 @@ onUnmounted(() => {
 
           <router-link to="/cameras" aria-label="摄像头" :class="{ active: isActive('/cameras') }">
             <VideoCameraOutlined /><span class="nav-text">摄像头</span>
+          </router-link>
+
+          <router-link to="/analysis-tasks" aria-label="分析任务" :class="{ active: isActive('/analysis-tasks') }">
+            <AppstoreOutlined /><span class="nav-text">分析任务</span>
           </router-link>
 
           <router-link to="/alerts" aria-label="告警中心" :class="{ active: isActive('/alerts') }">

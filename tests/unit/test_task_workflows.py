@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import struct
+import threading
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -229,12 +231,80 @@ def test_task_revision_change_blocks_old_workflow_mutation(environment):
     assert env.service.read_sample_image(current["workflow_id"], "sample-0") == png_image()
 
 
-def test_unsupported_collection_policy_is_explicitly_blocked(environment):
+def test_collection_policy_override_is_explicitly_blocked(environment):
     env = environment
-    with pytest.raises(TaskWorkflowBlocked, match="POLICY_NOT_IMPLEMENTED"):
+    with pytest.raises(TaskWorkflowBlocked, match="POLICY_MISMATCH"):
         env.service.start_collection(env.workflow["workflow_id"], expected_revision=1,
             actor="operator", manager=object(), params={"policy": "events"})
     assert env.service.get(env.workflow["workflow_id"])["state"] == "collectable"
+
+
+@pytest.mark.parametrize("policy", ["disagreement", "low_confidence"])
+def test_unimplemented_collection_policies_are_never_replaced_by_periodic(environment, policy):
+    env = environment
+    task = env.tasks.create_task("cam", "object_detection.v1", "unsupported collection", {
+        "collection": {"policy": policy},
+    }, requested_by="operator", idempotency_key="unsupported-policy")
+    workflow = env.service.create(task["task_id"], actor="operator")
+    with pytest.raises(TaskWorkflowBlocked, match="POLICY_NOT_IMPLEMENTED"):
+        env.service.start_collection(workflow["workflow_id"], expected_revision=1,
+                                     actor="operator", manager=object())
+    assert env.service.get(workflow["workflow_id"])["state"] == "collectable"
+
+
+def test_event_collection_requires_server_wired_provider_and_rejects_http_cursor(environment):
+    env = environment
+    task = env.tasks.create_task("cam", "object_detection.v1", "event collection", {
+        "collection": {"policy": "events"},
+    }, requested_by="operator", idempotency_key="event-policy")
+    workflow = env.service.create(task["task_id"], actor="operator")
+    with pytest.raises(ValueError, match="unknown collection parameters"):
+        env.service.start_collection(workflow["workflow_id"], expected_revision=1,
+            actor="operator", manager=object(), params={"start_cursor": 0})
+    with pytest.raises(TaskWorkflowBlocked, match="EVENT_COLLECTION_UNAVAILABLE"):
+        env.service.start_collection(workflow["workflow_id"], expected_revision=1,
+            actor="operator", manager=object())
+    with pytest.raises(ValueError, match="same database"):
+        env.service.set_event_provider(SimpleNamespace(authority_for=lambda db: False))
+    assert env.service.get(workflow["workflow_id"])["revision"] == 1
+
+
+def test_candidate_receipt_projects_the_exact_original_request_and_preserves_historical_manifest(environment):
+    env = environment
+    current = export_ready(env)
+    package = env.service.export_training_package(current["workflow_id"])
+    calls = []
+
+    def register(**kwargs):
+        calls.append(kwargs)
+        return {"artifact_id": "registered-model"}
+
+    env.service._candidate_registrar = register
+    candidate = {"relative_path": "candidate.onnx", "descriptor": {"name": "original request"}}
+    args = {"expected_revision": current["revision"], "candidate": candidate,
+            "expected_package_sha256": package["package_sha256"], "actor": "engineer"}
+    first = env.service.import_candidate(current["workflow_id"], **args)
+    expected = {"workflow_id": current["workflow_id"], "package_sha256": package["package_sha256"],
+                "candidate": candidate}
+    assert first["candidate_import_receipt"]["request_identity"] == expected
+    assert first["manifest"]["training"]["candidate"]["request_identity"] == expected
+    assert _sha(_canonical(first["manifest"])) == first["manifest_sha256"]
+    # Model a valid historical receipt that predates the optional projection.
+    with env.db.get_session() as session:
+        row, manifest = env.service._record(session, current["workflow_id"])
+        manifest["training"]["candidate"].pop("request_identity")
+        row.manifest_json = _canonical(manifest)
+        row.manifest_sha256 = _sha(row.manifest_json)
+        session.commit()
+    historical = env.service.get(current["workflow_id"])
+    retried = env.service.import_candidate(current["workflow_id"], **args)
+    assert retried["candidate_import_receipt"]["request_identity"] == expected
+    assert retried["manifest"] == historical["manifest"]
+    assert retried["manifest_sha256"] == historical["manifest_sha256"]
+    assert len(calls) == 1
+    with pytest.raises(TaskWorkflowConflict):
+        env.service.import_candidate(current["workflow_id"], **{**args,
+            "candidate": {**candidate, "relative_path": "another-candidate.onnx"}})
 
 
 def test_collection_start_failure_is_retryable_and_keeps_zero_images_failed(environment):
@@ -516,3 +586,188 @@ def test_final_candidate_commit_ack_loss_returns_same_receipt_on_exact_retry(env
     done = env.service.import_candidate(current["workflow_id"], **arguments)
     assert done["state"] == "candidate_registered"
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("denied_check", [1, 2, 3, 4])
+def test_candidate_rechecks_live_personal_authority_and_preserves_pending_identity(environment, denied_check):
+    env = environment
+    current = export_ready(env)
+    package = env.service.export_training_package(current["workflow_id"])
+    calls, authorizations = [], []
+    env.service._candidate_registrar = lambda **kwargs: calls.append(copy.deepcopy(kwargs)) or {"artifact_id": "candidate"}
+
+    def authorize():
+        authorizations.append(True)
+        return len(authorizations) != denied_check
+
+    arguments = {"expected_revision": current["revision"], "candidate": {"path": "candidate.onnx"},
+                 "expected_package_sha256": package["package_sha256"], "actor": "operator"}
+    with pytest.raises(TaskWorkflowBlocked, match="ACTOR_AUTHORITY_CHANGED"):
+        env.service.import_candidate(current["workflow_id"], **arguments, authorize=authorize)
+    pending = env.service.get(current["workflow_id"])
+    assert pending["manifest"]["reviews"] == current["manifest"]["reviews"]
+    assert pending["state"] == ("training_export_ready" if denied_check <= 2 else "candidate_importing")
+    assert len(calls) == (1 if denied_check == 4 else 0)
+    done = env.service.import_candidate(current["workflow_id"], **arguments, authorize=lambda: True)
+    assert done["state"] == "candidate_registered"
+    assert done["manifest"]["reviews"] == current["manifest"]["reviews"]
+    assert len({call["idempotency_key"] for call in calls}) == 1
+
+
+def test_pending_candidate_keeps_original_request_separate_from_normalized_descriptor(environment):
+    env = environment
+    current = export_ready(env)
+    package = env.service.export_training_package(current["workflow_id"])
+    candidate = {"relative_path": "candidate.onnx", "descriptor": {"name": "original"}}
+    normalized = {"relative_path": "candidate.onnx", "descriptor": {"name": "original", "input_layout": "NCHW"},
+                  "artifact_sha256": "a" * 64}
+    env.service._candidate_validator = lambda **kwargs: copy.deepcopy(normalized)
+    env.service._candidate_registrar = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("unknown registry write"))
+    args = {"expected_revision": current["revision"], "candidate": candidate,
+            "expected_package_sha256": package["package_sha256"], "actor": "engineer"}
+    with pytest.raises(RuntimeError, match="unknown registry"):
+        env.service.import_candidate(current["workflow_id"], **args)
+    pending = env.service.get(current["workflow_id"])
+    assert pending["operation"]["candidate"] == normalized
+    assert pending["operation"]["request_identity"] == {
+        "workflow_id": current["workflow_id"], "package_sha256": package["package_sha256"], "candidate": candidate,
+    }
+    with env.db.get_session() as session:
+        row = session.get(TaskWorkflowRecord, current["workflow_id"])
+        operation = json.loads(row.operation_json)
+        operation["request_identity"]["candidate"]["relative_path"] = "wrong.onnx"
+        row.operation_json = _canonical(operation)
+        session.commit()
+    with pytest.raises(TaskWorkflowConflict, match="request identity changed"):
+        env.service.import_candidate(current["workflow_id"], **args)
+
+
+def test_same_candidate_concurrent_registrations_have_one_receipt_and_keep_human_notes(environment):
+    env = environment
+    current = export_ready(env)
+    package = env.service.export_training_package(current["workflow_id"])
+    barrier, calls = threading.Barrier(2), []
+
+    def registrar(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        barrier.wait(timeout=5)
+        return {"artifact_id": "same-registered-artifact"}
+
+    env.service._candidate_registrar = registrar
+    args = {"expected_revision": current["revision"], "candidate": {"path": "candidate.onnx"},
+            "expected_package_sha256": package["package_sha256"], "actor": "engineer"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(env.service.import_candidate, current["workflow_id"], **args) for _ in range(2)]
+        results = [future.result(timeout=10) for future in futures]
+    assert results[0] == results[1]
+    assert results[0]["revision"] == current["revision"] + 2
+    assert results[0]["manifest"]["reviews"] == current["manifest"]["reviews"]
+    assert calls[0]["idempotency_key"] == calls[1]["idempotency_key"]
+
+
+def test_collection_admission_keeps_unknown_claims_and_local_cleanup_ownership(environment):
+    env = environment
+    old = env.workflow
+    newer = env.service.create(env.task["task_id"], actor="operator")
+    with env.db.get_session() as session:
+        row, manifest = env.service._record(session, old["workflow_id"])
+        env.service._save(session, row, manifest, "collecting", operation={
+            "collection_id": "unknown-start", "owner_id": env.service._owner_id,
+        })
+        session.commit()
+    with pytest.raises(TaskWorkflowBlocked, match="TASK_COLLECTION_RESOURCE_BUSY"):
+        env.service.start_collection(newer["workflow_id"], expected_revision=1, manager=object(), actor="operator")
+    claimed = env.service.get(old["workflow_id"])
+    env.service.stop_collection(old["workflow_id"], expected_revision=claimed["revision"], actor="operator")
+    local_state = {"state": "failed", "cleanup_confirmed": False, "persistence_pending": False}
+    env.service._collectors[old["workflow_id"]] = SimpleNamespace(snapshot=lambda: dict(local_state))
+    try:
+        with pytest.raises(TaskWorkflowBlocked, match="TASK_COLLECTION_RESOURCE_BUSY"):
+            env.service.start_collection(newer["workflow_id"], expected_revision=1, manager=object(), actor="operator")
+    finally:
+        env.service._collectors.pop(old["workflow_id"])
+    allowed = env.service.start_collection(newer["workflow_id"], expected_revision=1,
+        manager=SimpleNamespace(get_camera_source=lambda _: None), actor="operator")
+    assert allowed["state"] == "collection_failed"  # Admitted; synthetic source is absent.
+
+
+def test_global_collection_admission_limit_is_checked_before_allocating_a_worker(environment, monkeypatch):
+    env = environment
+    monkeypatch.setattr("argus.storage.task_workflows._MAX_ACTIVE_COLLECTIONS", 1)
+    with env.db.get_session() as session:
+        row, manifest = env.service._record(session, env.workflow["workflow_id"])
+        env.service._save(session, row, manifest, "collecting", operation={"collection_id": "held"})
+        session.commit()
+    task = env.tasks.create_task("cam", "object_detection.v1", "other task", {},
+        requested_by="operator", idempotency_key="another-admission-task")
+    workflow = env.service.create(task["task_id"], actor="operator")
+    with pytest.raises(TaskWorkflowBlocked, match="COLLECTION_RESOURCE_LIMIT"):
+        env.service.start_collection(workflow["workflow_id"], expected_revision=1, manager=object(), actor="operator")
+    assert workflow["workflow_id"] not in env.service._collectors
+    assert env.service.get(workflow["workflow_id"])["revision"] == 1
+
+
+def _event_sample(sample):
+    sample = copy.deepcopy(sample)
+    source = {key: sample["identity"][key] for key in (
+        "camera_id", "source_session_id", "source_epoch", "frame_index", "source_frame_index", "pts",
+        "time_base_num", "time_base_den", "frame_index_provenance", "timestamp_provenance",
+        "capture_wall_ts", "capture_monotonic_ts")}
+    source["source_runtime_hash"] = "a" * 10
+    sample["identity"] = source
+    payload = {"schema_version": "argus.task-event.v1", "event_type": "object_detected", "event_id": "event-one",
+               "binding": {**sample["binding"], "bundle_id": "bundle-one", "manifest_sha256": "b" * 64,
+                           "execution_id": "execution-one", "deployment_revision": 1,
+                           "deployment_operation_id": "operation-one"}, "source": source,
+               "first_source": copy.deepcopy(source), "frame_size": {"width": 3, "height": 2},
+               "replay": {"sha256": "e" * 64}}
+    sample["event_origin"] = {"schema": "argus.task-event-sample.v1", "event_id": "event-one",
+        "evidence_sha256": "e" * 64, "derivation": "verified_jpeg_to_png.v1", "payload": payload,
+        "immutable_sha256": _sha(_canonical({"payload": payload, "evidence_sha256": "e" * 64}))}
+    return sample
+
+
+@pytest.mark.parametrize("change", ["pts_type", "half_time_base", "size_type", "replay_sha", "payload_schema"])
+def test_frozen_event_sample_checks_full_typed_provenance_not_only_a_self_digest(environment, change):
+    env = environment
+    current = seed_samples(env, count=1)
+    sample = _event_sample(current["manifest"]["samples"][0])
+    assert env.service._verify_sample(sample, current["manifest"]["binding"])
+    payload = sample["event_origin"]["payload"]
+    if change == "pts_type":
+        sample["identity"]["pts"] = float(sample["identity"]["pts"])
+    elif change == "half_time_base":
+        sample["identity"]["time_base_num"] = None
+    elif change == "size_type":
+        payload["frame_size"]["width"] = 3.0
+    elif change == "replay_sha":
+        payload["replay"]["sha256"] = "f" * 64
+    else:
+        payload["schema_version"] = "wrong-event-schema"
+    sample["event_origin"]["immutable_sha256"] = _sha(_canonical({"payload": payload, "evidence_sha256": "e" * 64}))
+    with pytest.raises((TaskWorkflowConflict, ValueError)):
+        env.service._verify_sample(sample, current["manifest"]["binding"])
+
+
+def test_collection_receipt_retry_rejects_equal_looking_float_pts_without_changing_notes(environment):
+    env = environment
+    current = seed_samples(env, count=1)
+    sample = current["manifest"]["samples"][0]
+    receipt = {"collection_id": sample["collection_id"], "state": "completed", "error_code": None,
+               "binding": current["manifest"]["binding"], "samples": [copy.deepcopy(sample)]}
+    with env.db.get_session() as session:
+        record, manifest = env.service._record(session, current["workflow_id"])
+        manifest["samples"] = []
+        env.service._save(session, record, manifest, "collecting", operation={
+            "kind": "collection", "collection_id": sample["collection_id"], "owner_id": env.service._owner_id})
+        session.commit()
+    env.service._finish_collection(current["workflow_id"], sample["collection_id"], receipt)
+    current = env.service.get(current["workflow_id"])
+    reviewed = env.service.review(current["workflow_id"], sample["sample_id"], expected_revision=current["revision"],
+        expected_image_sha256=sample["image_sha256"], decision="needs_review", notes="keep independent human note",
+        actor="reviewer")
+    replay = copy.deepcopy(receipt)
+    replay["samples"][0]["identity"]["pts"] = float(sample["identity"]["pts"])
+    with pytest.raises(TaskWorkflowConflict, match="receipt changed"):
+        env.service._finish_collection(current["workflow_id"], sample["collection_id"], replay)
+    assert env.service.get(current["workflow_id"])["manifest"]["reviews"] == reviewed["manifest"]["reviews"]

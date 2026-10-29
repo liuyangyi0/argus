@@ -10,7 +10,7 @@ test('ordinary navigation renders without a model, GPU, or connected camera', as
   page.on('pageerror', error => pageErrors.push(error.message))
   await authenticateIfRequired(page)
   for (const path of [
-    '/overview', '/cameras', '/cameras/local-camera', '/alerts', '/reports',
+    '/overview', '/cameras', '/analysis-tasks', '/cameras/local-camera', '/alerts', '/reports',
     '/models/baseline', '/models/training', '/models/registry', '/models/comparison',
     '/models/labeling', '/models/threshold', '/models/collections',
     '/system/overview', '/system/config', '/system/degradation', '/system/model-status',
@@ -94,6 +94,211 @@ test('managed task controls remain unavailable to a viewer', async ({ page }) =>
     data: { camera_id: 'local-camera', template_id: 'fast_motion.v1', name: 'Denied' },
   })
   expect(denied.status()).toBe(403)
+})
+
+test('task center navigates an exact task and resumes the deep link without computation', async ({ page }, testInfo) => {
+  await authenticateIfRequired(page)
+  const created = await page.request.post('/api/analysis-tasks', {
+    headers: { 'Idempotency-Key': `task-center-${testInfo.project.name}-${Date.now()}` },
+    data: { camera_id: 'local-camera', template_id: 'object_detection.v1', name: `Guided task ${testInfo.project.name}` },
+  })
+  expect(created.ok()).toBe(true)
+  const task = (await created.json()).data as { task_id: string }
+  const mutations: string[] = []
+  page.on('request', request => { if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method())) mutations.push(request.url()) })
+  await page.goto('/analysis-tasks')
+  await page.getByRole('searchbox', { name: '查找任务' }).fill(task.task_id)
+  const card = page.locator('[data-test="task-center-card"]')
+  await expect(card).toHaveCount(1)
+  await expect(card).toContainText('已有兼容模型可直接验证')
+  await page.screenshot({ path: testInfo.outputPath('task-center.png') })
+  await card.getByRole('link', { name: '打开该任务工作台' }).click()
+  const workbench = page.getByRole('region', { name: '多任务工作台' })
+  await expect(workbench.locator('[data-test="task-select"]')).toHaveValue(task.task_id)
+  await expect(workbench.locator('[data-test="task-section-configuration"]')).toBeFocused()
+  await page.reload()
+  await expect(workbench.locator('[data-test="task-select"]')).toHaveValue(task.task_id)
+  await workbench.getByRole('button', { name: '验证事件与复核', exact: true }).click()
+  await expect(workbench.locator('[data-test="task-section-events"]')).toBeFocused()
+  await expect(workbench.getByRole('region', { name: '目标检测事件与发布闭环' })).toBeVisible()
+  await expect(workbench.getByRole('button', { name: '生产发布：NO-GO', exact: true })).toBeDisabled()
+  expect(mutations).toEqual([])
+  await workbench.screenshot({ path: testInfo.outputPath('task-center-guidance.png') })
+  await page.goto('/cameras/local-camera?analysis_task=missing-task&task_section=deployment')
+  await expect(workbench).toContainText('指定任务不在当前可编辑工作台中')
+  await expect(workbench.locator('[data-test="save-task"]')).toHaveCount(0)
+  await expect(workbench.getByRole('region', { name: '任务持久化部署' })).toHaveCount(0)
+  await workbench.getByRole('button', { name: '取消任务定位', exact: true }).click()
+  await expect(workbench.locator('[data-test="create-task"]')).toBeVisible()
+  await expect(page).not.toHaveURL(/analysis_task=/)
+  await page.goto(`/cameras/local-camera?analysis_task=${encodeURIComponent(task.task_id)}&analysis_task=ambiguous-task&task_section=models`)
+  await expect(page.getByText('任务定位参数无效，未自动选择其它任务。', { exact: false })).toBeVisible()
+  await expect(workbench.locator('[data-test="save-task"]')).toHaveCount(0)
+  await expect(workbench.locator('[data-test="create-task"]')).toHaveCount(0)
+  await page.getByRole('button', { name: '清除无效定位', exact: true }).click()
+  await expect(workbench.locator('[data-test="create-task"]')).toBeVisible()
+  await expect(page).not.toHaveURL(/analysis_task=/)
+  expect(mutations).toEqual([])
+})
+
+test('late templates preserve task edits without creating or deploying anything', async ({ page }, testInfo) => {
+  await authenticateIfRequired(page)
+  const created = await page.request.post('/api/analysis-tasks', {
+    headers: { 'Idempotency-Key': `late-template-${testInfo.project.name}-${Date.now()}` },
+    data: { camera_id: 'local-camera', template_id: 'object_detection.v1', name: `Late template ${testInfo.project.name}` },
+  })
+  expect(created.ok()).toBe(true)
+  const task = (await created.json()).data as { task_id: string }
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const writes: string[] = []
+  page.on('request', request => { if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method())) writes.push(request.url()) })
+  await page.route('**/api/analysis-task-templates', async route => {
+    const response = await route.fetch()
+    await gate
+    await route.fulfill({ response })
+  })
+  try {
+    await page.goto('/cameras/local-camera')
+    const workbench = page.getByRole('region', { name: '多任务工作台' })
+    await workbench.locator('[data-test="task-select"]').selectOption(task.task_id)
+    const editor = workbench.getByRole('textbox', { name: '任务配置 JSON', exact: true })
+    await workbench.getByText('任务配置（高级 JSON；严格校验；修改前须停止任务）', { exact: true }).click()
+    const original = JSON.parse(await editor.inputValue()) as Record<string, unknown>
+    const draft = JSON.stringify({ ...original, local_draft_marker: 'keep local draft' })
+    await editor.fill(draft)
+    release()
+    await expect(workbench.getByRole('region', { name: '通用目标检测配置引导' })).toBeVisible()
+    await expect(editor).toHaveValue(draft)
+    await expect(workbench.locator('[data-test="freeze-bundle"]')).toBeDisabled()
+    expect(writes).toEqual([])
+  } finally { release() }
+})
+
+test('denied task refresh clears old task controls instead of leaving a stale workbench', async ({ page }, testInfo) => {
+  await authenticateIfRequired(page)
+  const created = await page.request.post('/api/analysis-tasks', {
+    headers: { 'Idempotency-Key': `task-read-denied-${testInfo.project.name}-${Date.now()}` },
+    data: { camera_id: 'local-camera', template_id: 'object_detection.v1', name: `Denied refresh ${testInfo.project.name}` },
+  })
+  expect(created.ok()).toBe(true)
+  const task = (await created.json()).data as { task_id: string }
+  await page.goto(`/cameras/local-camera?analysis_task=${encodeURIComponent(task.task_id)}`)
+  await expect(page.getByRole('region', { name: '多任务工作台' }).locator('[data-test="save-task"]')).toBeVisible()
+  await page.route('**/api/analysis-tasks?camera_id=local-camera', route => route.fulfill({
+    status: 403, contentType: 'application/json', body: JSON.stringify({ code: 40300, msg: '权限不足', data: null }),
+  }))
+  await page.getByRole('button', { name: '刷新任务', exact: true }).click()
+  await expect(page.getByRole('region', { name: '多任务工作台' })).toHaveCount(0)
+  await expect(page.locator('[data-test="analysis-task"]')).toHaveCount(0)
+  await expect(page.locator('[data-test="task-error"]')).toContainText('权限不足')
+  await expect(page.locator('[data-test="task-error"]')).not.toContainText('上次成功读取')
+})
+
+test('object task guided configuration and lifecycle remain no-compute and NO-GO', async ({ page }, testInfo) => {
+  await authenticateIfRequired(page)
+  const computeWrites: string[] = []
+  page.on('request', request => {
+    if (request.method() === 'POST' && /\/(source\/start|runtime\/start|deployments|training-executions)$/.test(new URL(request.url()).pathname)) {
+      computeWrites.push(request.url())
+    }
+  })
+  await page.goto('/cameras/local-camera')
+  const workbench = page.getByRole('region', { name: '多任务工作台' })
+  await workbench.locator('[data-test="task-template"]').selectOption('object_detection.v1')
+  const guide = workbench.getByRole('region', { name: '通用目标检测配置引导' })
+  await expect(guide).toBeVisible()
+  await guide.locator('[data-test="guide-labels"]').fill('person')
+  await guide.locator('[data-test="guide-confidence"]').fill('0.7')
+  await guide.locator('[data-test="guide-device"]').selectOption('cpu')
+  await guide.locator('[data-test="apply-object-guide"]').click()
+  await guide.locator('[data-test="guide-collection-enabled"]').check()
+  await guide.locator('[data-test="guide-collection-policy"]').selectOption('events')
+  await guide.locator('[data-test="guide-collection-interval"]').fill('1')
+  await guide.locator('[data-test="guide-collection-limit"]').fill('20')
+  await guide.locator('[data-test="apply-collection-guide"]').click()
+  const name = `Guided object ${testInfo.project.name} ${Date.now()}`
+  await workbench.locator('[data-test="task-name"]').fill(name)
+  await workbench.locator('[data-test="create-task"]').click()
+  const option = workbench.locator('[data-test="task-select"] option').filter({ hasText: name })
+  await expect(option).toHaveCount(1)
+  const taskId = await option.getAttribute('value')
+  expect(taskId).toBeTruthy()
+  await workbench.locator('[data-test="task-select"]').selectOption(taskId!)
+  const task = await readApiData<{ config: { rules: { labels: string[]; confidence_threshold: number };
+    collection: { enabled: boolean; policy: string; interval_seconds: number; max_samples: number } } }>(page, `/api/analysis-tasks/${taskId}`)
+  expect(task.config.rules.labels).toEqual(['person'])
+  expect(task.config.rules.confidence_threshold).toBe(0.7)
+  expect(task.config.collection).toMatchObject({ enabled: true, policy: 'events', interval_seconds: 1, max_samples: 20 })
+  const dataPanel = workbench.getByRole('region', { name: '任务采集与审核' })
+  await dataPanel.getByRole('button', { name: '新建数据流程', exact: true }).click()
+  await expect(dataPanel.getByRole('button', { name: '按任务配置采集', exact: true })).toBeVisible()
+  await dataPanel.getByRole('button', { name: '按任务配置采集', exact: true }).click()
+  await expect(dataPanel.getByRole('alert')).toContainText('EVENT_COLLECTION_EXECUTION_UNAVAILABLE')
+  await expect(dataPanel).toContainText('待采集')
+  await workbench.locator('[data-test="toggle-task-lifecycle"]').click()
+  const lifecycle = workbench.getByRole('region', { name: '目标检测事件与发布闭环' })
+  await expect(lifecycle).toBeVisible()
+  await expect(lifecycle).toContainText('暂无验证事件')
+  await expect(lifecycle).toContainText('生产发布：NO-GO')
+  await expect(lifecycle.locator('[data-test="request-release"]')).toBeDisabled()
+  await lifecycle.locator('[data-test="read-training-capabilities"]').click()
+  const training = lifecycle.locator('[data-test="training-capabilities"]')
+  await expect(training).toContainText('已配置禁用')
+  await expect(training).toContainText('未配置可信基础模型')
+  const capabilities = await readApiData<{ configured_enabled: boolean; trusted_base_models: unknown[]; runtime: { state: string }; production_allowed: boolean }>(page, `/api/analysis-tasks/${taskId}/training-capabilities`)
+  expect(capabilities).toMatchObject({ configured_enabled: false, trusted_base_models: [], runtime: { state: 'disabled' }, production_allowed: false })
+  const readiness = await readApiData<{ document: { production_ready: boolean } }>(page, `/api/analysis-tasks/${taskId}/releases/readiness`)
+  expect(readiness.document.production_ready).toBe(false)
+  expect(computeWrites).toEqual([])
+  await page.route(/\/api\/analysis-tasks\?/, async route => {
+    const response = await route.fetch()
+    const body = await response.json()
+    const row = body.data.tasks.find((item: { task_id: string }) => item.task_id === taskId)
+    row.runtime = { state: 'running', running: true, event_error: 'EVENT_QUEUE_UNAVAILABLE' }
+    await route.fulfill({ response, json: body })
+  })
+  await page.getByRole('button', { name: '刷新任务', exact: true }).click()
+  const card = page.locator('[data-test="analysis-task"]').filter({ hasText: name })
+  await expect(card.locator('[data-test="task-event-error"]')).toContainText('部分事件可能缺失')
+  await expect(card).toContainText('运行中')
+  expect(computeWrites).toEqual([])
+})
+
+test('operator can enter task event review without model management and viewer cannot read replay', async ({ page, browser, baseURL }, testInfo) => {
+  await authenticateIfRequired(page)
+  const name = `Operator events ${testInfo.project.name} ${Date.now()}`
+  const created = await page.request.post('/api/analysis-tasks', {
+    headers: { 'Idempotency-Key': `operator-events-${testInfo.project.name}-${Date.now()}` },
+    data: { camera_id: 'local-camera', template_id: 'object_detection.v1', name },
+  })
+  expect(created.status()).toBe(201)
+  const taskId = (await created.json()).data.task_id as string
+  // Use independent sessions. Clearing cookies underneath a mounted SPA lets
+  // its old polling requests race the next user's login redirect.
+  const viewport = page.viewportSize()
+  const contexts = await Promise.all([
+    browser.newContext({ baseURL, viewport }), browser.newContext({ baseURL, viewport }),
+  ])
+  try {
+    const [operator, viewer] = await Promise.all(contexts.map(context => context.newPage()))
+    await authenticateIfRequired(operator!, { username: 'local-operator', password: 'Argus-local-only!42' })
+    await operator!.goto('/cameras/local-camera')
+    await expect(operator!.getByRole('region', { name: '多任务工作台' })).toHaveCount(0)
+    const card = operator!.locator('[data-test="analysis-task"]').filter({ hasText: name })
+    await card.locator('[data-test="open-task-event-review"]').click()
+    const lifecycle = card.getByRole('region', { name: '目标检测事件与发布闭环' })
+    await expect(lifecycle).toContainText('暂无验证事件')
+    await expect(lifecycle.locator('[data-test="request-release"]')).toHaveCount(0)
+    await expect(lifecycle.getByRole('button', { name: '确认提交训练申请', exact: true })).toHaveCount(0)
+    await authenticateIfRequired(viewer!, { username: 'local-viewer', password: 'Argus-local-only!42' })
+    await viewer!.goto('/cameras/local-camera')
+    await expect(viewer!.locator('[data-test="open-task-event-review"]')).toHaveCount(0)
+    const denied = await viewer!.request.get(`/api/analysis-tasks/${taskId}/events/not-an-event/replay`)
+    expect(denied.status()).toBe(403)
+  } finally {
+    await Promise.all(contexts.map(context => context.close()))
+  }
 })
 
 test('managed durable deployment distinguishes accepted intent from applied state and source ownership', async ({ page }, testInfo) => {

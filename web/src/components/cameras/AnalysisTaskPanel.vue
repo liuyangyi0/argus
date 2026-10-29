@@ -1,18 +1,56 @@
 <script setup lang="ts">
-import { onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { getActivePinia } from 'pinia'
+import { useAuthStore } from '../../stores/useAuthStore'
 import { getAnalysisTasks, type AnalysisTask } from '../../api/analysisTasks'
-import { extractErrorMessage } from '../../utils/error'
+import { extractErrorMessage, toApiError } from '../../utils/error'
 import TaskWorkbench from './TaskWorkbench.vue'
 import CameraSourceControls from './CameraSourceControls.vue'
+import TaskLifecyclePanel from './TaskLifecyclePanel.vue'
+import TaskGuidanceCard from './TaskGuidanceCard.vue'
 
-const props = defineProps<{ cameraId: string; canManage?: boolean }>()
+const props = defineProps<{ cameraId: string; canManage?: boolean; requestedTaskId?: string; requestedSection?: string; navigationInvalid?: boolean }>()
+const emit = defineEmits<{ clearTaskNavigation: [] }>()
 const tasks = ref<AnalysisTask[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
 const loaded = ref(false)
+const taskAccessDenied = ref(false)
+const eventReviewTaskId = ref('')
+const sourceSection = ref<HTMLElement | null>(null)
+const taskCards = ref<HTMLElement[]>([])
+const pinia = getActivePinia()
+const auth = pinia ? useAuthStore(pinia) : null
+const authenticationIdentity = computed(() => JSON.stringify([auth?.currentUser?.username, auth?.currentUser?.role]))
+const identityReady = computed(() => !auth || !!auth.currentUser?.username)
+const canReviewTaskEvents = computed(() => !!auth?.currentUser?.username && auth.currentUser.role === 'operator')
 let generation = 0
 let disposed = false
 let timer: ReturnType<typeof setTimeout> | null = null
+let handledNavigation = ''
+const missingRequestedTask = computed(() => loaded.value && !error.value && !!props.requestedTaskId
+  && !tasks.value.some(task => task.task_id === props.requestedTaskId))
+function focusSource() {
+  sourceSection.value?.focus({ preventScroll: true })
+  sourceSection.value?.scrollIntoView({ block: 'start' })
+}
+watch(() => [props.requestedTaskId, props.requestedSection, props.cameraId, tasks.value, props.canManage, props.navigationInvalid] as const, async () => {
+  if (props.navigationInvalid) { handledNavigation = ''; eventReviewTaskId.value = ''; return }
+  const task = tasks.value.find(item => item.task_id === props.requestedTaskId)
+  const identity = JSON.stringify([props.cameraId, props.requestedTaskId, props.requestedSection, props.canManage])
+  if (!task || (props.canManage && task.authority === 'managed' && task.lifecycle !== 'archived')) {
+    handledNavigation = ''
+    return
+  }
+  if (handledNavigation === identity) return
+  handledNavigation = identity
+  await nextTick()
+  if (disposed || props.navigationInvalid || handledNavigation !== identity
+    || identity !== JSON.stringify([props.cameraId, props.requestedTaskId, props.requestedSection, props.canManage])) return
+  if (props.requestedSection === 'source') { focusSource(); return }
+  const element = taskCards.value.find(card => card.dataset.taskId === task.task_id)
+  element?.focus({ preventScroll: true }); element?.scrollIntoView({ block: 'start' })
+})
 
 const states: Record<string, string> = {
   unknown: '未知', stopped: '已停止', starting: '启动中', running: '运行中',
@@ -55,24 +93,40 @@ async function load() {
   cancelTimer()
   const requestGeneration = ++generation
   const cameraId = props.cameraId
-  if (!cameraId) {
+  const requestIdentity = authenticationIdentity.value
+  if (!cameraId || !identityReady.value) {
     tasks.value = []
     loaded.value = false
     loading.value = false
+    taskAccessDenied.value = !identityReady.value
+    error.value = identityReady.value ? null : '当前个人身份尚未就绪，无法读取分析任务'
     return
   }
   loading.value = true
   try {
     const response = await getAnalysisTasks(cameraId)
-    if (disposed || generation !== requestGeneration || props.cameraId !== cameraId) return
+    if (disposed || generation !== requestGeneration || props.cameraId !== cameraId
+      || authenticationIdentity.value !== requestIdentity) return
+    if (response.tasks.some(task => task.camera_id !== cameraId)
+      || new Set(response.tasks.map(task => task.task_id)).size !== response.tasks.length) throw new Error('任务列表与当前相机不匹配')
     tasks.value = response.tasks
     error.value = null
     loaded.value = true
+    taskAccessDenied.value = false
   } catch (cause: unknown) {
-    if (disposed || generation !== requestGeneration || props.cameraId !== cameraId) return
+    if (disposed || generation !== requestGeneration || props.cameraId !== cameraId
+      || authenticationIdentity.value !== requestIdentity) return
     error.value = extractErrorMessage(cause, '无法读取分析任务')
+    const apiError = toApiError(cause)
+    if ([401, 403].includes(apiError.httpStatus ?? 0) || [40100, 40300].includes(apiError.businessCode ?? 0)) {
+      tasks.value = []
+      loaded.value = false
+      taskAccessDenied.value = true
+      eventReviewTaskId.value = ''
+    }
   } finally {
-    if (!disposed && generation === requestGeneration && props.cameraId === cameraId) {
+    if (!disposed && generation === requestGeneration && props.cameraId === cameraId
+      && authenticationIdentity.value === requestIdentity) {
       loading.value = false
       // REST reconciliation remains active even if the surrounding page has WS.
       timer = setTimeout(() => { void load() }, 60_000)
@@ -80,12 +134,15 @@ async function load() {
   }
 }
 
-watch(() => props.cameraId, () => {
+watch(() => [props.cameraId, authenticationIdentity.value] as const, () => {
+  handledNavigation = ''
+  eventReviewTaskId.value = ''
   tasks.value = []
   error.value = null
   loaded.value = false
+  taskAccessDenied.value = !identityReady.value
   void load()
-}, { immediate: true })
+}, { immediate: true, flush: 'sync' })
 
 onUnmounted(() => {
   disposed = true
@@ -101,15 +158,19 @@ onUnmounted(() => {
       <button type="button" :disabled="loading" @click="load">{{ loading ? '刷新中…' : '刷新任务' }}</button>
     </header>
     <p class="scope-note">保留现有异物检测与发布安全门。新任务仅支持旁路运行；生产发布保持 NO-GO。legacy 导入快照不是当前生效配置，managed 配置需冻结为执行包后启动。</p>
-    <CameraSourceControls :camera-id="cameraId" :can-manage="canManage" @refresh="load" />
-    <TaskWorkbench v-if="canManage" :camera-id="cameraId" :tasks="tasks" @refresh="load" />
+    <div ref="sourceSection" tabindex="-1" data-test="task-section-source"><CameraSourceControls :camera-id="cameraId" :can-manage="canManage" @refresh="load" /></div>
+    <p v-if="missingRequestedTask" role="alert">指定任务不存在或不属于当前摄像头；未自动选择其它任务。</p>
+    <p v-if="navigationInvalid" role="alert">任务定位参数无效，未自动选择其它任务。<button @click="emit('clearTaskNavigation')">清除无效定位</button></p>
+    <TaskWorkbench v-if="canManage && !taskAccessDenied" :key="authenticationIdentity" :camera-id="cameraId" :tasks="tasks" :initial-task-id="requestedTaskId" :initial-section="requestedSection" :navigation-invalid="navigationInvalid" :task-list-ready="loaded" :stale="!!error" @refresh="load" @open-source="focusSource" @clear-navigation="emit('clearTaskNavigation')" />
     <p v-if="error" class="error" role="alert" data-test="task-error">
       {{ error }}<span v-if="loaded">；下列为上次成功读取的状态，可能已过期。</span>
     </p>
     <p v-else-if="loading && !loaded" role="status">正在加载分析任务…</p>
     <p v-else-if="loaded && tasks.length === 0" data-test="task-empty">尚未登记分析任务；不代表摄像头已经停止。</p>
-    <article v-for="task in tasks" :key="task.task_id" class="task-card" data-test="analysis-task">
+    <article v-for="task in tasks" :key="task.task_id" ref="taskCards" tabindex="-1" :data-task-id="task.task_id" class="task-card" data-test="analysis-task">
       <h3>{{ task.template_id === 'legacy_anomaly.v1' ? '现有异物检测' : task.name || task.template_id }}<span v-if="task.lifecycle === 'archived'"> · 已归档</span></h3>
+      <TaskGuidanceCard :task="task" :stale="!!error" />
+      <p v-if="task.runtime?.event_error" class="error" role="alert" data-test="task-event-error">事件证据通道受阻（{{ task.runtime.event_error }}），部分事件可能缺失；推理与预览状态独立显示。</p>
       <dl>
         <div><dt>任务身份</dt><dd class="mono">{{ task.task_id }}</dd></div>
         <div><dt>模板 / 导入快照版本</dt><dd>{{ task.template_id }} / r{{ task.current_revision }}</dd></div>
@@ -129,6 +190,10 @@ onUnmounted(() => {
         </template>
         <div><dt>运行时模型观测</dt><dd>{{ task.runtime?.model_version ?? '未知' }} · {{ task.runtime?.model_identity_verified === true ? '制品身份已核验，不代表场景已放行' : '制品身份未确认' }}</dd></div>
       </dl>
+      <template v-if="!navigationInvalid && canReviewTaskEvents && task.template_id === 'object_detection.v1'">
+        <button data-test="open-task-event-review" @click="eventReviewTaskId = eventReviewTaskId === task.task_id ? '' : task.task_id">{{ eventReviewTaskId === task.task_id ? '收起任务事件复核' : '查看与复核任务事件' }}</button>
+        <TaskLifecyclePanel v-if="eventReviewTaskId === task.task_id" :key="task.task_id" :task="task" />
+      </template>
     </article>
   </section>
 </template>
@@ -141,6 +206,7 @@ h3 { margin-bottom: 10px; }
 button { border: 1px solid var(--border-default); border-radius: 6px; padding: 6px 10px; background: var(--bg); color: var(--text-primary); cursor: pointer; }
 button:disabled { cursor: wait; }
 button:focus-visible { outline: 2px solid var(--status-info); outline-offset: 2px; }
+[tabindex="-1"]:focus { outline: 2px solid var(--status-info); outline-offset: 4px; }
 .scope-note, [role="status"], [data-test="task-empty"] { font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
 .error { font-size: 12px; color: var(--status-danger); line-height: 1.6; }
 .task-card { border-top: 1px solid var(--border-default); padding-top: 12px; margin-top: 12px; }

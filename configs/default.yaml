@@ -430,6 +430,22 @@ retraining:
   historical_replay_days: 30
   require_human_confirmation: true
   confirmation_timeout_hours: 72
+task_training:
+  # Startup-only authority for validation task training, separate from legacy
+  # automatic retraining. HTTP config reload/toggles cannot enable or trust it.
+  enabled: false
+  # Explicit operator-approved maintenance window. Never stops live inference
+  # automatically; active or uncleared model consumers keep jobs waiting.
+  maintenance_approved: false
+  resource_mode: exclusive_maintenance
+  device: cuda:0
+  # Admission threshold, NOT an OS-enforced GPU memory limit or reservation.
+  minimum_free_memory_mb: 4096
+  poll_interval_seconds: 1.0
+  # Operator-preprovisioned .pt identities under storage.models_dir only.
+  # Entries: model_id, name, canonical relative_path, exact lowercase artifact_sha256.
+  # A request-supplied path/hash cannot add trust. Empty means deny all bases.
+  trusted_base_models: []
 feedback:
   auto_baseline_on_fp: true
   auto_validation_on_confirmed: true

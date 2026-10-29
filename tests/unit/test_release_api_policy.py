@@ -141,6 +141,28 @@ def alerts_dir(tmp_path):
     return path
 
 
+@pytest.fixture
+def candidate_compute_manager(tmp_path, db):
+    """Explicit compute authority for mocked candidate derivation only."""
+    from argus.capture.manager import CameraManager
+    from argus.config.schema import AlertConfig
+    from argus.runtime.compute_ownership import ComputeOwnership
+
+    manager = CameraManager([], AlertConfig(), database=db)
+    ownership = ComputeOwnership(tmp_path / "candidate-compute.lock")
+    manager.enable_compute_ownership(ownership)
+    try:
+        yield manager
+    finally:
+        # These tests use a Mock trainer and start no camera/worker. Releasing
+        # this handle is not a production shortcut for unknown cleanup.
+        try:
+            assert ownership.release(manager)
+        finally:
+            manager._inference_executor.shutdown(wait=False)
+            manager._encode_executor.shutdown(wait=False)
+
+
 def _make_app(db, camera_manager, alerts_dir):
     camera_manager._db = db
     app = create_app(
@@ -448,12 +470,14 @@ def test_promote_ignores_client_triggered_by_and_uses_authenticated_user(
 
 
 @pytest.mark.parametrize("operation", ["reexport", "recalibrate"])
+@pytest.mark.parametrize("with_compute_owner", [False, True])
 def test_released_artifacts_derive_new_candidates_without_mutating_source(
     db,
     alerts_dir,
     tmp_path,
     operation,
-    monkeypatch,
+    with_compute_owner,
+    candidate_compute_manager,
 ):
     model_dir, baseline_dir = _create_model_tree(tmp_path)
     registry = ModelRegistry(session_factory=db.get_session)
@@ -465,7 +489,8 @@ def test_released_artifacts_derive_new_candidates_without_mutating_source(
         "canary",
         canary_camera_id="cam_01",
     )
-    app = _make_app(db, ReleaseStateCameraManager(), alerts_dir)
+    camera_manager = candidate_compute_manager if with_compute_owner else ReleaseStateCameraManager()
+    app = _make_app(db, camera_manager, alerts_dir)
     trainer = MagicMock()
     getattr(trainer, f"{operation}_model").return_value = {
         "status": "ok", "model_version_id": "new-candidate", "model_path": "new/model.xml",
@@ -479,10 +504,15 @@ def test_released_artifacts_derive_new_candidates_without_mutating_source(
 
     response = client.post(f"/api/models/{version_id}/{operation}", json={})
 
-    assert response.status_code == 200
-    assert response.json()["data"]["model_version_id"] == "new-candidate"
     assert registry.get_by_version_id(version_id).stage == "canary"
     assert (model_dir / "model.xml").read_bytes() == original
+    if not with_compute_owner:
+        assert response.status_code == 409
+        assert response.json()["code"] == 40900
+        getattr(trainer, f"{operation}_model").assert_not_called()
+        return
+    assert response.status_code == 200
+    assert response.json()["data"]["model_version_id"] == "new-candidate"
     getattr(trainer, f"{operation}_model").assert_called_once()
 
 

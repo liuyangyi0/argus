@@ -64,7 +64,8 @@ def main() -> None:
     save_config(config, config_path)
     db = Database(storage.database_url)
     db.initialize()
-    for username, role in (("local-admin", "admin"), ("local-viewer", "viewer")):
+    for username, role in (("local-admin", "admin"), ("local-viewer", "viewer"),
+                           ("local-operator", "operator")):
         db.create_user(username, hash_password("Argus-local-only!42"), role, username)
     db.save_alert(
         alert_id="local-functional-alert", camera_id="local-camera", zone_id="default",

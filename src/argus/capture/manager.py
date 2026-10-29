@@ -65,6 +65,18 @@ class CameraStatus:
     lifecycle: dict | None = None
 
 
+class _TaskComputeReservation:
+    def __init__(self, manager, token):
+        self.manager, self.token = manager, token
+        self.released = False
+
+    def release(self):
+        with self.manager._lock:
+            if not self.released:
+                self.manager._task_compute_reservations.remove(self.token)
+                self.released = True
+
+
 @dataclass
 class _PreparedCameraRelease:
     """Manager-owned runtime transaction kept alive through the DB CAS."""
@@ -669,6 +681,102 @@ class CameraManager:
             self._broadcast_camera_and_wall(camera_id)
         return result
 
+    def enable_compute_ownership(self, ownership=None, *, retain_until_exit=False) -> None:
+        """Assembly-time, inert machine-local exclusion for managed instances."""
+        from argus.runtime.compute_ownership import ComputeOwnership
+        with self._lock:
+            if retain_until_exit:
+                # Legacy background executors do not expose positive cleanup
+                # leases yet. Never infer their exit from an empty camera map.
+                self._compute_ownership_process_lifetime = True
+            if getattr(self, "_compute_ownership", None) is None:
+                self._compute_ownership = ownership if ownership is not None else ComputeOwnership()
+
+    def claim_compute_ownership(self) -> bool:
+        with self._lock:
+            return self._claim_compute_ownership_locked()
+
+    def _claim_compute_ownership_locked(self) -> bool:
+        ownership = getattr(self, "_compute_ownership", None)
+        return ownership is None or ownership.acquire(self) is True
+
+    def get_training_worker_lock_path(self):
+        """Assembly-owned child guard path, never selected by a training request."""
+        with self._lock:
+            ownership = getattr(self, "_compute_ownership", None)
+            return ownership.worker_path if ownership is not None else None
+
+    def is_training_maintenance(self) -> bool:
+        with self._lock:
+            return getattr(self, "_training_maintenance_mode", False) is True
+
+    def authorize_legacy_compute(self) -> bool:
+        """Fence ad-hoc/background legacy compute before it can load a model.
+
+        Its HTTP response does not prove that caches/background work exited, so
+        the exclusion is deliberately sticky until a fresh process/manager.
+        """
+        with self._lock:
+            if getattr(self, "_training_maintenance_mode", False):
+                return False
+            if not self._claim_compute_ownership_locked():
+                return False
+            self._legacy_compute_authority_used = True
+            return True
+
+    def close_compute_ownership(self) -> bool:
+        """Release only when no model or pending cleanup still belongs to us."""
+        with self._lock:
+            self._ensure_lifecycle_state()
+            if (getattr(self, "_compute_ownership_process_lifetime", False)
+                    or getattr(self, "_legacy_compute_authority_used", False)):
+                return False
+            if (self._pipelines or self._runners or self._threads or self._starting_cameras
+                    or self._retiring_cameras or getattr(self, "_task_compute_reservations", set())
+                    or self._task_supervisor.list() or getattr(self, "_shared_anomaly_detector", None) is not None
+                    or getattr(self, "_shared_yolo", None) is not None):
+                return False
+            from argus.runtime.task_training_resources import training_compute_exclusion_required, training_resource_lease_held
+            if training_resource_lease_held(self) or training_compute_exclusion_required(None, getattr(self, "_db", None)):
+                return False
+            ownership = getattr(self, "_compute_ownership", None)
+            return ownership is None or ownership.release(self) is True
+
+    def enter_training_maintenance(self) -> bool:
+        """Process-sticky exclusion, never an implicit stop or scene approval.
+
+        Source/preview ownership is unchanged. A running, starting, prepared or
+        uncleared model prevents entry. Restart with normal config to leave.
+        """
+        with self._lock:
+            self._ensure_lifecycle_state()
+            if getattr(self, "_training_maintenance_mode", False):
+                return self._claim_compute_ownership_locked()
+            if getattr(self, "_legacy_compute_authority_used", False):
+                return False
+            if (self._pipelines or self._runners or self._threads or self._starting_cameras
+                    or self._retiring_cameras or getattr(self, "_task_compute_reservations", set())
+                    or self._task_supervisor.list() or getattr(self, "_shared_anomaly_detector", None) is not None
+                    or getattr(self, "_shared_yolo", None) is not None):
+                return False
+            if not self._claim_compute_ownership_locked():
+                return False
+            self._training_maintenance_mode = True
+            return True
+
+    def acquire_task_compute_reservation(self):
+        """Exclude maintenance before even a managed model starts loading."""
+        with self._lock:
+            if getattr(self, "_training_maintenance_mode", False):
+                raise RuntimeError("training maintenance excludes model execution")
+            if not self._claim_compute_ownership_locked():
+                raise RuntimeError("another Argus instance owns compute")
+            if not hasattr(self, "_task_compute_reservations"):
+                self._task_compute_reservations = set()
+            token = object()
+            self._task_compute_reservations.add(token)
+            return _TaskComputeReservation(self, token)
+
     def start_source(self, camera_id: str) -> bool:
         """Start acquisition/preview/recording without constructing legacy models."""
         cam_config = self.get_camera_config(camera_id)
@@ -1122,6 +1230,8 @@ class CameraManager:
         """
         with self._lock:
             self._ensure_lifecycle_state()
+            if getattr(self, "_training_maintenance_mode", False):
+                raise RuntimeError("training maintenance excludes analysis tasks")
             source = self._sources.get(runtime.source.camera_id)
             if (source is not runtime.source
                     or runtime.source.camera_id in self._stopping_cameras
@@ -2779,6 +2889,12 @@ class CameraManager:
 
         with self._lock:
             self._ensure_lifecycle_state()
+            if getattr(self, "_training_maintenance_mode", False):
+                self._legacy_task_errors[camera_id] = "TRAINING_MAINTENANCE_ACTIVE"
+                return False
+            if not self._claim_compute_ownership_locked():
+                self._legacy_task_errors[camera_id] = "COMPUTE_OWNERSHIP_UNAVAILABLE"
+                return False
             current_generation = self._camera_generations.get(camera_id, 0)
             if self._stop_event.is_set() or (
                 expected_generation is not None and expected_generation != current_generation

@@ -60,6 +60,9 @@ def test_list_is_read_only_and_does_not_expose_config_or_model_paths():
     assert task["deployment"]["desired_artifact_id"] == "artifact-1"
     assert task["deployment"]["applied_artifact_id"] is None
     assert task["runtime"]["state"] == "unknown"
+    assert task["guidance"]["state"] == "unknown"
+    assert task["guidance"]["is_authorization"] is False
+    assert task["guidance"]["training_requirement"] == "legacy_workflow"
     service.list_tasks.assert_called_once_with(camera_id="cam1")
     service.bootstrap_legacy.assert_not_called()
     service.sync_legacy_model_projection.assert_not_called()
@@ -101,6 +104,21 @@ def test_runtime_snapshot_failure_is_unknown_not_false_healthy():
     assert b"private" not in response.body
 
 
+@pytest.mark.parametrize("event_error", ["EVENT_QUEUE_UNAVAILABLE", "EVENT_QUEUE_FAILED", "C:/private/file"])
+def test_event_transport_failure_is_visible_without_changing_task_or_source_state(event_error):
+    manager = Mock()
+    manager.get_analysis_task_runtime.return_value = {
+        "state": "running", "running": True, "event_error": event_error,
+    }
+    manager.get_source_runtime_status.return_value = {"state": "running", "running": True, "connected": True}
+    response = routes.analysis_task_detail(_request(service=_service(), manager=manager), "task-1")
+    assert response.status_code == 200
+    task = json.loads(response.body)["data"]
+    assert task["runtime"]["state"] == task["source"]["state"] == "running"
+    assert task["runtime"]["event_error"] == (event_error if event_error.startswith("EVENT_QUEUE_") else None)
+    assert b"private" not in response.body
+
+
 @pytest.mark.parametrize("role", ["invalid", None])
 def test_denied_read_does_not_touch_storage_or_runtime(role):
     service = _service()
@@ -124,6 +142,187 @@ def test_missing_task_and_unavailable_storage_are_not_empty_successes():
     assert json.loads(response.body)["code"] == 40400
     assert routes.analysis_tasks_list(_request()).status_code == 503
     assert routes.analysis_task_detail(_request(), "task-1").status_code == 503
+
+
+def _managed_running_request():
+    service, manager = _service(), Mock()
+    task = service.get_task.return_value
+    task.update(authority="managed", template_id="object_detection.v1", config={})
+    task["deployment"] = {"authority": "managed", "desired_state": "running", "runtime_status": "running",
+                          "desired_bundle_id": "bundle-one", "applied_bundle_id": "bundle-one",
+                          "deployment_revision": 4, "applied_deployment_revision": 4,
+                          "current_operation_id": "operation-four"}
+    manager.get_source_runtime_status.return_value = {"state": "running", "running": True, "connected": True}
+    # Exact real TaskExecutionManager.status shape: no running or mode fields.
+    status = {"task_id": "task-1", "state": "running", "bundle_id": "bundle-one",
+              "task_revision": 1, "applied_task_revision": 1, "deployment_revision": 4,
+              "deployment_operation_id": "operation-four", "production_allowed": False}
+    executor = SimpleNamespace(status=Mock(return_value=status))
+    request = _request(service=service, manager=manager)
+    request.app.state.task_execution = executor
+    return request, executor
+
+
+def test_guidance_uses_the_real_managed_status_shape_and_exact_operation_identity():
+    request, executor = _managed_running_request()
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["guidance"]["state"] == "observed_running"
+    assert data["runtime"]["running"] is None
+    assert data["runtime"]["deployment_revision"] == 4
+    assert data["guidance"]["is_authorization"] is False
+    executor.status.return_value["deployment_operation_id"] = "old-operation"
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["guidance"]["reason_code"] == "APPLICATION_UNVERIFIED"
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    ("pending", "DEPLOYMENT_PENDING"),
+    ("failed", "DEPLOYMENT_FAILED"),
+    ("late_operation", "APPLICATION_UNVERIFIED"),
+    ("late_revision", "APPLICATION_UNVERIFIED"),
+])
+def test_reusing_the_same_bundle_does_not_make_an_old_execution_current(change, reason):
+    request, executor = _managed_running_request()
+    task = request.app.state.analysis_task_service.get_task.return_value
+    deployment = task["deployment"]
+    if change == "pending":
+        deployment.update(runtime_status="pending", deployment_revision=5, current_operation_id="operation-five")
+    elif change == "failed":
+        deployment.update(failure_code="LOAD_TIMEOUT", deployment_revision=5, current_operation_id="operation-five")
+    elif change == "late_operation":
+        executor.status.return_value["deployment_operation_id"] = "old-operation"
+    else:
+        executor.status.return_value["deployment_revision"] = 3
+    assert deployment["desired_bundle_id"] == deployment["applied_bundle_id"] == executor.status.return_value["bundle_id"]
+    request.app.state.analysis_task_service.list_tasks.return_value = [task]
+    for response in (routes.analysis_task_detail(request, "task-1"), routes.analysis_tasks_list(request)):
+        data = json.loads(response.body)["data"]
+        public_task = data["tasks"][0] if "tasks" in data else data
+        assert public_task["guidance"]["reason_code"] == reason
+        assert public_task["guidance"]["state"] != "observed_running"
+        assert public_task["guidance"]["is_authorization"] is False
+
+
+def test_managed_absent_execution_is_distinct_from_failed_or_invalid_snapshot():
+    request, executor = _managed_running_request()
+    task = request.app.state.analysis_task_service.get_task.return_value
+    task["deployment"].update(desired_state="stopped", runtime_status="stopped")
+    executor.status.return_value = None
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["runtime"]["state"] == "stopped"
+    assert data["runtime"]["running"] is False
+    assert data["guidance"]["state"] == "stopped"
+    executor.status.return_value = {"task_id": "task-1", "state": "stopped", "bundle_id": "bundle-one"}
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["runtime"]["running"] is False
+    assert data["guidance"]["state"] == "stopped"
+    executor.status.return_value["running"] = True
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["guidance"]["reason_code"] == "UNEXPECTED_RUNTIME"
+    for invalid in [{}, "invalid"]:
+        executor.status.return_value = invalid
+        data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+        assert data["runtime"]["state"] == "unknown"
+        assert data["guidance"]["state"] == "unknown"
+    executor.status.side_effect = RuntimeError("private")
+    response = routes.analysis_task_detail(request, "task-1")
+    assert json.loads(response.body)["data"]["guidance"]["state"] == "unknown"
+    assert b"private" not in response.body
+
+
+def test_explicit_contradictory_mode_cannot_be_relabelled_shadow():
+    request, executor = _managed_running_request()
+    executor.status.return_value["mode"] = "production"
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["runtime"]["mode"] is None
+    assert data["guidance"]["reason_code"] == "APPLICATION_UNVERIFIED"
+
+
+@pytest.mark.parametrize("production_allowed", [None, True, 0, "false"])
+def test_unknown_or_contradictory_production_flag_does_not_infer_shadow(production_allowed):
+    request, executor = _managed_running_request()
+    executor.status.return_value["production_allowed"] = production_allowed
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["runtime"]["mode"] is None
+    assert data["guidance"]["reason_code"] == "APPLICATION_UNVERIFIED"
+    assert data["guidance"]["is_authorization"] is False
+
+
+@pytest.mark.parametrize("contradiction", ["missing_flag", "unknown_mode", "alerts_emitted", "explicit_production"])
+def test_shadow_mode_requires_uncontradicted_authoritative_evidence(contradiction):
+    request, executor = _managed_running_request()
+    status = executor.status.return_value
+    if contradiction == "missing_flag":
+        status.pop("production_allowed")
+    elif contradiction == "unknown_mode":
+        status["mode"] = None
+    elif contradiction == "alerts_emitted":
+        status["alerts_emitted"] = True
+    else:
+        status.update(mode="shadow", production_allowed=True)
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["runtime"]["mode"] is None
+    assert data["guidance"]["state"] != "observed_running"
+
+
+def test_camera_manager_snapshot_cannot_supply_missing_managed_execution_mode():
+    request, executor = _managed_running_request()
+    request.app.state.camera_manager.get_analysis_task_runtime.return_value = executor.status.return_value
+    request.app.state.task_execution = None
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["runtime"]["state"] == "running"
+    assert data["runtime"]["mode"] is None
+    assert data["guidance"]["reason_code"] == "APPLICATION_UNVERIFIED"
+
+
+@pytest.mark.parametrize("identity", [None, "another-task"])
+def test_authoritative_execution_snapshot_must_identify_the_requested_task(identity):
+    request, executor = _managed_running_request()
+    if identity is None:
+        executor.status.return_value.pop("task_id")
+    else:
+        executor.status.return_value["task_id"] = identity
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["runtime"]["state"] == "unknown"
+    assert data["guidance"]["state"] != "observed_running"
+
+
+def test_execution_snapshot_is_independent_when_camera_manager_is_unavailable():
+    request, executor = _managed_running_request()
+    request.app.state.camera_manager = None
+    data = json.loads(routes.analysis_task_detail(request, "task-1").body)["data"]
+    assert data["runtime"]["state"] == "running"
+    assert data["source"]["state"] == "unknown"
+    assert data["guidance"]["reason_code"] == "SOURCE_UNVERIFIED"
+    executor.status.assert_called_once_with("task-1")
+
+
+def test_scene_blocked_execution_error_uses_stable_reason_without_raw_details():
+    request, executor = _managed_running_request()
+    executor.status.return_value.update(
+        state="blocked", reason_code="SCENE_BLOCKED", error_code=None, reason="C:/private/profile.json",
+    )
+    response = routes.analysis_task_detail(request, "task-1")
+    data = json.loads(response.body)["data"]
+    assert data["runtime"]["reason_code"] == "SCENE_BLOCKED"
+    assert data["guidance"]["reason_code"] == "SCENE_BLOCKED"
+    assert b"private" not in response.body
+
+
+@pytest.mark.parametrize("reason_code", ["SOURCE_CHANGED", "CANCELLED"])
+def test_authoritative_block_reason_is_not_lost_or_replaced_by_raw_details(reason_code):
+    request, executor = _managed_running_request()
+    executor.status.return_value.update(
+        state="blocked", reason_code=reason_code, error_code=None,
+        reason="rtsp://private:password@camera/stream",
+    )
+    response = routes.analysis_task_detail(request, "task-1")
+    data = json.loads(response.body)["data"]
+    assert data["runtime"]["reason_code"] == reason_code
+    assert data["guidance"]["state"] == "attention"
+    assert data["guidance"]["is_authorization"] is False
+    assert b"private" not in response.body
+    assert b"password" not in response.body
 
 
 def test_storage_error_is_enveloped_without_leaking_exception():

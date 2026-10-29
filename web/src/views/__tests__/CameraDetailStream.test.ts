@@ -19,7 +19,7 @@ const streamStart = vi.hoisted(() => vi.fn())
 const streamStop = vi.hoisted(() => vi.fn())
 const streamVideoElementAtStart = vi.hoisted(() => vi.fn())
 const routeFixture = vi.hoisted(() => ({
-  route: null as { params: { id: string } } | null,
+  route: null as { params: { id: string }; query: Record<string, string | string[]> } | null,
 }))
 const antStubs = vi.hoisted(() => ({
   button: {
@@ -53,7 +53,7 @@ let pinia: ReturnType<typeof createPinia>
 
 vi.mock('vue-router', async () => {
   const vue = await vi.importActual<typeof import('vue')>('vue')
-  routeFixture.route = vue.reactive({ params: { id: 'dev_cam' } })
+  routeFixture.route = vue.reactive({ params: { id: 'dev_cam' }, query: {} })
   return {
     useRoute: () => routeFixture.route,
     useRouter: () => ({ push: routerPush }),
@@ -150,6 +150,7 @@ describe('CameraDetail live stream fallback', () => {
     setActivePinia(pinia)
     useAuthStore().currentUser = { username: 'operator', role: 'operator' }
     routeFixture.route!.params.id = 'dev_cam'
+    routeFixture.route!.query = {}
     routerPush.mockReset()
     streamStart.mockReset()
     streamStop.mockReset()
@@ -163,6 +164,19 @@ describe('CameraDetail live stream fallback', () => {
     vi.mocked(updateZones).mockReset()
     vi.mocked(message.success).mockReset()
     vi.mocked(message.error).mockReset()
+  })
+
+  it.each<Record<string, string | string[]>>([
+    { analysis_task: ['task-a', 'task-b'] },
+    { analysis_task: 'task-a', task_section: ['deployment', 'models'] },
+    { analysis_task: 'task-a', task_section: 'unsupported-section' },
+  ])('rejects ambiguous task query %j instead of silently opening a new task form', async query => {
+    useAuthStore().currentUser = { username: 'engineer', role: 'engineer' }
+    routeFixture.route!.query = query
+    const wrapper = mount(CameraDetail, { global: { plugins: [pinia], stubs: { ZoneEditor: true, CalibrationWizard: true } } })
+    await flushPromises()
+    expect(wrapper.text()).toContain('任务定位参数无效')
+    expect(wrapper.find('[data-test="create-task"]').exists()).toBe(false)
   })
 
   it('renders MJPEG stream when go2rtc falls back for a connected camera', async () => {

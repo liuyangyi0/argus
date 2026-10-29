@@ -77,6 +77,12 @@ const router = createRouter({
           meta: { title: '摄像头详情', requiresAuth: true },
         },
         {
+          path: 'analysis-tasks',
+          name: 'analysis-tasks',
+          component: () => import('../views/AnalysisTasks.vue'),
+          meta: { title: '分析任务', requiresAuth: true },
+        },
+        {
           path: 'alerts',
           name: 'alerts',
           component: () => import('../views/Alerts.vue'),

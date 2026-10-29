@@ -34,6 +34,11 @@ def register_training_job_processing(
     path callback: even an apparently informational hook could reload runtime
     out of band and bypass ModelReleaseService.
     """
+    from argus.runtime.task_training_resources import training_compute_exclusion_required
+    if training_compute_exclusion_required(config, database):
+        # Exclusive task training owns compute in this process. Keep the old
+        # durable queue intact, but do not import/start its training engines.
+        return
     from argus.anomaly.backbone_trainer import BackboneTrainer
     from argus.anomaly.job_executor import TrainingJobExecutor
     from argus.anomaly.trainer import ModelTrainer

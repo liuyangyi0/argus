@@ -51,6 +51,48 @@ _REGION_UPDATABLE_FIELDS = {
 # When you add a new column to an ORM model, append it here AND keep this in sync
 # with the SQL type. Tuple shape: (table_name, column_name, column_sql_type).
 _AUTO_MIGRATIONS: list[tuple[str, str, str]] = [
+    # These additive tables are created by metadata on first use. Explicit
+    # entries also repair interrupted/partial upgrades without fabricating
+    # task provenance, release approval or training success for old rows.
+    ("task_events", "task_id", "VARCHAR(64)"),
+    ("task_events", "camera_id", "VARCHAR(64)"),
+    ("task_events", "bundle_id", "VARCHAR(64)"),
+    ("task_events", "task_revision", "INTEGER"),
+    ("task_events", "deployment_revision", "INTEGER"),
+    ("task_events", "execution_id", "VARCHAR(64)"),
+    ("task_events", "source_session_id", "VARCHAR(128)"),
+    ("task_events", "source_epoch", "INTEGER"),
+    ("task_events", "frame_index", "INTEGER"),
+    ("task_events", "occurred_at", "DATETIME"),
+    ("task_events", "mode", "VARCHAR(20) DEFAULT 'validation' NOT NULL"),
+    ("task_events", "status", "VARCHAR(24) DEFAULT 'new' NOT NULL"),
+    ("task_events", "revision", "INTEGER DEFAULT 1 NOT NULL"),
+    ("task_events", "payload_json", "TEXT"),
+    ("task_events", "evidence_status", "VARCHAR(24) DEFAULT 'unavailable'"),
+    ("task_events", "evidence_path", "VARCHAR(500)"),
+    ("task_events", "evidence_sha256", "VARCHAR(64)"),
+    ("task_events", "alert_id", "VARCHAR(64)"),
+    ("task_events", "notes", "TEXT"),
+    ("task_events", "reviewed_by", "VARCHAR(100)"),
+    ("task_events", "reviewed_at", "DATETIME"),
+    ("task_events", "created_at", "DATETIME"),
+    ("task_releases", "task_id", "VARCHAR(64)"),
+    ("task_releases", "revision", "INTEGER"),
+    ("task_releases", "document_json", "TEXT"),
+    ("task_releases", "document_sha256", "VARCHAR(64)"),
+    ("task_releases", "created_by", "VARCHAR(100)"),
+    ("task_releases", "created_at", "DATETIME"),
+    ("task_releases", "updated_at", "DATETIME"),
+    ("task_training_executions", "task_id", "VARCHAR(64)"),
+    ("task_training_executions", "workflow_id", "VARCHAR(64)"),
+    ("task_training_executions", "revision", "INTEGER DEFAULT 1 NOT NULL"),
+    ("task_training_executions", "status", "VARCHAR(32)"),
+    ("task_training_executions", "request_json", "TEXT"),
+    ("task_training_executions", "request_sha256", "VARCHAR(64)"),
+    ("task_training_executions", "result_json", "TEXT"),
+    ("task_training_executions", "created_by", "VARCHAR(100)"),
+    ("task_training_executions", "created_at", "DATETIME"),
+    ("task_training_executions", "updated_at", "DATETIME"),
     ("analysis_tasks", "archived", "BOOLEAN DEFAULT 0 NOT NULL"),
     ("analysis_tasks", "created_by", "VARCHAR(100)"),
     ("analysis_tasks", "updated_at", "DATETIME"),
@@ -165,6 +207,12 @@ _AUTO_INDEX_MIGRATIONS: list[tuple[str, str]] = [
 # existing ORM column is changed. Keep their index migration separate from the
 # legacy model-production invariant, whose tests deliberately inspect models.
 _ANALYSIS_TASK_INDEX_MIGRATIONS: list[tuple[str, str]] = [
+    ("ix_task_events_task_created", "CREATE INDEX ix_task_events_task_created "
+     "ON task_events(task_id, created_at)"),
+    ("ix_task_releases_task_created", "CREATE INDEX ix_task_releases_task_created "
+     "ON task_releases(task_id, created_at)"),
+    ("ix_task_training_task_created", "CREATE INDEX ix_task_training_task_created "
+     "ON task_training_executions(task_id, created_at)"),
     (
         "uq_analysis_tasks_legacy_per_camera",
         "CREATE UNIQUE INDEX uq_analysis_tasks_legacy_per_camera "

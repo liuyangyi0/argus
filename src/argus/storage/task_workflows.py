@@ -17,7 +17,7 @@ import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from argus.capture.task_collector import TaskFrameCollector, controlled_path, png_image_size, safe_component
 from argus.core.analysis_task_contracts import normalize_task_config
@@ -27,6 +27,7 @@ from argus.storage.models import (
 
 _LIVE_SERVICES = weakref.WeakValueDictionary()
 _PROCESS_IDENTITY = uuid.uuid4().hex
+_MAX_ACTIVE_COLLECTIONS = 32
 
 
 def _process_alive(process_id: int) -> bool:
@@ -103,17 +104,30 @@ class TaskTrainingRecipeRegistry:
 
 
 class TaskWorkflowService:
-    def __init__(self, db, taskdata_root: str | Path, *, encoder=None, candidate_registrar=None):
+    def __init__(self, db, taskdata_root: str | Path, *, encoder=None, candidate_registrar=None,
+                 candidate_validator=None, event_provider=None):
         self._db = db
         self.root = Path(taskdata_root).resolve()
         self._encoder = encoder
         self._candidate_registrar = candidate_registrar
+        self._candidate_validator = candidate_validator
+        self._event_provider = None
         self._owner_id = uuid.uuid4().hex
         self._collectors: dict[str, TaskFrameCollector] = {}
         self._collector_lock = threading.RLock()
         self._closed = False
         _LIVE_SERVICES[self._owner_id] = self
         self.recipes = TaskTrainingRecipeRegistry()
+        if event_provider is not None:
+            self.set_event_provider(event_provider)
+
+    def set_event_provider(self, provider) -> None:
+        """Application wiring, never supplied by HTTP collection parameters."""
+        if not callable(getattr(provider, "authority_for", None)) or provider.authority_for(self._db) is not True:
+            raise ValueError("event collection requires the same database authority")
+        if self._event_provider is not None and self._event_provider is not provider:
+            raise RuntimeError("event collection authority is already bound")
+        self._event_provider = provider
 
     def close(self) -> bool:
         """A successful close confirms worker, subscription and receipt cleanup."""
@@ -305,15 +319,39 @@ class TaskWorkflowService:
                 raise TaskWorkflowConflict("collection is already in progress")
             if prior is not None and (not prior.stop() or not prior.retry_finalize()):
                 raise TaskWorkflowBlocked("COLLECTION_CLEANUP_NOT_CONFIRMED")
+            # Observe local cleanup before taking SQLite's writer lock: a
+            # finalizer must not wait on a writer that is waiting on its lock.
+            local_held = set()
+            for owned_id, owned in self._collectors.items():
+                try:
+                    state = owned.snapshot()
+                    held = (state.get("state") == "collecting" or state.get("cleanup_confirmed") is not True
+                            or state.get("persistence_pending") is True)
+                except Exception:
+                    held = True
+                if held:
+                    local_held.add(owned_id)
             with self._db.get_session() as session:
                 self._begin(session)
                 record, manifest = self._record(session, workflow_id, expected_revision)
                 if record.state not in {"collectable", "review", "collection_failed"}:
                     raise TaskWorkflowConflict("workflow cannot collect in its current state")
+                occupied = dict(session.execute(select(TaskWorkflowRecord.workflow_id, TaskWorkflowRecord.task_id).where(
+                    or_(TaskWorkflowRecord.state == "collecting", TaskWorkflowRecord.workflow_id.in_(local_held)),
+                )).all())
+                if not local_held <= occupied.keys():
+                    raise TaskWorkflowBlocked("COLLECTION_OWNER_STATE_UNAVAILABLE")
+                if record.task_id in occupied.values():
+                    raise TaskWorkflowBlocked("TASK_COLLECTION_RESOURCE_BUSY")
+                if len(occupied) >= _MAX_ACTIVE_COLLECTIONS:
+                    raise TaskWorkflowBlocked("COLLECTION_RESOURCE_LIMIT")
                 if any(receipt.get("collection_id") == collection_id for receipt in manifest["collections"]):
                     raise TaskWorkflowConflict("collection identity was already finalized")
                 policy = self._task_config(session, manifest["binding"])["collection"]
-                if policy["policy"] != "periodic" or params.pop("policy", "periodic") != "periodic":
+                selected_policy = params.pop("policy", policy["policy"])
+                if selected_policy != policy["policy"]:
+                    raise TaskWorkflowBlocked("COLLECTION_POLICY_MISMATCH")
+                if selected_policy not in {"periodic", "events"}:
                     raise TaskWorkflowBlocked("COLLECTION_POLICY_NOT_IMPLEMENTED")
                 params.setdefault("max_samples", min(policy["max_samples"], 10000))
                 params.setdefault("interval", policy["interval_seconds"])
@@ -325,14 +363,40 @@ class TaskWorkflowService:
                         or params["max_storage_mb"] > policy["max_storage_mb"]
                         or params["interval"] < policy["interval_seconds"]):
                     raise TaskWorkflowBlocked("COLLECTION_EXCEEDS_TASK_POLICY")
-                collector = TaskFrameCollector(
+                collector_class, extra = TaskFrameCollector, {}
+                if selected_policy == "events":
+                    from argus.capture.task_event_collector import TaskEventCollector
+
+                    provider = self._event_provider
+                    if manifest["binding"]["template_id"] != "object_detection.v1":
+                        raise TaskWorkflowBlocked("EVENT_COLLECTION_TEMPLATE_NOT_SUPPORTED")
+                    if provider is None or provider.authority_for(self._db) is not True:
+                        raise TaskWorkflowBlocked("EVENT_COLLECTION_UNAVAILABLE")
+                    try:
+                        context = provider.collection_context(manifest["binding"], session=session)
+                        cursor = provider.collection_cursor(session=session)
+                    except Exception:
+                        raise TaskWorkflowBlocked("EVENT_COLLECTION_EXECUTION_UNAVAILABLE") from None
+                    collector_class = TaskEventCollector
+                    existing_sources = []
+                    for sample in manifest["samples"]:
+                        if "event_origin" not in sample:
+                            raise TaskWorkflowBlocked("EVENT_COLLECTION_HISTORY_IDENTITY_UNAVAILABLE")
+                        self._event_origin(sample, manifest["binding"])
+                        existing_sources.append(sample["identity"])
+                    extra = {"event_provider": provider, "event_context": context, "start_cursor": cursor,
+                             "existing_sources": existing_sources}
+                collector = collector_class(
                     manager, manifest["binding"], self.root, collection_id, **params,
                     encoder=self._encoder,
                     on_finish=lambda snapshot: self._finish_collection(workflow_id, collection_id, snapshot),
+                    **extra,
                 )
                 operation = {"kind": "collection", "collection_id": collection_id, "owner_id": self._owner_id,
                              "process_id": os.getpid(), "process_identity": _PROCESS_IDENTITY,
-                             "requested_by": actor, "parameters": params}
+                             "requested_by": actor, "parameters": {**params, "policy": selected_policy}}
+                if selected_policy == "events":
+                    operation.update(event_context=context, start_cursor=cursor)
                 self._save(session, record, manifest, "collecting", operation=operation)
                 session.commit()
             self._collectors[workflow_id] = collector
@@ -343,6 +407,13 @@ class TaskWorkflowService:
         return self.get(workflow_id)
 
     def _finish_collection(self, workflow_id: str, collection_id: str, snapshot: dict) -> None:
+        if (not isinstance(snapshot, dict) or snapshot.get("collection_id") != collection_id
+                or not isinstance(snapshot.get("samples"), list)
+                or len(snapshot["samples"]) > 10000
+                or snapshot.get("state") not in {"completed", "stopped", "failed"}
+                or any(not isinstance(sample, dict) or sample.get("collection_id") != collection_id
+                       for sample in snapshot["samples"])):
+            raise TaskWorkflowConflict("collection receipt identity is invalid")
         with self._db.get_session() as session:
             self._begin(session)
             # Captured samples stay bound to their original revision. A changed
@@ -355,17 +426,38 @@ class TaskWorkflowService:
                 samples = [sample for sample in manifest["samples"] if sample["collection_id"] == collection_id]
                 def immutable(rows):
                     return [{key: value for key, value in row.items() if key != "auto_annotation"} for row in rows]
-                if completed != receipt or immutable(samples) != immutable(snapshot["samples"]):
+                if (_canonical(completed) != _canonical(receipt)
+                        or _canonical(immutable(samples)) != _canonical(immutable(snapshot["samples"]))):
                     raise TaskWorkflowConflict("collection receipt changed after commit")
                 return
             operation = json.loads(record.operation_json or "{}")
             if (record.state != "collecting" or operation.get("collection_id") != collection_id
                     or operation.get("owner_id") != self._owner_id):
                 raise TaskWorkflowConflict("collection operation ownership changed")
-            if snapshot["binding"] != manifest["binding"]:
+            if _canonical(snapshot["binding"]) != _canonical(manifest["binding"]):
                 raise TaskWorkflowConflict("collection binding changed")
+            event_collection = operation.get("parameters", {}).get("policy") == "events"
+            if event_collection:
+                if (snapshot.get("policy") != "events" or snapshot.get("kind") != "event_keyframes"
+                        or _canonical(snapshot.get("event_context")) != _canonical(operation.get("event_context"))
+                        or _canonical(snapshot.get("start_cursor")) != _canonical(operation.get("start_cursor"))):
+                    raise TaskWorkflowConflict("event collection receipt scope changed")
+                seen_frames = {self._event_frame_key(sample["identity"]) for sample in manifest["samples"]
+                               if "event_origin" in sample}
             for sample in snapshot["samples"]:
                 self._verify_sample(sample, manifest["binding"])
+                if event_collection:
+                    origin = self._event_origin(sample, manifest["binding"])
+                    source, bound = sample["identity"], origin["payload"]["binding"]
+                    actual_context = {key: bound[key] for key in (
+                        "task_id", "bundle_id", "manifest_sha256", "execution_id", "deployment_revision",
+                        "deployment_operation_id")}
+                    actual_context.update(source_session_id=source["source_session_id"], source_epoch=source["source_epoch"])
+                    frame_key = self._event_frame_key(source)
+                    if (_canonical(actual_context) != _canonical(operation["event_context"])
+                            or frame_key in seen_frames):
+                        raise TaskWorkflowConflict("event collection frame scope changed or duplicated")
+                    seen_frames.add(frame_key)
             old_ids = {sample["sample_id"] for sample in manifest["samples"]}
             new_ids = [sample["sample_id"] for sample in snapshot["samples"]]
             if old_ids.intersection(new_ids) or len(new_ids) != len(set(new_ids)):
@@ -478,7 +570,25 @@ class TaskWorkflowService:
                                               or numerator < 1 or denominator < 1)
                 or identity["pts"] is not None and numerator is None):
             raise ValueError("invalid original PTS time base")
+        if "event_origin" in sample:
+            self._event_origin(sample, binding)
         return path, data
+
+    @staticmethod
+    def _event_frame_key(source) -> tuple:
+        return tuple(source[key] for key in ("camera_id", "source_session_id", "source_epoch", "frame_index"))
+
+    @staticmethod
+    def _event_origin(sample: dict, binding: dict) -> dict:
+        """Validate frozen provenance without IO or a live event/runtime lookup."""
+        from argus.core.task_events import validate_event_sample_origin
+
+        try:
+            origin = sample["event_origin"]
+            validate_event_sample_origin(origin, sample["identity"], sample["image_size"], binding)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TaskWorkflowConflict("event sample provenance changed") from exc
+        return origin
 
     def _verify_sample(self, sample: dict, binding: dict) -> Path:
         return self._sample_data(sample, binding)[0]
@@ -708,6 +818,123 @@ class TaskWorkflowService:
                 "media_type": "images", "samples": current["manifest"]["samples"],
                 "reviews": current["manifest"]["reviews"], "external_side_effects": False}
 
+    @staticmethod
+    def _exchange_identity(sample: dict) -> dict:
+        """Export source evidence, never source URLs or private filesystem paths."""
+        fields = (
+            "camera_id", "source_session_id", "source_epoch", "frame_index",
+            "source_frame_index", "pts", "time_base_num", "time_base_den",
+            "capture_wall_ts", "capture_monotonic_ts", "frame_index_provenance", "timestamp_provenance",
+        )
+        return {key: sample["identity"][key] for key in fields}
+
+    def _annotation_exchange(self, session, record, manifest: dict, target: str) -> dict:
+        if target not in {"cvat", "fiftyone"}:
+            raise ValueError("unsupported annotation exchange target")
+        if not manifest["samples"]:
+            raise TaskWorkflowBlocked("ANNOTATION_EXCHANGE_HAS_NO_SAMPLES")
+        config = self._task_config(session, manifest["binding"])
+        # A tool must receive an explicit task label vocabulary. Deriving it
+        # from the tool's own predictions would allow it to invent new labels.
+        labels = config["rules"]["labels"]
+        if not labels:
+            raise TaskWorkflowBlocked("ANNOTATION_EXCHANGE_LABEL_SCHEMA_REQUIRED")
+        label_schema = {"schema": "argus.task-label-schema.v1", "labels": labels,
+                        "origin": "task_rules", "kind": "detection"}
+        if record.template_id != "object_detection.v1":
+            raise TaskWorkflowBlocked("ANNOTATION_EXCHANGE_TEMPLATE_NOT_SUPPORTED")
+        samples = []
+        for sample in manifest["samples"]:
+            self._verify_sample(sample, manifest["binding"])
+            samples.append({"sample_id": sample["sample_id"], "image_sha256": sample["image_sha256"],
+                            "image_size": sample["image_size"], "identity": self._exchange_identity(sample)})
+        return {"schema": "argus.task-annotation-exchange.v2", "target": target,
+                "workflow_id": record.workflow_id, "workflow_revision": record.revision,
+                "report_sha256": record.manifest_sha256, "binding": manifest["binding"],
+                "label_schema": label_schema, "label_schema_sha256": _sha(_canonical(label_schema)),
+                "media_type": "images", "samples": samples, "external_side_effects": False,
+                "approval_policy": "external_annotations_require_argus_human_review"}
+
+    def export_annotation_exchange(self, workflow_id: str, *, target: str) -> dict:
+        """Strict, image-only exchange contract; this method contacts no SDK."""
+        with self._db.get_session() as session:
+            record, manifest = self._record(session, workflow_id)
+            return self._annotation_exchange(session, record, manifest, target)
+
+    def import_annotation_exchange(self, workflow_id: str, *, expected_revision: int,
+                                   payload: dict, actor: str) -> dict:
+        """Accept tool annotations as drafts, never as independent approval.
+
+        A successful commit carries a receipt in the same manifest. If the
+        response/commit outcome is lost, an identical actor+payload retry can
+        recover that receipt before checking the old expected revision.
+        """
+        actor = _actor(actor)
+        if not isinstance(payload, dict):
+            raise ValueError("annotation exchange must be a JSON object")
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError("annotation exchange needs an integer revision")
+        import_sha = _sha(_canonical({"payload": payload, "actor": actor,
+                                      "expected_revision": expected_revision}))
+        with self._db.get_session() as session:
+            self._begin(session)
+            record, manifest = self._record(session, workflow_id, check_binding=False)
+            receipt = manifest.get("annotation_exchange_import")
+            if isinstance(receipt, dict) and receipt.get("import_sha256") == import_sha:
+                return self._view(record)
+            if record.revision != expected_revision:
+                raise TaskWorkflowConflict("workflow revision changed")
+            if self._binding(session, record.task_id) != manifest["binding"]:
+                raise TaskWorkflowConflict("task configuration changed")
+            if record.state in {"collecting", "candidate_importing"}:
+                raise TaskWorkflowConflict("workflow operation is in progress")
+            context = self._annotation_exchange(session, record, manifest, payload.get("target"))
+            if set(payload) != set(context) | {"results"} or any(_canonical(payload[key]) != _canonical(value) for key, value in context.items()):
+                raise TaskWorkflowConflict("annotation report, source identity or label schema changed")
+            rows = payload["results"]
+            if not isinstance(rows, list) or not rows or len(rows) > len(manifest["samples"]):
+                raise ValueError("annotation exchange needs non-empty unique results")
+            known = {sample["sample_id"]: sample for sample in context["samples"]}
+            validated = []
+            seen = set()
+            for row in rows:
+                if not isinstance(row, dict) or set(row) not in (
+                    {"sample_id", "image_sha256", "image_size", "identity", "annotation"},
+                    {"sample_id", "image_sha256", "image_size", "identity", "annotation", "notes"},
+                ):
+                    raise ValueError("invalid annotation exchange row")
+                sample_id = row["sample_id"]
+                if not isinstance(sample_id, str) or sample_id in seen or sample_id not in known:
+                    raise ValueError("unknown or duplicate annotation sample")
+                seen.add(sample_id)
+                if any(_canonical(row[key]) != _canonical(known[sample_id][key]) for key in ("image_sha256", "image_size", "identity")):
+                    raise TaskWorkflowConflict("annotation sample source identity changed")
+                notes = row.get("notes")
+                if notes is not None and (not isinstance(notes, str) or len(notes) > 10000):
+                    raise ValueError("invalid external annotation notes")
+                annotation = self._annotation(row["annotation"], record.template_id, context["label_schema"]["labels"])
+                validated.append((row, annotation))
+            # Validate every row before changing any sample. The database
+            # transaction also protects the persisted review/approval history.
+            for row, annotation in validated:
+                sample_id = row["sample_id"]
+                sample = next(item for item in manifest["samples"] if item["sample_id"] == sample_id)
+                previous = manifest["reviews"].get(sample_id)
+                sample["auto_annotation"] = {"annotation": annotation, "imported_by": actor,
+                    "source": {"schema": context["schema"], "target": context["target"],
+                               "report_sha256": context["report_sha256"], "import_sha256": import_sha},
+                    "external_notes": row.get("notes")}
+                self._apply_review(manifest, sample_id, expected_image_sha256=row["image_sha256"],
+                    decision="needs_review", notes=previous.get("notes") if previous else None,
+                    annotation=None, actor=actor)
+            manifest["annotation_exchange_import"] = {"import_sha256": import_sha,
+                "source_report_sha256": context["report_sha256"], "target": context["target"],
+                "imported_by": actor, "sample_ids": sorted(seen)}
+            self._save(session, record, manifest, "review")
+            result = self._view(record)
+            session.commit()
+            return result
+
     def import_review(self, workflow_id: str, *, expected_revision: int, payload: dict, actor: str) -> dict:
         actor = _actor(actor)
         with self._db.get_session() as session:
@@ -746,9 +973,11 @@ class TaskWorkflowService:
                                        decision="needs_review", notes=previous.get("notes") if previous else None,
                                        annotation=None, actor=actor)
                 elif row.get("origin") == "human":
-                    self._apply_review(manifest, sample_id, expected_image_sha256=row["image_sha256"],
-                                       decision=row["decision"], notes=row.get("notes"),
-                                       annotation=row.get("annotation"), actor=actor, allowed_labels=allowed_labels)
+                    # Legacy envelopes have no exact returned source/label
+                    # contract. An external origin string is not an Argus
+                    # personal approval. Keep v1 export/read compatibility,
+                    # but require the strict draft-only v2 return path.
+                    raise TaskWorkflowBlocked("LEGACY_EXTERNAL_HUMAN_APPROVAL_NOT_ACCEPTED_USE_V2")
                 else:
                     raise ValueError("annotation origin must be explicit")
             self._save(session, record, manifest, "review")
@@ -828,43 +1057,167 @@ class TaskWorkflowService:
             return {**package, "package_sha256": _sha(_canonical(package))}
 
     def import_candidate(self, workflow_id: str, *, expected_revision: int, candidate: dict,
-                         expected_package_sha256: str, actor: str) -> dict:
+                         expected_package_sha256: str, actor: str, authorize=None) -> dict:
         actor = _actor(actor)
+
+        def check_authority():
+            if authorize is not None:
+                try:
+                    allowed = callable(authorize) and authorize() is True
+                except Exception:
+                    allowed = False
+                if not allowed:
+                    raise TaskWorkflowBlocked("CANDIDATE_ACTOR_AUTHORITY_CHANGED")
+
+        check_authority()
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError("candidate import needs an integer workflow revision")
         if self._candidate_registrar is None:
             raise TaskWorkflowBlocked("P3_CANDIDATE_REGISTRAR_UNAVAILABLE")
-        package = self.export_training_package(workflow_id)
-        if package["package_sha256"] != expected_package_sha256:
-            raise TaskWorkflowConflict("training package identity changed")
+        if not isinstance(candidate, dict):
+            raise ValueError("candidate must be a JSON object")
+        if ((self._candidate_validator is not None or "artifact_sha256" in candidate)
+                and (set(candidate) not in (
+                    {"relative_path", "descriptor"}, {"relative_path", "descriptor", "artifact_sha256"})
+                    or not isinstance(candidate.get("relative_path"), str)
+                    or not isinstance(candidate.get("descriptor"), dict))):
+            raise ValueError("candidate requires a model path, descriptor and optional artifact SHA-256")
+        if "artifact_sha256" in candidate:
+            digest = candidate["artifact_sha256"]
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)):
+                raise ValueError("candidate artifact identity must be a SHA-256")
+            if self._candidate_validator is None:
+                raise TaskWorkflowBlocked("CANDIDATE_CONTENT_VALIDATION_UNAVAILABLE")
+        # Detach the request before invoking callbacks. Its historical identity
+        # deliberately remains the original body, not validator normalization.
+        candidate = json.loads(_canonical(candidate))
+        request_identity = {"workflow_id": workflow_id, "package_sha256": expected_package_sha256,
+                            "candidate": candidate}
         operation_id = _sha(_canonical({"workflow_id": workflow_id, "package": expected_package_sha256,
                                        "candidate": candidate}))
-        with self._db.get_session() as session:
-            self._begin(session)
-            record, manifest = self._record(session, workflow_id)
+
+        def completed_view(record, manifest, artifact_id=None):
             completed = (manifest.get("training") or {}).get("candidate")
             if (record.state == "candidate_registered" and isinstance(completed, dict)
                     and completed.get("operation_id") == operation_id):
-                return self._view(record)
-            if record.revision != expected_revision:
+                requested = completed.get("requested_revision", record.revision - 2)
+                if expected_revision not in {requested, completed.get("import_revision", record.revision - 1), record.revision}:
+                    raise TaskWorkflowConflict("workflow revision changed")
+                if artifact_id is not None and completed.get("artifact_id") != artifact_id:
+                    raise TaskWorkflowConflict("candidate registration receipt changed")
+                if (completed.get("request_identity") is not None
+                        and _canonical(completed["request_identity"]) != _canonical(request_identity)):
+                    raise TaskWorkflowConflict("candidate registration request identity changed")
+                result = self._view(record)
+                # Project only after the exact persisted operation ID matched.
+                # Historical manifests stay byte-identical: adding fields to
+                # their response copy would invalidate manifest_sha256.
+                result["candidate_import_receipt"] = {
+                    **completed, "request_identity": json.loads(_canonical(request_identity)),
+                }
+                return result
+            return None
+
+        def pending(record):
+            existing = json.loads(record.operation_json or "{}")
+            if record.state != "candidate_importing" or existing.get("operation_id") != operation_id:
+                return None
+            if expected_revision not in {existing.get("requested_revision", record.revision - 1), record.revision}:
+                raise TaskWorkflowConflict("workflow revision changed")
+            if (existing.get("kind") != "candidate_import"
+                    or existing.get("package_sha256") != expected_package_sha256
+                    or existing.get("approval_manifest_sha256", record.manifest_sha256) != record.manifest_sha256):
+                raise TaskWorkflowConflict("candidate approval changed")
+            if (existing.get("request_identity") is not None
+                    and _canonical(existing["request_identity"]) != _canonical(request_identity)):
+                raise TaskWorkflowConflict("candidate import request identity changed")
+            if not existing.get("requested_by"):
+                raise TaskWorkflowBlocked("CANDIDATE_IMPORT_ACTOR_UNRECORDED")
+            return existing
+
+        def check_package(session, record, manifest, package):
+            # Check persisted identities in the same transaction as the intent
+            # and final CAS, without rehashing large files under a writer lock.
+            body = {key: value for key, value in package.items() if key != "package_sha256"}
+            dataset = session.get(TaskDatasetRecord, manifest["dataset_id"])
+            training = manifest.get("training") or {}
+            if (package.get("package_sha256") != expected_package_sha256
+                    or _sha(_canonical(body)) != expected_package_sha256
+                    or package.get("workflow_id") != workflow_id or package.get("binding") != manifest["binding"]
+                    or dataset is None or dataset.task_id != record.task_id
+                    or dataset.task_revision != record.task_revision
+                    or _sha(dataset.manifest_json) != dataset.manifest_sha256
+                    or json.loads(dataset.manifest_json) != package.get("dataset")
+                    or training.get("dataset_id") != manifest["dataset_id"]
+                    or training.get("recipe_id") != package.get("recipe")
+                    or training.get("approved_by") != package.get("approved_by")
+                    or not training.get("approved_by") or training.get("blocked_reason")):
+                raise TaskWorkflowConflict("training package identity changed")
+
+        with self._db.get_session() as session:
+            record, manifest = self._record(session, workflow_id)
+            completed = completed_view(record, manifest)
+            if completed is not None:
+                return completed
+            existing = pending(record)
+            if existing is None and record.revision != expected_revision:
+                raise TaskWorkflowConflict("workflow revision changed")
+            source_sha = record.manifest_sha256
+        package = (existing or {}).get("training_manifest") or self.export_training_package(workflow_id)
+        if package["package_sha256"] != expected_package_sha256:
+            raise TaskWorkflowConflict("training package identity changed")
+        # Known format/content failures must not first persist an import intent
+        # that can only be repaired by changing its frozen request identity. A
+        # pending import instead reconciles its registry receipt first, using
+        # the frozen bytes/descriptor and authenticated original actor.
+        frozen_candidate = candidate
+        if existing is None and self._candidate_validator is not None:
+            frozen_candidate = self._candidate_validator(task_id=package["binding"]["task_id"],
+                candidate=json.loads(_canonical(candidate)), training_manifest=package)
+            if (not isinstance(frozen_candidate, dict)
+                    or set(frozen_candidate) != {"relative_path", "descriptor", "artifact_sha256"}
+                    or frozen_candidate["relative_path"] != candidate["relative_path"]
+                    or ("artifact_sha256" in candidate
+                        and frozen_candidate["artifact_sha256"] != candidate["artifact_sha256"])):
+                raise TaskWorkflowBlocked("CANDIDATE_CONTENT_VALIDATION_NOT_CONFIRMED")
+            frozen_candidate = json.loads(_canonical(frozen_candidate))
+        with self._db.get_session() as session:
+            self._begin(session)
+            record, manifest = self._record(session, workflow_id)
+            completed = completed_view(record, manifest)
+            if completed is not None:
+                return completed
+            existing = pending(record)
+            if existing is None and record.revision != expected_revision:
                 raise TaskWorkflowConflict("workflow revision changed")
             if record.state not in {"training_export_ready", "candidate_importing"}:
                 raise TaskWorkflowConflict("candidate import is not available")
-            existing = json.loads(record.operation_json or "{}")
-            if existing and existing.get("operation_id") != operation_id:
+            if record.operation_json and existing is None:
                 raise TaskWorkflowConflict("another candidate import requires reconciliation")
-            if existing and not existing.get("requested_by"):
-                # A legacy unknown write cannot be safely replayed under a
-                # newly guessed actor: registry idempotency includes the actor.
-                raise TaskWorkflowBlocked("CANDIDATE_IMPORT_ACTOR_UNRECORDED")
-            registration_actor = _actor(existing.get("requested_by", actor))
-            self._save(session, record, manifest, "candidate_importing", operation={
-                "kind": "candidate_import", "operation_id": operation_id,
-                "package_sha256": expected_package_sha256, "requested_by": registration_actor,
-            })
+            if record.manifest_sha256 != source_sha:
+                raise TaskWorkflowConflict("candidate approval changed during preparation")
+            check_package(session, record, manifest, package)
+            check_authority()
+            registration_actor = _actor((existing or {}).get("requested_by", actor))
+            if existing is None:
+                self._save(session, record, manifest, "candidate_importing", operation={
+                    "kind": "candidate_import", "operation_id": operation_id,
+                    "package_sha256": expected_package_sha256, "requested_by": registration_actor,
+                    "requested_revision": expected_revision, "approval_manifest_sha256": source_sha,
+                    "candidate": frozen_candidate, "training_manifest": package,
+                    "request_identity": json.loads(_canonical(request_identity)),
+                })
+            else:
+                # No identity is fabricated for a legacy unknown write. The
+                # registrar may only reconcile its matching historical receipt.
+                frozen_candidate = existing.get("candidate", candidate)
             session.commit()
         # Only an injected P3 registrar may register a candidate. Its stable
         # idempotency key permits retry after an unknown commit; never publish.
+        check_authority()
         registered = self._candidate_registrar(
-            task_id=package["binding"]["task_id"], candidate=candidate,
+            task_id=package["binding"]["task_id"], candidate=frozen_candidate,
             training_manifest=package, actor=registration_actor, idempotency_key=operation_id,
         )
         if not isinstance(registered, dict) or not registered.get("artifact_id"):
@@ -872,12 +1225,19 @@ class TaskWorkflowService:
         with self._db.get_session() as session:
             self._begin(session)
             record, manifest = self._record(session, workflow_id)
-            operation = json.loads(record.operation_json or "{}")
-            if record.state != "candidate_importing" or operation.get("operation_id") != operation_id:
+            completed = completed_view(record, manifest, registered["artifact_id"])
+            if completed is not None:
+                return completed
+            operation = pending(record)
+            if operation is None:
                 raise TaskWorkflowConflict("candidate import state changed")
+            check_package(session, record, manifest, package)
+            check_authority()
             manifest["training"]["candidate"] = {"artifact_id": registered["artifact_id"], "stage": "candidate",
-                                                   "operation_id": operation_id}
+                "operation_id": operation_id, "requested_revision": operation.get("requested_revision", record.revision - 1),
+                "import_revision": record.revision, "request_identity": json.loads(_canonical(request_identity))}
             self._save(session, record, manifest, "candidate_registered")
             result = self._view(record)
+            result["candidate_import_receipt"] = manifest["training"]["candidate"]
             session.commit()
             return result
