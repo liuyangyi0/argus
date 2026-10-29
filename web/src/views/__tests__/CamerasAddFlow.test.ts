@@ -192,6 +192,45 @@ describe('Cameras page add camera flow', () => {
     vi.mocked(getRegions).mockResolvedValue({ regions: [] } as any)
   })
 
+  it('keeps each source draft and ignores USB discovery that arrives after switching to network', async () => {
+    let finish!: (result: Awaited<ReturnType<typeof getUsbDevices>>) => void
+    vi.mocked(getUsbDevices).mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+    const wrapper = mount(Cameras, { global: { plugins: [pinia], stubs: {
+      ConnectionTestResult: true, HealthBadge: true, ModeBadge: true,
+    } } })
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text().includes('新增摄像头'))!.trigger('click')
+    await flushPromises()
+    await wrapper.findAll('input.ant-input')[2]!.setValue('rtsp://camera.example/stream')
+    const type = wrapper.get('[data-test="camera-type"]')
+    await type.setValue('usb'); await flushPromises()
+    await type.setValue('rtsp'); await flushPromises()
+    finish({ devices: [{ index: 1, name: 'Late USB camera', width: 640, height: 480 }] })
+    await flushPromises()
+    expect((wrapper.findAll('input.ant-input')[2]!.element as HTMLInputElement).value).toBe('rtsp://camera.example/stream')
+    expect(wrapper.text()).toContain('网络视频流地址')
+    expect(wrapper.text()).not.toContain('Late USB camera')
+    wrapper.unmount()
+  })
+
+  it('allows an explicit USB index zero when device discovery cannot list an occupied device', async () => {
+    vi.mocked(getUsbDevices).mockResolvedValueOnce({ devices: [] })
+    vi.mocked(testCameraConnectionDraft).mockResolvedValueOnce({ ok: true } as never)
+    const wrapper = mount(Cameras, { global: { plugins: [pinia], stubs: {
+      ConnectionTestResult: true, HealthBadge: true, ModeBadge: true,
+    } } })
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text().includes('新增摄像头'))!.trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-test="camera-type"]').setValue('usb'); await flushPromises()
+    expect((wrapper.get('[data-test="usb-device-index"]').element as HTMLInputElement).value).toBe('0')
+    expect(wrapper.text()).toContain('0 表示第一台 USB 相机')
+    await wrapper.findAll('button').find(button => button.text().includes('测试连接'))!.trigger('click')
+    await flushPromises()
+    expect(testCameraConnectionDraft).toHaveBeenCalledWith({ source: '0', protocol: 'usb' })
+    wrapper.unmount()
+  })
+
   it('submits file camera settings and runs draft plus saved connection probes', async () => {
     vi.mocked(testCameraConnectionDraft).mockResolvedValue({
       ok: true,

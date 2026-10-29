@@ -109,10 +109,12 @@ const uptimeFormatted = computed(() => {
   return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`
 })
 
-const connectedCount = computed(() => health.value?.cameras?.filter((c: any) => c.connected).length ?? 0)
-const totalCameras = computed(() => health.value?.cameras?.length ?? 0)
+// Preview availability belongs to the source, not detection readiness or the
+// optional health-monitor registration. A missing model must not hide video.
+const connectedCount = computed(() => cameras.value.filter(camera => camera.status === 'online').length)
+const totalCameras = computed(() => cameras.value.length)
 function isCameraConnected(cameraId: string) {
-  return Boolean(health.value?.cameras?.find((c: any) => c.camera_id === cameraId)?.connected)
+  return cameras.value.find(camera => camera.camera_id === cameraId)?.status === 'online'
 }
 
 const todayAlerts = computed(() => cameras.value.reduce((sum: number, c: any) => sum + (c.alert_count_today || 0), 0))
@@ -371,7 +373,7 @@ function sparklineFill(values: number[]): string {
           <span v-if="anomalyDegradedCameras"> ({{ anomalyDegradedCameras }})</span>
         </template>
         <template #description>
-          原因：{{ anomalyDegradedReason }}。告警 severity 已被自动调低，请尽快排查。
+          原因：{{ anomalyDegradedReason }}。视频预览独立运行；识别和告警是否就绪，请查看对应分析任务。
         </template>
       </a-alert>
 
@@ -420,10 +422,10 @@ function sparklineFill(values: number[]): string {
                 <div style="display:flex;justify-content:space-between;align-items:flex-start">
                   <div style="display:flex;gap:6px">
                     <span class="chip"><span class="d" style="color:#2563eb"></span>{{ cam.name || cam.camera_id }}</span>
-                    <span class="chip mono" style="color:var(--ink-4)">{{ health?.cameras?.find((c: any) => c.camera_id === cam.camera_id)?.frames_captured ?? '--' }} FPS</span>
+                    <span class="chip mono" style="color:var(--ink-4)">{{ cam.fps ?? '--' }} FPS</span>
                   </div>
                   <div style="display:flex;gap:6px">
-                    <span class="chip green" v-if="health?.cameras?.find((c: any) => c.camera_id === cam.camera_id)?.connected">REC</span>
+                    <span class="chip green" v-if="isCameraConnected(cam.camera_id)">视频在线</span>
                     <span class="chip red" v-else>OFFLINE</span>
                     <span class="chip amber">AI</span>
                   </div>

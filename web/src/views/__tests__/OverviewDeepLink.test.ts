@@ -189,4 +189,34 @@ describe('Overview active alert links', () => {
 
     wrapper.unmount()
   })
+
+  it.each([{ cameraHealth: [] }, { cameraHealth: [{ camera_id: 'cam_01', connected: false }] }])('keeps source preview online without a detection health record: %j', async ({ cameraHealth }) => {
+    vi.mocked(getHealth).mockResolvedValue({ status: 'unhealthy', cameras: cameraHealth } as never)
+    vi.mocked(getAnomalyDegradation).mockResolvedValue({ anomaly: {
+      degraded: true, reason: 'model_unavailable', since: null, cameras: [],
+    } } as never)
+    const wrapper = mount(Overview, { global: { plugins: [pinia], stubs: {
+      'a-alert': alertStub, 'a-button': buttonStub, ContentSkeleton: true, OverviewLiveStream: true,
+    } } })
+    await flushPromises()
+    expect(wrapper.getComponent({ name: 'OverviewLiveStream' }).props('online')).toBe(true)
+    expect(wrapper.text()).toContain('异常检测模型不可用')
+    expect(wrapper.text()).toContain('视频预览独立运行')
+    expect(wrapper.text()).not.toContain('severity 已被自动调低')
+    expect(wrapper.text()).toContain('视频在线')
+    expect(wrapper.text()).not.toContain('REC')
+    wrapper.unmount()
+  })
+
+  it('does not revive an offline source from an old connected health record', async () => {
+    const current = await getWallStatus()
+    vi.mocked(getWallStatus).mockResolvedValue({ cameras: current.cameras.map(camera => ({ ...camera, status: 'offline' })) })
+    const wrapper = mount(Overview, { global: { plugins: [pinia], stubs: {
+      'a-alert': alertStub, 'a-button': buttonStub, ContentSkeleton: true, OverviewLiveStream: true,
+    } } })
+    await flushPromises()
+    expect(wrapper.getComponent({ name: 'OverviewLiveStream' }).props('online')).toBe(false)
+    expect(wrapper.text()).not.toContain('视频在线')
+    wrapper.unmount()
+  })
 })

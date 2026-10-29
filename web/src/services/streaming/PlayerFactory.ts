@@ -2,6 +2,9 @@ import axios from 'axios'
 import { logger } from '../../utils/logger'
 import { STREAM_CONNECT_TIMEOUT_MS } from '../../config/constants'
 
+const MSE_CODECS = ['avc1.640029', 'avc1.64002A', 'avc1.640033', 'avc1.42E01E',
+  'hvc1.1.6.L153.B0', 'mp4a.40.2', 'mp4a.40.5', 'opus', 'flac']
+
 export interface StreamInfo {
   camera_id: string
   go2rtc: boolean
@@ -42,6 +45,7 @@ export class WebRTCPlayer implements PlayerInstance {
   private wsUrl: string
   private videoEl: HTMLVideoElement
   private ownedStream: MediaStream | null = null
+  private removeFrameListeners: (() => void) | null = null
   private cancelConnection: (() => void) | null = null
 
   constructor(cameraId: string, wsUrl: string, videoEl: HTMLVideoElement) {
@@ -92,16 +96,38 @@ export class WebRTCPlayer implements PlayerInstance {
             pc.ontrack = (event) => {
               if (this.pc !== pc || this.ws !== ws) return
               if (this.videoEl && event.streams[0]) {
+                this.removeFrameListeners?.()
                 this.ownedStream = event.streams[0]
-                this.videoEl.srcObject = this.ownedStream
-                this.setStatus('playing')
-                settle(true)
+                const stream = this.ownedStream
+                const frameReady = () => {
+                  if (this.pc !== pc || this.ws !== ws || this.ownedStream !== stream
+                    || this.videoEl.srcObject !== stream || this.videoEl.paused
+                    || this.videoEl.readyState < 2 || this.videoEl.videoWidth <= 0 || this.videoEl.videoHeight <= 0) return
+                  this.removeFrameListeners?.()
+                  this.removeFrameListeners = null
+                  this.setStatus('playing')
+                  settle(true)
+                }
+                this.videoEl.addEventListener('loadeddata', frameReady)
+                this.videoEl.addEventListener('playing', frameReady)
+                this.removeFrameListeners = () => {
+                  this.videoEl.removeEventListener('loadeddata', frameReady)
+                  this.videoEl.removeEventListener('playing', frameReady)
+                }
+                this.videoEl.srcObject = stream
+                try {
+                  void this.videoEl.play().catch(() => {
+                    if (this.pc === pc && this.ws === ws && this.ownedStream === stream) failConnection()
+                  })
+                } catch { failConnection() }
               }
             }
             pc.onconnectionstatechange = () => {
               if (this.pc !== pc || this.ws !== ws) return
               if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                this.onReconnectRequest()
+                // Initial ICE/media failure must settle false so the factory
+                // can try MSE; it must not restart WebRTC indefinitely.
+                failConnection()
               }
             }
             pc.onicecandidate = (event) => {
@@ -165,6 +191,8 @@ export class WebRTCPlayer implements PlayerInstance {
   }
 
   private cleanup() {
+    this.removeFrameListeners?.()
+    this.removeFrameListeners = null
     if (this.pc) {
       this.pc.onconnectionstatechange = null
       this.pc.ontrack = null
@@ -255,6 +283,20 @@ export class MSEPlayer implements PlayerInstance {
         this.sourceOpenHandler = () => {
           this.mseWs = new WebSocket(this.wsUrl)
           this.mseWs.binaryType = 'arraybuffer'
+          const socket = this.mseWs
+          // A connected WebSocket alone does not subscribe to go2rtc MSE.
+          // Negotiate this browser's supported codecs before awaiting media.
+          socket.onopen = () => {
+            if (this.mseWs !== socket || !this.mediaSource) return
+            try {
+              const codecs = MSE_CODECS.filter(codec => MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`))
+              if (!codecs.length) throw new Error('No supported MSE codecs')
+              socket.send(JSON.stringify({ type: 'mse', value: codecs.join(',') }))
+            } catch {
+              this.cleanup()
+              settle(false)
+            }
+          }
 
           this.mseWs.onmessage = (event) => {
             if (typeof event.data === 'string') {
@@ -313,6 +355,20 @@ export class MSEPlayer implements PlayerInstance {
           }
         }
         this.mediaSource.addEventListener('sourceopen', this.sourceOpenHandler)
+        const ownedSource = this.mediaSource
+        const playbackFailed = () => {
+          if (this.mediaSource !== ownedSource) return
+          const wasPlaying = this.settled && this.status === 'playing'
+          this.cleanup()
+          if (!this.settled) settle(false)
+          else if (wasPlaying) {
+            this.setStatus('error')
+            this.onReconnectRequest()
+          }
+        }
+        // Replacing src after a WebRTC attempt can leave the element paused,
+        // even with autoplay. Explicitly resume this owned MSE source.
+        try { void this.videoEl.play().catch(playbackFailed) } catch { playbackFailed() }
       } catch {
         settle(false)
       }

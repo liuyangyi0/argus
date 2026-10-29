@@ -16,6 +16,7 @@ class FakeSocket {
 
 class FakePeer {
   static instances: FakePeer[] = []
+  connectionState: RTCPeerConnectionState = 'new'
   ontrack: ((event: { streams: MediaStream[] }) => void) | null = null
   onconnectionstatechange: (() => void) | null = null
   onicecandidate: ((event: RTCPeerConnectionIceEvent) => void) | null = null
@@ -29,12 +30,22 @@ class FakePeer {
 }
 
 class FakeMediaSource extends EventTarget {
+  static instances: FakeMediaSource[] = []
+  static isTypeSupported = vi.fn<(type: string) => boolean>(() => true)
   readyState = 'closed'
+  constructor() { super(); FakeMediaSource.instances.push(this) }
 }
 
 function stream() {
   const stop = vi.fn()
   return { media: { getTracks: () => [{ stop }] } as unknown as MediaStream, stop }
+}
+
+function decodedFrame(video: HTMLVideoElement) {
+  for (const [key, value] of Object.entries({ readyState: 2, videoWidth: 640, videoHeight: 480, paused: false })) {
+    Object.defineProperty(video, key, { value, configurable: true })
+  }
+  video.dispatchEvent(new Event('loadeddata'))
 }
 
 describe('player media ownership and cancellation', () => {
@@ -44,6 +55,8 @@ describe('player media ownership and cancellation', () => {
   beforeEach(() => {
     FakeSocket.instances = []
     FakePeer.instances = []
+    FakeMediaSource.instances = []
+    FakeMediaSource.isTypeSupported.mockReset().mockReturnValue(true)
     revoke = vi.fn<(url: string) => void>()
     class TestURL extends NativeURL {
       static createObjectURL = vi.fn().mockReturnValue('blob:old-player')
@@ -55,6 +68,7 @@ describe('player media ownership and cancellation', () => {
     vi.stubGlobal('MediaSource', FakeMediaSource)
     vi.stubGlobal('RTCSessionDescription', class { constructor(_init: unknown) {} })
     vi.stubGlobal('RTCIceCandidate', class { constructor(_init: unknown) {} })
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -71,6 +85,7 @@ describe('player media ownership and cancellation', () => {
     const pending = player.connect()
     FakeSocket.instances[0]?.onopen?.()
     FakePeer.instances[0]?.ontrack?.({ streams: [old.media] })
+    decodedFrame(video)
     await expect(pending).resolves.toBe(true)
     video.srcObject = newer.media
 
@@ -90,6 +105,7 @@ describe('player media ownership and cancellation', () => {
     const pending = player.connect()
     FakeSocket.instances[0]?.onopen?.()
     FakePeer.instances[0]?.ontrack?.({ streams: [owned.media] })
+    decodedFrame(video)
     await expect(pending).resolves.toBe(true)
     expect(player.status).toBe('playing')
 
@@ -170,6 +186,7 @@ describe('player media ownership and cancellation', () => {
     const pending = player.connect()
     FakeSocket.instances[0]?.onopen?.()
     FakePeer.instances[0]?.ontrack?.({ streams: [old.media] })
+    decodedFrame(video)
     await expect(pending).resolves.toBe(true)
     FakeSocket.instances[0]?.onmessage?.({ data: JSON.stringify({ type: `webrtc/${kind}`, value: 'negotiation' }) } as MessageEvent)
     player.destroy()
@@ -211,6 +228,7 @@ describe('player media ownership and cancellation', () => {
     const pending = player.connect()
     FakeSocket.instances[0]?.onopen?.()
     FakePeer.instances[0]?.ontrack?.({ streams: [owned.media] })
+    decodedFrame(video)
     await expect(pending).resolves.toBe(true)
     FakeSocket.instances[0]?.onmessage?.({ data: JSON.stringify({ type: 'webrtc/candidate', value: 'bad-candidate' }) } as MessageEvent)
     await flushPromises()
@@ -228,6 +246,73 @@ describe('player media ownership and cancellation', () => {
     expect(FakeSocket.instances[0]?.close).toHaveBeenCalledOnce()
   })
 
+  it.each(['failed', 'disconnected'] as const)('lets initial WebRTC %s fall through without restarting WebRTC', async state => {
+    vi.useFakeTimers()
+    const video = document.createElement('video')
+    const player = new WebRTCPlayer('cam1', 'ws://example.test/webrtc', video)
+    player.onReconnectRequest = vi.fn()
+    const pending = player.connect()
+    FakeSocket.instances[0]!.onopen!()
+    const peer = FakePeer.instances[0]!, owned = stream()
+    peer.ontrack!({ streams: [owned.media] })
+    expect(player.status).toBe('connecting')
+    expect(vi.getTimerCount()).toBe(1)
+    peer.connectionState = state
+    peer.onconnectionstatechange!()
+    await expect(pending).resolves.toBe(false)
+    expect(player.onReconnectRequest).not.toHaveBeenCalled()
+    expect(owned.stop).toHaveBeenCalledOnce()
+    decodedFrame(video)
+    expect(player.status).not.toBe('playing')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not count a signaled track without decoded frames as playback', async () => {
+    vi.useFakeTimers()
+    const video = document.createElement('video')
+    const player = new WebRTCPlayer('cam1', 'ws://example.test/webrtc', video)
+    const pending = player.connect()
+    FakeSocket.instances[0]!.onopen!()
+    FakePeer.instances[0]!.ontrack!({ streams: [stream().media] })
+    expect(player.status).toBe('connecting')
+    await vi.advanceTimersByTimeAsync(15000)
+    await expect(pending).resolves.toBe(false)
+    expect(player.status).not.toBe('playing')
+  })
+
+  it('keeps paused metadata-only WebRTC connecting until real playback starts', async () => {
+    vi.useFakeTimers()
+    const video = document.createElement('video')
+    const player = new WebRTCPlayer('cam1', 'ws://example.test/webrtc', video)
+    const pending = player.connect()
+    FakeSocket.instances[0]!.onopen!()
+    FakePeer.instances[0]!.ontrack!({ streams: [stream().media] })
+    for (const [key, value] of Object.entries({ readyState: 2, videoWidth: 640, videoHeight: 480, paused: true })) {
+      Object.defineProperty(video, key, { value, configurable: true })
+    }
+    video.dispatchEvent(new Event('loadeddata'))
+    expect(player.status).toBe('connecting')
+    decodedFrame(video)
+    await expect(pending).resolves.toBe(true)
+    expect(player.status).toBe('playing')
+    expect(vi.getTimerCount()).toBe(0)
+    player.destroy()
+  })
+
+  it('cleans up rejected WebRTC playback before accepting the first frame', async () => {
+    const video = document.createElement('video')
+    vi.mocked(video.play).mockRejectedValueOnce(new Error('playback denied'))
+    const player = new WebRTCPlayer('cam1', 'ws://example.test/webrtc', video)
+    player.onReconnectRequest = vi.fn()
+    const pending = player.connect()
+    FakeSocket.instances[0]!.onopen!()
+    const owned = stream()
+    FakePeer.instances[0]!.ontrack!({ streams: [owned.media] })
+    await expect(pending).resolves.toBe(false)
+    expect(owned.stop).toHaveBeenCalledOnce()
+    expect(player.onReconnectRequest).not.toHaveBeenCalled()
+  })
+
   it('releases only its MSE URL without resetting the next player element', async () => {
     const video = document.createElement('video')
     const load = vi.spyOn(video, 'load').mockImplementation(() => {})
@@ -242,6 +327,70 @@ describe('player media ownership and cancellation', () => {
     expect(load).not.toHaveBeenCalled()
     expect(revoke).toHaveBeenCalledOnce()
     expect(revoke).toHaveBeenCalledWith('blob:old-player')
+  })
+
+  it('negotiates MSE codecs on socket open and does not subscribe a cancelled player', async () => {
+    FakeMediaSource.isTypeSupported.mockImplementation(type => type.includes('avc1.64002A'))
+    const video = document.createElement('video')
+    vi.spyOn(video, 'load').mockImplementation(() => {})
+    const player = new MSEPlayer('cam1', 'ws://example.test/mse', video)
+    const pending = player.connect()
+    expect(video.play).toHaveBeenCalledOnce()
+    FakeMediaSource.instances[0]!.dispatchEvent(new Event('sourceopen'))
+    const socket = FakeSocket.instances[0]!
+    socket.onopen!()
+    expect(socket.send).toHaveBeenCalledWith(JSON.stringify({ type: 'mse', value: 'avc1.64002A' }))
+    const lateOpen = socket.onopen!
+    player.destroy()
+    await expect(pending).resolves.toBe(false)
+    lateOpen()
+    expect(socket.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('cleans up rejected MSE playback instead of leaving a paused connecting stream', async () => {
+    vi.useFakeTimers()
+    const video = document.createElement('video')
+    vi.spyOn(video, 'load').mockImplementation(() => {})
+    vi.mocked(video.play).mockRejectedValueOnce(new Error('playback denied'))
+    const player = new MSEPlayer('cam1', 'ws://example.test/mse', video)
+    await expect(player.connect()).resolves.toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(revoke).toHaveBeenCalledOnce()
+    player.destroy()
+  })
+
+  it('ignores an old play rejection after another player owns the element', async () => {
+    let reject!: (error: Error) => void
+    const video = document.createElement('video')
+    vi.spyOn(video, 'load').mockImplementation(() => {})
+    vi.mocked(video.play).mockReturnValueOnce(new Promise((_, fail) => { reject = fail }))
+    const player = new MSEPlayer('cam1', 'ws://example.test/mse', video)
+    player.onReconnectRequest = vi.fn()
+    const pending = player.connect()
+    player.destroy()
+    await expect(pending).resolves.toBe(false)
+    video.src = 'blob:new-owner'
+    reject(new Error('old playback aborted'))
+    await flushPromises()
+    expect(video.getAttribute('src')).toBe('blob:new-owner')
+    expect(player.onReconnectRequest).not.toHaveBeenCalled()
+  })
+
+  it.each(['unsupported_codec', 'send_failure'])('fails MSE negotiation promptly on %s', async failure => {
+    vi.useFakeTimers()
+    const video = document.createElement('video')
+    vi.spyOn(video, 'load').mockImplementation(() => {})
+    const player = new MSEPlayer('cam1', 'ws://example.test/mse', video)
+    const pending = player.connect()
+    FakeMediaSource.instances[0]!.dispatchEvent(new Event('sourceopen'))
+    const socket = FakeSocket.instances[0]!
+    if (failure === 'unsupported_codec') FakeMediaSource.isTypeSupported.mockReturnValue(false)
+    else socket.send.mockImplementation(() => { throw new Error('socket send failed') })
+    expect(() => socket.onopen!()).not.toThrow()
+    await expect(pending).resolves.toBe(false)
+    expect(socket.close).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+    player.destroy()
   })
 
   it('does not clear a newer WebRTC stream even if its old MSE src attribute remains', async () => {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Badge, Button, Form, Input, InputNumber, Modal, Select, Space, Typography, message } from 'ant-design-vue'
 import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons-vue'
@@ -74,25 +74,47 @@ const cameraForm = ref(defaultForm())
 
 const usbDevices = ref<{ index: number; name: string; width: number; height: number }[]>([])
 const usbLoading = ref(false)
+const usbManual = ref(false)
+const usbError = ref('')
+let usbRequest = 0
+let disposed = false
+const sourceDrafts = new Map<string, string>()
 const regionOptions = ref<{ id: number; name: string }[]>([])
 const regionsLoading = ref(false)
 
-watch(() => cameraForm.value.protocol, async (proto) => {
+watch([() => cameraForm.value, () => cameraForm.value.protocol], async ([form, proto], [previousForm, previousProtocol]) => {
+  const request = ++usbRequest
+  usbLoading.value = false; usbError.value = ''
+  if (form !== previousForm) {
+    sourceDrafts.clear(); usbManual.value = false
+  } else if (proto !== previousProtocol) {
+    sourceDrafts.set(previousProtocol, form.source)
+    form.source = sourceDrafts.get(proto) ?? ''
+    probeState.value = 'idle'; probeResult.value = null
+  }
   if (proto !== 'usb') return
-
+  const originalSource = form.source
   usbLoading.value = true
   try {
     const res = await getUsbDevices()
+    if (disposed || request !== usbRequest || form !== cameraForm.value || proto !== form.protocol) return
     usbDevices.value = res.devices
-    if (usbDevices.value.length > 0 && !editingId.value) {
-      cameraForm.value.source = String(usbDevices.value[0].index)
+    if (!form.source && !originalSource && usbDevices.value.length > 0) {
+      form.source = String(usbDevices.value[0].index)
     }
+    usbManual.value = !usbDevices.value.some(device => String(device.index) === form.source)
+    if (usbManual.value && !form.source) form.source = '0'
   } catch {
+    if (disposed || request !== usbRequest || form !== cameraForm.value || proto !== form.protocol) return
     usbDevices.value = []
+    usbError.value = '设备列表暂不可用，可手动填写设备索引；0 表示第一台 USB 相机。'
+    usbManual.value = true
+    if (!form.source) form.source = '0'
   } finally {
-    usbLoading.value = false
+    if (!disposed && request === usbRequest) usbLoading.value = false
   }
 })
+onBeforeUnmount(() => { disposed = true; usbRequest++ })
 
 function sourcePlaceholder(): string {
   switch (cameraForm.value.protocol) {
@@ -103,7 +125,7 @@ function sourcePlaceholder(): string {
     case 'gige':
       return '192.0.2.11'
     default:
-      return 'rtsp://admin:pass@192.0.2.100:554/stream'
+      return 'rtsp://192.0.2.100:554/stream'
   }
 }
 
@@ -414,9 +436,17 @@ function cameraRowProps(record: CameraSummary) {
             </Select.Option>
           </Select>
         </Form.Item>
-        <Form.Item label="视频源" required>
+        <Form.Item label="相机类型" required>
+          <Select v-model:value="cameraForm.protocol" data-test="camera-type">
+            <Select.Option value="usb">USB 相机</Select.Option>
+            <Select.Option value="rtsp">网络相机（RTSP）</Select.Option>
+            <Select.Option value="gige">工业相机（GigE Vision）</Select.Option>
+            <Select.Option value="file">视频文件</Select.Option>
+          </Select>
+        </Form.Item>
+        <Form.Item :label="cameraForm.protocol === 'usb' ? 'USB 设备' : cameraForm.protocol === 'rtsp' ? '网络视频流地址' : '视频源'" required>
           <Select
-            v-if="cameraForm.protocol === 'usb'"
+            v-if="cameraForm.protocol === 'usb' && !usbManual"
             v-model:value="cameraForm.source"
             :loading="usbLoading"
             :placeholder="usbLoading ? '正在检测...' : '选择 USB 摄像头'"
@@ -426,7 +456,16 @@ function cameraRowProps(record: CameraSummary) {
               {{ device.name }} ({{ device.width }}x{{ device.height }})
             </Select.Option>
           </Select>
+          <InputNumber v-else-if="cameraForm.protocol === 'usb'" data-test="usb-device-index"
+            :value="cameraForm.source === '' ? undefined : Number(cameraForm.source)" :min="0" :precision="0"
+            @update:value="value => cameraForm.source = value == null ? '' : String(value)" />
           <Input v-else v-model:value="cameraForm.source" :placeholder="sourcePlaceholder()" />
+          <template v-if="cameraForm.protocol === 'usb'">
+            <Button size="small" type="link" :disabled="usbLoading" @click="usbManual = !usbManual">{{ usbManual ? '从设备列表选择' : '手动填写设备索引' }}</Button>
+            <p class="source-help">设备位于运行 Argus 的电脑上；0 表示第一台 USB 相机，不是浏览网页电脑的设备。</p>
+            <p v-if="usbError" role="status">{{ usbError }}</p>
+          </template>
+          <p v-else-if="cameraForm.protocol === 'rtsp'" class="source-help">填写摄像头的完整 RTSP 流地址，不是摄像头管理网页地址。</p>
           <Button
             size="small"
             style="margin-top: 6px"
@@ -438,14 +477,6 @@ function cameraRowProps(record: CameraSummary) {
         </Form.Item>
 
         <Space>
-          <Form.Item label="协议">
-            <Select v-model:value="cameraForm.protocol" style="width: 140px">
-              <Select.Option value="rtsp">RTSP</Select.Option>
-              <Select.Option value="usb">USB</Select.Option>
-              <Select.Option value="gige">GigE Vision</Select.Option>
-              <Select.Option value="file">文件</Select.Option>
-            </Select>
-          </Form.Item>
           <Form.Item label="目标帧率">
             <InputNumber v-model:value="cameraForm.fps_target" :min="1" :max="120" />
           </Form.Item>
